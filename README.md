@@ -2,6 +2,8 @@
 
 FileTree is a standalone Windows disk-usage explorer written in Rust. It scans directories with a native threaded scanner and opens a native desktop UI by default.
 
+Current version: `0.1.0`
+
 ## Run
 
 ```powershell
@@ -20,6 +22,17 @@ Or run the built executable directly:
 .\target\debug\filetree.exe scan D:\Data --format json --out scan.json
 .\target\debug\filetree.exe scan D:\Data --format csv --out scan.csv
 ```
+
+## Development
+
+```powershell
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build --release
+```
+
+The release executable is written to `.\target\release\filetree.exe`. A convenience copy can be placed at `.\FileTree.exe` for local testing.
 
 ## Current Features
 
