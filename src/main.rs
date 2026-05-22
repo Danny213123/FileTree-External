@@ -595,10 +595,10 @@ fn add_node(shared: &WorkerShared, mut node: NodeRecord) -> usize {
     let mut nodes = shared.nodes.lock().expect("nodes lock poisoned");
     let id = nodes.len();
     node.id = id;
-    if let Some(parent) = node.parent {
-        if let Some(parent_node) = nodes.get_mut(parent) {
-            parent_node.children.push(id);
-        }
+    if let Some(parent) = node.parent
+        && let Some(parent_node) = nodes.get_mut(parent)
+    {
+        parent_node.children.push(id);
     }
     nodes.push(node);
     id
@@ -1702,7 +1702,7 @@ fn is_hidden_entry(path: &Path, _metadata: &Metadata) -> bool {
 
 #[cfg(windows)]
 fn platform_allocated_size(path: &Path, metadata: &Metadata) -> u64 {
-    windows_compressed_file_size(path).unwrap_or_else(|| metadata.len())
+    windows_compressed_file_size(path).unwrap_or(metadata.len())
 }
 
 #[cfg(not(windows))]
@@ -1766,6 +1766,12 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 
 #[cfg(windows)]
 mod desktop {
+    #![allow(dead_code)]
+    #![allow(clippy::manual_is_multiple_of)]
+    #![allow(clippy::manual_range_contains)]
+    #![allow(clippy::too_many_arguments)]
+    #![allow(clippy::upper_case_acronyms)]
+    #![allow(non_upper_case_globals)]
     #![allow(non_snake_case)]
     #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -4327,10 +4333,10 @@ mod desktop {
         })
         .flatten();
 
-        if let Some(p) = path {
-            if show_shell_context_menu(hwnd, &p, screen_pt.x, screen_pt.y) {
-                return;
-            }
+        if let Some(p) = path
+            && show_shell_context_menu(hwnd, &p, screen_pt.x, screen_pt.y)
+        {
+            return;
         }
 
         let menu = CreatePopupMenu();
@@ -4449,10 +4455,10 @@ mod desktop {
             (old, node_id)
         });
 
-        if let Some((old_hover, new_hover)) = hovered {
-            if old_hover != new_hover {
-                InvalidateRect(hwnd, null(), 0);
-            }
+        if let Some((old_hover, new_hover)) = hovered
+            && old_hover != new_hover
+        {
+            InvalidateRect(hwnd, null(), 0);
         }
     }
 
@@ -4968,14 +4974,14 @@ mod tests {
             // Simulate work
             let queue = shared.queue.lock().unwrap();
             assert_eq!(queue.active, 1);
-            assert_eq!(queue.done, false);
+            assert!(!queue.done);
         }
 
         // After guard is dropped:
         let queue = shared.queue.lock().unwrap();
         assert_eq!(queue.active, 0, "active count should be decremented");
-        assert_eq!(
-            queue.done, true,
+        assert!(
+            queue.done,
             "done should be true because active == 0 and dirs is empty"
         );
     }
@@ -5010,8 +5016,8 @@ mod tests {
 
         let queue = shared.queue.lock().unwrap();
         assert_eq!(queue.active, 1, "active count should be decremented");
-        assert_eq!(
-            queue.done, false,
+        assert!(
+            !queue.done,
             "done should be false because dirs is not empty"
         );
     }

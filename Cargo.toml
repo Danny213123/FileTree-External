@@ -2,5 +2,9 @@
 name = "filetree"
 version = "0.1.0"
 edition = "2024"
+description = "A standalone Windows disk-usage explorer with real-time threaded scans."
+repository = "https://github.com/Danny213123/FileTree"
+readme = "README.md"
+publish = false
 
 [dependencies]
