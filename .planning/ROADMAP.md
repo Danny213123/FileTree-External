@@ -54,7 +54,7 @@ Plans:
 - [x] 02-01-PLAN.md — Settings module foundation: hand-rolled JSON parse/write + Settings struct + atomic temp+rename store + baseline FFI (Kernel32 MoveFileExW, Shell32 SHGetKnownFolderPath)
 - [x] 02-02-PLAN.md — Single-instance named mutex (`LocalFileTree.SingleInstance.v1`) + WM_COPYDATA path forwarding (memcpy-out discipline, 64 KB cap, path validation)
 - [x] 02-03-PLAN.md — Path bar (ComboBoxEx32 drive picker + EDIT with SHAutoComplete) + 6-shortcut accelerator table (Enter/Esc/Del/Ctrl+F/Ctrl+E/F5)
-- [ ] 02-04-PLAN.md — 5-pane msctls_statusbar32 with live scan stats + settings save-on-mutate with drag-coalesce + window geometry restore + manual QA checkpoint
+- [x] 02-04-PLAN.md — 5-pane msctls_statusbar32 with live scan stats + settings save-on-mutate with drag-coalesce + window geometry restore + manual QA checkpoint
 **UI hint**: yes
 
 ### Phase 3: Search & Filter
