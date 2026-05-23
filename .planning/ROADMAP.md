@@ -35,7 +35,7 @@ This roadmap reaches rough TreeSize Personal-tier coverage atop the existing v0.
 Plans:
 - [x] 01-01-PLAN.md — Extract 8 top-level modules (model, io, scan, analytics, export, server, cli, diff) bottom-up per CONTEXT D-05; each commit passes the four-command CI quad
 - [x] 01-02-PLAN.md — Split the inline `mod desktop` block into 8 files under `src/desktop/` (state, ffi, theme, paint, shell, tabs+treemap placeholders, finalized mod.rs facade); each commit passes the CI quad
-- [ ] 01-03-PLAN.md — Final BLOCKING manual smoke checkpoint verifying scan / serve / desktop mode parity with v0.1.0 + zero-new-deps audit
+- [x] 01-03-PLAN.md — Final BLOCKING manual smoke checkpoint verifying scan / serve / desktop mode parity with v0.1.0 + zero-new-deps audit
 
 ### Phase 2: Settings & Polish
 **Goal**: Settings persist across launches under `%APPDATA%\FileTree\`, and the desktop shell feels finished (path bar, status bar, keyboard shortcuts) so manual testing of every later phase is ergonomic.
