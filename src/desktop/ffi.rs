@@ -206,7 +206,7 @@ pub(super) const SB_SETTEXTW: Uint = 0x040B;
 /// SB_GETPARTS: get the number of panes (not used in production, useful for testing).
 pub(super) const SB_GETPARTS: Uint = 0x0406;
 /// SPI_GETWORKAREA: retrieve the primary monitor's work area (excludes taskbar).
-pub(super) const SPI_GETWORKAREA: Uint = 0x0030;
+pub(crate) const SPI_GETWORKAREA: Uint = 0x0030;
 
 // Status-bar pane indices (Plan 02-04, UI-SPEC §"Status bar")
 pub(super) const PANE_FILES: usize = 0;
@@ -263,11 +263,11 @@ pub(super) struct Msg {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub(super) struct Rect {
-    pub(super) left: i32,
-    pub(super) top: i32,
-    pub(super) right: i32,
-    pub(super) bottom: i32,
+pub(crate) struct Rect {
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) right: i32,
+    pub(crate) bottom: i32,
 }
 
 #[repr(C)]
@@ -619,7 +619,7 @@ unsafe extern "system" {
     pub(super) fn DestroyAcceleratorTable(hAccel: Handle) -> Bool;
     pub(super) fn GetFocus() -> Hwnd;
     // Work-area query for window-geometry clamp (Plan 02-04, T-02-18)
-    pub(super) fn SystemParametersInfoW(
+    pub(crate) fn SystemParametersInfoW(
         uiAction: Uint,
         uiParam: Uint,
         pvParam: *mut c_void,

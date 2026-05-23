@@ -71,7 +71,12 @@ unsafe fn enable_visual_styles() {
     }
 }
 
-pub(crate) fn run(initial_path: PathBuf) -> io::Result<()> {
+pub(crate) fn run(
+    initial_path: PathBuf,
+    settings: crate::settings::Settings,
+    settings_store: std::sync::Arc<crate::settings::SettingsStore>,
+    clamped_geom: crate::settings::WindowGeometry,
+) -> io::Result<()> {
     unsafe {
         enable_visual_styles();
         let com_initialized = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED) >= 0;
@@ -83,7 +88,10 @@ pub(crate) fn run(initial_path: PathBuf) -> io::Result<()> {
         };
         InitCommonControlsEx(&controls);
 
-        let _ = STATE.set(Mutex::new(DesktopState::new(initial_path)));
+        let mut initial_state = DesktopState::new(initial_path);
+        initial_state.settings = settings;
+        initial_state.settings_store = Some(settings_store);
+        let _ = STATE.set(Mutex::new(initial_state));
 
         let h_instance = GetModuleHandleW(null());
         let class_name = crate::io::wide("FileTreeDesktopWindow");
@@ -111,15 +119,18 @@ pub(crate) fn run(initial_path: PathBuf) -> io::Result<()> {
         RegisterClassW(&window_class);
 
         let title = crate::io::wide(&format!("{APP_NAME} - Native Disk Explorer"));
+        // Use geometry restored from settings (clamped to work area) — no CW_USEDEFAULT.
+        // This is the no-jank invariant: geometry feeds directly into CreateWindowExW
+        // so there is never a SetWindowPos flicker after the window appears.
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
             title.as_ptr(),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            1280,
-            760,
+            clamped_geom.x,
+            clamped_geom.y,
+            clamped_geom.w,
+            clamped_geom.h,
             0,
             0,
             h_instance,
@@ -133,7 +144,8 @@ pub(crate) fn run(initial_path: PathBuf) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
 
-        set_window_dark_mode(hwnd, true);
+        let initial_dark = with_state_mut(|s| s.settings.dark_mode).unwrap_or(true);
+        set_window_dark_mode(hwnd, initial_dark);
 
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
@@ -216,6 +228,8 @@ unsafe extern "system" fn window_proc(
         WM_SIZE => {
             resize_controls(hwnd);
             InvalidateRect(hwnd, null(), 1);
+            // Mark pending persist so WM_EXITSIZEMOVE flushes the new geometry once (D-03).
+            with_state_mut(|state| state.pending_persist = true);
             0
         }
         WM_LBUTTONDOWN => {
@@ -330,15 +344,40 @@ unsafe extern "system" fn window_proc(
                     });
                 }
                 ID_DARK_CHECK => {
-                    let status_text = with_state_mut(|state| {
+                    let snap = with_state_mut(|state| {
                         state.dark_mode = button_checked(state.dark_check);
+                        state.settings.dark_mode = state.dark_mode;
                         DARK_MODE_ATOMIC.store(state.dark_mode, Ordering::Relaxed);
                         apply_theme(state);
-                        render_list(state)
+                        let _ = render_list(state);
+                        state::snapshot_for_save(state)
                     })
                     .flatten();
-                    if let Some(text) = status_text {
-                        with_state_mut(|state| set_window_text(state.status, &text));
+                    // Save OUTSIDE the lock (reentrancy discipline, PATTERNS.md §"Save-pattern rule").
+                    if let Some(snap) = snap {
+                        state::save_settings_if_dirty(snap);
+                    }
+                }
+                ID_HIDDEN_CHECK => {
+                    let snap = with_state_mut(|state| {
+                        let checked = button_checked(state.hidden_check);
+                        state.settings.show_hidden = checked;
+                        state::snapshot_for_save(state)
+                    })
+                    .flatten();
+                    if let Some(snap) = snap {
+                        state::save_settings_if_dirty(snap);
+                    }
+                }
+                ID_FOLLOW_CHECK => {
+                    let snap = with_state_mut(|state| {
+                        let checked = button_checked(state.follow_check);
+                        state.settings.follow_symlinks = checked;
+                        state::snapshot_for_save(state)
+                    })
+                    .flatten();
+                    if let Some(snap) = snap {
+                        state::save_settings_if_dirty(snap);
                     }
                 }
                 ID_MENU_OPEN => {
@@ -467,6 +506,15 @@ unsafe extern "system" fn window_proc(
             let _ = lparam;
             0
         }
+        // Drag-coalesce flush: end of mouse drag or window resize (Plan 02-04, D-03).
+        WM_LBUTTONUP => {
+            state::flush_pending_persist(hwnd);
+            0
+        }
+        WM_EXITSIZEMOVE => {
+            state::flush_pending_persist(hwnd);
+            0
+        }
         WM_COPYDATA => handle_copy_data(hwnd, lparam),
         WM_SCAN_DONE => {
             if lparam != 0 {
@@ -504,6 +552,9 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             stop_current_scan();
+            // Final flush: capture any pending drag-coalesced changes before exit.
+            // Handles window-close via X button that may not have fired WM_LBUTTONUP.
+            state::flush_pending_persist(hwnd);
             destroy_cached_icons();
             PostQuitMessage(0);
             0
@@ -545,11 +596,17 @@ unsafe fn create_controls(hwnd: Hwnd) {
         }
 
         // Create path edit EDIT control (Plan 02-03).
+        // Use last_path from settings if non-empty; fall back to initial_path (command-line arg).
+        let initial_path_text = if !state.settings.last_path.is_empty() {
+            state.settings.last_path.clone()
+        } else {
+            path_to_string(&state.initial_path)
+        };
         state.path_edit = create_child(
             hwnd,
             h_instance,
             "EDIT",
-            &path_to_string(&state.initial_path),
+            &initial_path_text,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
             0,
             ID_PATH_EDIT,
@@ -692,9 +749,29 @@ unsafe fn create_controls(hwnd: Hwnd) {
         }
         state.list = 0;
 
-        SendMessageW(state.hidden_check, BM_SETCHECK, BST_CHECKED, 0);
+        // Restore settings-persisted checkbox states.
+        let hidden_check = if state.settings.show_hidden {
+            BST_CHECKED
+        } else {
+            0
+        };
+        let follow_check = if state.settings.follow_symlinks {
+            BST_CHECKED
+        } else {
+            0
+        };
+        let dark_check = if state.settings.dark_mode {
+            BST_CHECKED
+        } else {
+            0
+        };
+        SendMessageW(state.hidden_check, BM_SETCHECK, hidden_check, 0);
         SendMessageW(state.files_check, BM_SETCHECK, BST_CHECKED, 0);
-        SendMessageW(state.dark_check, BM_SETCHECK, BST_CHECKED, 0);
+        SendMessageW(state.follow_check, BM_SETCHECK, follow_check, 0);
+        SendMessageW(state.dark_check, BM_SETCHECK, dark_check, 0);
+        // Sync runtime state with loaded settings.
+        state.dark_mode = state.settings.dark_mode;
+        DARK_MODE_ATOMIC.store(state.dark_mode, Ordering::Relaxed);
         for control in [
             state.drive_picker,
             state.path_edit,
@@ -920,6 +997,8 @@ pub(super) unsafe fn start_scan_from_controls(hwnd: Hwnd) {
             return None;
         }
         let path = get_window_text(state.path_edit);
+        // Persist the last scanned path immediately (discrete mutation, D-03).
+        state.settings.last_path = path.clone();
         state.scanning = true;
         state.current_scan = None;
         state.visible_rows.clear();
@@ -953,13 +1032,18 @@ pub(super) unsafe fn start_scan_from_controls(hwnd: Hwnd) {
             state.refresh_button,
             state.stop_button,
         );
-        Some((options, cancel_flag, controls))
+        let snap = state::snapshot_for_save(state);
+        Some((options, cancel_flag, controls, snap))
     })
     .flatten();
 
-    let Some((options, cancel, controls)) = scan_setup else {
+    let Some((options, cancel, controls, path_snap)) = scan_setup else {
         return;
     };
+    // Save last_path OUTSIDE the lock (reentrancy discipline).
+    if let Some(snap) = path_snap {
+        state::save_settings_if_dirty(snap);
+    }
 
     // Win32 calls OUTSIDE the mutex Ã¢â‚¬â€ safe from deadlock.
     if controls.0 != 0 {
@@ -1670,6 +1754,15 @@ unsafe fn handle_drive_picker_change(hwnd: Hwnd) {
         SetWindowTextW(path_edit, path_wide.as_ptr());
         // SHAutoComplete is already wired; it will suggest first-level folders from X:\.
         // Per UI-SPEC: do NOT auto-start a scan on drive selection.
+        // Persist the drive path immediately (discrete mutation, D-03).
+        let snap = with_state_mut(|state| {
+            state.settings.last_path = path_str;
+            state::snapshot_for_save(state)
+        })
+        .flatten();
+        if let Some(snap) = snap {
+            state::save_settings_if_dirty(snap);
+        }
     }
     let _ = hwnd;
 }
