@@ -55,9 +55,14 @@ pub(super) unsafe fn apply_theme(state: &mut DesktopState) {
 
     // Setting Explorer themes on buttons and checkboxes strips their ComCtl32 v6
     // modern visuals and falls back to flat ugly legacy classic styles.
-    // We only set it on edit and status static controls.
+    // We only set it on edit, combo, and status controls (Plan 02-03 adds drive_picker).
     SetWindowTheme(state.path_edit, theme.as_ptr(), null());
     SetWindowTheme(state.status, theme.as_ptr(), null());
+    // drive_picker (ComboBoxEx32) requires DarkMode_Explorer / Explorer theme for dark-mode
+    // coherence — without this, the ComboBoxEx32 dropdown ignores dark mode entirely.
+    if state.drive_picker != 0 {
+        SetWindowTheme(state.drive_picker, theme.as_ptr(), null());
+    }
 
     let buttons = [
         state.browse_button,
