@@ -16,8 +16,8 @@ use std::sync::{Mutex, OnceLock};
 use crate::model::ScanResult;
 
 use super::ffi::{
-    CopyDataStruct, FILETREE_PATH_MSG_ID, Hfont, Hicon, Hwnd, Lparam, Lresult, MAX_COPYDATA_BYTES,
-    SetForegroundWindow, SetWindowTextW,
+    CopyDataStruct, FILETREE_PATH_MSG_ID, Handle, Hfont, Hicon, Hwnd, Lparam, Lresult,
+    MAX_COPYDATA_BYTES, SetForegroundWindow, SetWindowTextW,
 };
 
 pub(super) static STATE: OnceLock<Mutex<DesktopState>> = OnceLock::new();
@@ -25,6 +25,12 @@ pub(super) static STATE: OnceLock<Mutex<DesktopState>> = OnceLock::new();
 pub(super) struct DesktopState {
     pub(super) initial_path: PathBuf,
     pub(super) hwnd: Hwnd,
+    /// ComboBoxEx32 drive picker HWND — populated in create_controls (Plan 02-03).
+    /// Initialized to 0; destroyed implicitly by DestroyWindow on WM_DESTROY.
+    pub(super) drive_picker: Hwnd,
+    /// Accelerator table handle — created before the message loop (Plan 02-03),
+    /// destroyed via DestroyAcceleratorTable after the message loop exits.
+    pub(super) accel_table: Handle,
     pub(super) path_edit: Hwnd,
     pub(super) browse_button: Hwnd,
     pub(super) scan_button: Hwnd,
@@ -72,6 +78,8 @@ impl DesktopState {
         Self {
             initial_path,
             hwnd: 0,
+            drive_picker: 0,
+            accel_table: 0,
             path_edit: 0,
             browse_button: 0,
             scan_button: 0,

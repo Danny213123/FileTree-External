@@ -75,9 +75,11 @@ pub(crate) fn run(initial_path: PathBuf) -> io::Result<()> {
     unsafe {
         enable_visual_styles();
         let com_initialized = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED) >= 0;
+        // ICC_USEREX_CLASSES enables ComboBoxEx32; ICC_BAR_CLASSES enables msctls_statusbar32.
+        // Without these, CreateWindowExW for those classes returns 0 silently (RESEARCH anti-pattern).
         let controls = InitCommonControlsEx {
             dwSize: size_of::<InitCommonControlsEx>() as Dword,
-            dwICC: ICC_LISTVIEW_CLASSES,
+            dwICC: ICC_LISTVIEW_CLASSES | ICC_USEREX_CLASSES | ICC_BAR_CLASSES,
         };
         InitCommonControlsEx(&controls);
 
@@ -137,10 +139,53 @@ pub(crate) fn run(initial_path: PathBuf) -> io::Result<()> {
         UpdateWindow(hwnd);
         start_scan_from_controls(hwnd);
 
+        // Build the accelerator table (Plan 02-03, Pattern 6).
+        // Use MaybeUninit + ptr::write to build the packed Accel array without triggering
+        // Rust's unaligned-references lint (fields of packed structs cannot be directly
+        // referenced). TranslateAcceleratorW is called BEFORE TranslateMessage (Pitfall #8):
+        // the accelerator wins over the edit control's default key handling for Enter/Esc/F5.
+        let mut accel_uninit = [
+            core::mem::MaybeUninit::<Accel>::uninit(),
+            core::mem::MaybeUninit::<Accel>::uninit(),
+            core::mem::MaybeUninit::<Accel>::uninit(),
+            core::mem::MaybeUninit::<Accel>::uninit(),
+            core::mem::MaybeUninit::<Accel>::uninit(),
+            core::mem::MaybeUninit::<Accel>::uninit(),
+        ];
+        let accel_data: [(u8, u16, u16); 6] = [
+            (FVIRTKEY, VK_RETURN, CMD_SCAN),
+            (FVIRTKEY, VK_ESCAPE, CMD_CANCEL_SCAN),
+            (FVIRTKEY, VK_DELETE, CMD_DELETE_SEL),
+            (FVIRTKEY | FCONTROL, 'F' as u16, CMD_FOCUS_SEARCH),
+            (FVIRTKEY | FCONTROL, 'E' as u16, CMD_EXPORT),
+            (FVIRTKEY, VK_F5, CMD_REFRESH),
+        ];
+        for (slot, (fvirt, key, cmd)) in accel_uninit.iter_mut().zip(accel_data.iter()) {
+            // SAFETY: MaybeUninit::as_mut_ptr() gives a valid pointer to write the value.
+            let ptr = slot.as_mut_ptr();
+            core::ptr::write_unaligned(core::ptr::addr_of_mut!((*ptr).fVirt), *fvirt);
+            core::ptr::write_unaligned(core::ptr::addr_of_mut!((*ptr).key), *key);
+            core::ptr::write_unaligned(core::ptr::addr_of_mut!((*ptr).cmd), *cmd);
+        }
+        // SAFETY: all six slots were initialized via write_unaligned above.
+        let accels: [Accel; 6] = core::mem::transmute(accel_uninit);
+        let haccel = CreateAcceleratorTableW(accels.as_ptr(), 6);
+        with_state_mut(|s| s.accel_table = haccel);
+
         let mut message: Msg = zeroed();
+        // TranslateAcceleratorW MUST come before TranslateMessage (Pitfall #8).
+        // When it returns non-zero the accelerator was dispatched as WM_COMMAND;
+        // we skip TranslateMessage + DispatchMessageW for that iteration.
         while GetMessageW(&mut message, 0, 0, 0) > 0 {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
+            if TranslateAcceleratorW(hwnd, haccel, &mut message) == 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+
+        // Destroy accelerator table after the message loop exits.
+        if haccel != 0 {
+            DestroyAcceleratorTable(haccel);
         }
 
         if com_initialized {
@@ -218,7 +263,60 @@ unsafe extern "system" fn window_proc(
         }
         WM_COMMAND => {
             let id = (wparam & 0xffff) as isize;
+            let notify_code = ((wparam >> 16) & 0xffff) as u32;
             match id {
+                // --- Accelerator-table shortcut commands (Plan 02-03, Pattern 6) ---
+                // CMD_SCAN (Enter): start a scan if none is in flight.
+                // UI-SPEC: no-op when already scanning (button is disabled by EnableWindow).
+                id if id == CMD_SCAN as isize => {
+                    let scanning = with_state_mut(|s| s.scanning).unwrap_or(false);
+                    if !scanning {
+                        start_scan_from_controls(hwnd);
+                    }
+                }
+                // CMD_CANCEL_SCAN (Esc): cancel an active scan; no-op otherwise.
+                id if id == CMD_CANCEL_SCAN as isize => {
+                    let scanning = with_state_mut(|s| s.scanning).unwrap_or(false);
+                    if scanning {
+                        stop_current_scan();
+                    }
+                }
+                // CMD_REFRESH (F5): restart the scan (cancel if in flight, then re-start).
+                id if id == CMD_REFRESH as isize => {
+                    let scanning = with_state_mut(|s| s.scanning).unwrap_or(false);
+                    if scanning {
+                        stop_current_scan();
+                    }
+                    start_scan_from_controls(hwnd);
+                }
+                // CMD_EXPORT (Ctrl+E): route to the existing export entry (no-op stub until
+                // Phase 4 wires the export pipeline; debug-only log confirms dispatch).
+                id if id == CMD_EXPORT as isize => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("CMD_EXPORT fired (stub — Phase 4 wires export pipeline)");
+                }
+                // CMD_FOCUS_SEARCH (Ctrl+F): no-op stub per UI-SPEC (Phase 3 wires focus call).
+                id if id == CMD_FOCUS_SEARCH as isize => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("CMD_FOCUS_SEARCH fired (stub — Phase 3 wires search focus)");
+                }
+                // CMD_DELETE_SEL (Del): focus-conditional per UI-SPEC.
+                // Fires ONLY when the custom tree list has focus; when path edit has focus,
+                // the accelerator handler checks GetFocus() and no-ops so Del falls through
+                // to the edit control's default delete-char behavior.
+                id if id == CMD_DELETE_SEL as isize => {
+                    let list_hwnd = with_state_mut(|s| s.list).unwrap_or(0);
+                    if GetFocus() == list_hwnd && list_hwnd != 0 {
+                        #[cfg(debug_assertions)]
+                        eprintln!("CMD_DELETE_SEL fired (stub — Phase 5 wires IFileOperation)");
+                    }
+                    // When list does not have focus, fall through — let the edit control handle Del.
+                }
+                // Drive picker CBN_SELCHANGE: user selected a drive — set path edit to X:\
+                ID_DRIVE_PICKER if notify_code == CBN_SELCHANGE => {
+                    handle_drive_picker_change(hwnd);
+                }
+                // --- Existing button / menu commands ---
                 ID_BROWSE_BUTTON => choose_and_set_directory(hwnd),
                 ID_SCAN_BUTTON | ID_REFRESH_BUTTON => start_scan_from_controls(hwnd),
                 ID_STOP_BUTTON => stop_current_scan(),
@@ -422,6 +520,31 @@ unsafe fn create_controls(hwnd: Hwnd) {
         state.font = CreateFontW(-15, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
         state.bold_font = CreateFontW(-15, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
 
+        // Create drive picker (ComboBoxEx32) — left of the path edit (Plan 02-03, Pattern 4).
+        // Positioned at placeholder coords (0, 0, 10, 10); resize_controls does final layout.
+        {
+            let class = crate::io::wide("ComboBoxEx32");
+            state.drive_picker = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                null(),
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+                0,
+                0,
+                10,
+                10,
+                hwnd,
+                ID_DRIVE_PICKER as Hmenu,
+                h_instance,
+                null_mut(),
+            );
+        }
+        // Populate the drive picker with all non-empty drives.
+        if state.drive_picker != 0 {
+            populate_drive_picker(state.drive_picker, &path_to_string(&state.initial_path));
+        }
+
+        // Create path edit EDIT control (Plan 02-03).
         state.path_edit = create_child(
             hwnd,
             h_instance,
@@ -431,6 +554,15 @@ unsafe fn create_controls(hwnd: Hwnd) {
             0,
             ID_PATH_EDIT,
         );
+        // SHAutoComplete MUST be called AFTER CreateWindowExW returns a non-zero HWND
+        // (Pitfall #3 — calling before the edit HWND is valid silently fails).
+        // This wires the Explorer-style filesystem autocomplete dropdown to the path edit.
+        if state.path_edit != 0 {
+            SHAutoComplete(
+                state.path_edit,
+                SHACF_FILESYS_DIRS | SHACF_AUTOSUGGEST_FORCE_ON | SHACF_AUTOAPPEND_FORCE_ON,
+            );
+        }
         state.browse_button = create_child(
             hwnd,
             h_instance,
@@ -545,6 +677,7 @@ unsafe fn create_controls(hwnd: Hwnd) {
         SendMessageW(state.files_check, BM_SETCHECK, BST_CHECKED, 0);
         SendMessageW(state.dark_check, BM_SETCHECK, BST_CHECKED, 0);
         for control in [
+            state.drive_picker,
             state.path_edit,
             state.browse_button,
             state.scan_button,
@@ -559,7 +692,9 @@ unsafe fn create_controls(hwnd: Hwnd) {
             state.dark_check,
             state.status,
         ] {
-            SendMessageW(control, WM_SETFONT, state.font as Wparam, 1);
+            if control != 0 {
+                SendMessageW(control, WM_SETFONT, state.font as Wparam, 1);
+            }
         }
         apply_theme(state);
         EnableWindow(state.stop_button, 0);
@@ -609,13 +744,30 @@ unsafe fn resize_controls(hwnd: Hwnd) {
         let actions_y = 74;
         let status_h = 26;
 
-        // Path edit takes all width minus browse button
-        let path_w = (width - margin * 2 - browse_w - 8).max(260);
+        // Drive picker: 80 logical px wide (UI-SPEC), left-inset of `margin` (8px sm spacing)
+        let picker_w = 80;
+        let picker_gap = 4; // xs spacing between picker and path edit
+        let bar_h = 32; // xl token — path bar height
 
-        MoveWindow(state.path_edit, margin, path_y, path_w, button_h, 1);
+        // Layout drive picker + path edit:
+        //   [margin] [picker_w] [picker_gap] [path_edit_w] [8] [browse_w] [margin]
+        let path_edit_x = margin + picker_w + picker_gap;
+        let path_edit_w = (width - path_edit_x - 8 - browse_w - margin).max(100);
+
+        if state.drive_picker != 0 {
+            MoveWindow(state.drive_picker, margin, path_y, picker_w, bar_h, 1);
+        }
+        MoveWindow(
+            state.path_edit,
+            path_edit_x,
+            path_y,
+            path_edit_w,
+            button_h,
+            1,
+        );
         MoveWindow(
             state.browse_button,
-            margin + path_w + 8,
+            path_edit_x + path_edit_w + 8,
             path_y,
             browse_w,
             button_h,
@@ -1265,4 +1417,226 @@ unsafe fn show_error(hwnd: Hwnd, message: &str) {
     let title = crate::io::wide(APP_NAME);
     let message = crate::io::wide(message);
     MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+}
+
+// ---------------------------------------------------------------------------
+// Drive picker helpers (Plan 02-03, Pattern 4)
+// ---------------------------------------------------------------------------
+
+/// Filters the `GetLogicalDrives` bitmask using a caller-supplied drive-type probe.
+///
+/// Returns letters ('A'..='Z') for every bit that is set in `mask` whose drive type
+/// (returned by the `drive_type` closure) is NOT `DRIVE_UNKNOWN` or `DRIVE_NO_ROOT_DIR`.
+///
+/// Pure-Rust; no Win32 calls. The closure abstraction makes the function unit-testable
+/// without hitting the OS (tests supply a mock closure).
+fn pure_filter_drive_letters(mask: u32, drive_type: impl Fn(char) -> Uint) -> Vec<char> {
+    ('A'..='Z')
+        .enumerate()
+        .filter_map(|(bit, letter)| {
+            if (mask >> bit) & 1 == 0 {
+                return None;
+            }
+            let dt = drive_type(letter);
+            if dt == DRIVE_UNKNOWN || dt == DRIVE_NO_ROOT_DIR {
+                return None;
+            }
+            Some(letter)
+        })
+        .collect()
+}
+
+/// Formats a drive picker entry string per UI-SPEC copywriting contract.
+///
+/// - If `label` is `Some` and non-empty, returns `"X: <label>"`.
+/// - Otherwise falls back to the drive-type name.
+fn format_drive_entry(letter: char, dt: Uint, label: Option<&str>) -> String {
+    let fallback = match dt {
+        DRIVE_FIXED => "Local Disk",
+        DRIVE_REMOVABLE => "Removable",
+        DRIVE_CDROM => "CD/DVD",
+        DRIVE_REMOTE => "Network",
+        DRIVE_RAMDISK => "RAM Disk",
+        _ => "Disk",
+    };
+    let display_label = match label {
+        Some(s) if !s.is_empty() => s,
+        _ => fallback,
+    };
+    format!("{letter}: {display_label}")
+}
+
+/// Populates the drive picker with entries for every enumerable drive.
+///
+/// Reads `GetLogicalDrives`, filters via `pure_filter_drive_letters` + `GetDriveTypeW`,
+/// fetches each volume label via `GetVolumeInformationW`, formats via `format_drive_entry`,
+/// and inserts via `CBEM_INSERTITEMW`.
+///
+/// `initial_path` is used to pre-select the matching drive letter (falls back to C: or first).
+unsafe fn populate_drive_picker(picker: Hwnd, initial_path: &str) {
+    let mask = GetLogicalDrives();
+    let letters = pure_filter_drive_letters(mask, |letter| {
+        let root: Vec<u16> = format!("{letter}:\\")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        GetDriveTypeW(root.as_ptr())
+    });
+
+    // Determine the initial drive letter from the path (first char if alpha).
+    let initial_letter = initial_path
+        .chars()
+        .next()
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|c| c.to_ascii_uppercase());
+
+    let mut sel_index: i32 = 0;
+    for (index, &letter) in letters.iter().enumerate() {
+        let root: Vec<u16> = format!("{letter}:\\")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let dt = GetDriveTypeW(root.as_ptr());
+
+        // Try to read the volume label.
+        let mut name_buf = [0u16; 256];
+        let label_ok = GetVolumeInformationW(
+            root.as_ptr(),
+            name_buf.as_mut_ptr(),
+            256,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            0,
+        );
+        let label: Option<String> = if label_ok != 0 {
+            let len = name_buf.iter().position(|&c| c == 0).unwrap_or(0);
+            if len > 0 {
+                Some(String::from_utf16_lossy(&name_buf[..len]).to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let entry = format_drive_entry(letter, dt, label.as_deref());
+        let mut entry_wide: Vec<u16> = entry.encode_utf16().chain(Some(0)).collect();
+
+        let mut item = ComboBoxExItemW {
+            mask: CBEIF_TEXT,
+            iItem: -1,
+            pszText: entry_wide.as_mut_ptr(),
+            cchTextMax: entry_wide.len() as i32,
+            iImage: 0,
+            iSelectedImage: 0,
+            iOverlay: 0,
+            iIndent: 0,
+            lParam: 0,
+        };
+        SendMessageW(
+            picker,
+            CBEM_INSERTITEMW as Uint,
+            0,
+            &mut item as *mut _ as Lparam,
+        );
+
+        // Track which index to pre-select.
+        if initial_letter == Some(letter) {
+            sel_index = index as i32;
+        }
+    }
+
+    // If no match found and letters is non-empty, prefer C: if present, else 0.
+    let no_match = initial_letter.is_none() || !letters.contains(&initial_letter.unwrap_or('_'));
+    if no_match && let Some(c_pos) = letters.iter().position(|&l| l == 'C') {
+        sel_index = c_pos as i32;
+    }
+
+    if !letters.is_empty() {
+        SendMessageW(picker, CB_SETCURSEL as Uint, sel_index as Wparam, 0);
+    }
+}
+
+/// Handles drive picker CBN_SELCHANGE: reads the selected letter and sets the path edit to `X:\`.
+unsafe fn handle_drive_picker_change(hwnd: Hwnd) {
+    let (picker, path_edit) = match with_state_mut(|s| (s.drive_picker, s.path_edit)) {
+        Some(pair) => pair,
+        None => return,
+    };
+    if picker == 0 || path_edit == 0 {
+        return;
+    }
+
+    // Retrieve the text of the currently selected item (first char is the letter).
+    let len = GetWindowTextLengthW(picker).max(0);
+    let mut buf = vec![0u16; len as usize + 2];
+    let read = GetWindowTextW(picker, buf.as_mut_ptr(), buf.len() as i32);
+    if read < 1 {
+        return;
+    }
+    let text = String::from_utf16_lossy(&buf[..read as usize]);
+    if let Some(letter) = text.chars().next().filter(|c| c.is_ascii_alphabetic()) {
+        let path_str = format!("{letter}:\\");
+        let path_wide: Vec<u16> = path_str.encode_utf16().chain(Some(0)).collect();
+        SetWindowTextW(path_edit, path_wide.as_ptr());
+        // SHAutoComplete is already wired; it will suggest first-level folders from X:\.
+        // Per UI-SPEC: do NOT auto-start a scan on drive selection.
+    }
+    let _ = hwnd;
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for pure-Rust drive picker helpers (Plan 02-03, Task 2 behavior)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[cfg(windows)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pure_filter_drive_letters_includes_cdrom() {
+        // C: fixed, D: CDROM — both should be included (only UNKNOWN/NO_ROOT_DIR excluded).
+        let mask = 0b0000_0000_0000_1100u32; // bits 2 and 3 = C and D
+        let letters = pure_filter_drive_letters(mask, |letter| match letter {
+            'C' => DRIVE_FIXED,
+            'D' => DRIVE_CDROM,
+            _ => DRIVE_UNKNOWN,
+        });
+        assert_eq!(letters, vec!['C', 'D']);
+    }
+
+    #[test]
+    fn pure_filter_drive_letters_excludes_unknown() {
+        let mask = 0b0000_0000_0000_0100u32; // bit 2 = C
+        let letters = pure_filter_drive_letters(mask, |_| DRIVE_UNKNOWN);
+        assert!(letters.is_empty(), "DRIVE_UNKNOWN should be excluded");
+    }
+
+    #[test]
+    fn pure_filter_drive_letters_excludes_no_root_dir() {
+        let mask = 0b0000_0000_0000_0100u32; // bit 2 = C
+        let letters = pure_filter_drive_letters(mask, |_| DRIVE_NO_ROOT_DIR);
+        assert!(letters.is_empty(), "DRIVE_NO_ROOT_DIR should be excluded");
+    }
+
+    #[test]
+    fn format_drive_entry_uses_label() {
+        let s = format_drive_entry('C', DRIVE_FIXED, Some("Windows"));
+        assert_eq!(s, "C: Windows");
+    }
+
+    #[test]
+    fn format_drive_entry_falls_back_to_type_name() {
+        assert_eq!(format_drive_entry('C', DRIVE_FIXED, None), "C: Local Disk");
+        assert_eq!(
+            format_drive_entry('D', DRIVE_REMOVABLE, None),
+            "D: Removable"
+        );
+        assert_eq!(format_drive_entry('E', DRIVE_CDROM, None), "E: CD/DVD");
+        assert_eq!(format_drive_entry('Z', DRIVE_REMOTE, None), "Z: Network");
+        assert_eq!(format_drive_entry('R', DRIVE_RAMDISK, None), "R: RAM Disk");
+    }
 }
