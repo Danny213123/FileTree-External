@@ -60,6 +60,21 @@ pub(super) struct DesktopState {
     pub(super) scroll_row: usize,
     pub(super) hovered_id: Option<usize>,
     pub(super) active_tab: usize,
+    // Settings persistence (Plan 02-04)
+    /// Loaded settings; mutated in place by toggle/drag handlers.
+    pub(super) settings: crate::settings::Settings,
+    /// Store handle for saving; None on non-Windows builds or when unavailable.
+    pub(super) settings_store: Option<std::sync::Arc<crate::settings::SettingsStore>>,
+    /// Drag-coalesce flag (D-03): set true during continuous drag events;
+    /// flushed exactly once on WM_LBUTTONUP / WM_EXITSIZEMOVE.
+    pub(super) pending_persist: bool,
+    // Status-bar data (Plan 02-04, POL-03)
+    /// Total bytes scanned so far — used by the throughput formula.
+    pub(super) last_scan_bytes: u64,
+    /// Elapsed milliseconds at last progress update — used by throughput formula.
+    pub(super) last_scan_elapsed_ms: u128,
+    /// True before first scan and after scan completion/cancel — controls idle markers.
+    pub(super) status_idle: bool,
 }
 
 pub(super) struct ScanDone {
@@ -109,6 +124,12 @@ impl DesktopState {
             scroll_row: 0,
             hovered_id: None,
             active_tab: 1,
+            settings: crate::settings::Settings::default(),
+            settings_store: None,
+            pending_persist: false,
+            last_scan_bytes: 0,
+            last_scan_elapsed_ms: 0,
+            status_idle: true,
         }
     }
 }

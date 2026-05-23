@@ -662,15 +662,34 @@ unsafe fn create_controls(hwnd: Hwnd) {
             0,
             ID_DARK_CHECK,
         );
-        state.status = create_child(
-            hwnd,
-            h_instance,
-            "STATIC",
-            "Ready",
-            WS_CHILD | WS_VISIBLE,
-            0,
-            ID_STATUS,
-        );
+        // Create the 5-pane msctls_statusbar32 status bar (Plan 02-04, UI-SPEC §"Status bar").
+        // ICC_BAR_CLASSES must be set in InitCommonControlsEx (already done in run()).
+        // Coordinates are ignored — the status bar auto-sizes to the bottom of the parent.
+        {
+            let class = crate::io::wide("msctls_statusbar32");
+            state.status = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                null(),
+                WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                ID_STATUS as Hmenu,
+                h_instance,
+                null_mut(),
+            );
+        }
+        // Set initial idle-state pane texts.
+        if state.status != 0 {
+            set_status_pane(state.status, PANE_FILES, "-- files");
+            set_status_pane(state.status, PANE_FOLDERS, "-- folders");
+            set_status_pane(state.status, PANE_ERRORS, "-- errors");
+            set_status_pane(state.status, PANE_ELAPSED, "--:--");
+            set_status_pane(state.status, PANE_THROUGHPUT, "-- MB/s");
+        }
         state.list = 0;
 
         SendMessageW(state.hidden_check, BM_SETCHECK, BST_CHECKED, 0);
@@ -735,14 +754,14 @@ unsafe fn resize_controls(hwnd: Hwnd) {
     }
 
     let width = (rect.right - rect.left).max(500);
-    let height = (rect.bottom - rect.top).max(300);
+    let _height = (rect.bottom - rect.top).max(300);
     with_state_mut(|state| {
         let margin = 10;
         let browse_w = 110;
         let button_h = 26;
         let path_y = 38;
         let actions_y = 74;
-        let status_h = 26;
+        let _status_h = 26;
 
         // Drive picker: 80 logical px wide (UI-SPEC), left-inset of `margin` (8px sm spacing)
         let picker_w = 80;
@@ -879,14 +898,17 @@ unsafe fn resize_controls(hwnd: Hwnd) {
             ShowWindow(state.dark_check, hide);
         }
 
-        MoveWindow(
-            state.status,
-            margin,
-            height - status_h,
-            width - margin * 2,
-            status_h,
-            1,
-        );
+        // msctls_statusbar32 auto-positions itself at the bottom when WM_SIZE is sent.
+        // We also recompute the pane layout for the current width and DPI.
+        if state.status != 0 {
+            // Send WM_SIZE to the status bar so it repositions itself.
+            SendMessageW(state.status, WM_SIZE, 0, 0);
+            // Recompute pane right-edge x-coordinates for the current DPI.
+            let dpi = GetDpiForWindow(hwnd);
+            let dpi = if dpi == 0 { 96 } else { dpi };
+            let parts = compute_status_parts(width, dpi);
+            SendMessageW(state.status, SB_SETPARTS, 5, parts.as_ptr() as Lparam);
+        }
     });
 }
 
@@ -909,6 +931,9 @@ pub(super) unsafe fn start_scan_from_controls(hwnd: Hwnd) {
             }
         }
         state.show_files = button_checked(state.files_check);
+        state.status_idle = false;
+        state.last_scan_bytes = 0;
+        state.last_scan_elapsed_ms = 0;
         let cancel_flag = Arc::new(AtomicBool::new(false));
         state.current_cancel = Some(Arc::clone(&cancel_flag));
 
@@ -937,7 +962,13 @@ pub(super) unsafe fn start_scan_from_controls(hwnd: Hwnd) {
     };
 
     // Win32 calls OUTSIDE the mutex Ã¢â‚¬â€ safe from deadlock.
-    set_window_text(controls.0, "Scanning...");
+    if controls.0 != 0 {
+        set_status_pane(controls.0, PANE_FILES, "0 files");
+        set_status_pane(controls.0, PANE_FOLDERS, "0 folders");
+        set_status_pane(controls.0, PANE_ERRORS, "0 errors");
+        set_status_pane(controls.0, PANE_ELAPSED, "0:00");
+        set_status_pane(controls.0, PANE_THROUGHPUT, "0.0 MB/s");
+    }
     EnableWindow(controls.1, 0);
     EnableWindow(controls.2, 0);
     EnableWindow(controls.3, 0);
@@ -978,6 +1009,8 @@ unsafe fn finish_scan(hwnd: Hwnd, result: Result<ScanResult, String>, canceled: 
     let deferred = with_state_mut(|state| {
         state.scanning = false;
         state.current_cancel = None;
+        // Mark status idle so throughput pane resets to "-- MB/s" immediately (UI-SPEC).
+        state.status_idle = true;
         let controls = (
             state.status,
             state.path_edit,
@@ -991,40 +1024,64 @@ unsafe fn finish_scan(hwnd: Hwnd, result: Result<ScanResult, String>, canceled: 
             Ok(scan) => {
                 let elapsed = scan.elapsed_ms;
                 let node_count = scan.nodes.len();
+                let file_count = scan.nodes.iter().filter(|n| !n.is_dir).count() as u64;
+                let folder_count = scan.nodes.iter().filter(|n| n.is_dir).count() as u64;
+                let error_count = scan.errors.len() as u64;
                 let root_size = scan.nodes.first().map(|node| node.size).unwrap_or(0);
                 state.current_scan = Some(Arc::new(scan));
                 state.expanded.clear();
                 state.expanded.insert(0);
-                let list_status = render_list(state);
-                let status_message = if canceled {
-                    format!(
-                        "Stopped after {node_count} nodes in {} | partial total {}",
-                        format_duration_ui(elapsed),
-                        format_bytes_ui(root_size)
-                    )
-                } else {
-                    format!(
-                        "Scanned {node_count} nodes in {} | {}",
-                        format_duration_ui(elapsed),
-                        format_bytes_ui(root_size)
-                    )
-                };
-                let _ = list_status; // render_list already invalidated
-                (controls, Some(status_message), None)
+                let _ = render_list(state);
+                (
+                    controls,
+                    Some((
+                        file_count,
+                        folder_count,
+                        error_count,
+                        elapsed,
+                        canceled,
+                        node_count,
+                        root_size,
+                    )),
+                    None::<String>,
+                )
             }
-            Err(message) => (controls, Some("Scan failed".to_string()), Some(message)),
+            Err(message) => (controls, None, Some(message)),
         }
     });
 
-    if let Some((controls, status_msg, error_msg)) = deferred {
+    if let Some((controls, scan_info, error_msg)) = deferred {
         // Win32 calls OUTSIDE the mutex.
         EnableWindow(controls.1, 1);
         EnableWindow(controls.2, 1);
         EnableWindow(controls.3, 1);
         EnableWindow(controls.4, 1);
         EnableWindow(controls.5, 0);
-        if let Some(msg) = status_msg {
-            set_window_text(controls.0, &msg);
+        if let Some((files, folders, errors, elapsed, was_canceled, node_count, root_size)) =
+            scan_info
+        {
+            let status = controls.0;
+            if status != 0 {
+                // Count and elapsed panes FREEZE at final values (UI-SPEC §"Status bar / completed scan").
+                set_status_pane(status, PANE_FILES, &format_status_files(files, false));
+                set_status_pane(status, PANE_FOLDERS, &format_status_folders(folders, false));
+                set_status_pane(status, PANE_ERRORS, &format_status_errors(errors, false));
+                set_status_pane(status, PANE_ELAPSED, &format_status_elapsed(elapsed, false));
+                // Throughput resets to "-- MB/s" immediately on completion/cancel (UI-SPEC).
+                set_status_pane(status, PANE_THROUGHPUT, "-- MB/s");
+            }
+            // Also update the legacy status for the title bar / error log.
+            let _ = (was_canceled, node_count, root_size);
+        } else if error_msg.is_none() {
+            // Scan failed path — show idle markers.
+            let status = controls.0;
+            if status != 0 {
+                set_status_pane(status, PANE_FILES, "-- files");
+                set_status_pane(status, PANE_FOLDERS, "-- folders");
+                set_status_pane(status, PANE_ERRORS, "-- errors");
+                set_status_pane(status, PANE_ELAPSED, "--:--");
+                set_status_pane(status, PANE_THROUGHPUT, "-- MB/s");
+            }
         }
         if let Some(msg) = error_msg {
             show_error(hwnd, &msg);
@@ -1038,27 +1095,57 @@ unsafe fn apply_scan_progress(
     partial_result: Option<ScanResult>,
 ) {
     // Update the scan result inside state and trigger render_list if a partial result is present.
-    let status_hwnd = with_state_mut(|state| {
+    // Also capture bytes and elapsed for the throughput formula.
+    let status_info = with_state_mut(|state| {
         if !state.scanning {
             return None;
         }
-        if let Some(scan) = partial_result {
+        let bytes = if let Some(scan) = partial_result {
+            let root_size = scan.nodes.first().map(|n| n.size).unwrap_or(0);
             state.current_scan = Some(Arc::new(scan));
             let _ = render_list(state);
-        }
-        Some(state.status)
+            root_size
+        } else {
+            state
+                .current_scan
+                .as_ref()
+                .and_then(|s| s.nodes.first())
+                .map(|n| n.size)
+                .unwrap_or(0)
+        };
+        state.last_scan_bytes = bytes;
+        state.last_scan_elapsed_ms = elapsed_ms;
+        let files = state
+            .current_scan
+            .as_ref()
+            .map(|s| s.nodes.iter().filter(|n| !n.is_dir).count() as u64)
+            .unwrap_or(0);
+        let folders = state
+            .current_scan
+            .as_ref()
+            .map(|s| s.nodes.iter().filter(|n| n.is_dir).count() as u64)
+            .unwrap_or(node_count as u64);
+        let errors = state
+            .current_scan
+            .as_ref()
+            .map(|s| s.errors.len() as u64)
+            .unwrap_or(0);
+        Some((state.status, files, folders, errors, bytes, elapsed_ms))
     })
     .flatten();
 
-    // Win32 call OUTSIDE the mutex Ã¢â‚¬â€ safe from deadlock.
-    if let Some(status) = status_hwnd {
-        set_window_text(
+    // Win32 calls OUTSIDE the mutex — safe from deadlock.
+    if let Some((status, files, folders, errors, bytes, elapsed)) = status_info
+        && status != 0
+    {
+        set_status_pane(status, PANE_FILES, &format_status_files(files, false));
+        set_status_pane(status, PANE_FOLDERS, &format_status_folders(folders, false));
+        set_status_pane(status, PANE_ERRORS, &format_status_errors(errors, false));
+        set_status_pane(status, PANE_ELAPSED, &format_status_elapsed(elapsed, false));
+        set_status_pane(
             status,
-            &format!(
-                "Scanning... {} nodes | {} elapsed",
-                format_count_ui(node_count as u64),
-                format_duration_ui(elapsed_ms)
-            ),
+            PANE_THROUGHPUT,
+            &format_status_throughput(bytes, elapsed, false),
         );
     }
 }

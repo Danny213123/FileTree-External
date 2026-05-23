@@ -715,3 +715,182 @@ pub(super) unsafe fn button_checked(hwnd: Hwnd) -> bool {
     use super::ffi::{BM_GETCHECK, BST_CHECKED, Wparam};
     SendMessageW(hwnd, BM_GETCHECK, 0, 0) as Wparam == BST_CHECKED
 }
+
+/// Format the files pane text.
+/// idle=true → "-- files" regardless of count (no scan in flight or scan complete).
+pub(super) fn format_status_files(count: u64, idle: bool) -> String {
+    if idle {
+        "-- files".to_string()
+    } else if count == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{} files", format_count_ui(count))
+    }
+}
+
+/// Format the folders pane text.
+pub(super) fn format_status_folders(count: u64, idle: bool) -> String {
+    if idle {
+        "-- folders".to_string()
+    } else if count == 1 {
+        "1 folder".to_string()
+    } else {
+        format!("{} folders", format_count_ui(count))
+    }
+}
+
+/// Format the errors pane text.
+pub(super) fn format_status_errors(count: u64, idle: bool) -> String {
+    if idle {
+        "-- errors".to_string()
+    } else if count == 1 {
+        "1 error".to_string()
+    } else {
+        format!("{} errors", format_count_ui(count))
+    }
+}
+
+/// Format the elapsed pane text.
+/// idle=true → "--:--"; otherwise M:SS for < 1 hour, H:MM:SS for >= 1 hour.
+pub(super) fn format_status_elapsed(elapsed_ms: u128, idle: bool) -> String {
+    if idle {
+        return "--:--".to_string();
+    }
+    let total_secs = elapsed_ms / 1_000;
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    if hours > 0 {
+        format!("{}:{:02}:{:02}", hours, minutes, secs)
+    } else {
+        format!("{}:{:02}", minutes, secs)
+    }
+}
+
+/// Format the throughput pane text.
+/// idle=true → "-- MB/s" (before scan or after completion/cancel).
+/// bytes=0 → "0.0 MB/s".
+/// Non-zero but < 0.1 MB/s → "<0.1 MB/s".
+pub(super) fn format_status_throughput(bytes: u64, elapsed_ms: u128, idle: bool) -> String {
+    if idle {
+        return "-- MB/s".to_string();
+    }
+    if elapsed_ms == 0 {
+        return "0.0 MB/s".to_string();
+    }
+    let mb_per_sec = (bytes as f64) / (elapsed_ms as f64 / 1_000.0) / (1024.0 * 1024.0);
+    if bytes == 0 {
+        "0.0 MB/s".to_string()
+    } else if mb_per_sec < 0.1 {
+        "<0.1 MB/s".to_string()
+    } else {
+        format!("{:.1} MB/s", mb_per_sec)
+    }
+}
+
+/// Compute the right-edge x-coordinates for the 5 status-bar panes.
+/// Pane widths at 96 dpi: [180, 360, 500, 640, -1 (last fills to end)].
+/// All values are scaled by dpi/96.
+pub(super) fn compute_status_parts(_client_width: i32, dpi: u32) -> [i32; 5] {
+    let scale = |v: i32| -> i32 { (v as i64 * dpi as i64 / 96) as i32 };
+    [scale(180), scale(360), scale(500), scale(640), -1]
+}
+
+/// Send a single status-bar pane text via SB_SETTEXTW.
+/// The wide string must stay alive for the duration of the SendMessageW call.
+pub(super) unsafe fn set_status_pane(status: Hwnd, pane: usize, text: &str) {
+    use super::ffi::{SB_SETTEXTW, SendMessageW};
+    let wide = crate::io::wide(text);
+    SendMessageW(
+        status,
+        SB_SETTEXTW,
+        pane,
+        wide.as_ptr() as super::ffi::Lparam,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_status_files_active() {
+        assert_eq!(format_status_files(1234, false), "1,234 files");
+        assert_eq!(format_status_files(1, false), "1 file");
+        assert_eq!(format_status_files(0, false), "0 files");
+    }
+
+    #[test]
+    fn format_status_files_idle() {
+        assert_eq!(format_status_files(0, true), "-- files");
+        assert_eq!(format_status_files(999, true), "-- files");
+    }
+
+    #[test]
+    fn format_status_folders_pluralization() {
+        assert_eq!(format_status_folders(1, false), "1 folder");
+        assert_eq!(format_status_folders(567, false), "567 folders");
+    }
+
+    #[test]
+    fn format_status_errors_pluralization() {
+        assert_eq!(format_status_errors(1, false), "1 error");
+        assert_eq!(format_status_errors(8, false), "8 errors");
+    }
+
+    #[test]
+    fn format_status_elapsed_under_hour() {
+        assert_eq!(format_status_elapsed(42_000, false), "0:42");
+        assert_eq!(format_status_elapsed(63_000, false), "1:03");
+        assert_eq!(format_status_elapsed(0, false), "0:00");
+    }
+
+    #[test]
+    fn format_status_elapsed_over_hour() {
+        assert_eq!(format_status_elapsed(3_723_456, false), "1:02:03");
+        assert_eq!(format_status_elapsed(7_200_000, false), "2:00:00");
+    }
+
+    #[test]
+    fn format_status_elapsed_idle() {
+        assert_eq!(format_status_elapsed(0, true), "--:--");
+    }
+
+    #[test]
+    fn format_status_throughput_active() {
+        assert_eq!(
+            format_status_throughput(10 * 1024 * 1024, 1000, false),
+            "10.0 MB/s"
+        );
+    }
+
+    #[test]
+    fn format_status_throughput_below_threshold() {
+        assert_eq!(format_status_throughput(1024, 1000, false), "<0.1 MB/s");
+    }
+
+    #[test]
+    fn format_status_throughput_zero_bytes() {
+        assert_eq!(format_status_throughput(0, 1500, false), "0.0 MB/s");
+    }
+
+    #[test]
+    fn format_status_throughput_idle_or_completed() {
+        assert_eq!(format_status_throughput(99_999_999, 1000, true), "-- MB/s");
+    }
+
+    #[test]
+    fn compute_status_parts_96dpi() {
+        assert_eq!(compute_status_parts(1280, 96), [180, 360, 500, 640, -1]);
+    }
+
+    #[test]
+    fn compute_status_parts_144dpi() {
+        let parts = compute_status_parts(1920, 144);
+        assert_eq!(parts[0], 270);
+        assert_eq!(parts[1], 540);
+        assert_eq!(parts[2], 750);
+        assert_eq!(parts[3], 960);
+        assert_eq!(parts[4], -1);
+    }
+}
