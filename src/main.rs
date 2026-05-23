@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod model;
+use crate::model::*;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File, Metadata};
@@ -17,105 +20,6 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/styles.css");
 const APP_JS: &str = include_str!("../web/app.js");
-
-#[derive(Clone, Debug)]
-struct ScanOptions {
-    root: PathBuf,
-    include_hidden: bool,
-    follow_links: bool,
-    exclude_patterns: Vec<String>,
-    max_depth: Option<usize>,
-    threads: usize,
-}
-
-#[derive(Clone, Debug)]
-struct NodeRecord {
-    id: usize,
-    parent: Option<usize>,
-    name: String,
-    path: String,
-    is_dir: bool,
-    is_link: bool,
-    hidden: bool,
-    readonly: bool,
-    size: u64,
-    allocated: u64,
-    files: u64,
-    folders: u64,
-    modified_ms: u128,
-    depth: usize,
-    errors: u64,
-    children: Vec<usize>,
-    extension: String,
-}
-
-#[derive(Clone, Debug)]
-struct ScanError {
-    path: String,
-    message: String,
-}
-
-#[derive(Clone, Debug)]
-struct ScanResult {
-    root_path: String,
-    scanned_at_ms: u128,
-    elapsed_ms: u128,
-    thread_count: usize,
-    nodes: Vec<NodeRecord>,
-    errors: Vec<ScanError>,
-}
-
-#[derive(Debug)]
-struct QueueState {
-    dirs: VecDeque<usize>,
-    active: usize,
-    done: bool,
-}
-
-#[derive(Debug)]
-struct WorkerShared {
-    options: ScanOptions,
-    nodes: Mutex<Vec<NodeRecord>>,
-    errors: Mutex<Vec<ScanError>>,
-    queue: Mutex<QueueState>,
-    queue_ready: Condvar,
-    cancel: Arc<AtomicBool>,
-}
-
-#[derive(Debug)]
-struct AppState {
-    initial_path: PathBuf,
-    last_scan: Mutex<Option<Arc<ScanResult>>>,
-}
-
-#[derive(Debug)]
-struct HttpRequest {
-    method: String,
-    target: String,
-}
-
-#[derive(Debug)]
-struct ExtensionStat {
-    ext: String,
-    bytes: u64,
-    allocated: u64,
-    files: u64,
-}
-
-#[derive(Debug)]
-struct AgeBucket {
-    label: &'static str,
-    bytes: u64,
-    files: u64,
-}
-
-#[derive(Debug)]
-struct DuplicateCandidate {
-    name: String,
-    size: u64,
-    waste: u64,
-    ids: Vec<usize>,
-}
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -1367,7 +1271,7 @@ fn extension_stats(nodes: &[NodeRecord], limit: usize) -> Vec<ExtensionStat> {
         entry.files = entry.files.saturating_add(1);
     }
     let mut stats: Vec<ExtensionStat> = stats.into_values().collect();
-    stats.sort_by(|left, right| right.bytes.cmp(&left.bytes));
+    stats.sort_by_key(|stat| std::cmp::Reverse(stat.bytes));
     stats.truncate(limit);
     stats
 }
@@ -1445,7 +1349,7 @@ fn duplicate_candidates(nodes: &[NodeRecord], limit: usize) -> Vec<DuplicateCand
             ids,
         });
     }
-    candidates.sort_by(|left, right| right.waste.cmp(&left.waste));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.waste));
     candidates.truncate(limit);
     candidates
 }
