@@ -7,7 +7,7 @@
 #![allow(non_snake_case)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::io;
@@ -25,6 +25,9 @@ use crate::cli::APP_NAME;
 use crate::io::{default_thread_count, epoch_ms_to_utc, path_to_string, reveal_path};
 use crate::model::*;
 use crate::scan::scan_path_with_progress;
+
+mod state;
+use state::{DesktopState, STATE, ScanDone, ScanProgressInfo, with_state_mut};
 
 type Bool = i32;
 type Dword = u32;
@@ -161,7 +164,6 @@ struct Point {
     y: i32,
 }
 
-static STATE: OnceLock<Mutex<DesktopState>> = OnceLock::new();
 static DARK_BRUSH: OnceLock<Hbrush> = OnceLock::new();
 static LIGHT_BRUSH: OnceLock<Hbrush> = OnceLock::new();
 static DARK_MODE_ATOMIC: AtomicBool = AtomicBool::new(true);
@@ -607,89 +609,6 @@ unsafe extern "system" {
         ppv: *mut *mut c_void,
         ppidlLast: *mut *const ITEMIDLIST,
     ) -> i32;
-}
-
-struct DesktopState {
-    initial_path: PathBuf,
-    hwnd: Hwnd,
-    path_edit: Hwnd,
-    browse_button: Hwnd,
-    scan_button: Hwnd,
-    stop_button: Hwnd,
-    refresh_button: Hwnd,
-    expand_button: Hwnd,
-    collapse_button: Hwnd,
-    columns_button: Hwnd,
-    hidden_check: Hwnd,
-    files_check: Hwnd,
-    follow_check: Hwnd,
-    dark_check: Hwnd,
-    status: Hwnd,
-    list: Hwnd,
-    font: Hfont,
-    bold_font: Hfont,
-    current_scan: Option<Arc<ScanResult>>,
-    current_cancel: Option<Arc<AtomicBool>>,
-    expanded: BTreeSet<usize>,
-    visible_rows: Vec<usize>,
-    icon_cache: HashMap<String, Hicon>,
-    show_files: bool,
-    scanning: bool,
-    dark_mode: bool,
-    path_column_visible: bool,
-    selected_id: usize,
-    scroll_row: usize,
-    hovered_id: Option<usize>,
-    active_tab: usize,
-}
-
-struct ScanDone {
-    result: Result<ScanResult, String>,
-    canceled: bool,
-}
-
-struct ScanProgressInfo {
-    node_count: usize,
-    elapsed_ms: u128,
-    partial_result: Option<ScanResult>,
-}
-
-impl DesktopState {
-    fn new(initial_path: PathBuf) -> Self {
-        Self {
-            initial_path,
-            hwnd: 0,
-            path_edit: 0,
-            browse_button: 0,
-            scan_button: 0,
-            stop_button: 0,
-            refresh_button: 0,
-            expand_button: 0,
-            collapse_button: 0,
-            columns_button: 0,
-            hidden_check: 0,
-            files_check: 0,
-            follow_check: 0,
-            dark_check: 0,
-            status: 0,
-            list: 0,
-            font: 0,
-            bold_font: 0,
-            current_scan: None,
-            current_cancel: None,
-            expanded: BTreeSet::new(),
-            visible_rows: Vec::new(),
-            icon_cache: HashMap::new(),
-            show_files: true,
-            scanning: false,
-            dark_mode: true,
-            path_column_visible: true,
-            selected_id: 0,
-            scroll_row: 0,
-            hovered_id: None,
-            active_tab: 1,
-        }
-    }
 }
 
 unsafe fn enable_visual_styles() {
@@ -2960,19 +2879,6 @@ unsafe fn show_error(hwnd: Hwnd, message: &str) {
     let title = wide(APP_NAME);
     let message = wide(message);
     MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
-}
-
-fn with_state_mut<T>(callback: impl FnOnce(&mut DesktopState) -> T) -> Option<T> {
-    let state = STATE.get()?;
-    // Use try_lock instead of lock to prevent deadlocks from reentrant
-    // calls. Win32 APIs (e.g. SetWindowTextW, EnableWindow) can send
-    // synchronous messages back to our window proc while we hold this
-    // lock. Rust's std::Mutex is NOT reentrant â€” lock() on the same
-    // thread would deadlock permanently. try_lock() returns Err
-    // (WouldBlock) for reentrant calls, allowing the reentrant handler
-    // to gracefully skip non-critical work.
-    let mut state = state.try_lock().ok()?;
-    Some(callback(&mut state))
 }
 
 fn wide(value: &str) -> Vec<u16> {
