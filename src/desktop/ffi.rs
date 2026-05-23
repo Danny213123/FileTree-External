@@ -640,6 +640,28 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+/// Atomically renames `tmp_path` to `final_path` using
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`.
+/// Returns `Ok(())` on success, `Err(io::Error::last_os_error())` on failure.
+/// Same-volume NTFS rename is atomic; callers must close the temp file handle
+/// before calling this function.
+pub(crate) fn atomic_rename(tmp_path: *const u16, final_path: *const u16) -> io::Result<()> {
+    // SAFETY: pointers are valid for the duration of the call; the file is
+    // closed before this call; MoveFileExW does not retain the pointers.
+    let ok = unsafe {
+        MoveFileExW(
+            tmp_path,
+            final_path,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Resolves `%APPDATA%` (`FOLDERID_RoamingAppData`) via the Shell API.
 /// Returns the path as a `PathBuf` on success, or an `io::Error` on failure.
 /// This is the only correct way to resolve the AppData path; env-var
