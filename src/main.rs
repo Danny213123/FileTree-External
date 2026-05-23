@@ -2,6 +2,7 @@
 
 mod analytics;
 mod cli;
+mod diff;
 mod export;
 mod io;
 mod model;
