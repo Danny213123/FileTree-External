@@ -9,6 +9,7 @@
 
 use std::ffi::c_void;
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::slice;
 
@@ -143,6 +144,19 @@ pub(super) const WM_SCAN_PROGRESS: Uint = WM_APP + 8;
 
 pub(super) const MOVEFILE_REPLACE_EXISTING: Dword = 0x0000_0001;
 pub(super) const MOVEFILE_WRITE_THROUGH: Dword = 0x0000_0008;
+
+// Single-instance mutex + WM_COPYDATA constants (Plan 02-02)
+pub(super) const WM_COPYDATA: Uint = 0x004A;
+pub(super) const ERROR_ALREADY_EXISTS: Dword = 183;
+/// Magic discriminator for WM_COPYDATA path-forward messages: "FT" + msg id 1.
+/// Any other dwData value is silently rejected per D-06.2.
+pub(crate) const FILETREE_PATH_MSG_ID: UlongPtr = 0x4654_0001;
+/// Maximum accepted cbData for WM_COPYDATA payloads — DoS sanity ceiling per D-06.1.
+pub(crate) const MAX_COPYDATA_BYTES: u32 = 64 * 1024;
+pub(super) const INVALID_FILE_ATTRIBUTES: Dword = 0xFFFF_FFFF;
+/// SYNCHRONIZE access right — used with OpenMutexW so the second instance can
+/// detect an existing mutex without taking ownership.
+pub(super) const SYNCHRONIZE: Dword = 0x0010_0000;
 
 pub(super) const FOLDERID_RoamingAppData: GUID = GUID {
     Data1: 0x3EB685DB,
@@ -305,6 +319,27 @@ unsafe extern "system" {
         dwFlags: Dword,
     ) -> Bool;
     pub(super) fn FlushFileBuffers(hFile: Handle) -> Bool;
+    // Single-instance mutex API (Plan 02-02, Pattern 2)
+    pub(super) fn CreateMutexW(
+        lpMutexAttributes: *mut c_void,
+        bInitialOwner: Bool,
+        lpName: *const u16,
+    ) -> Handle;
+    pub(super) fn OpenMutexW(
+        dwDesiredAccess: Dword,
+        bInheritHandle: Bool,
+        lpName: *const u16,
+    ) -> Handle;
+    pub(super) fn CloseHandle(hObject: Handle) -> Bool;
+    pub(super) fn GetLastError() -> Dword;
+    // Path canonicalization for WM_COPYDATA payload validation (D-06.3)
+    pub(super) fn GetFullPathNameW(
+        lpFileName: *const u16,
+        nBufferLength: Dword,
+        lpBuffer: *mut u16,
+        lpFilePart: *mut *mut u16,
+    ) -> Dword;
+    pub(super) fn GetFileAttributesW(lpFileName: *const u16) -> Dword;
 }
 
 #[link(name = "Ole32")]
@@ -456,6 +491,11 @@ unsafe extern "system" {
     pub(super) fn GetCursorPos(lpPoint: *mut Point) -> Bool;
     pub(super) fn ScreenToClient(hWnd: Hwnd, lpPoint: *mut Point) -> Bool;
     pub(super) fn GetDpiForWindow(hwnd: Hwnd) -> Uint;
+    // Single-instance foreground + window discovery (Plan 02-02, Pattern 2)
+    pub(super) fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> Hwnd;
+    pub(super) fn GetWindowThreadProcessId(hWnd: Hwnd, lpdwProcessId: *mut Dword) -> Dword;
+    pub(super) fn AllowSetForegroundWindow(dwProcessId: Dword) -> Bool;
+    pub(super) fn SetForegroundWindow(hWnd: Hwnd) -> Bool;
 }
 
 #[repr(C)]
@@ -662,6 +702,90 @@ pub(crate) fn atomic_rename(tmp_path: *const u16, final_path: *const u16) -> io:
     }
 }
 
+/// Win32 COPYDATASTRUCT — carries the path payload in WM_COPYDATA messages.
+/// IMPORTANT: `lpData` is valid ONLY for the duration of the synchronous
+/// `SendMessageW` call. The receiver MUST memcpy the payload into a local
+/// buffer before `SendMessageW` returns (see Pitfall #2 in 02-RESEARCH.md).
+#[repr(C)]
+pub(crate) struct CopyDataStruct {
+    /// Magic discriminator — must equal `FILETREE_PATH_MSG_ID` to be accepted.
+    pub(crate) dwData: UlongPtr,
+    /// Byte length of the payload (must be even; payload is UTF-16 pairs).
+    pub(crate) cbData: Dword,
+    /// Pointer to the UTF-16 path payload. Valid only during SendMessageW.
+    pub(crate) lpData: *const c_void,
+}
+
+/// Acquires the single-instance named mutex `Local\FileTree.SingleInstance.v1`.
+///
+/// - **Primary instance**: returns `Ok(mutex_handle)`. Caller MUST keep the
+///   returned handle alive for the process lifetime (dropping it releases the
+///   mutex). The OS auto-releases it on process exit.
+/// - **Second instance**: finds the primary window, requests foreground rights,
+///   forwards `initial_path` via WM_COPYDATA, then calls `std::process::exit(0)`.
+///   This function never returns for the second instance.
+///
+/// Errors are returned only when `CreateMutexW` itself fails (very rare — out
+/// of kernel resources).
+///
+/// # Safety
+/// Calls Win32 APIs. Must be called from the UI thread before the message loop.
+pub(crate) unsafe fn try_forward_or_acquire(
+    initial_path: &std::path::Path,
+) -> Result<Handle, std::io::Error> {
+    let name = crate::io::wide("Local\\FileTree.SingleInstance.v1");
+    let mutex = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+    if mutex == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if GetLastError() == ERROR_ALREADY_EXISTS {
+        // We are a second instance — the primary already holds the mutex.
+        CloseHandle(mutex);
+
+        // Locate the primary window by its registered class name.
+        let class_name = crate::io::wide("FileTreeDesktopWindow");
+        let hwnd = FindWindowW(class_name.as_ptr(), std::ptr::null());
+        if hwnd != 0 {
+            // Grant the primary process foreground rights before sending.
+            // Belt-and-suspenders per Pitfall #9: AllowSetForegroundWindow
+            // gives explicit rights; SendMessageW also grants implicit rights
+            // via the message-dispatch contract.
+            let mut pid: Dword = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            AllowSetForegroundWindow(pid); // best-effort; ignore return value
+
+            // Forward the requested path as a UTF-16 WM_COPYDATA payload.
+            // The path is NUL-terminated so the receiver can strip the NUL.
+            let path_u16: Vec<u16> = initial_path
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let bytes = path_u16.len().saturating_mul(2);
+            if bytes as u32 <= MAX_COPYDATA_BYTES {
+                let cds = CopyDataStruct {
+                    dwData: FILETREE_PATH_MSG_ID,
+                    cbData: bytes as Dword,
+                    lpData: path_u16.as_ptr() as *const c_void,
+                };
+                // SendMessageW is synchronous — lpData is valid for the entire call.
+                SendMessageW(hwnd, WM_COPYDATA, 0, &cds as *const _ as Lparam);
+            }
+
+            // Pop the primary window to the foreground (belt-and-suspenders #2).
+            SetForegroundWindow(hwnd);
+        }
+
+        // Second instance always exits 0 — no window created, clean exit.
+        std::process::exit(0);
+    }
+
+    // Primary instance — return the mutex handle. Caller holds it for the process
+    // lifetime; no explicit CloseHandle needed (OS releases it on exit).
+    Ok(mutex)
+}
+
 /// Resolves `%APPDATA%` (`FOLDERID_RoamingAppData`) via the Shell API.
 /// Returns the path as a `PathBuf` on success, or an `io::Error` on failure.
 /// This is the only correct way to resolve the AppData path; env-var
@@ -686,4 +810,42 @@ pub(crate) fn known_folder_roaming_appdata() -> io::Result<PathBuf> {
     let path_str = String::from_utf16_lossy(wide_slice);
     unsafe { CoTaskMemFree(ptr as *mut c_void) };
     Ok(PathBuf::from(path_str))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    /// Verifies CopyDataStruct layout matches Win32 COPYDATASTRUCT on x86_64.
+    /// Win32 layout: ULONG_PTR(8) + DWORD(4) + 4-byte natural padding + PVOID(8) = 24 bytes.
+    /// The padding appears because PVOID is 8-byte aligned on x86_64.
+    #[test]
+    fn copydatastruct_layout_matches_win32() {
+        // On x86_64 Windows the struct is exactly 24 bytes due to natural alignment.
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(size_of::<CopyDataStruct>(), 24);
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(size_of::<CopyDataStruct>(), 12);
+
+        // dwData is at offset 0.
+        assert_eq!(offset_of!(CopyDataStruct, dwData), 0);
+        // cbData immediately follows dwData (offset == size of UlongPtr).
+        assert_eq!(offset_of!(CopyDataStruct, cbData), size_of::<UlongPtr>());
+        // lpData is pointer-aligned; on x86_64 that means offset 16 (8 + 4 + 4 pad).
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(offset_of!(CopyDataStruct, lpData), 16);
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(offset_of!(CopyDataStruct, lpData), 8);
+    }
+
+    /// Verifies WM_COPYDATA and related constants match Win32 header values.
+    #[test]
+    fn copydata_constants_match_win32() {
+        assert_eq!(WM_COPYDATA, 0x004A);
+        assert_eq!(FILETREE_PATH_MSG_ID, 0x46540001);
+        assert_eq!(MAX_COPYDATA_BYTES, 65536);
+        assert_eq!(ERROR_ALREADY_EXISTS, 183);
+        assert_eq!(INVALID_FILE_ATTRIBUTES, 0xFFFF_FFFF);
+    }
 }

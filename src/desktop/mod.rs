@@ -25,7 +25,7 @@ use crate::model::*;
 use crate::scan::scan_path_with_progress;
 
 mod state;
-use state::{DesktopState, STATE, ScanDone, ScanProgressInfo, with_state_mut};
+use state::{DesktopState, STATE, ScanDone, ScanProgressInfo, handle_copy_data, with_state_mut};
 pub(crate) mod ffi;
 use ffi::*;
 mod theme;
@@ -369,6 +369,7 @@ unsafe extern "system" fn window_proc(
             let _ = lparam;
             0
         }
+        WM_COPYDATA => handle_copy_data(hwnd, lparam),
         WM_SCAN_DONE => {
             if lparam != 0 {
                 let payload = Box::from_raw(lparam as *mut ScanDone);
@@ -737,7 +738,7 @@ unsafe fn resize_controls(hwnd: Hwnd) {
     });
 }
 
-unsafe fn start_scan_from_controls(hwnd: Hwnd) {
+pub(super) unsafe fn start_scan_from_controls(hwnd: Hwnd) {
     // Collect everything we need from state, then release the mutex
     // BEFORE calling any Win32 APIs that could send messages back.
     let scan_setup = with_state_mut(|state| {
