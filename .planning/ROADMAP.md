@@ -33,7 +33,7 @@ This roadmap reaches rough TreeSize Personal-tier coverage atop the existing v0.
 **Brownfield refactor exception**: This phase intentionally delivers no new user-visible features. Per ARCHITECTURE.md, the split is mechanical, runs in its own phase with no feature piggyback, and unblocks every later phase. The "vertical MVP" success criterion here is "the existing vertical slice still works end-to-end after the split."
 **Plans:** 3 plans
 Plans:
-- [ ] 01-01-PLAN.md — Extract 8 top-level modules (model, io, scan, analytics, export, server, cli, diff) bottom-up per CONTEXT D-05; each commit passes the four-command CI quad
+- [x] 01-01-PLAN.md — Extract 8 top-level modules (model, io, scan, analytics, export, server, cli, diff) bottom-up per CONTEXT D-05; each commit passes the four-command CI quad
 - [ ] 01-02-PLAN.md — Split the inline `mod desktop` block into 8 files under `src/desktop/` (state, ffi, theme, paint, shell, tabs+treemap placeholders, finalized mod.rs facade); each commit passes the CI quad
 - [ ] 01-03-PLAN.md — Final BLOCKING manual smoke checkpoint verifying scan / serve / desktop mode parity with v0.1.0 + zero-new-deps audit
 
