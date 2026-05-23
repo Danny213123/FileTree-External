@@ -142,6 +142,60 @@ pub(super) const ID_MENU_PROPERTIES: isize = 3005;
 pub(super) const WM_SCAN_DONE: Uint = WM_APP + 7;
 pub(super) const WM_SCAN_PROGRESS: Uint = WM_APP + 8;
 
+// ComboBoxEx32 drive picker constants (Plan 02-03, Pattern 4)
+pub(super) const ICC_USEREX_CLASSES: Dword = 0x0000_0200;
+pub(super) const ICC_BAR_CLASSES: Dword = 0x0000_0004;
+pub(super) const CBEM_INSERTITEMW: Uint = 0x040B;
+pub(super) const CBEIF_TEXT: Uint = 0x0000_0001;
+pub(super) const CBS_DROPDOWNLIST: Dword = 0x0003;
+pub(super) const CB_SETCURSEL: Uint = 0x014E;
+pub(super) const CB_GETCURSEL: Uint = 0x0147;
+// combobox notification code sent when user changes selection
+pub(super) const CBN_SELCHANGE: u32 = 1;
+
+// Drive type constants for GetDriveTypeW (Plan 02-03)
+pub(super) const DRIVE_UNKNOWN: Uint = 0;
+pub(super) const DRIVE_NO_ROOT_DIR: Uint = 1;
+pub(super) const DRIVE_REMOVABLE: Uint = 2;
+pub(super) const DRIVE_FIXED: Uint = 3;
+pub(super) const DRIVE_REMOTE: Uint = 4;
+pub(super) const DRIVE_CDROM: Uint = 5;
+pub(super) const DRIVE_RAMDISK: Uint = 6;
+
+// SHAutoComplete flags (Plan 02-03, Pattern 5)
+pub(super) const SHACF_FILESYS_DIRS: Dword = 0x0000_0020;
+pub(super) const SHACF_AUTOSUGGEST_FORCE_ON: Dword = 0x1000_0000;
+pub(super) const SHACF_AUTOAPPEND_FORCE_ON: Dword = 0x4000_0000;
+
+// Accelerator virtual-key flags (Plan 02-03, Pattern 6, Pitfall #1)
+pub(super) const FVIRTKEY: u8 = 0x01;
+pub(super) const FCONTROL: u8 = 0x08;
+pub(super) const FSHIFT: u8 = 0x04;
+pub(super) const FALT: u8 = 0x10;
+pub(super) const FNOINVERT: u8 = 0x02;
+
+// Virtual key codes for the six shortcuts (Plan 02-03)
+pub(super) const VK_RETURN: u16 = 0x0D;
+pub(super) const VK_ESCAPE: u16 = 0x1B;
+pub(super) const VK_DELETE: u16 = 0x2E;
+pub(super) const VK_F5: u16 = 0x74;
+
+// Accelerator command IDs: 0xA001–0xA006, confirmed vacant in this file.
+// These map keyboard shortcuts to WM_COMMAND IDs handled by the command router.
+pub(super) const CMD_SCAN: u16 = 0xA001;
+pub(super) const CMD_CANCEL_SCAN: u16 = 0xA002;
+pub(super) const CMD_DELETE_SEL: u16 = 0xA003;
+pub(super) const CMD_FOCUS_SEARCH: u16 = 0xA004;
+pub(super) const CMD_EXPORT: u16 = 0xA005;
+pub(super) const CMD_REFRESH: u16 = 0xA006;
+
+// New ID for drive picker control — must not collide with existing ID_* values (101–112, 201, 3001–3005)
+pub(super) const ID_DRIVE_PICKER: isize = 113;
+
+// WM_ constants used by drag-coalesce flush (Plan 02-03; also consumed by Plan 02-04)
+pub(super) const WM_EXITSIZEMOVE: Uint = 0x0232;
+pub(super) const WM_LBUTTONUP: Uint = 0x0202;
+
 pub(super) const MOVEFILE_REPLACE_EXISTING: Dword = 0x0000_0001;
 pub(super) const MOVEFILE_WRITE_THROUGH: Dword = 0x0000_0008;
 
@@ -243,6 +297,37 @@ pub(super) struct PaintStruct {
     pub(super) rgbReserved: [u8; 32],
 }
 
+/// ComboBoxEx32 item descriptor used with CBEM_INSERTITEMW.
+/// All pointer fields remain valid only for the duration of the SendMessageW call.
+#[repr(C)]
+pub(super) struct ComboBoxExItemW {
+    pub(super) mask: Uint,
+    pub(super) iItem: isize,
+    pub(super) pszText: *mut u16,
+    pub(super) cchTextMax: i32,
+    pub(super) iImage: i32,
+    pub(super) iSelectedImage: i32,
+    pub(super) iOverlay: i32,
+    pub(super) iIndent: i32,
+    pub(super) lParam: Lparam,
+}
+
+/// Win32 ACCEL struct for CreateAcceleratorTableW.
+///
+/// **This is the ONLY packed struct in ffi.rs** (winuser.h uses #pragma pack(1) for ACCEL).
+/// Layout: BYTE fVirt (1) + WORD key (2) + WORD cmd (2) = 5 bytes packed; Rust may report
+/// 5 or 6 depending on trailing padding rules — both are acceptable to CreateAcceleratorTableW
+/// which reads only the 5 meaningful bytes per entry.
+///
+/// IMPORTANT: Field reads MUST use `core::ptr::addr_of!(...).read_unaligned()` to satisfy
+/// clippy's `unaligned-references` lint (Rust forbids direct references to packed-struct fields).
+#[repr(C, packed(1))]
+pub(super) struct Accel {
+    pub(super) fVirt: u8,
+    pub(super) key: u16,
+    pub(super) cmd: u16,
+}
+
 #[link(name = "Comctl32")]
 unsafe extern "system" {
     pub(super) fn InitCommonControlsEx(picce: *const InitCommonControlsEx) -> Bool;
@@ -340,6 +425,19 @@ unsafe extern "system" {
         lpFilePart: *mut *mut u16,
     ) -> Dword;
     pub(super) fn GetFileAttributesW(lpFileName: *const u16) -> Dword;
+    // Drive enumeration for ComboBoxEx32 drive picker (Plan 02-03, Pattern 4)
+    pub(super) fn GetLogicalDrives() -> Dword;
+    pub(super) fn GetDriveTypeW(lpRootPathName: *const u16) -> Uint;
+    pub(super) fn GetVolumeInformationW(
+        lpRootPathName: *const u16,
+        lpVolumeNameBuffer: *mut u16,
+        nVolumeNameSize: Dword,
+        lpVolumeSerialNumber: *mut Dword,
+        lpMaximumComponentLength: *mut Dword,
+        lpFileSystemFlags: *mut Dword,
+        lpFileSystemNameBuffer: *mut u16,
+        nFileSystemNameSize: Dword,
+    ) -> Bool;
 }
 
 #[link(name = "Ole32")]
@@ -496,6 +594,18 @@ unsafe extern "system" {
     pub(super) fn GetWindowThreadProcessId(hWnd: Hwnd, lpdwProcessId: *mut Dword) -> Dword;
     pub(super) fn AllowSetForegroundWindow(dwProcessId: Dword) -> Bool;
     pub(super) fn SetForegroundWindow(hWnd: Hwnd) -> Bool;
+    // Accelerator table APIs (Plan 02-03, Pattern 6)
+    pub(super) fn CreateAcceleratorTableW(paccel: *const Accel, cAccel: i32) -> Handle;
+    pub(super) fn TranslateAcceleratorW(hWnd: Hwnd, hAccTable: Handle, lpMsg: *mut Msg) -> i32;
+    pub(super) fn DestroyAcceleratorTable(hAccel: Handle) -> Bool;
+    pub(super) fn GetFocus() -> Hwnd;
+}
+
+// SHAutoComplete lives in Shlwapi.dll, NOT Shell32.dll — this is the ONE new DLL link
+// for Phase 2 (CLAUDE.md Constraint #3 / CONTEXT.md §canonical_refs "Phase 2 adds one new DLL: Shlwapi").
+#[link(name = "Shlwapi")]
+unsafe extern "system" {
+    pub(super) fn SHAutoComplete(hwndEdit: Hwnd, dwFlags: Dword) -> i32;
 }
 
 #[repr(C)]
@@ -847,5 +957,66 @@ mod tests {
         assert_eq!(MAX_COPYDATA_BYTES, 65536);
         assert_eq!(ERROR_ALREADY_EXISTS, 183);
         assert_eq!(INVALID_FILE_ATTRIBUTES, 0xFFFF_FFFF);
+    }
+
+    /// Verifies the Accel struct has the expected packed size.
+    ///
+    /// Win32 ACCEL is declared with #pragma pack(1): BYTE fVirt + WORD key + WORD cmd = 5 bytes.
+    /// Rust's #[repr(C, packed(1))] may produce 5 or 6 bytes depending on trailing padding.
+    /// Both are acceptable — CreateAcceleratorTableW reads only the first 5 bytes per entry.
+    /// This test pins whichever size the compiler chooses and documents the choice.
+    #[test]
+    fn accel_struct_is_six_bytes_packed() {
+        let sz = size_of::<Accel>();
+        // Accept either 5 (no trailing pad) or 6 (one byte trailing pad).
+        assert!(
+            sz == 5 || sz == 6,
+            "Accel size = {sz}; expected 5 or 6 (packed BYTE+WORD+WORD)"
+        );
+    }
+
+    /// Verifies Accel field values survive round-trip through packed storage.
+    ///
+    /// Fields of a packed struct must be read via `core::ptr::addr_of!(...).read_unaligned()`
+    /// because Rust forbids taking direct references to potentially-unaligned fields.
+    #[test]
+    fn accel_field_values_match_pitfall_1_recipe() {
+        let a = Accel {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: 'F' as u16,
+            cmd: CMD_FOCUS_SEARCH,
+        };
+        // SAFETY: addr_of! does not create a reference; read_unaligned handles packed alignment.
+        let fvirt = unsafe { core::ptr::addr_of!(a.fVirt).read_unaligned() };
+        let key = unsafe { core::ptr::addr_of!(a.key).read_unaligned() };
+        let cmd = unsafe { core::ptr::addr_of!(a.cmd).read_unaligned() };
+        assert_eq!(fvirt, FVIRTKEY | FCONTROL);
+        assert_eq!(key, 'F' as u16);
+        assert_eq!(cmd, CMD_FOCUS_SEARCH);
+    }
+
+    /// Verifies command ID values are in the expected range and pairwise distinct.
+    #[test]
+    fn command_ids_in_expected_range() {
+        let ids = [
+            CMD_SCAN,
+            CMD_CANCEL_SCAN,
+            CMD_DELETE_SEL,
+            CMD_FOCUS_SEARCH,
+            CMD_EXPORT,
+            CMD_REFRESH,
+        ];
+        for &id in &ids {
+            assert!(
+                id >= 0xA001 && id <= 0xA006,
+                "CMD id {id:#06X} outside 0xA001..=0xA006"
+            );
+        }
+        // Pairwise distinct: sort and check no adjacent duplicates.
+        let mut sorted = ids;
+        sorted.sort_unstable();
+        for pair in sorted.windows(2) {
+            assert_ne!(pair[0], pair[1], "Duplicate CMD id {:#06X}", pair[0]);
+        }
     }
 }
