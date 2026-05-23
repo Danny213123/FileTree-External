@@ -1,19 +1,26 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod io;
 mod model;
+use crate::io::{
+    current_dir_or_dot, default_thread_count, display_name, epoch_ms_to_utc, extension_for,
+    first_positional_arg, has_flag, is_hidden_entry, metadata_modified_ms, now_ms, open_path,
+    option_value, parse_bool, path_to_string, platform_allocated_size, reveal_path, should_exclude,
+    should_recurse, split_patterns,
+};
 use crate::model::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File, Metadata};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self as sio, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const APP_NAME: &str = "FileTree";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -85,7 +92,7 @@ Examples:
     );
 }
 
-fn run_desktop(initial_path: PathBuf) -> io::Result<()> {
+fn run_desktop(initial_path: PathBuf) -> sio::Result<()> {
     #[cfg(windows)]
     {
         desktop::run(initial_path)
@@ -94,14 +101,14 @@ fn run_desktop(initial_path: PathBuf) -> io::Result<()> {
     #[cfg(not(windows))]
     {
         let _ = initial_path;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
+        Err(sio::Error::new(
+            sio::ErrorKind::Unsupported,
             "the native desktop app is currently implemented for Windows",
         ))
     }
 }
 
-fn run_scan_command(args: &[String]) -> io::Result<()> {
+fn run_scan_command(args: &[String]) -> sio::Result<()> {
     let path = option_value(args, "--path")
         .map(PathBuf::from)
         .or_else(|| first_positional_arg(args).map(PathBuf::from))
@@ -126,8 +133,8 @@ fn run_scan_command(args: &[String]) -> io::Result<()> {
         "csv" => scan_result_to_csv(&result),
         "json" => scan_result_to_json(&result),
         other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(sio::Error::new(
+                sio::ErrorKind::InvalidInput,
                 format!("unsupported format '{other}'"),
             ));
         }
@@ -142,7 +149,7 @@ fn run_scan_command(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-fn run_server(initial_path: PathBuf, port: u16) -> io::Result<()> {
+fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let state = Arc::new(AppState {
         initial_path,
@@ -169,7 +176,7 @@ fn run_server(initial_path: PathBuf, port: u16) -> io::Result<()> {
     Ok(())
 }
 
-fn scan_path(options: ScanOptions) -> io::Result<ScanResult> {
+fn scan_path(options: ScanOptions) -> sio::Result<ScanResult> {
     scan_path_with_progress(options, Arc::new(AtomicBool::new(false)), |_, _, _| {})
 }
 
@@ -177,13 +184,13 @@ fn scan_path_with_progress<F>(
     options: ScanOptions,
     cancel: Arc<AtomicBool>,
     mut progress: F,
-) -> io::Result<ScanResult>
+) -> sio::Result<ScanResult>
 where
     F: FnMut(usize, u128, Option<ScanResult>),
 {
     if !options.root.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
+        return Err(sio::Error::new(
+            sio::ErrorKind::NotFound,
             format!("path does not exist: {}", options.root.display()),
         ));
     }
@@ -486,7 +493,7 @@ fn scan_directory_job(shared: &Arc<WorkerShared>, dir_id: usize) {
     }
 }
 
-fn metadata_for_entry(path: &Path, follow_links: bool) -> io::Result<Metadata> {
+fn metadata_for_entry(path: &Path, follow_links: bool) -> sio::Result<Metadata> {
     let symlink_metadata = fs::symlink_metadata(path)?;
     if follow_links && symlink_metadata.file_type().is_symlink() {
         fs::metadata(path)
@@ -574,7 +581,7 @@ fn aggregate_nodes(nodes: &mut [NodeRecord]) {
     }
 }
 
-fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> io::Result<()> {
+fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()> {
     let request = match read_http_request(&stream) {
         Ok(request) => request,
         Err(error) => {
@@ -777,18 +784,18 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> io::Result<()> 
     }
 }
 
-fn read_http_request(stream: &TcpStream) -> io::Result<HttpRequest> {
+fn read_http_request(stream: &TcpStream) -> sio::Result<HttpRequest> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut first_line = String::new();
     reader.read_line(&mut first_line)?;
     let mut parts = first_line.split_whitespace();
     let method = parts
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing method"))?
+        .ok_or_else(|| sio::Error::new(sio::ErrorKind::InvalidData, "missing method"))?
         .to_string();
     let target = parts
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing target"))?
+        .ok_or_else(|| sio::Error::new(sio::ErrorKind::InvalidData, "missing target"))?
         .to_string();
 
     let mut line = String::new();
@@ -805,7 +812,7 @@ fn read_http_request(stream: &TcpStream) -> io::Result<HttpRequest> {
     Ok(HttpRequest { method, target })
 }
 
-fn respond_text(stream: &mut TcpStream, status: u16, reason: &str, body: &str) -> io::Result<()> {
+fn respond_text(stream: &mut TcpStream, status: u16, reason: &str, body: &str) -> sio::Result<()> {
     respond_bytes(
         stream,
         status,
@@ -816,7 +823,7 @@ fn respond_text(stream: &mut TcpStream, status: u16, reason: &str, body: &str) -
     )
 }
 
-fn respond_json(stream: &mut TcpStream, status: u16, reason: &str, body: &str) -> io::Result<()> {
+fn respond_json(stream: &mut TcpStream, status: u16, reason: &str, body: &str) -> sio::Result<()> {
     respond_bytes(
         stream,
         status,
@@ -834,7 +841,7 @@ fn respond_bytes(
     content_type: &str,
     body: &[u8],
     extra_headers: &[(&str, &str)],
-) -> io::Result<()> {
+) -> sio::Result<()> {
     write!(
         stream,
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n",
@@ -1213,7 +1220,7 @@ fn exact_duplicates_json(result: &ScanResult, min_size: u64, limit: usize) -> St
     output
 }
 
-fn fnv1a_file(path: &Path) -> io::Result<u64> {
+fn fnv1a_file(path: &Path) -> sio::Result<u64> {
     let mut file = File::open(path)?;
     let mut buffer = [0u8; 1024 * 1024];
     let mut hash = 0xcbf29ce484222325u64;
@@ -1398,276 +1405,6 @@ fn push_csv_field(output: &mut String, value: &str) {
     }
 }
 
-fn reveal_path(path: &str) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        Command::new("explorer.exe")
-            .arg(format!("/select,{path}"))
-            .spawn()?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open").arg("-R").arg(path).spawn()?;
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let target = Path::new(path).parent().unwrap_or_else(|| Path::new(path));
-        Command::new("xdg-open").arg(target).spawn()?;
-    }
-    Ok(())
-}
-
-fn open_path(path: &str) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        Command::new("explorer.exe").arg(path).spawn()?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open").arg(path).spawn()?;
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        Command::new("xdg-open").arg(path).spawn()?;
-    }
-    Ok(())
-}
-
-fn display_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| path.display().to_string())
-}
-
-fn path_to_string(path: &Path) -> String {
-    path.display().to_string()
-}
-
-fn extension_for(path: &Path) -> String {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("")
-        .to_lowercase()
-}
-
-fn metadata_modified_ms(metadata: &Metadata) -> u128 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
-}
-
-fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
-}
-
-fn current_dir_or_dot() -> PathBuf {
-    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-fn default_thread_count() -> usize {
-    thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(4)
-        .clamp(2, 32)
-}
-
-fn option_value(args: &[String], name: &str) -> Option<String> {
-    args.windows(2)
-        .find(|window| window[0] == name)
-        .map(|window| window[1].clone())
-        .or_else(|| {
-            let prefix = format!("{name}=");
-            args.iter()
-                .find_map(|arg| arg.strip_prefix(&prefix).map(str::to_string))
-        })
-}
-
-fn has_flag(args: &[String], name: &str) -> bool {
-    args.iter().any(|arg| arg == name)
-}
-
-fn first_positional_arg(args: &[String]) -> Option<String> {
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if arg.starts_with("--") {
-            if !arg.contains('=') {
-                skip_next = true;
-            }
-            continue;
-        }
-        return Some(arg.clone());
-    }
-    None
-}
-
-fn parse_bool(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-fn split_patterns(value: &str) -> Vec<String> {
-    value
-        .split([';', ','])
-        .map(str::trim)
-        .filter(|pattern| !pattern.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn should_recurse(depth: usize, max_depth: Option<usize>) -> bool {
-    max_depth.map(|max_depth| depth < max_depth).unwrap_or(true)
-}
-
-fn should_exclude(patterns: &[String], name: &str, path: &str) -> bool {
-    patterns.iter().any(|pattern| {
-        pattern_matches(pattern, name)
-            || pattern_matches(pattern, path)
-            || pattern_matches(pattern, &path.replace('\\', "/"))
-    })
-}
-
-fn pattern_matches(pattern: &str, value: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
-    let value = value.to_ascii_lowercase();
-    if pattern.contains('*') || pattern.contains('?') {
-        wildcard_match(&pattern, &value)
-    } else {
-        value.contains(&pattern)
-    }
-}
-
-fn wildcard_match(pattern: &str, value: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let value = value.as_bytes();
-    let mut pattern_index = 0usize;
-    let mut value_index = 0usize;
-    let mut star_index = None;
-    let mut match_index = 0usize;
-
-    while value_index < value.len() {
-        if pattern_index < pattern.len()
-            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == value[value_index])
-        {
-            pattern_index += 1;
-            value_index += 1;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-            star_index = Some(pattern_index);
-            match_index = value_index;
-            pattern_index += 1;
-        } else if let Some(star) = star_index {
-            pattern_index = star + 1;
-            match_index += 1;
-            value_index = match_index;
-        } else {
-            return false;
-        }
-    }
-
-    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-        pattern_index += 1;
-    }
-
-    pattern_index == pattern.len()
-}
-
-#[cfg(windows)]
-fn is_hidden_entry(path: &Path, metadata: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-    metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
-        || path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.starts_with('.'))
-            .unwrap_or(false)
-}
-
-#[cfg(not(windows))]
-fn is_hidden_entry(path: &Path, _metadata: &Metadata) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| name.starts_with('.'))
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn platform_allocated_size(path: &Path, metadata: &Metadata) -> u64 {
-    windows_compressed_file_size(path).unwrap_or(metadata.len())
-}
-
-#[cfg(not(windows))]
-fn platform_allocated_size(_path: &Path, metadata: &Metadata) -> u64 {
-    metadata.len()
-}
-
-#[cfg(windows)]
-fn windows_compressed_file_size(path: &Path) -> Option<u64> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "Kernel32")]
-    unsafe extern "system" {
-        fn GetCompressedFileSizeW(lpFileName: *const u16, lpFileSizeHigh: *mut u32) -> u32;
-        fn GetLastError() -> u32;
-    }
-
-    const INVALID_FILE_SIZE: u32 = 0xFFFF_FFFF;
-    const NO_ERROR: u32 = 0;
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut high = 0u32;
-    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
-    if low == INVALID_FILE_SIZE {
-        let error = unsafe { GetLastError() };
-        if error != NO_ERROR {
-            return None;
-        }
-    }
-    Some(((high as u64) << 32) | low as u64)
-}
-
-fn epoch_ms_to_utc(ms: u128) -> String {
-    if ms == 0 {
-        return String::new();
-    }
-    let seconds = (ms / 1000) as i64;
-    let days = seconds.div_euclid(86_400);
-    let seconds_of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = seconds_of_day / 3600;
-    let minute = (seconds_of_day % 3600) / 60;
-    let second = seconds_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
-    let days = days_since_epoch + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += if month <= 2 { 1 } else { 0 };
-    (year, month, day)
-}
-
 #[cfg(windows)]
 mod desktop {
     #![allow(dead_code)]
@@ -1681,6 +1418,7 @@ mod desktop {
 
     use super::*;
     use std::ffi::{OsStr, c_void};
+    use std::io;
     use std::mem::{size_of, zeroed};
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::{null, null_mut};
@@ -4706,22 +4444,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wildcard_supports_star_and_question() {
-        assert!(wildcard_match("*.rs", "main.rs"));
-        assert!(wildcard_match("file?.txt", "file1.txt"));
-        assert!(!wildcard_match("file?.txt", "file10.txt"));
-    }
-
-    #[test]
     fn csv_fields_are_escaped() {
         let mut output = String::new();
         push_csv_field(&mut output, "a,b \"c\"");
         assert_eq!(output, "\"a,b \"\"c\"\"\"");
-    }
-
-    #[test]
-    fn epoch_formats_unix_start() {
-        assert_eq!(epoch_ms_to_utc(1_000), "1970-01-01 00:00:01 UTC");
     }
 
     fn make_test_node(id: usize, parent: Option<usize>, is_dir: bool, size: u64) -> NodeRecord {
