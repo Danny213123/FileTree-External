@@ -49,7 +49,12 @@ Plans:
   4. User can drive the app from the keyboard: Enter scans, Esc cancels a scan, Del initiates a delete on the current selection, Ctrl+F focuses search, Ctrl+E opens export, F5 refreshes.
   5. The status bar shows live scan stats (files / folders / errors / elapsed / throughput MB/s) during and after a scan.
 **Risk callouts**: Atomic temp-file + rename writes are mandatory (Pitfall #7); a half-written `settings.json` from a crash or concurrent write would wipe user state. Settings file includes `schema_version: 1` from day one.
-**Plans**: TBD
+**Plans:** 4 plans
+Plans:
+- [ ] 02-01-PLAN.md — Settings module foundation: hand-rolled JSON parse/write + Settings struct + atomic temp+rename store + baseline FFI (Kernel32 MoveFileExW, Shell32 SHGetKnownFolderPath)
+- [ ] 02-02-PLAN.md — Single-instance named mutex (`LocalFileTree.SingleInstance.v1`) + WM_COPYDATA path forwarding (memcpy-out discipline, 64 KB cap, path validation)
+- [ ] 02-03-PLAN.md — Path bar (ComboBoxEx32 drive picker + EDIT with SHAutoComplete) + 6-shortcut accelerator table (Enter/Esc/Del/Ctrl+F/Ctrl+E/F5)
+- [ ] 02-04-PLAN.md — 5-pane msctls_statusbar32 with live scan stats + settings save-on-mutate with drag-coalesce + window geometry restore + manual QA checkpoint
 **UI hint**: yes
 
 ### Phase 3: Search & Filter
@@ -140,7 +145,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Module Split | 0/3 | Planned | - |
-| 2. Settings & Polish | 0/0 | Not started | - |
+| 2. Settings & Polish | 0/4 | Planned | - |
 | 3. Search & Filter | 0/0 | Not started | - |
 | 4. Multi-Select Infrastructure | 0/0 | Not started | - |
 | 5. Cleanup Workflow + Hardened API | 0/0 | Not started | - |
@@ -177,4 +182,4 @@ These constraints apply across all phases and override anything in PROJECT.md on
 
 ---
 *Roadmap created: 2026-05-22*
-*Last updated: 2026-05-22 (Phase 1 plans created)*
+*Last updated: 2026-05-23 (Phase 2 plans created)*
