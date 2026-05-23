@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::analytics::exact_duplicates_json;
+use crate::cli::APP_NAME;
 use crate::export::{
     app_config_json, drives_json, push_json_string, scan_result_to_csv, scan_result_to_json,
 };
@@ -26,7 +27,7 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
         last_scan: Mutex::new(None),
     });
 
-    println!("{} is running at http://127.0.0.1:{port}", crate::APP_NAME);
+    println!("{} is running at http://127.0.0.1:{port}", APP_NAME);
     println!("Press Ctrl+C to stop.");
 
     for stream in listener.incoming() {
