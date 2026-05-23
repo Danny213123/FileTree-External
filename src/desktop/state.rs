@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::model::ScanResult;
 
-use super::{Hfont, Hicon, Hwnd};
+use super::ffi::{Hfont, Hicon, Hwnd};
 
 pub(super) static STATE: OnceLock<Mutex<DesktopState>> = OnceLock::new();
 
