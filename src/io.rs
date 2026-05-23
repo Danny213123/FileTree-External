@@ -278,6 +278,13 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+#[cfg(windows)]
+pub(crate) fn wide(value: &str) -> Vec<u16> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    OsStr::new(value).encode_wide().chain(Some(0)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +299,32 @@ mod tests {
     #[test]
     fn epoch_formats_unix_start() {
         assert_eq!(epoch_ms_to_utc(1_000), "1970-01-01 00:00:01 UTC");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wide_ascii_has_nul_terminator() {
+        let result = wide("C:\\Users");
+        assert_eq!(*result.last().unwrap(), 0u16);
+        let without_nul: Vec<u16> = result.into_iter().take_while(|&c| c != 0).collect();
+        let decoded = String::from_utf16_lossy(&without_nul);
+        assert_eq!(decoded, "C:\\Users");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wide_empty_is_just_nul() {
+        let result = wide("");
+        assert_eq!(result, vec![0u16]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wide_unicode_round_trips() {
+        let result = wide("caf\u{00e9}");
+        assert_eq!(*result.last().unwrap(), 0u16);
+        let without_nul: Vec<u16> = result.into_iter().take_while(|&c| c != 0).collect();
+        let decoded = String::from_utf16_lossy(&without_nul);
+        assert_eq!(decoded, "caf\u{00e9}");
     }
 }

@@ -8,6 +8,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::ffi::c_void;
+use std::io;
+use std::path::PathBuf;
+use std::slice;
 
 pub(super) type Bool = i32;
 pub(super) type Dword = u32;
@@ -137,6 +140,16 @@ pub(super) const ID_MENU_PROPERTIES: isize = 3005;
 
 pub(super) const WM_SCAN_DONE: Uint = WM_APP + 7;
 pub(super) const WM_SCAN_PROGRESS: Uint = WM_APP + 8;
+
+pub(super) const MOVEFILE_REPLACE_EXISTING: Dword = 0x0000_0001;
+pub(super) const MOVEFILE_WRITE_THROUGH: Dword = 0x0000_0008;
+
+pub(super) const FOLDERID_RoamingAppData: GUID = GUID {
+    Data1: 0x3EB685DB,
+    Data2: 0x65F9,
+    Data3: 0x4CF6,
+    Data4: [0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D],
+};
 
 #[repr(C)]
 pub(super) struct Point {
@@ -286,6 +299,12 @@ unsafe extern "system" {
     ) -> Bool;
     pub(super) fn CreateActCtxW(pActCtx: *const ACTCTXW) -> Handle;
     pub(super) fn ActivateActCtx(hActCtx: Handle, lpCookie: *mut UlongPtr) -> Bool;
+    pub(super) fn MoveFileExW(
+        lpExistingFileName: *const u16,
+        lpNewFileName: *const u16,
+        dwFlags: Dword,
+    ) -> Bool;
+    pub(super) fn FlushFileBuffers(hFile: Handle) -> Bool;
 }
 
 #[link(name = "Ole32")]
@@ -314,6 +333,12 @@ unsafe extern "system" {
         lpDirectory: *const u16,
         nShowCmd: i32,
     ) -> isize;
+    pub(super) fn SHGetKnownFolderPath(
+        rfid: *const GUID,
+        dwFlags: Dword,
+        hToken: Handle,
+        ppszPath: *mut *mut u16,
+    ) -> i32;
 }
 
 #[link(name = "UxTheme")]
@@ -430,6 +455,7 @@ unsafe extern "system" {
     pub(super) fn SetClipboardData(uFormat: Uint, hMem: isize) -> isize;
     pub(super) fn GetCursorPos(lpPoint: *mut Point) -> Bool;
     pub(super) fn ScreenToClient(hWnd: Hwnd, lpPoint: *mut Point) -> Bool;
+    pub(super) fn GetDpiForWindow(hwnd: Hwnd) -> Uint;
 }
 
 #[repr(C)]
@@ -612,4 +638,52 @@ unsafe extern "system" {
         ppv: *mut *mut c_void,
         ppidlLast: *mut *const ITEMIDLIST,
     ) -> i32;
+}
+
+/// Atomically renames `tmp_path` to `final_path` using
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`.
+/// Returns `Ok(())` on success, `Err(io::Error::last_os_error())` on failure.
+/// Same-volume NTFS rename is atomic; callers must close the temp file handle
+/// before calling this function.
+pub(crate) fn atomic_rename(tmp_path: *const u16, final_path: *const u16) -> io::Result<()> {
+    // SAFETY: pointers are valid for the duration of the call; the file is
+    // closed before this call; MoveFileExW does not retain the pointers.
+    let ok = unsafe {
+        MoveFileExW(
+            tmp_path,
+            final_path,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Resolves `%APPDATA%` (`FOLDERID_RoamingAppData`) via the Shell API.
+/// Returns the path as a `PathBuf` on success, or an `io::Error` on failure.
+/// This is the only correct way to resolve the AppData path; env-var
+/// concatenation does not respect Group Policy folder redirection.
+pub(crate) fn known_folder_roaming_appdata() -> io::Result<PathBuf> {
+    let mut ptr: *mut u16 = std::ptr::null_mut();
+    // SAFETY: FOLDERID_RoamingAppData is a valid GUID constant; ptr receives
+    // a CoTaskMem-allocated wide string that we free via CoTaskMemFree below.
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_RoamingAppData, 0, 0, &mut ptr) };
+    if hr < 0 {
+        return Err(io::Error::from_raw_os_error(hr));
+    }
+    // Compute length of the NUL-terminated wide string without pulling in wcslen.
+    let len = unsafe {
+        let mut end = ptr;
+        while *end != 0 {
+            end = end.add(1);
+        }
+        end.offset_from(ptr) as usize
+    };
+    let wide_slice = unsafe { slice::from_raw_parts(ptr, len) };
+    let path_str = String::from_utf16_lossy(wide_slice);
+    unsafe { CoTaskMemFree(ptr as *mut c_void) };
+    Ok(PathBuf::from(path_str))
 }

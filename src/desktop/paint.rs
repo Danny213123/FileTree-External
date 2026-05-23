@@ -46,7 +46,7 @@ pub(super) unsafe fn icon_for_node(state: &mut DesktopState, node: &NodeRecord) 
     } else {
         format!("file.{0}", node.extension)
     };
-    let sample_path = super::wide(&sample_path);
+    let sample_path = crate::io::wide(&sample_path);
     let attributes = if node.is_dir {
         FILE_ATTRIBUTE_DIRECTORY
     } else {
@@ -648,7 +648,7 @@ pub(super) unsafe fn fill_rect(hdc: Hdc, rect: Rect, color: super::ffi::Dword) {
 }
 
 pub(super) unsafe fn draw_text(hdc: Hdc, text: &str, rect: &mut Rect, flags: Uint) {
-    let wide = super::wide(text);
+    let wide = crate::io::wide(text);
     DrawTextW(hdc, wide.as_ptr(), -1, rect, flags);
 }
 

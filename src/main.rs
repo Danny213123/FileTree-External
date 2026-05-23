@@ -8,6 +8,8 @@ mod io;
 mod model;
 mod scan;
 mod server;
+#[cfg(windows)]
+mod settings;
 
 fn main() {
     cli::run();

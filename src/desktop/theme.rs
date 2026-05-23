@@ -48,9 +48,9 @@ pub(super) unsafe fn update_column_widths(state: &DesktopState) {
 pub(super) unsafe fn apply_theme(state: &mut DesktopState) {
     set_window_dark_mode(state.hwnd, state.dark_mode);
     let theme = if state.dark_mode {
-        super::wide("DarkMode_Explorer")
+        crate::io::wide("DarkMode_Explorer")
     } else {
-        super::wide("Explorer")
+        crate::io::wide("Explorer")
     };
 
     // Setting Explorer themes on buttons and checkboxes strips their ComCtl32 v6
