@@ -31,7 +31,11 @@ This roadmap reaches rough TreeSize Personal-tier coverage atop the existing v0.
   3. Manual smoke test confirms `desktop`, `serve`, and `scan` modes all run with identical observable behavior to v0.1.0 (same scan output, same desktop UI, same web UI, same CSV/JSON export).
   4. No new dependencies appear in `Cargo.toml` `[dependencies]`.
 **Brownfield refactor exception**: This phase intentionally delivers no new user-visible features. Per ARCHITECTURE.md, the split is mechanical, runs in its own phase with no feature piggyback, and unblocks every later phase. The "vertical MVP" success criterion here is "the existing vertical slice still works end-to-end after the split."
-**Plans**: TBD
+**Plans:** 3 plans
+Plans:
+- [ ] 01-01-PLAN.md — Extract 8 top-level modules (model, io, scan, analytics, export, server, cli, diff) bottom-up per CONTEXT D-05; each commit passes the four-command CI quad
+- [ ] 01-02-PLAN.md — Split the inline `mod desktop` block into 8 files under `src/desktop/` (state, ffi, theme, paint, shell, tabs+treemap placeholders, finalized mod.rs facade); each commit passes the CI quad
+- [ ] 01-03-PLAN.md — Final BLOCKING manual smoke checkpoint verifying scan / serve / desktop mode parity with v0.1.0 + zero-new-deps audit
 
 ### Phase 2: Settings & Polish
 **Goal**: Settings persist across launches under `%APPDATA%\FileTree\`, and the desktop shell feels finished (path bar, status bar, keyboard shortcuts) so manual testing of every later phase is ergonomic.
@@ -135,7 +139,7 @@ This roadmap reaches rough TreeSize Personal-tier coverage atop the existing v0.
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Module Split | 0/0 | Not started | - |
+| 1. Module Split | 0/3 | Planned | - |
 | 2. Settings & Polish | 0/0 | Not started | - |
 | 3. Search & Filter | 0/0 | Not started | - |
 | 4. Multi-Select Infrastructure | 0/0 | Not started | - |
@@ -173,4 +177,4 @@ These constraints apply across all phases and override anything in PROJECT.md on
 
 ---
 *Roadmap created: 2026-05-22*
-*Last updated: 2026-05-22*
+*Last updated: 2026-05-22 (Phase 1 plans created)*
