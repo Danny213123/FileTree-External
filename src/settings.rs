@@ -143,9 +143,9 @@ impl SettingsStore {
         };
         match parse_settings_json(&text) {
             Ok(settings) => settings,
-            Err(error) => {
+            Err(_error) => {
                 #[cfg(debug_assertions)]
-                eprintln!("settings parse failed: {error}");
+                eprintln!("settings parse failed: {_error}");
                 // Rename the broken file so the user can inspect it.
                 let ts = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
