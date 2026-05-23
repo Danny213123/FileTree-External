@@ -123,27 +123,63 @@ Explicitly excluded.
 
 ## Traceability
 
-Empty initially. Populated by the roadmapper during phase mapping.
+Every v1 requirement maps to exactly one phase in `.planning/ROADMAP.md`. No orphans; no duplicates.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| REFAC-01 | TBD | Pending |
-| SET-01 .. SET-05 | TBD | Pending |
-| POL-01 .. POL-03 | TBD | Pending |
-| SRCH-01 .. SRCH-05 | TBD | Pending |
-| SEL-01 .. SEL-03 | TBD | Pending |
-| CLEAN-01 .. CLEAN-10 | TBD | Pending |
-| DUP-01 .. DUP-03 | TBD | Pending |
-| VIZ-01 .. VIZ-03 | TBD | Pending |
-| SNAP-01 .. SNAP-07 | TBD | Pending |
-| EXP-01 .. EXP-03 | TBD | Pending |
-| API-01 .. API-03 | TBD | Pending |
+| REFAC-01 | Phase 1 — Module Split | Pending |
+| SET-01 | Phase 2 — Settings & Polish | Pending |
+| SET-02 | Phase 2 — Settings & Polish | Pending |
+| SET-03 | Phase 2 — Settings & Polish | Pending |
+| SET-04 | Phase 2 — Settings & Polish | Pending |
+| SET-05 | Phase 2 — Settings & Polish | Pending |
+| POL-01 | Phase 2 — Settings & Polish | Pending |
+| POL-02 | Phase 2 — Settings & Polish | Pending |
+| POL-03 | Phase 2 — Settings & Polish | Pending |
+| SRCH-01 | Phase 3 — Search & Filter | Pending |
+| SRCH-02 | Phase 3 — Search & Filter | Pending |
+| SRCH-03 | Phase 3 — Search & Filter | Pending |
+| SRCH-04 | Phase 3 — Search & Filter | Pending |
+| SRCH-05 | Phase 3 — Search & Filter | Pending |
+| SEL-01 | Phase 4 — Multi-Select Infrastructure | Pending |
+| SEL-02 | Phase 4 — Multi-Select Infrastructure | Pending |
+| SEL-03 | Phase 4 — Multi-Select Infrastructure | Pending |
+| CLEAN-01 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| CLEAN-02 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| CLEAN-03 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| CLEAN-04 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| CLEAN-05 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| CLEAN-06 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| CLEAN-07 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| CLEAN-08 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| CLEAN-09 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| CLEAN-10 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| API-01 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| API-02 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| API-03 | Phase 5 — Cleanup Workflow + Hardened API | Pending |
+| DUP-01 | Phase 6 — Duplicates UX Upgrade | Pending |
+| DUP-02 | Phase 6 — Duplicates UX Upgrade | Pending |
+| DUP-03 | Phase 6 — Duplicates UX Upgrade | Pending |
+| SNAP-01 | Phase 7 — Snapshots & Diff | Pending |
+| SNAP-02 | Phase 7 — Snapshots & Diff | Pending |
+| SNAP-03 | Phase 7 — Snapshots & Diff | Pending |
+| SNAP-04 | Phase 7 — Snapshots & Diff | Pending |
+| SNAP-05 | Phase 7 — Snapshots & Diff | Pending |
+| SNAP-06 | Phase 7 — Snapshots & Diff | Pending |
+| SNAP-07 | Phase 7 — Snapshots & Diff | Pending |
+| VIZ-01 | Phase 8 — Visualizations & Reports | Pending |
+| VIZ-02 | Phase 8 — Visualizations & Reports | Pending |
+| VIZ-03 | Phase 8 — Visualizations & Reports | Pending |
+| EXP-01 | Phase 8 — Visualizations & Reports | Pending |
+| EXP-02 | Phase 8 — Visualizations & Reports | Pending |
+| EXP-03 | Phase 8 — Visualizations & Reports | Pending |
 
 **Coverage:**
-- v1 requirements: 48 total
-- Mapped to phases: 0 (pending roadmapper)
-- Unmapped: 48 ⚠️ (resolved after roadmap creation)
+- v1 requirements enumerated: 46 (REFAC=1, SET=5, POL=3, SRCH=5, SEL=3, CLEAN=10, DUP=3, VIZ=3, SNAP=7, EXP=3, API=3)
+- Mapped to phases: 46 / 46 (100%)
+- Unmapped: 0
+- Note: The earlier header text claimed "48 total" but the enumerated v1 list contains 46 items. The count was overstated by 2 in the initial draft and is corrected here.
 
 ---
 *Requirements defined: 2026-05-22*
-*Last updated: 2026-05-22 after initial definition*
+*Last updated: 2026-05-22 after roadmap creation (100% phase mapping)*
