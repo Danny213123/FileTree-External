@@ -82,6 +82,18 @@ Examples:
 fn run_desktop(initial_path: PathBuf) -> sio::Result<()> {
     #[cfg(windows)]
     {
+        // Acquire the single-instance named mutex BEFORE creating any window.
+        // If a primary instance is already running, try_forward_or_acquire will
+        // forward `initial_path` via WM_COPYDATA and call std::process::exit(0)
+        // — it never returns for the second instance.
+        // The handle is kept alive for the lifetime of run_desktop; no explicit
+        // CloseHandle is needed because the OS releases the mutex automatically
+        // when the process exits.
+        let _mutex = unsafe { crate::desktop::ffi::try_forward_or_acquire(&initial_path) }
+            .map_err(|error| {
+                sio::Error::other(format!("single-instance mutex acquire failed: {error}"))
+            })?;
+
         crate::desktop::run(initial_path)
     }
 

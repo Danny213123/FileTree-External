@@ -14,10 +14,11 @@ use std::thread;
 
 use super::ffi::{
     AppendMenuW, CF_UNICODETEXT, CMINVOKECOMMANDINFO, CloseClipboard, CoTaskMemFree,
-    CreatePopupMenu, DestroyMenu, EmptyClipboard, GMEM_MOVEABLE, GetCursorPos, GlobalAlloc,
-    GlobalFree, GlobalLock, GlobalUnlock, Hwnd, IContextMenuVtbl, ID_MENU_COPY_PATH,
-    ID_MENU_DELETE, ID_MENU_OPEN, ID_MENU_PROPERTIES, ID_MENU_REVEAL, IID_IContextMenu,
-    IID_IShellFolder, IShellFolderVtbl, ITEMIDLIST, InvalidateRect, MB_ICONERROR, MB_OK,
+    CreatePopupMenu, DestroyMenu, Dword, EmptyClipboard, FILE_ATTRIBUTE_DIRECTORY, GMEM_MOVEABLE,
+    GetCursorPos, GetFileAttributesW, GetFullPathNameW, GlobalAlloc, GlobalFree, GlobalLock,
+    GlobalUnlock, Hwnd, IContextMenuVtbl, ID_MENU_COPY_PATH, ID_MENU_DELETE, ID_MENU_OPEN,
+    ID_MENU_PROPERTIES, ID_MENU_REVEAL, IID_IContextMenu, IID_IShellFolder,
+    INVALID_FILE_ATTRIBUTES, IShellFolderVtbl, ITEMIDLIST, InvalidateRect, MB_ICONERROR, MB_OK,
     MF_SEPARATOR, MF_STRING, MessageBoxW, OpenClipboard, Point, SHBindToParent, SHParseDisplayName,
     SW_SHOW, SetClipboardData, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
 };
@@ -247,3 +248,105 @@ pub(super) fn show_error_in_thread(hwnd: Hwnd, message: String) {
 }
 
 pub(super) unsafe fn destroy_icons_on_shutdown(_hwnd: Hwnd) {}
+
+/// Canonicalizes `raw` via `GetFullPathNameW` and verifies it is an existing
+/// directory via `GetFileAttributesW`. Returns `Some(canonical_path)` on
+/// success, `None` on any failure (non-existent path, not a directory, etc.).
+///
+/// Used to validate WM_COPYDATA path payloads before triggering a scan (D-06.3).
+/// Invalid payloads are silently dropped per D-06.4.
+#[cfg(windows)]
+pub(crate) unsafe fn canonicalize_and_check_dir(raw: &str) -> Option<String> {
+    let raw_w = crate::io::wide(raw);
+
+    // First call: query the required buffer length (no NUL in the count).
+    let needed = GetFullPathNameW(
+        raw_w.as_ptr(),
+        0,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    if needed == 0 {
+        return None;
+    }
+
+    // Second call: fill the buffer. `needed` includes the NUL terminator.
+    let mut buf: Vec<u16> = vec![0u16; needed as usize];
+    let written = GetFullPathNameW(
+        raw_w.as_ptr(),
+        buf.len() as Dword,
+        buf.as_mut_ptr(),
+        std::ptr::null_mut(),
+    );
+    // `written` is the char count WITHOUT the NUL. A return of 0 or >= buf.len()
+    // indicates truncation or error.
+    if written == 0 || written >= buf.len() as Dword {
+        return None;
+    }
+    // Truncate to the actual content (no trailing NUL).
+    buf.truncate(written as usize);
+
+    // GetFileAttributesW requires a NUL-terminated string, so clone and append.
+    let mut nul_term = buf.clone();
+    nul_term.push(0);
+    let attrs = GetFileAttributesW(nul_term.as_ptr());
+    if attrs == INVALID_FILE_ATTRIBUTES {
+        return None;
+    }
+    if attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return None;
+    }
+
+    Some(String::from_utf16_lossy(&buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_rejects_empty() {
+        // An empty string has no canonical directory form.
+        assert!(unsafe { canonicalize_and_check_dir("") }.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_accepts_temp_dir() {
+        let temp = std::env::temp_dir();
+        let temp_str = temp.to_str().expect("temp dir must be valid UTF-8");
+        let result = unsafe { canonicalize_and_check_dir(temp_str) };
+        assert!(
+            result.is_some(),
+            "temp dir should be accepted as a directory"
+        );
+        let canonical = result.unwrap();
+        // Canonical path must be absolute (starts with a drive letter on Windows).
+        assert!(
+            canonical.contains(':'),
+            "canonical path should contain a drive colon"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_rejects_existing_file() {
+        use std::io::Write;
+        // Create a temp FILE and assert it is rejected (it's not a directory).
+        let mut tmp = std::env::temp_dir();
+        tmp.push("filetree_test_not_a_dir.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).expect("create temp file");
+            f.write_all(b"test").expect("write temp file");
+        }
+        let path_str = tmp.to_str().expect("path to str");
+        let result = unsafe { canonicalize_and_check_dir(path_str) };
+        // Clean up before asserting so the file is removed even on failure.
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            result.is_none(),
+            "a file should be rejected, not accepted as a directory"
+        );
+    }
+}

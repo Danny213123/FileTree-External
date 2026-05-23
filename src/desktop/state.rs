@@ -15,7 +15,10 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::model::ScanResult;
 
-use super::ffi::{Hfont, Hicon, Hwnd};
+use super::ffi::{
+    CopyDataStruct, FILETREE_PATH_MSG_ID, Hfont, Hicon, Hwnd, Lparam, Lresult, MAX_COPYDATA_BYTES,
+    SetForegroundWindow, SetWindowTextW,
+};
 
 pub(super) static STATE: OnceLock<Mutex<DesktopState>> = OnceLock::new();
 
@@ -113,4 +116,77 @@ pub(super) fn with_state_mut<T>(callback: impl FnOnce(&mut DesktopState) -> T) -
     // to gracefully skip non-critical work.
     let mut state = state.try_lock().ok()?;
     Some(callback(&mut state))
+}
+
+/// Handles an incoming `WM_COPYDATA` message from a second instance of FileTree.
+///
+/// Validates the `COPYDATASTRUCT` payload (magic discriminator, size cap, UTF-16
+/// alignment), memcopies the path out IMMEDIATELY (see Pitfall #2 — `lpData` is
+/// valid only for the duration of the synchronous `SendMessageW` call in the
+/// sender), then canonicalizes and validates the path before triggering a scan.
+/// Invalid payloads are silently dropped per D-06.4; the window still receives
+/// focus even on a rejected payload.
+///
+/// Returns 1 if the message was handled, 0 otherwise.
+pub(crate) fn handle_copy_data(hwnd: Hwnd, lparam: Lparam) -> Lresult {
+    if lparam == 0 {
+        return 0;
+    }
+
+    // SAFETY: lparam is a valid pointer to COPYDATASTRUCT for the duration of
+    // the synchronous SendMessageW call in the sender. We memcpy all fields we
+    // need into local variables BEFORE any other call that could release the
+    // sender (Pitfall #2 — WM_COPYDATA lpData lifetime discipline).
+    let (dwdata, cbdata, lpdata) = unsafe {
+        let cds = &*(lparam as *const CopyDataStruct);
+        // Memcpy field values out before any further function calls.
+        (cds.dwData, cds.cbData, cds.lpData)
+    };
+
+    // Validate magic discriminator (D-06.2).
+    if dwdata != FILETREE_PATH_MSG_ID {
+        return 0;
+    }
+    // Validate size: must be non-zero, within the 64 KB cap (D-06.1), and
+    // an even number of bytes (UTF-16 pairs require 2 bytes each).
+    if cbdata == 0 || cbdata > MAX_COPYDATA_BYTES || cbdata % 2 != 0 {
+        return 0;
+    }
+
+    // Memcpy payload into a local Vec<u16> — after this, lpdata is no longer touched.
+    // This is the critical memcpy-out discipline: no use of lpdata after this point.
+    let u16_len = (cbdata as usize) / 2;
+    let mut buf = vec![0u16; u16_len];
+    unsafe {
+        std::ptr::copy_nonoverlapping(lpdata as *const u16, buf.as_mut_ptr(), u16_len);
+    }
+    // Strip optional trailing NUL added by the sender.
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
+
+    let raw = String::from_utf16_lossy(&buf);
+
+    // Validate the path: must be an existing directory (D-06.3).
+    // On non-Windows builds this function is not reachable (the mutex path
+    // is #[cfg(windows)] guarded), but the compiler still checks both arms.
+    #[cfg(windows)]
+    if let Some(canonical) = unsafe { super::shell::canonicalize_and_check_dir(&raw) } {
+        // Extract the path_edit HWND inside the state lock, then release the lock
+        // before calling Win32 APIs (reentrancy discipline from with_state_mut).
+        let path_edit = with_state_mut(|s| s.path_edit).unwrap_or(0);
+        if path_edit != 0 {
+            let wide = crate::io::wide(&canonical);
+            unsafe { SetWindowTextW(path_edit, wide.as_ptr()) };
+        }
+        // Trigger a scan with the new path (function lives in desktop/mod.rs).
+        // SAFETY: called from the Win32 message pump thread; state is valid.
+        unsafe { super::start_scan_from_controls(hwnd) };
+    }
+
+    // Bring the window to the foreground regardless of whether the path was valid
+    // (D-06.4: silent drop on invalid payload, but still focus the primary window).
+    unsafe { SetForegroundWindow(hwnd) };
+
+    1
 }
