@@ -1,3 +1,16 @@
+---
+gsd_state_version: 1.0
+milestone: v0.1.0
+milestone_name: milestone
+status: Roadmap drafted; ready for `/gsd-plan-phase 1`
+last_updated: "2026-05-23T01:43:13.014Z"
+progress:
+  total_phases: 8
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+---
+
 # STATE: FileTree v1
 
 **Updated:** 2026-05-22
@@ -70,6 +83,7 @@ None.
 **Last action:** Roadmap created from research consensus + sequencing guidance.
 **Next action:** Run `/gsd-plan-phase 1` to decompose Phase 1 (Module Split) into executable plans.
 **Files of interest:**
+
 - `.planning/ROADMAP.md` — phase structure + success criteria
 - `.planning/REQUIREMENTS.md` — v1 requirements with phase mappings
 - `.planning/PROJECT.md` — core value, constraints, key decisions
