@@ -36,6 +36,8 @@ mod paint;
 use paint::*;
 mod shell;
 use shell::*;
+mod tabs;
+mod treemap;
 
 unsafe fn enable_visual_styles() {
     let manifest_content = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
