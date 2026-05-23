@@ -26,7 +26,7 @@ use crate::scan::scan_path_with_progress;
 
 mod state;
 use state::{DesktopState, STATE, ScanDone, ScanProgressInfo, with_state_mut};
-mod ffi;
+pub(crate) mod ffi;
 use ffi::*;
 mod theme;
 use theme::*;
