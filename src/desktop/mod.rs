@@ -8,11 +8,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::ptr::{null, null_mut};
@@ -28,7 +26,7 @@ use crate::scan::scan_path_with_progress;
 
 mod state;
 use state::{DesktopState, STATE, ScanDone, ScanProgressInfo, with_state_mut};
-mod ffi;
+pub(crate) mod ffi;
 use ffi::*;
 mod theme;
 use theme::*;
@@ -53,7 +51,7 @@ unsafe fn enable_visual_styles() {
     let mut temp_path = std::env::temp_dir();
     temp_path.push("filetree.manifest");
     if std::fs::write(&temp_path, manifest_content).is_ok() {
-        let path_wide = wide(&temp_path.to_string_lossy());
+        let path_wide = crate::io::wide(&temp_path.to_string_lossy());
         let act_ctx = ACTCTXW {
             cbSize: size_of::<ACTCTXW>() as Dword,
             dwFlags: 0,
@@ -86,7 +84,7 @@ pub(crate) fn run(initial_path: PathBuf) -> io::Result<()> {
         let _ = STATE.set(Mutex::new(DesktopState::new(initial_path)));
 
         let h_instance = GetModuleHandleW(null());
-        let class_name = wide("FileTreeDesktopWindow");
+        let class_name = crate::io::wide("FileTreeDesktopWindow");
         let cursor = LoadCursorW(0, IDC_ARROW as *const u16);
         let app_icon = LoadImageW(
             0,
@@ -110,7 +108,7 @@ pub(crate) fn run(initial_path: PathBuf) -> io::Result<()> {
         };
         RegisterClassW(&window_class);
 
-        let title = wide(&format!("{APP_NAME} - Native Disk Explorer"));
+        let title = crate::io::wide(&format!("{APP_NAME} - Native Disk Explorer"));
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
@@ -256,8 +254,8 @@ unsafe extern "system" fn window_proc(
                         thread::spawn(move || unsafe {
                             ShellExecuteW(
                                 0,
-                                wide("open").as_ptr(),
-                                wide(&p).as_ptr(),
+                                crate::io::wide("open").as_ptr(),
+                                crate::io::wide(&p).as_ptr(),
                                 null(),
                                 null(),
                                 5,
@@ -300,8 +298,8 @@ unsafe extern "system" fn window_proc(
                     .flatten();
                     if let Some(p) = path {
                         unsafe {
-                            let title = wide("Confirm Delete");
-                            let msg = wide(&format!(
+                            let title = crate::io::wide("Confirm Delete");
+                            let msg = crate::io::wide(&format!(
                                 "Are you sure you want to permanently delete this item?\n\n{}",
                                 p
                             ));
@@ -419,7 +417,7 @@ unsafe fn create_controls(hwnd: Hwnd) {
     let h_instance = GetModuleHandleW(null());
     with_state_mut(|state| {
         state.hwnd = hwnd;
-        let face = wide("Segoe UI");
+        let face = crate::io::wide("Segoe UI");
         state.font = CreateFontW(-15, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
         state.bold_font = CreateFontW(-15, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
 
@@ -576,8 +574,8 @@ unsafe fn create_child(
     ex_style: Dword,
     id: isize,
 ) -> Hwnd {
-    let class = wide(class_name);
-    let text = wide(text);
+    let class = crate::io::wide(class_name);
+    let text = crate::io::wide(text);
     CreateWindowExW(
         ex_style,
         class.as_ptr(),
@@ -996,7 +994,7 @@ unsafe fn choose_and_set_directory(hwnd: Hwnd) {
 }
 
 unsafe fn browse_for_directory(hwnd: Hwnd) -> Option<String> {
-    let title = wide("Select a directory to scan");
+    let title = crate::io::wide("Select a directory to scan");
     let mut display_name = [0u16; 260];
     let mut info = BrowseInfoW {
         hwndOwner: hwnd,
@@ -1089,8 +1087,8 @@ unsafe fn handle_mouse_click(hwnd: Hwnd, lparam: Lparam, double_click: bool) {
                 thread::spawn(move || unsafe {
                     ShellExecuteW(
                         0,
-                        wide("open").as_ptr(),
-                        wide(&path_clone).as_ptr(),
+                        crate::io::wide("open").as_ptr(),
+                        crate::io::wide(&path_clone).as_ptr(),
                         null(),
                         null(),
                         5,
@@ -1258,16 +1256,12 @@ unsafe fn get_window_text(hwnd: Hwnd) -> String {
 }
 
 unsafe fn set_window_text(hwnd: Hwnd, text: &str) {
-    let text = wide(text);
+    let text = crate::io::wide(text);
     SetWindowTextW(hwnd, text.as_ptr());
 }
 
 unsafe fn show_error(hwnd: Hwnd, message: &str) {
-    let title = wide(APP_NAME);
-    let message = wide(message);
+    let title = crate::io::wide(APP_NAME);
+    let message = crate::io::wide(message);
     MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    OsStr::new(value).encode_wide().chain(Some(0)).collect()
 }
