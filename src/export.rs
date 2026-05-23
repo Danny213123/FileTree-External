@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::analytics::{
     age_stats, duplicate_candidates, extension_stats, largest_dir_ids, top_file_ids,
 };
+use crate::cli::{APP_NAME, APP_VERSION};
 use crate::io::{default_thread_count, epoch_ms_to_utc, path_to_string};
 use crate::model::{AppState, ScanResult};
 
@@ -17,9 +18,9 @@ pub(crate) fn scan_result_to_json(result: &ScanResult) -> String {
     let mut output = String::with_capacity(result.nodes.len().saturating_mul(260));
     output.push('{');
     output.push_str("\"app\":");
-    push_json_string(&mut output, crate::APP_NAME);
+    push_json_string(&mut output, APP_NAME);
     output.push_str(",\"version\":");
-    push_json_string(&mut output, crate::APP_VERSION);
+    push_json_string(&mut output, APP_VERSION);
     output.push_str(",\"rootPath\":");
     push_json_string(&mut output, &result.root_path);
     output.push_str(",\"scannedAt\":");
