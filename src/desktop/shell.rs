@@ -26,7 +26,7 @@ use super::state::with_state_mut;
 use crate::cli::APP_NAME;
 
 pub(super) unsafe fn show_shell_context_menu(hwnd: Hwnd, path: &str, x: i32, y: i32) -> bool {
-    let wide_path = super::wide(path);
+    let wide_path = crate::io::wide(path);
     let mut pidl: *mut ITEMIDLIST = null_mut();
 
     let hr_parse = SHParseDisplayName(wide_path.as_ptr(), null_mut(), &mut pidl, 0, null_mut());
@@ -163,11 +163,11 @@ pub(super) unsafe fn handle_right_click(hwnd: Hwnd, _client_x: i32, client_y: i3
         return;
     }
 
-    let label_open = super::wide("Open / Play");
-    let label_reveal = super::wide("Reveal in Explorer");
-    let label_copy = super::wide("Copy Path");
-    let label_delete = super::wide("Delete");
-    let label_properties = super::wide("Properties");
+    let label_open = crate::io::wide("Open / Play");
+    let label_reveal = crate::io::wide("Reveal in Explorer");
+    let label_copy = crate::io::wide("Copy Path");
+    let label_delete = crate::io::wide("Delete");
+    let label_properties = crate::io::wide("Properties");
 
     AppendMenuW(menu, MF_STRING, ID_MENU_OPEN as usize, label_open.as_ptr());
     AppendMenuW(
@@ -211,7 +211,7 @@ pub(super) unsafe fn handle_right_click(hwnd: Hwnd, _client_x: i32, client_y: i3
 }
 
 pub(super) unsafe fn copy_to_clipboard(text: &str) -> bool {
-    let wide_str = super::wide(text);
+    let wide_str = crate::io::wide(text);
     let len_bytes = wide_str.len() * 2;
     let h_mem = GlobalAlloc(GMEM_MOVEABLE, len_bytes);
     if h_mem == 0 {
@@ -240,8 +240,8 @@ pub(super) unsafe fn copy_to_clipboard(text: &str) -> bool {
 
 pub(super) fn show_error_in_thread(hwnd: Hwnd, message: String) {
     thread::spawn(move || unsafe {
-        let title = super::wide(APP_NAME);
-        let msg = super::wide(&message);
+        let title = crate::io::wide(APP_NAME);
+        let msg = crate::io::wide(&message);
         MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
     });
 }
