@@ -196,6 +196,25 @@ pub(super) const ID_DRIVE_PICKER: isize = 113;
 pub(super) const WM_EXITSIZEMOVE: Uint = 0x0232;
 pub(super) const WM_LBUTTONUP: Uint = 0x0202;
 
+// msctls_statusbar32 constants (Plan 02-04)
+/// SBARS_SIZEGRIP style bit: adds a size-grip at the right end of the status bar.
+pub(super) const SBARS_SIZEGRIP: Dword = 0x0100;
+/// SB_SETPARTS: set the number of panes and their right-edge x-coordinates.
+pub(super) const SB_SETPARTS: Uint = 0x0404;
+/// SB_SETTEXTW: set the text of a status-bar pane (wide string).
+pub(super) const SB_SETTEXTW: Uint = 0x040B;
+/// SB_GETPARTS: get the number of panes (not used in production, useful for testing).
+pub(super) const SB_GETPARTS: Uint = 0x0406;
+/// SPI_GETWORKAREA: retrieve the primary monitor's work area (excludes taskbar).
+pub(crate) const SPI_GETWORKAREA: Uint = 0x0030;
+
+// Status-bar pane indices (Plan 02-04, UI-SPEC §"Status bar")
+pub(super) const PANE_FILES: usize = 0;
+pub(super) const PANE_FOLDERS: usize = 1;
+pub(super) const PANE_ERRORS: usize = 2;
+pub(super) const PANE_ELAPSED: usize = 3;
+pub(super) const PANE_THROUGHPUT: usize = 4;
+
 pub(super) const MOVEFILE_REPLACE_EXISTING: Dword = 0x0000_0001;
 pub(super) const MOVEFILE_WRITE_THROUGH: Dword = 0x0000_0008;
 
@@ -244,11 +263,11 @@ pub(super) struct Msg {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub(super) struct Rect {
-    pub(super) left: i32,
-    pub(super) top: i32,
-    pub(super) right: i32,
-    pub(super) bottom: i32,
+pub(crate) struct Rect {
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) right: i32,
+    pub(crate) bottom: i32,
 }
 
 #[repr(C)]
@@ -599,6 +618,15 @@ unsafe extern "system" {
     pub(super) fn TranslateAcceleratorW(hWnd: Hwnd, hAccTable: Handle, lpMsg: *mut Msg) -> i32;
     pub(super) fn DestroyAcceleratorTable(hAccel: Handle) -> Bool;
     pub(super) fn GetFocus() -> Hwnd;
+    // Work-area query for window-geometry clamp (Plan 02-04, T-02-18)
+    pub(crate) fn SystemParametersInfoW(
+        uiAction: Uint,
+        uiParam: Uint,
+        pvParam: *mut c_void,
+        fWinIni: Uint,
+    ) -> Bool;
+    // Window-rect query for flush_pending_persist geometry capture (Plan 02-04)
+    pub(super) fn GetWindowRect(hWnd: Hwnd, lpRect: *mut Rect) -> Bool;
 }
 
 // SHAutoComplete lives in Shlwapi.dll, NOT Shell32.dll — this is the ONE new DLL link
