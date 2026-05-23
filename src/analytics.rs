@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
+use crate::export::{push_id_array, push_json_string};
 use crate::model::{
     AgeBucket, DuplicateCandidate, ExtensionStat, NodeRecord, ScanError, ScanResult,
 };
@@ -54,11 +55,11 @@ pub(crate) fn exact_duplicates_json(result: &ScanResult, min_size: u64, limit: u
         output.push_str("\"size\":");
         output.push_str(&size.to_string());
         output.push_str(",\"hash\":");
-        crate::push_json_string(&mut output, &format!("{hash:016x}"));
+        push_json_string(&mut output, &format!("{hash:016x}"));
         output.push_str(",\"waste\":");
         output.push_str(&waste.to_string());
         output.push_str(",\"ids\":");
-        crate::push_id_array(&mut output, ids);
+        push_id_array(&mut output, ids);
         output.push('}');
     }
     output.push_str("],\"errors\":[");
@@ -68,9 +69,9 @@ pub(crate) fn exact_duplicates_json(result: &ScanResult, min_size: u64, limit: u
         }
         output.push('{');
         output.push_str("\"path\":");
-        crate::push_json_string(&mut output, &error.path);
+        push_json_string(&mut output, &error.path);
         output.push_str(",\"message\":");
-        crate::push_json_string(&mut output, &error.message);
+        push_json_string(&mut output, &error.message);
         output.push('}');
     }
     output.push_str("]}");
