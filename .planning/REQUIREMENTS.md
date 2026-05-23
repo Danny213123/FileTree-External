@@ -21,8 +21,8 @@ Scoped to roughly TreeSize Personal-tier coverage as an "inspired-by" implementa
 
 ### Polish (POL)
 
-- [ ] **POL-01**: Path bar with drive picker dropdown and folder autocomplete
-- [ ] **POL-02**: Keyboard shortcuts — Enter (scan), Esc (cancel scan), Del (delete selection), Ctrl+F (focus search), Ctrl+E (export), F5 (refresh)
+- [x] **POL-01**: Path bar with drive picker dropdown and folder autocomplete
+- [x] **POL-02**: Keyboard shortcuts — Enter (scan), Esc (cancel scan), Del (delete selection), Ctrl+F (focus search), Ctrl+E (export), F5 (refresh)
 - [ ] **POL-03**: Status bar showing scan stats (files / folders / errors / elapsed / throughput MB/s)
 
 ### Search & filter (SRCH)
@@ -133,8 +133,8 @@ Every v1 requirement maps to exactly one phase in `.planning/ROADMAP.md`. No orp
 | SET-03 | Phase 2 — Settings & Polish | Pending |
 | SET-04 | Phase 2 — Settings & Polish | Pending |
 | SET-05 | Phase 2 — Settings & Polish | Pending |
-| POL-01 | Phase 2 — Settings & Polish | Pending |
-| POL-02 | Phase 2 — Settings & Polish | Pending |
+| POL-01 | Phase 2 — Settings & Polish | Complete |
+| POL-02 | Phase 2 — Settings & Polish | Complete |
 | POL-03 | Phase 2 — Settings & Polish | Pending |
 | SRCH-01 | Phase 3 — Search & Filter | Pending |
 | SRCH-02 | Phase 3 — Search & Filter | Pending |

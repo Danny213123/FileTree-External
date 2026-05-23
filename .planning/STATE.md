@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.1.0
 milestone_name: milestone
 status: executing
-last_updated: "2026-05-23T19:53:52.414Z"
+last_updated: "2026-05-23T23:10:25.882Z"
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 7
-  completed_plans: 3
-  percent: 43
+  completed_plans: 6
+  percent: 86
 ---
 
 # STATE: FileTree v1
@@ -20,22 +20,22 @@ progress:
 
 **Project:** FileTree
 **Core Value:** Point at a folder, see what's taking space, and clean it up — fast, on a single Windows machine, with no install footprint beyond a single .exe.
-**Current Focus:** Phase 01 — module-split
+**Current Focus:** Phase 02 — settings-polish
 
 ## Current Position
 
-Phase: 01 (module-split) — EXECUTING
-Plan: 2 of 3
+Phase: 02 (settings-polish) — EXECUTING
+Plan: 3 of 4 complete; next is 02-04 (status bar + settings save-on-mutate + window geometry + QA checkpoint)
 **Milestone:** v1 (TreeSize-Personal-tier coverage atop v0.1.0 brownfield)
 **Phase:** 2
-**Plan:** Not started
-**Status:** Ready to execute
-**Progress:** [░░░░░░░░] 0/8 phases complete
+**Plan:** 4 (next to execute)
+**Status:** Executing — Plan 02-03 complete (QA checkpoint passed); Plan 02-04 ready
+**Progress:** [█████████░] 86% (6/7 plans complete across active phases)
 
 ## Phase Index
 
-1. Module Split — in progress (1/3 plans complete)
-2. Settings & Polish — not started
+1. Module Split — complete (3/3 plans)
+2. Settings & Polish — in progress (3/4 plans complete)
 3. Search & Filter — not started
 4. Multi-Select Infrastructure — not started
 5. Cleanup Workflow + Hardened API — not started (HIGHEST-RISK PHASE)
@@ -47,11 +47,12 @@ Plan: 2 of 3
 
 | Metric | Value |
 |--------|-------|
-| Phases completed | 0/8 |
-| Plans completed | 0/0 |
+| Phases completed | 1/8 (Phase 1 complete) |
+| Plans completed | 6/7 (Phase 1: 3/3, Phase 2: 3/4) |
 | Requirements mapped | 46/46 (100%) |
-| Requirements delivered | 13/46 (existing v0.1.0 baseline; see PROJECT.md "Validated") |
+| Requirements delivered | 13/46 baseline + POL-01, POL-02 (02-03) |
 | Open blockers | 0 |
+| Phase 02 P03 duration | 45 min, 2 tasks, 4 files |
 
 ## Accumulated Context
 
@@ -66,6 +67,9 @@ Plan: 2 of 3
 - XLSX export (EXP-02) IN v1 as hand-rolled STORED-ZIP + OOXML — user explicitly accepted extra scope over adding a crate.
 - `/api/delete` is HARDENED (not removed) via API-01..03 — bundled with cleanup pipeline in Phase 5.
 - Snapshot diff (SNAP-04..07) IN v1, including `filetree diff` CLI subcommand.
+- Accel struct uses `#[repr(C, packed(1))]` producing 5-byte size_of; CreateAcceleratorTableW reads 5 bytes per entry — correct. (02-03)
+- SHAutoComplete called immediately after CreateWindowExW returns non-zero HWND, per Pitfall #3 discipline. (02-03)
+- CMD_EXPORT/CMD_FOCUS_SEARCH/CMD_DELETE_SEL wired as stubs in 02-03; Phases 4/3/5 fill these in. (02-03)
 
 ### Decisions Pending
 
@@ -83,16 +87,15 @@ None.
 
 ## Session Continuity
 
-**Last action:** Plan 01-01 complete — extracted 8 modules (model, io, scan, analytics, export, server, cli, diff) from main.rs in 8 commits, all CI quad green.
-**Next action:** Execute Plan 01-02 (desktop module fine-split).
+**Last action:** Plan 02-03 complete — path bar (ComboBoxEx32 drive picker + EDIT with SHAutoComplete) + 6-shortcut accelerator table; 13/13 tests passing; user QA checkpoint passed.
+**Next action:** Execute Plan 02-04 (5-pane status bar + settings save-on-mutate + window geometry restore + final QA checkpoint).
 **Files of interest:**
 
 - `.planning/ROADMAP.md` — phase structure + success criteria
 - `.planning/REQUIREMENTS.md` — v1 requirements with phase mappings
 - `.planning/PROJECT.md` — core value, constraints, key decisions
-- `.planning/research/ARCHITECTURE.md` — target module layout for Phase 1
-- `.planning/research/PITFALLS.md` — phase-by-phase risk callouts
-- `.planning/codebase/` — brownfield baseline map
+- `.planning/phases/02-settings-polish/02-04-PLAN.md` — next plan to execute
+- `.planning/phases/02-settings-polish/02-03-SUMMARY.md` — plan 03 summary
 
 ---
 *State initialized: 2026-05-22*
