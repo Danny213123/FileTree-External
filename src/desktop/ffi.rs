@@ -783,6 +783,7 @@ unsafe extern "system" {
     pub(super) fn GetParent(hWnd: Hwnd) -> Hwnd;
     pub(super) fn SetCursor(hCursor: Handle) -> Handle;
     pub(super) fn DrawMenuBar(hWnd: Hwnd) -> Bool;
+    pub(super) fn GetMenu(hWnd: Hwnd) -> Hmenu;
 }
 
 // SHAutoComplete lives in Shlwapi.dll, NOT Shell32.dll — this is the ONE new DLL link
