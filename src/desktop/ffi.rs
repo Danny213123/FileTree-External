@@ -140,6 +140,15 @@ pub(super) const ODS_DISABLED: Uint = 0x0004;
 pub(super) const ODS_CHECKED: Uint = 0x0008;
 pub(super) const ODS_HOTLIGHT: Uint = 0x0040;
 pub(super) const UISF_HIDEACCEL: Uint = 0x0002;
+pub(super) const WM_UPDATEUISTATE: Uint = 0x0128;
+pub(super) const WM_CHANGEUISTATE: Uint = 0x0127;
+pub(super) const UIS_SET: Uint = 0x0001;
+pub(super) const UIS_CLEAR: Uint = 0x0002;
+pub(super) const UIS_INITIALIZE: Uint = 0x0003;
+pub(super) const DT_HIDEPREFIX: Uint = 0x0010_0000;
+pub(super) const ODT_MENU: Uint = 0x01;
+pub(super) const ID_STATUS_FOOTER: isize = 115;
+pub(super) const STATUS_FOOTER_CLASS_NAME: &str = "FileTreeStatusFooter";
 
 pub(super) const ID_PATH_EDIT: isize = 101;
 pub(super) const ID_SCAN_BUTTON: isize = 102;
@@ -773,6 +782,8 @@ unsafe extern "system" {
     // Tab strip helpers (Plan 02.1-04, D-08)
     pub(super) fn GetParent(hWnd: Hwnd) -> Hwnd;
     pub(super) fn SetCursor(hCursor: Handle) -> Handle;
+    pub(super) fn DrawMenuBar(hWnd: Hwnd) -> Bool;
+    pub(super) fn GetMenu(hWnd: Hwnd) -> Hmenu;
 }
 
 // SHAutoComplete lives in Shlwapi.dll, NOT Shell32.dll — this is the ONE new DLL link

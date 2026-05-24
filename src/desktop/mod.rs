@@ -154,6 +154,16 @@ pub(crate) fn run(
         let initial_dark = with_state_mut(|s| s.settings.dark_mode).unwrap_or(true);
         set_window_dark_mode(hwnd, initial_dark);
 
+        // Phase 02.1-06 (POL-03): hide mnemonic underlines until the user presses ALT.
+        // WM_CHANGEUISTATE propagates down to child windows so the entire UI is in sync.
+        // UIS_SET | (UISF_HIDEACCEL << 16): action=UIS_SET, flags=UISF_HIDEACCEL.
+        SendMessageW(
+            hwnd,
+            WM_CHANGEUISTATE,
+            MAKEWPARAM(UIS_SET as u16, UISF_HIDEACCEL as u16),
+            0,
+        );
+
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
 
@@ -337,6 +347,66 @@ unsafe extern "system" fn window_proc(
             handle_key(hwnd, wparam);
             0
         }
+        WM_MEASUREITEM => {
+            // Paint-level spec: each menu item is 22 logical px tall (per status-footer token).
+            // WM_MEASUREITEM fires for every MF_OWNERDRAW item before first display.
+            // SAFETY: lparam points to a valid MEASUREITEMSTRUCT for the lifetime of this call.
+            use ffi::MEASUREITEMSTRUCT;
+            let mis = &mut *(lparam as *mut MEASUREITEMSTRUCT);
+            if mis.CtlType == ODT_MENU as Uint {
+                let dpi = with_state_mut(|s| GetDpiForWindow(s.hwnd)).unwrap_or(96);
+                let dpi = if dpi == 0 { 96 } else { dpi };
+                mis.itemHeight = MulDiv(22, dpi as i32, 96) as Uint;
+                // itemWidth: 0 means "use default menu width" — Win32 respects this for popups.
+                mis.itemWidth = 0;
+            }
+            0
+        }
+        WM_DRAWITEM => {
+            // Paint one owner-drawn menu item via draw_menu_item in paint.rs.
+            // SAFETY: lparam points to a valid DRAWITEMSTRUCT for the lifetime of this call.
+            use ffi::DRAWITEMSTRUCT;
+            let dis = &*(lparam as *const DRAWITEMSTRUCT);
+            if dis.CtlType == ODT_MENU as Uint {
+                // Recover the label string from the DRAWITEMSTRUCT.itemData field.
+                // Win32 stores the lpNewItem pointer (wide string) in itemData when using
+                // MF_STRING | MF_OWNERDRAW, making it retrievable here (RESEARCH Pitfall 4).
+                let label_ptr = dis.itemData as *const u16;
+                let label = if label_ptr.is_null() {
+                    String::new()
+                } else {
+                    let mut len = 0usize;
+                    while *label_ptr.add(len) != 0 {
+                        len += 1;
+                    }
+                    String::from_utf16_lossy(std::slice::from_raw_parts(label_ptr, len))
+                };
+                let checked = dis.itemState & ODS_CHECKED != 0;
+                with_state_mut(|state| {
+                    let mnemonics_visible = state.ui_state & UISF_HIDEACCEL == 0;
+                    paint::draw_menu_item(dis, &label, checked, mnemonics_visible, state);
+                });
+            }
+            1
+        }
+        WM_UPDATEUISTATE => {
+            // Sync ui_state mirror and force menu repaint so underlines appear/disappear.
+            // wparam low word = UIS_SET / UIS_CLEAR / UIS_INITIALIZE; high word = flags.
+            let action = (wparam & 0xffff) as Uint;
+            let flags = ((wparam >> 16) & 0xffff) as Uint;
+            with_state_mut(|state| {
+                if action == UIS_SET {
+                    state.ui_state |= flags;
+                } else if action == UIS_CLEAR {
+                    state.ui_state &= !flags;
+                } else if action == UIS_INITIALIZE {
+                    // UIS_INITIALIZE: set bits present in flags, clear bits absent.
+                    state.ui_state = flags;
+                }
+            });
+            // Propagate to DefWindowProcW so child windows also update.
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_COMMAND => {
             let id = (wparam & 0xffff) as isize;
             let notify_code = ((wparam >> 16) & 0xffff) as u32;
@@ -456,16 +526,28 @@ unsafe extern "system" fn window_proc(
                 }
                 // Phase 02.1-05 — 3 View-menu toggle arms (replace old ID_*_CHECK button arms).
                 ID_VIEW_DARK_MODE => {
-                    let snap = with_state_mut(|state| {
+                    let (snap, main_menu, view_menu, dark_mode) = with_state_mut(|state| {
                         state.dark_mode = !state.dark_mode;
                         state.settings.dark_mode = state.dark_mode;
                         DARK_MODE_ATOMIC.store(state.dark_mode, Ordering::Relaxed);
                         apply_theme(state);
                         let _ = render_list(state);
                         InvalidateRect(state.hwnd, null(), 1);
-                        state::snapshot_for_save(state)
+                        // Retrieve menu handles for apply_menu_bg outside the lock.
+                        let main_menu = GetMenu(state.hwnd);
+                        let view_menu = state.view_menu;
+                        let dark = state.dark_mode;
+                        (state::snapshot_for_save(state), main_menu, view_menu, dark)
                     })
-                    .flatten();
+                    .unwrap_or((None, 0, 0, true));
+                    // Phase 02.1-06 (D-03): refresh menu-bar gutter brush on dark/light toggle.
+                    if main_menu != 0 {
+                        apply_menu_bg(main_menu, dark_mode);
+                    }
+                    if view_menu != 0 {
+                        apply_menu_bg(view_menu, dark_mode);
+                    }
+                    DrawMenuBar(hwnd);
                     if let Some(snap) = snap {
                         state::save_settings_if_dirty(snap);
                     }
@@ -707,6 +789,27 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+/// Set MIM_BACKGROUND on `menu` so Win32 uses the dark or light panel brush for the
+/// menu gutter, eliminating the white strip visible in dark mode (D-03).
+///
+/// Called once after SetMenu in create_controls and again in ID_VIEW_DARK_MODE on toggle.
+///
+/// SAFETY: `menu` must be a valid HMENU handle.
+unsafe fn apply_menu_bg(menu: Hmenu, dark: bool) {
+    use std::mem::size_of;
+    let brush = if dark { dark_brush() } else { light_brush() };
+    let info = MENUINFO {
+        cbSize: size_of::<MENUINFO>() as Dword,
+        fMask: MIM_BACKGROUND,
+        dwStyle: 0,
+        cyMax: 0,
+        hbrBack: brush,
+        dwContextHelpID: 0,
+        dwMenuData: 0,
+    };
+    SetMenuInfo(menu, &info);
+}
+
 unsafe fn create_controls(hwnd: Hwnd) {
     let h_instance = GetModuleHandleW(null());
     with_state_mut(|state| {
@@ -838,33 +941,47 @@ unsafe fn create_controls(hwnd: Hwnd) {
         // hidden_check / files_check / follow_check / dark_check HWND fields remain
         // on DesktopState as 0 for binary compat — no HWND is ever created for them.
         // Build the View menu bar (D-08 / WM_INITMENUPOPUP sync via Pitfall 7 guard).
+        // Phase 02.1-06: All AppendMenuW calls use MF_OWNERDRAW so WM_DRAWITEM paints
+        // them with dark palette + accent hover (D-03 owner-draw requirement).
         {
             let main_menu = CreateMenu();
             let view_menu = CreatePopupMenu();
+            // MF_STRING | MF_OWNERDRAW: Win32 uses the label string for accessibility;
+            // visual rendering goes through WM_DRAWITEM (RESEARCH Pitfall 4).
             let label_show_hidden = crate::io::wide("&Show Hidden");
             AppendMenuW(
                 view_menu,
-                MF_STRING,
+                MF_STRING | MF_OWNERDRAW,
                 ID_VIEW_SHOW_HIDDEN as usize,
                 label_show_hidden.as_ptr(),
             );
             let label_show_files = crate::io::wide("Show &Files");
             AppendMenuW(
                 view_menu,
-                MF_STRING,
+                MF_STRING | MF_OWNERDRAW,
                 ID_VIEW_SHOW_FILES as usize,
                 label_show_files.as_ptr(),
             );
             let label_dark = crate::io::wide("&Dark Mode");
             AppendMenuW(
                 view_menu,
-                MF_STRING,
+                MF_STRING | MF_OWNERDRAW,
                 ID_VIEW_DARK_MODE as usize,
                 label_dark.as_ptr(),
             );
+            // Top-level "&View" item is also owner-drawn (MF_POPUP | MF_OWNERDRAW).
             let label_view = crate::io::wide("&View");
-            AppendMenuW(main_menu, MF_POPUP, view_menu as usize, label_view.as_ptr());
+            AppendMenuW(
+                main_menu,
+                MF_POPUP | MF_OWNERDRAW,
+                view_menu as usize,
+                label_view.as_ptr(),
+            );
             SetMenu(state.hwnd, main_menu);
+            // MIM_BACKGROUND: paint the menu-bar gutter with dark/light brush so no
+            // white strip appears in dark mode (D-03 closure).
+            apply_menu_bg(main_menu, state.dark_mode);
+            apply_menu_bg(view_menu, state.dark_mode);
             // Cache the view_menu handle for WM_INITMENUPOPUP filter (Pitfall 7):
             // without this guard CheckMenuItem fires on every popup including Shell
             // context menus, corrupting their state.
@@ -950,33 +1067,29 @@ unsafe fn create_controls(hwnd: Hwnd) {
                 }
             }
         }
-        // Create the 5-pane msctls_statusbar32 status bar (Plan 02-04, UI-SPEC §"Status bar").
-        // ICC_BAR_CLASSES must be set in InitCommonControlsEx (already done in run()).
-        // Coordinates are ignored — the status bar auto-sizes to the bottom of the parent.
+        // Phase 02.1-06 (D-07): Replace msctls_statusbar32 with a custom-painted
+        // FileTreeStatusFooter child window. No sizing grip, no Win9x visual cruft.
+        // Status content is pulled directly from state fields in draw_status_footer.
         {
-            let class = crate::io::wide("msctls_statusbar32");
-            state.status = CreateWindowExW(
+            paint::register_status_footer_class(h_instance);
+            let class = crate::io::wide(STATUS_FOOTER_CLASS_NAME);
+            state.status_footer = CreateWindowExW(
                 0,
                 class.as_ptr(),
                 null(),
-                WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+                WS_CHILD | WS_VISIBLE,
                 0,
                 0,
                 0,
                 0,
                 hwnd,
-                ID_STATUS as Hmenu,
+                ID_STATUS_FOOTER as Hmenu,
                 h_instance,
                 null_mut(),
             );
-        }
-        // Set initial idle-state pane texts.
-        if state.status != 0 {
-            set_status_pane(state.status, PANE_FILES, "-- files");
-            set_status_pane(state.status, PANE_FOLDERS, "-- folders");
-            set_status_pane(state.status, PANE_ERRORS, "-- errors");
-            set_status_pane(state.status, PANE_ELAPSED, "--:--");
-            set_status_pane(state.status, PANE_THROUGHPUT, "-- MB/s");
+            if state.status_footer != 0 {
+                apply_dark_mode_to_window(state.status_footer, state.dark_mode);
+            }
         }
         state.list = 0;
 
@@ -994,7 +1107,6 @@ unsafe fn create_controls(hwnd: Hwnd) {
             state.expand_button,
             state.collapse_button,
             state.columns_button,
-            state.status,
         ] {
             if control != 0 {
                 SendMessageW(control, WM_SETFONT, state.font as Wparam, 1);
@@ -1103,14 +1215,14 @@ unsafe fn resize_controls(hwnd: Hwnd) {
         );
 
         // Phase 02.1-05 — Tab strip + content panels replace the old toolbar row.
-        // Layout: path bar → tab strip (30 px DPI-scaled) → content panel → status bar.
+        // Layout: path bar → tab strip (30 px DPI-scaled) → content panel → status footer.
         let dpi = GetDpiForWindow(hwnd);
         let dpi = if dpi == 0 { 96 } else { dpi };
         let strip_h = MulDiv(30, dpi as i32, 96);
         // Path bar bottom edge determines where the tab strip begins.
         let path_bar_bottom = path_y + bar_h;
-        // Status bar height (msctls_statusbar32 sizes itself; use 26 logical px as budget).
-        let status_h = MulDiv(26, dpi as i32, 96);
+        // Phase 02.1-06 (D-07): footer height token = 22 logical px (matches menu-item token).
+        let footer_h = MulDiv(22, dpi as i32, 96);
         let client_h = (rect.bottom - rect.top).max(300);
         // Tab strip: full width, directly below the path bar.
         let strip_y = path_bar_bottom + 4; // 4px gap below the path bar
@@ -1120,9 +1232,9 @@ unsafe fn resize_controls(hwnd: Hwnd) {
             let rects = tabs::recompute_rects(state.tab_strip, width, dpi, state.font);
             state.tab_rects = rects;
         }
-        // Content panels: fill from below the strip to above the status bar.
+        // Content panels: fill from below the strip to above the status footer.
         let panel_y = strip_y + strip_h;
-        let panel_h = (client_h - panel_y - status_h).max(1);
+        let panel_h = (client_h - panel_y - footer_h).max(1);
         for &panel in &state.tab_panels {
             if panel != 0 {
                 MoveWindow(panel, 0, panel_y, width, panel_h, 1);
@@ -1153,14 +1265,17 @@ unsafe fn resize_controls(hwnd: Hwnd) {
         ShowWindow(state.columns_button, SW_SHOW);
         MoveWindow(state.columns_button, btn_x, btn_y, 90, button_h, 1);
 
-        // msctls_statusbar32 auto-positions itself at the bottom when WM_SIZE is sent.
-        // We also recompute the pane layout for the current width and DPI.
-        if state.status != 0 {
-            // Send WM_SIZE to the status bar so it repositions itself.
-            SendMessageW(state.status, WM_SIZE, 0, 0);
-            // Recompute pane right-edge x-coordinates for the current DPI.
-            let parts = compute_status_parts(width, dpi);
-            SendMessageW(state.status, SB_SETPARTS, 5, parts.as_ptr() as Lparam);
+        // Phase 02.1-06 (D-07): position custom FileTreeStatusFooter at the bottom.
+        if state.status_footer != 0 {
+            MoveWindow(
+                state.status_footer,
+                0,
+                client_h - footer_h,
+                width,
+                footer_h,
+                1,
+            );
+            InvalidateRect(state.status_footer, null(), 1);
         }
     });
 }
@@ -1204,7 +1319,7 @@ pub(super) unsafe fn start_scan_from_controls(hwnd: Hwnd) {
             threads: default_thread_count(),
         };
         let controls = (
-            state.status,
+            state.status_footer,
             state.path_edit,
             state.browse_button,
             state.scan_button,
@@ -1225,12 +1340,9 @@ pub(super) unsafe fn start_scan_from_controls(hwnd: Hwnd) {
     }
 
     // Win32 calls OUTSIDE the mutex Ã¢â‚¬â€ safe from deadlock.
+    // Phase 02.1-06 (D-07): custom footer paints from state fields; invalidate to repaint.
     if controls.0 != 0 {
-        set_status_pane(controls.0, PANE_FILES, "0 files");
-        set_status_pane(controls.0, PANE_FOLDERS, "0 folders");
-        set_status_pane(controls.0, PANE_ERRORS, "0 errors");
-        set_status_pane(controls.0, PANE_ELAPSED, "0:00");
-        set_status_pane(controls.0, PANE_THROUGHPUT, "0.0 MB/s");
+        InvalidateRect(controls.0, null(), 1);
     }
     EnableWindow(controls.1, 0);
     EnableWindow(controls.2, 0);
@@ -1275,7 +1387,7 @@ unsafe fn finish_scan(hwnd: Hwnd, result: Result<ScanResult, String>, canceled: 
         // Mark status idle so throughput pane resets to "-- MB/s" immediately (UI-SPEC).
         state.status_idle = true;
         let controls = (
-            state.status,
+            state.status_footer,
             state.path_edit,
             state.browse_button,
             state.scan_button,
@@ -1320,30 +1432,20 @@ unsafe fn finish_scan(hwnd: Hwnd, result: Result<ScanResult, String>, canceled: 
         EnableWindow(controls.3, 1);
         EnableWindow(controls.4, 1);
         EnableWindow(controls.5, 0);
-        if let Some((files, folders, errors, elapsed, was_canceled, node_count, root_size)) =
+        if let Some((_files, _folders, _errors, _elapsed, was_canceled, node_count, root_size)) =
             scan_info
         {
-            let status = controls.0;
-            if status != 0 {
-                // Count and elapsed panes FREEZE at final values (UI-SPEC §"Status bar / completed scan").
-                set_status_pane(status, PANE_FILES, &format_status_files(files, false));
-                set_status_pane(status, PANE_FOLDERS, &format_status_folders(folders, false));
-                set_status_pane(status, PANE_ERRORS, &format_status_errors(errors, false));
-                set_status_pane(status, PANE_ELAPSED, &format_status_elapsed(elapsed, false));
-                // Throughput resets to "-- MB/s" immediately on completion/cancel (UI-SPEC).
-                set_status_pane(status, PANE_THROUGHPUT, "-- MB/s");
+            // Phase 02.1-06 (D-07): footer reads from state.current_scan; just invalidate.
+            let footer = controls.0;
+            if footer != 0 {
+                InvalidateRect(footer, null(), 1);
             }
-            // Also update the legacy status for the title bar / error log.
             let _ = (was_canceled, node_count, root_size);
         } else if error_msg.is_none() {
-            // Scan failed path — show idle markers.
-            let status = controls.0;
-            if status != 0 {
-                set_status_pane(status, PANE_FILES, "-- files");
-                set_status_pane(status, PANE_FOLDERS, "-- folders");
-                set_status_pane(status, PANE_ERRORS, "-- errors");
-                set_status_pane(status, PANE_ELAPSED, "--:--");
-                set_status_pane(status, PANE_THROUGHPUT, "-- MB/s");
+            // Scan failed path — invalidate footer to show idle markers.
+            let footer = controls.0;
+            if footer != 0 {
+                InvalidateRect(footer, null(), 1);
             }
         }
         if let Some(msg) = error_msg {
@@ -1378,53 +1480,37 @@ unsafe fn apply_scan_progress(
         };
         state.last_scan_bytes = bytes;
         state.last_scan_elapsed_ms = elapsed_ms;
-        let files = state
-            .current_scan
-            .as_ref()
-            .map(|s| s.nodes.iter().filter(|n| !n.is_dir).count() as u64)
-            .unwrap_or(0);
-        let folders = state
-            .current_scan
-            .as_ref()
-            .map(|s| s.nodes.iter().filter(|n| n.is_dir).count() as u64)
-            .unwrap_or(node_count as u64);
-        let errors = state
-            .current_scan
-            .as_ref()
-            .map(|s| s.errors.len() as u64)
-            .unwrap_or(0);
-        Some((state.status, files, folders, errors, bytes, elapsed_ms))
+        // files/folders/errors are now read directly by draw_status_footer from state;
+        // we no longer need to pass them through the tuple. Suppress unused-variable lint.
+        let _ = node_count;
+        Some((state.status_footer, bytes, elapsed_ms))
     })
     .flatten();
 
     // Win32 calls OUTSIDE the mutex — safe from deadlock.
-    if let Some((status, files, folders, errors, bytes, elapsed)) = status_info
-        && status != 0
+    // Phase 02.1-06 (D-07): custom footer reads from state fields; just invalidate.
+    if let Some((footer, _bytes, _elapsed)) = status_info
+        && footer != 0
     {
-        set_status_pane(status, PANE_FILES, &format_status_files(files, false));
-        set_status_pane(status, PANE_FOLDERS, &format_status_folders(folders, false));
-        set_status_pane(status, PANE_ERRORS, &format_status_errors(errors, false));
-        set_status_pane(status, PANE_ELAPSED, &format_status_elapsed(elapsed, false));
-        set_status_pane(
-            status,
-            PANE_THROUGHPUT,
-            &format_status_throughput(bytes, elapsed, false),
-        );
+        InvalidateRect(footer, null(), 1);
     }
 }
 
 unsafe fn stop_current_scan() {
-    let status = with_state_mut(|state| {
+    let footer = with_state_mut(|state| {
         if let Some(cancel) = &state.current_cancel {
             cancel.store(true, Ordering::Relaxed);
-            Some(state.status)
+            // Phase 02.1-06 (D-07): footer auto-paints; just invalidate on cancel.
+            Some(state.status_footer)
         } else {
             None
         }
     })
     .flatten();
-    if let Some(status) = status {
-        set_window_text(status, "Stopping scan...");
+    if let Some(footer) = footer
+        && footer != 0
+    {
+        InvalidateRect(footer, null(), 1);
     }
 }
 
@@ -1453,9 +1539,14 @@ unsafe fn expand_all_directories() {
         }
     })
     .flatten();
-    if let Some(text) = deferred {
-        with_state_mut(|state| set_window_text(state.status, &text));
-    }
+    // Phase 02.1-06 (D-07): status text is reflected through draw_status_footer;
+    // invalidate the footer HWND so it repaints from current state.
+    let _ = deferred; // status text no longer sent to footer; it auto-paints from state
+    with_state_mut(|state| {
+        if state.status_footer != 0 {
+            InvalidateRect(state.status_footer, null(), 1);
+        }
+    });
 }
 
 unsafe fn collapse_to_root() {
@@ -1465,9 +1556,12 @@ unsafe fn collapse_to_root() {
         render_list(state)
     })
     .flatten();
-    if let Some(text) = deferred {
-        with_state_mut(|state| set_window_text(state.status, &text));
-    }
+    let _ = deferred;
+    with_state_mut(|state| {
+        if state.status_footer != 0 {
+            InvalidateRect(state.status_footer, null(), 1);
+        }
+    });
 }
 
 unsafe fn toggle_path_column() {
@@ -1479,19 +1573,25 @@ unsafe fn toggle_path_column() {
         } else {
             "Path column hidden"
         };
-        (state.status, msg.to_string())
+        (state.status_footer, msg.to_string())
     });
-    if let Some((status, msg)) = deferred {
-        set_window_text(status, &msg);
+    if let Some((footer, _msg)) = deferred {
+        // Phase 02.1-06 (D-07): footer auto-paints from state; just invalidate.
+        if footer != 0 {
+            InvalidateRect(footer, null(), 1);
+        }
     }
 }
 
 unsafe fn choose_and_set_directory(hwnd: Hwnd) {
     if let Some(path) = browse_for_directory(hwnd) {
-        let hwnds = with_state_mut(|state| (state.path_edit, state.status));
-        if let Some((path_edit, status)) = hwnds {
+        let hwnds = with_state_mut(|state| (state.path_edit, state.status_footer));
+        if let Some((path_edit, footer)) = hwnds {
             set_window_text(path_edit, &path);
-            set_window_text(status, "Directory selected");
+            // Phase 02.1-06 (D-07): footer auto-paints; invalidate to refresh.
+            if footer != 0 {
+                InvalidateRect(footer, null(), 1);
+            }
         }
     }
 }
