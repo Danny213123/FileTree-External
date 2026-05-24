@@ -154,6 +154,13 @@ fn run_desktop(initial_path: PathBuf) -> sio::Result<()> {
             })?);
         let settings = settings_store.load_or_default();
 
+        // POL-03 / D-04 — pre-window dark-mode bootstrap.
+        // Set the process-wide AppMode BEFORE desktop::run registers any window class.
+        // This tells uxtheme to dark-theme built-in scrollbar / combobox chrome from
+        // the very first CreateWindowExW call, preventing the white-flash on launch.
+        // See bootstrap_dark_mode for cross-version behavior notes (Pitfall 2).
+        crate::desktop::bootstrap_dark_mode(settings.dark_mode);
+
         // Clamp geometry to primary monitor work area BEFORE CreateWindowExW (T-02-18).
         let wa = primary_workarea();
         let clamped_geom = clamp_window_to_workarea(settings.window.clone(), wa);
