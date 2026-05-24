@@ -119,6 +119,23 @@ pub(super) const TPM_LEFTALIGN: Uint = 0x0000;
 pub(super) const TPM_RIGHTBUTTON: Uint = 0x0002;
 pub(super) const SRCCOPY: Dword = 0x00CC0020;
 
+// Phase 02.1 — menu, owner-draw, DWM color change, DPI
+pub(super) const WM_INITMENUPOPUP: Uint = 0x0117;
+pub(super) const WM_DWMCOLORIZATIONCOLORCHANGED: Uint = 0x0320;
+pub(super) const WM_DRAWITEM: Uint = 0x002B;
+pub(super) const WM_MEASUREITEM: Uint = 0x002C;
+pub(super) const WM_DPICHANGED: Uint = 0x02E0;
+pub(super) const MF_CHECKED: Uint = 0x0008;
+pub(super) const MF_UNCHECKED: Uint = 0x0000;
+pub(super) const MF_BYCOMMAND: Uint = 0x0000;
+pub(super) const MF_OWNERDRAW: Uint = 0x0100;
+pub(super) const MIM_BACKGROUND: Dword = 0x0000_0002;
+pub(super) const ODS_SELECTED: Uint = 0x0001;
+pub(super) const ODS_DISABLED: Uint = 0x0004;
+pub(super) const ODS_CHECKED: Uint = 0x0008;
+pub(super) const ODS_HOTLIGHT: Uint = 0x0040;
+pub(super) const UISF_HIDEACCEL: Uint = 0x0002;
+
 pub(super) const ID_PATH_EDIT: isize = 101;
 pub(super) const ID_SCAN_BUTTON: isize = 102;
 pub(super) const ID_REFRESH_BUTTON: isize = 103;
@@ -316,6 +333,41 @@ pub(super) struct PaintStruct {
     pub(super) rgbReserved: [u8; 32],
 }
 
+// Phase 02.1 — menu / owner-draw structs (mirror Win32 layout exactly)
+#[repr(C)]
+pub(super) struct MENUINFO {
+    pub(super) cbSize: Dword,
+    pub(super) fMask: Dword,
+    pub(super) dwStyle: Dword,
+    pub(super) cyMax: Uint,
+    pub(super) hbrBack: Hbrush,
+    pub(super) dwContextHelpID: Dword,
+    pub(super) dwMenuData: usize,
+}
+
+#[repr(C)]
+pub(super) struct DRAWITEMSTRUCT {
+    pub(super) CtlType: Uint,
+    pub(super) CtlID: Uint,
+    pub(super) itemID: Uint,
+    pub(super) itemAction: Uint,
+    pub(super) itemState: Uint,
+    pub(super) hwndItem: Hwnd,
+    pub(super) hDC: Hdc,
+    pub(super) rcItem: Rect,
+    pub(super) itemData: usize,
+}
+
+#[repr(C)]
+pub(super) struct MEASUREITEMSTRUCT {
+    pub(super) CtlType: Uint,
+    pub(super) CtlID: Uint,
+    pub(super) itemID: Uint,
+    pub(super) itemWidth: Uint,
+    pub(super) itemHeight: Uint,
+    pub(super) itemData: usize,
+}
+
 /// ComboBoxEx32 item descriptor used with CBEM_INSERTITEMW.
 /// All pointer fields remain valid only for the duration of the SendMessageW call.
 #[repr(C)]
@@ -359,6 +411,11 @@ unsafe extern "system" {
         dwAttribute: Dword,
         pvAttribute: *const c_void,
         cbAttribute: Dword,
+    ) -> i32;
+    // Phase 02.1 — query the system accent (ARGB); pfOpaqueBlend is unused by us.
+    pub(super) fn DwmGetColorizationColor(
+        pcrColorization: *mut Dword,
+        pfOpaqueBlend: *mut i32,
     ) -> i32;
 }
 
@@ -457,6 +514,10 @@ unsafe extern "system" {
         lpFileSystemNameBuffer: *mut u16,
         nFileSystemNameSize: Dword,
     ) -> Bool;
+    // Phase 02.1 — runtime DLL load + ordinal resolution for the undocumented
+    // uxtheme dark-mode APIs (Pattern 1; null-checked per Pitfall 2).
+    pub(super) fn LoadLibraryW(lpLibFileName: *const u16) -> Hinstance;
+    pub(super) fn GetProcAddress(hModule: Hinstance, lpProcName: *const i8) -> *mut c_void;
 }
 
 #[link(name = "Ole32")]
@@ -601,6 +662,12 @@ unsafe extern "system" {
         prcRect: *const Rect,
     ) -> Bool;
     pub(super) fn DestroyMenu(hMenu: Hmenu) -> Bool;
+    // Phase 02.1 — menu-bar construction + WM_INITMENUPOPUP sync (D-12).
+    pub(super) fn CreateMenu() -> Hmenu;
+    pub(super) fn SetMenu(hWnd: Hwnd, hMenu: Hmenu) -> Bool;
+    pub(super) fn CheckMenuItem(hMenu: Hmenu, uIDCheckItem: Uint, uCheck: Uint) -> Dword;
+    pub(super) fn SetMenuInfo(hMenu: Hmenu, lpcmi: *const MENUINFO) -> Bool;
+    pub(super) fn GetSubMenu(hMenu: Hmenu, nPos: i32) -> Hmenu;
     pub(super) fn OpenClipboard(hWndNewOwner: Hwnd) -> Bool;
     pub(super) fn CloseClipboard() -> Bool;
     pub(super) fn EmptyClipboard() -> Bool;
