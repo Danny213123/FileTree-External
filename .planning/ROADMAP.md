@@ -63,7 +63,7 @@ Plans:
 **Goal:** Dark mode that actually looks dark (#1e1e1e neutral palette, no brown tint, no first-paint flash), modern chrome that replaces the toolbar checkbox row with a View menu plus a 5-tab content strip (Details/Treemap/Extensions/Top Files/Duplicates), settings persistence for the active tab and drive picker selection, and Windows-native mnemonic accessibility (Alt-to-reveal underlines via UISF_HIDEACCEL).
 **Requirements**: SET-01, POL-01, POL-02, POL-03
 **Depends on:** Phase 2
-**Plans:** 7/8 plans executed
+**Plans:** 8/8 plans executed
 
 Plans:
 - [x] 02.1-01-PLAN.md — Embed Bootstrap Icons 1.11.3 TTF via AddFontMemResourceEx; new `src/desktop/icons.rs` exposes glyph constants for menu/tab/status iconography (BLOCKING checkpoint for license-clean TTF download)
@@ -73,7 +73,7 @@ Plans:
 - [x] 02.1-05-PLAN.md — Delete 4 toolbar checkboxes; build View popup menu (Show Hidden / Show Files / Dark Mode); create tab_strip + 5 tab_panels; wire WM_INITMENUPOPUP filter (Pitfall 7), WM_DWMCOLORIZATIONCOLORCHANGED accent refresh, Ctrl+1..5 accelerators, activate_tab + persist active_tab; restore active tab on startup
 - [x] 02.1-06-PLAN.md — Owner-draw View menu + footer status bar with mnemonic accessibility: `MF_OWNERDRAW` items, `MIM_BACKGROUND`, WM_DRAWITEM/WM_MEASUREITEM, `FileTreeStatusFooter` custom class replacing msctls_statusbar32, WM_UPDATEUISTATE + UISF_HIDEACCEL initialize for Alt-to-reveal underlines
 - [x] 02.1-07-PLAN.md — Close D-04 (first-paint flash) + D-10 (light theme honored): `bootstrap_dark_mode()` wrapper called from cli.rs before desktop::run; strip WS_VISIBLE from main CreateWindowExW; apply_dark_mode_to_window on HWND and per-child BEFORE ShowWindow
-- [ ] 02.1-08-PLAN.md — ROADMAP finalize + BLOCKING dual-screenshot capture (light + dark, public test directory only) + final visual sign-off checkpoint against all 13 D-XX decisions and SET-01/POL-01..03
+- [x] 02.1-08-PLAN.md — ROADMAP finalize + BLOCKING dual-screenshot capture (light + dark, public test directory only) + final visual sign-off checkpoint against all 13 D-XX decisions and SET-01/POL-01..03
 
 ### Phase 3: Search & Filter
 **Goal**: User can narrow a loaded scan to what matters by name / size / date / extension / category combinations, save useful combinations as named views, and watch results update live without re-scanning.
@@ -164,7 +164,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 1. Module Split | 0/3 | Planned | - |
 | 2. Settings & Polish | 4/5 | In Progress|  |
-| 02.1. UI polish — dark mode, chrome, persistence | 7/8 | In Progress|  |
+| 02.1. UI polish — dark mode, chrome, persistence | 8/8 | Completed |  |
 | 3. Search & Filter | 0/0 | Not started | - |
 | 4. Multi-Select Infrastructure | 0/0 | Not started | - |
 | 5. Cleanup Workflow + Hardened API | 0/0 | Not started | - |
