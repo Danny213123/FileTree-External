@@ -223,6 +223,12 @@ pub(super) const ID_TAB_ERRORS: isize = 3024;
 pub(super) const IDC_HAND: usize = 32649;
 pub(super) const WM_SETCURSOR: Uint = 0x0020;
 
+/// MAKEWPARAM — packs two u16 values into a usize (mirrors the Win32 macro).
+#[inline(always)]
+pub(super) fn MAKEWPARAM(lo: u16, hi: u16) -> Wparam {
+    ((hi as u32) << 16 | lo as u32) as usize
+}
+
 // WM_ constants used by drag-coalesce flush (Plan 02-03; also consumed by Plan 02-04)
 pub(super) const WM_EXITSIZEMOVE: Uint = 0x0232;
 pub(super) const WM_LBUTTONUP: Uint = 0x0202;
@@ -465,6 +471,12 @@ unsafe extern "system" {
 
 #[link(name = "Gdi32")]
 unsafe extern "system" {
+    pub(super) fn GetTextExtentPoint32W(
+        hdc: Hdc,
+        lpString: *const u16,
+        c: i32,
+        psizl: *mut SizeL,
+    ) -> Bool;
     pub(super) fn CreateFontW(
         cHeight: i32,
         cWidth: i32,
@@ -513,6 +525,7 @@ unsafe extern "system" {
 
 #[link(name = "Kernel32")]
 unsafe extern "system" {
+    pub(super) fn MulDiv(nNumber: i32, nNumerator: i32, nDenominator: i32) -> i32;
     pub(super) fn GetModuleHandleW(lpModuleName: *const u16) -> Hinstance;
     pub(super) fn GlobalAlloc(uFlags: Uint, dwBytes: usize) -> isize;
     pub(super) fn GlobalLock(hMem: isize) -> *mut c_void;
@@ -746,6 +759,9 @@ unsafe extern "system" {
     ) -> Bool;
     // Window-rect query for flush_pending_persist geometry capture (Plan 02-04)
     pub(super) fn GetWindowRect(hWnd: Hwnd, lpRect: *mut Rect) -> Bool;
+    // Tab strip helpers (Plan 02.1-04, D-08)
+    pub(super) fn GetParent(hWnd: Hwnd) -> Hwnd;
+    pub(super) fn SetCursor(hCursor: Handle) -> Handle;
 }
 
 // SHAutoComplete lives in Shlwapi.dll, NOT Shell32.dll — this is the ONE new DLL link
@@ -753,6 +769,13 @@ unsafe extern "system" {
 #[link(name = "Shlwapi")]
 unsafe extern "system" {
     pub(super) fn SHAutoComplete(hwndEdit: Hwnd, dwFlags: Dword) -> i32;
+}
+
+/// SIZE — used by GetTextExtentPoint32W for label measurement.
+#[repr(C)]
+pub(super) struct SizeL {
+    pub(super) cx: i32,
+    pub(super) cy: i32,
 }
 
 #[repr(C)]
