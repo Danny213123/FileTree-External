@@ -17,7 +17,7 @@ use crate::model::ScanResult;
 
 use super::ffi::{
     CopyDataStruct, Dword, FILETREE_PATH_MSG_ID, Handle, Hfont, Hicon, Hmenu, Hwnd, Lparam,
-    Lresult, MAX_COPYDATA_BYTES, Rect, SetForegroundWindow, SetWindowTextW,
+    Lresult, MAX_COPYDATA_BYTES, Rect, SetForegroundWindow, SetWindowTextW, Uint,
 };
 
 // ---------------------------------------------------------------------------
@@ -163,6 +163,14 @@ pub(super) struct DesktopState {
     pub(super) last_scan_elapsed_ms: u128,
     /// True before first scan and after scan completion/cancel — controls idle markers.
     pub(super) status_idle: bool,
+    // Phase 02.1-06 — Owner-draw menu + custom status footer (D-03 + D-07)
+    /// Custom-painted FileTreeStatusFooter child HWND (replaces msctls_statusbar32).
+    /// Initialized to 0; created in create_controls and positioned in resize_controls.
+    pub(super) status_footer: Hwnd,
+    /// Mirror of the current WM_UPDATEUISTATE bits (UISF_HIDEACCEL = 0x0002).
+    /// Initialized to UISF_HIDEACCEL (mnemonics hidden by default — POL-03 Windows-native behavior).
+    /// Updated in WM_UPDATEUISTATE handler; read in draw_menu_item to gate underline rendering.
+    pub(super) ui_state: Uint,
 }
 
 pub(super) struct ScanDone {
@@ -230,6 +238,9 @@ impl DesktopState {
             last_scan_bytes: 0,
             last_scan_elapsed_ms: 0,
             status_idle: true,
+            status_footer: 0,
+            // UISF_HIDEACCEL = 0x0002: mnemonics hidden until ALT pressed (POL-03).
+            ui_state: super::ffi::UISF_HIDEACCEL,
         }
     }
 }
