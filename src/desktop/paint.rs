@@ -13,11 +13,11 @@ use super::ffi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DI_NORMAL,
     DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
     DeleteDC, DeleteObject, DrawIconEx, DrawTextW, EndPaint, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FillRect, GetClientRect, Hdc, Hgdobj, Hicon, Hwnd, PaintStruct, Rect,
-    SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SRCCOPY, SelectObject,
-    SendMessageW, SetBkMode, SetTextColor, ShFileInfoW, TRANSPARENT, Uint,
+    FILE_ATTRIBUTE_NORMAL, FillRect, GetClientRect, Hdc, Hgdobj, Hicon, Hwnd, MulDiv, PaintStruct,
+    Rect, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SRCCOPY,
+    SelectObject, SendMessageW, SetBkMode, SetTextColor, ShFileInfoW, TRANSPARENT, Uint,
 };
-use super::state::{DesktopState, with_state_mut};
+use super::state::{DesktopState, TAB_ICONS, TAB_LABELS, with_state_mut};
 use super::theme::{
     palette_bg, palette_grid, palette_header, palette_hovered, palette_line, palette_muted,
     palette_panel, palette_percent_fill, palette_percent_track, palette_selected, palette_size_bar,
@@ -639,6 +639,94 @@ pub(super) unsafe fn draw_percent_cell(
         &mut text_rect,
         DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
     );
+}
+
+/// Render the 5-tab owner-drawn strip (Plan 02.1-04, D-08).
+///
+/// Each cell shows a Bootstrap Icons glyph (`draw_icon`) + label text, with a 2 px
+/// accent-color underline under the active tab. The accent comes from
+/// `state.accent_color` (single source of truth — set by `refresh_accent` in
+/// Plan 02.1-03 and refreshed on `WM_DWMCOLORIZATIONCOLORCHANGED` in Plan 02.1-05).
+/// No hover highlight and no borders — Apple-HIG restraint per D-07.
+pub(super) unsafe fn draw_tab_strip(
+    hdc: Hdc,
+    rc: Rect,
+    active: usize,
+    accent: super::ffi::Dword,
+    tab_rects: &[Rect; 5],
+    state: &DesktopState,
+) {
+    // Derive DPI from the cached field if available; fall back to 96 if zero.
+    // DesktopState.current_dpi is not yet present in Phase 02.1; we use 96 as a
+    // safe default — the strip looks correct at 100% scaling and degrades gracefully.
+    let dpi: u32 = 96;
+    let icon_size = MulDiv(14, dpi as i32, 96);
+    let pad_sm = MulDiv(8, dpi as i32, 96);
+    let pad_xs = MulDiv(4, dpi as i32, 96);
+    let underline_h = MulDiv(2, dpi as i32, 96).max(2);
+
+    // 1. Fill strip background.
+    fill_rect(hdc, rc, palette_panel(state));
+
+    // 2. 1 px separator hairline along the bottom edge of the strip.
+    fill_rect(
+        hdc,
+        Rect {
+            left: rc.left,
+            top: rc.bottom - 1,
+            right: rc.right,
+            bottom: rc.bottom,
+        },
+        palette_line(state),
+    );
+
+    let fg = palette_text(state);
+
+    SetBkMode(hdc, TRANSPARENT);
+    let old_font = SelectObject(hdc, state.font as Hgdobj);
+
+    // 3. Draw each tab cell.
+    for (i, cell) in tab_rects.iter().enumerate() {
+        let cell_height = cell.bottom - cell.top;
+
+        // Icon — vertically centred in the cell.
+        let icon_x = cell.left + pad_sm;
+        let icon_y = cell.top + (cell_height - icon_size) / 2;
+        super::icons::draw_icon(hdc, icon_x, icon_y, TAB_ICONS[i], icon_size, fg);
+
+        // Label — left of icon, right-padded.
+        let mut label_rect = Rect {
+            left: cell.left + pad_sm + icon_size + pad_xs,
+            top: cell.top,
+            right: cell.right - pad_sm,
+            bottom: cell.bottom,
+        };
+        SetTextColor(hdc, fg);
+        let wide = crate::io::wide(TAB_LABELS[i]);
+        DrawTextW(
+            hdc,
+            wide.as_ptr(),
+            -1,
+            &mut label_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+
+        // Accent underline on the active tab only.
+        if i == active {
+            fill_rect(
+                hdc,
+                Rect {
+                    left: cell.left,
+                    top: cell.bottom - underline_h,
+                    right: cell.right,
+                    bottom: cell.bottom,
+                },
+                accent,
+            );
+        }
+    }
+
+    SelectObject(hdc, old_font);
 }
 
 pub(super) unsafe fn fill_rect(hdc: Hdc, rect: Rect, color: super::ffi::Dword) {
