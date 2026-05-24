@@ -11,17 +11,18 @@ use std::mem::{size_of, zeroed};
 
 use super::ffi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DI_NORMAL,
-    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
-    DeleteDC, DeleteObject, DrawIconEx, DrawTextW, EndPaint, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FillRect, GetClientRect, Hdc, Hgdobj, Hicon, Hwnd, MulDiv, PaintStruct,
-    Rect, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SRCCOPY,
-    SelectObject, SendMessageW, SetBkMode, SetTextColor, ShFileInfoW, TRANSPARENT, Uint,
+    DRAWITEMSTRUCT, DT_CENTER, DT_END_ELLIPSIS, DT_HIDEPREFIX, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
+    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawIconEx, DrawTextW, EndPaint,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FillRect, GetClientRect, GetDpiForWindow, Hdc,
+    Hgdobj, Hicon, Hwnd, MulDiv, PaintStruct, Rect, SHGFI_ICON, SHGFI_SMALLICON,
+    SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SRCCOPY, SelectObject, SendMessageW, SetBkMode,
+    SetTextColor, ShFileInfoW, TRANSPARENT, Uint,
 };
 use super::state::{DesktopState, TAB_ICONS, TAB_LABELS, with_state_mut};
 use super::theme::{
-    palette_bg, palette_grid, palette_header, palette_hovered, palette_line, palette_muted,
-    palette_panel, palette_percent_fill, palette_percent_track, palette_selected, palette_size_bar,
-    palette_table, palette_table_alt, palette_text, rgb,
+    palette_bg, palette_disabled, palette_grid, palette_header, palette_hovered, palette_line,
+    palette_muted, palette_panel, palette_percent_fill, palette_percent_track, palette_selected,
+    palette_size_bar, palette_table, palette_table_alt, palette_text, rgb,
 };
 use crate::io::epoch_ms_to_utc;
 use crate::model::{NodeRecord, ScanResult};
@@ -897,6 +898,282 @@ pub(super) unsafe fn set_status_pane(status: Hwnd, pane: usize, text: &str) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Phase 02.1-06 — Owner-draw menu helpers + custom status footer
+// ---------------------------------------------------------------------------
+
+/// Pure fn: returns `(fg, bg)` COLORREF pair for a menu item based on ODS_* flags and theme.
+///
+/// Rules (per UI-SPEC D-03 + D-05):
+/// - ODS_DISABLED → `(palette_disabled, palette_panel)`
+/// - ODS_SELECTED or ODS_HOTLIGHT → `(selected_text, accent)` — hover and selected look identical (D-07)
+/// - Normal → `(palette_text, palette_panel)`
+///
+/// The ODS_CHECKED flag affects rendering (checkmark glyph) but NOT fg/bg colors.
+pub(super) fn menu_item_colors(
+    item_state: Uint,
+    dark: bool,
+    accent: super::ffi::Dword,
+    selected_text: super::ffi::Dword,
+) -> (super::ffi::Dword, super::ffi::Dword) {
+    // Use a temporary DesktopState to call the palette functions without unsafe.
+    // All palette_* fns only read the dark_mode field.
+    let mut tmp = super::state::DesktopState::new(std::path::PathBuf::from("."));
+    tmp.dark_mode = dark;
+
+    if item_state & super::ffi::ODS_DISABLED != 0 {
+        (palette_disabled(&tmp), palette_panel(&tmp))
+    } else if item_state & (super::ffi::ODS_SELECTED | super::ffi::ODS_HOTLIGHT) != 0 {
+        (selected_text, accent)
+    } else {
+        (palette_text(&tmp), palette_panel(&tmp))
+    }
+}
+
+/// Paint one owner-drawn menu item per the DRAWITEMSTRUCT.
+///
+/// 1. Compute `(fg, bg)` via `menu_item_colors`.
+/// 2. Fill background.
+/// 3. If checked: draw a checkmark glyph.
+/// 4. Draw label text with DT_HIDEPREFIX when mnemonics are hidden.
+///
+/// SAFETY: `dis` must be a valid DRAWITEMSTRUCT supplied by Win32.
+pub(super) unsafe fn draw_menu_item(
+    dis: &DRAWITEMSTRUCT,
+    label: &str,
+    checked: bool,
+    mnemonics_visible: bool,
+    state: &super::state::DesktopState,
+) {
+    let (fg, bg) = menu_item_colors(
+        dis.itemState,
+        state.dark_mode,
+        state.accent_color,
+        state.selected_text_color,
+    );
+    fill_rect(dis.hDC, dis.rcItem, bg);
+
+    let dpi = GetDpiForWindow(state.hwnd);
+    let dpi = if dpi == 0 { 96 } else { dpi };
+
+    if checked {
+        let icon_size = MulDiv(14, dpi as i32, 96);
+        let pad = MulDiv(6, dpi as i32, 96);
+        let height = dis.rcItem.bottom - dis.rcItem.top;
+        let icon_y = dis.rcItem.top + (height - icon_size) / 2;
+        super::icons::draw_icon(
+            dis.hDC,
+            dis.rcItem.left + pad,
+            icon_y,
+            super::icons::ICON_CHECK,
+            icon_size,
+            fg,
+        );
+    }
+
+    let left_pad = MulDiv(26, dpi as i32, 96);
+    let right_pad = MulDiv(8, dpi as i32, 96);
+    let mut label_rect = Rect {
+        left: dis.rcItem.left + left_pad,
+        top: dis.rcItem.top,
+        right: dis.rcItem.right - right_pad,
+        bottom: dis.rcItem.bottom,
+    };
+
+    SetBkMode(dis.hDC, TRANSPARENT);
+    SetTextColor(dis.hDC, fg);
+    let old_font = SelectObject(dis.hDC, state.font as Hgdobj);
+
+    let label_wide = crate::io::wide(label);
+    let fmt =
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | if mnemonics_visible { 0 } else { DT_HIDEPREFIX };
+    DrawTextW(dis.hDC, label_wide.as_ptr(), -1, &mut label_rect, fmt);
+
+    // Restore previous font to avoid leaking a GDI object selection.
+    SelectObject(dis.hDC, old_font);
+}
+
+/// Paint the custom status footer child window (class FileTreeStatusFooter).
+///
+/// Uses double-buffering identical to `paint_window`. Paints:
+/// 1. `palette_panel` background.
+/// 2. 1 px `palette_line` top-edge hairline (structural-seam rule, UI-SPEC).
+/// 3. 5 status panes with text from `format_status_*` helpers.
+///
+/// SAFETY: `hwnd` must be the status footer HWND; `state` must be valid.
+pub(super) unsafe fn draw_status_footer(hwnd: Hwnd, state: &super::state::DesktopState) {
+    use super::ffi::{PANE_ELAPSED, PANE_ERRORS, PANE_FILES, PANE_FOLDERS, PANE_THROUGHPUT};
+
+    let mut paint: PaintStruct = std::mem::zeroed();
+    let hdc = BeginPaint(hwnd, &mut paint);
+    if hdc == 0 {
+        return;
+    }
+
+    let mut client_rc: Rect = std::mem::zeroed();
+    GetClientRect(hwnd, &mut client_rc);
+    let width = client_rc.right - client_rc.left;
+    let height = client_rc.bottom - client_rc.top;
+
+    if width > 0 && height > 0 {
+        let mem_dc = CreateCompatibleDC(hdc);
+        if mem_dc != 0 {
+            let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
+            if mem_bmp != 0 {
+                let old_bmp = SelectObject(mem_dc, mem_bmp);
+
+                // 1. Fill background.
+                fill_rect(mem_dc, client_rc, palette_panel(state));
+
+                // 2. 1 px top-edge hairline.
+                fill_rect(
+                    mem_dc,
+                    Rect {
+                        left: 0,
+                        top: 0,
+                        right: width,
+                        bottom: 1,
+                    },
+                    palette_line(state),
+                );
+
+                // 3. Draw each pane.
+                let dpi = GetDpiForWindow(hwnd);
+                let dpi = if dpi == 0 { 96 } else { dpi };
+                let parts = compute_status_parts(width, dpi);
+
+                let texts = [
+                    format_status_files(
+                        state
+                            .current_scan
+                            .as_ref()
+                            .map(|s| s.nodes.iter().filter(|n| !n.is_dir).count() as u64)
+                            .unwrap_or(0),
+                        state.status_idle,
+                    ),
+                    format_status_folders(
+                        state
+                            .current_scan
+                            .as_ref()
+                            .map(|s| s.nodes.iter().filter(|n| n.is_dir).count() as u64)
+                            .unwrap_or(0),
+                        state.status_idle,
+                    ),
+                    format_status_errors(
+                        state
+                            .current_scan
+                            .as_ref()
+                            .map(|s| s.errors.len() as u64)
+                            .unwrap_or(0),
+                        state.status_idle,
+                    ),
+                    format_status_elapsed(state.last_scan_elapsed_ms, state.status_idle),
+                    format_status_throughput(
+                        state.last_scan_bytes,
+                        state.last_scan_elapsed_ms,
+                        state.status_idle,
+                    ),
+                ];
+                let pane_indices = [
+                    PANE_FILES,
+                    PANE_FOLDERS,
+                    PANE_ERRORS,
+                    PANE_ELAPSED,
+                    PANE_THROUGHPUT,
+                ];
+
+                let old_font = SelectObject(mem_dc, state.font as Hgdobj);
+                SetBkMode(mem_dc, TRANSPARENT);
+                SetTextColor(mem_dc, palette_text(state));
+
+                let pad = MulDiv(4, dpi as i32, 96);
+                for (i, pane_idx) in pane_indices.iter().enumerate() {
+                    let left_x = if *pane_idx == 0 {
+                        0
+                    } else {
+                        parts[pane_idx - 1].max(0)
+                    };
+                    let right_x = if parts[i] == -1 { width } else { parts[i] };
+                    let mut text_rect = Rect {
+                        left: left_x + pad,
+                        top: 0,
+                        right: right_x - pad,
+                        bottom: height,
+                    };
+                    let wide = crate::io::wide(&texts[i]);
+                    DrawTextW(
+                        mem_dc,
+                        wide.as_ptr(),
+                        -1,
+                        &mut text_rect,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                    );
+                }
+                SelectObject(mem_dc, old_font);
+
+                use super::ffi::SRCCOPY;
+                BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+                SelectObject(mem_dc, old_bmp);
+                DeleteObject(mem_bmp);
+            }
+            DeleteDC(mem_dc);
+        }
+    }
+
+    EndPaint(hwnd, &paint);
+}
+
+/// Window proc for the FileTreeStatusFooter custom-painted child window.
+///
+/// SAFETY: Win32 calls this with validated HWND/msg/wparam/lparam per the OS contract.
+pub(super) unsafe extern "system" fn status_footer_window_proc(
+    hwnd: Hwnd,
+    msg: Uint,
+    wparam: super::ffi::Wparam,
+    lparam: super::ffi::Lparam,
+) -> super::ffi::Lresult {
+    use super::ffi::{DefWindowProcW, WM_ERASEBKGND, WM_PAINT};
+    match msg {
+        WM_PAINT => {
+            super::state::with_state_mut(|state| {
+                draw_status_footer(hwnd, state);
+            });
+            0
+        }
+        WM_ERASEBKGND => 1,
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Register the FileTreeStatusFooter window class (idempotent via OnceLock).
+///
+/// SAFETY: h_instance must be the module's HINSTANCE from GetModuleHandleW.
+pub(super) fn register_status_footer_class(h_instance: super::ffi::Hinstance) -> super::ffi::Bool {
+    use super::ffi::{
+        CS_HREDRAW, CS_VREDRAW, IDC_ARROW, LoadCursorW, RegisterClassW, STATUS_FOOTER_CLASS_NAME,
+        WndClassW,
+    };
+    use std::sync::OnceLock;
+    static REGISTERED: OnceLock<bool> = OnceLock::new();
+    *REGISTERED.get_or_init(|| unsafe {
+        let class_name = crate::io::wide(STATUS_FOOTER_CLASS_NAME);
+        let cursor = LoadCursorW(0, IDC_ARROW as *const u16);
+        let wc = WndClassW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(status_footer_window_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: h_instance,
+            hIcon: 0,
+            hCursor: cursor,
+            hbrBackground: 0,
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class_name.as_ptr(),
+        };
+        RegisterClassW(&wc) != 0
+    }) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,5 +1257,97 @@ mod tests {
         assert_eq!(parts[2], 750);
         assert_eq!(parts[3], 960);
         assert_eq!(parts[4], -1);
+    }
+
+    // --- Phase 02.1-06 unit tests for menu_item_colors ---
+
+    // Palette values from UI-SPEC D-05 (dark branch):
+    // palette_text dark  = rgb(204, 204, 204)
+    // palette_panel dark = rgb(45, 45, 45)
+    // palette_disabled dark = rgb(122, 122, 122)
+
+    /// Normal (unselected, enabled) in dark mode → palette_text + palette_panel.
+    #[test]
+    fn menu_item_colors_normal_dark() {
+        let accent = rgb(0, 120, 215);
+        let sel_text = rgb(255, 255, 255);
+        let (fg, bg) = menu_item_colors(0, true, accent, sel_text);
+        assert_eq!(
+            fg,
+            rgb(204, 204, 204),
+            "dark normal fg should be palette_text_dark"
+        );
+        assert_eq!(
+            bg,
+            rgb(45, 45, 45),
+            "dark normal bg should be palette_panel_dark"
+        );
+    }
+
+    /// ODS_SELECTED in dark mode → selected_text + accent colors.
+    #[test]
+    fn menu_item_colors_selected_dark() {
+        let accent = rgb(0, 120, 215);
+        let sel_text = rgb(255, 255, 255);
+        let (fg, bg) = menu_item_colors(super::super::ffi::ODS_SELECTED, true, accent, sel_text);
+        assert_eq!(
+            fg,
+            rgb(255, 255, 255),
+            "selected fg should be selected_text_color"
+        );
+        assert_eq!(bg, rgb(0, 120, 215), "selected bg should be accent");
+    }
+
+    /// ODS_DISABLED in dark mode → palette_disabled + palette_panel.
+    #[test]
+    fn menu_item_colors_disabled_dark() {
+        let accent = rgb(0, 120, 215);
+        let sel_text = rgb(255, 255, 255);
+        let (fg, bg) = menu_item_colors(super::super::ffi::ODS_DISABLED, true, accent, sel_text);
+        assert_eq!(
+            fg,
+            rgb(122, 122, 122),
+            "disabled fg should be palette_disabled_dark"
+        );
+        assert_eq!(
+            bg,
+            rgb(45, 45, 45),
+            "disabled bg should be palette_panel_dark"
+        );
+    }
+
+    /// Normal in light mode → NOT the dark-palette values (light branch delegate from system).
+    #[test]
+    fn menu_item_colors_normal_light() {
+        let accent = rgb(0, 120, 215);
+        let sel_text = rgb(0, 0, 0);
+        let (fg, bg) = menu_item_colors(0, false, accent, sel_text);
+        // Light-mode palette delegates to different values; assert they are NOT the dark values.
+        assert_ne!(
+            bg,
+            rgb(45, 45, 45),
+            "light bg must not be dark palette_panel"
+        );
+        assert_ne!(
+            fg,
+            rgb(204, 204, 204),
+            "light fg must not be dark palette_text"
+        );
+    }
+
+    /// ODS_HOTLIGHT returns the same colors as ODS_SELECTED (D-07 rule).
+    #[test]
+    fn menu_item_colors_hotlight_same_as_selected() {
+        let accent = rgb(0, 120, 215);
+        let sel_text = rgb(255, 255, 255);
+        let (fg_sel, bg_sel) =
+            menu_item_colors(super::super::ffi::ODS_SELECTED, true, accent, sel_text);
+        let (fg_hot, bg_hot) =
+            menu_item_colors(super::super::ffi::ODS_HOTLIGHT, true, accent, sel_text);
+        assert_eq!(
+            (fg_sel, bg_sel),
+            (fg_hot, bg_hot),
+            "hover (HOTLIGHT) and selected must produce identical colors"
+        );
     }
 }
