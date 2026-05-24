@@ -156,13 +156,57 @@ pub(crate) fn run(
 
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+
+        // Phase 02.1-05 — D-11: restore drive picker to last_path's drive letter on launch.
+        // populate_drive_picker was called in create_controls with initial_path; here we
+        // re-call it with settings.last_path (non-empty after any prior scan) so the
+        // ComboBoxEx32 pre-selects the correct drive when the user reopens the app.
+        {
+            let (picker, last_path, initial_path_str) = with_state_mut(|s| {
+                (
+                    s.drive_picker,
+                    s.settings.last_path.clone(),
+                    path_to_string(&s.initial_path),
+                )
+            })
+            .unwrap_or((0, String::new(), String::new()));
+            if picker != 0 {
+                let restore_path = if !last_path.is_empty() {
+                    last_path
+                } else {
+                    initial_path_str
+                };
+                populate_drive_picker(picker, &restore_path);
+            }
+        }
+
         start_scan_from_controls(hwnd);
+
+        // Phase 02.1-05 — D-13 / SET-01: restore active tab from settings.
+        // PostMessageW queues WM_COMMAND through the same ID_TAB_* arm a user click triggers —
+        // single code path, no special-case logic needed. The message is processed after
+        // ShowWindow + UpdateWindow have completed.
+        {
+            let tab_id = with_state_mut(|s| {
+                let tab = ActiveTab::from_str(&s.settings.active_tab).unwrap_or(ActiveTab::Details);
+                ID_TAB_DETAILS + tab as isize
+            })
+            .unwrap_or(ID_TAB_DETAILS);
+            PostMessageW(hwnd, WM_COMMAND, MAKEWPARAM(tab_id as u16, 0), 0);
+        }
 
         // Build the accelerator table (Plan 02-03, Pattern 6).
         // Use MaybeUninit + ptr::write to build the packed Accel array without triggering
         // Rust's unaligned-references lint (fields of packed structs cannot be directly
         // referenced). TranslateAcceleratorW is called BEFORE TranslateMessage (Pitfall #8):
         // the accelerator wins over the edit control's default key handling for Enter/Esc/F5.
+        // Phase 02.1-05 — extend accelerator table with Ctrl+1..5 for tab switching (POL-02).
+        // VK_1..VK_5 = 0x31..0x35; FVIRTKEY | FCONTROL = 0x09.
+        const VK_1: u16 = 0x31;
+        const VK_2: u16 = 0x32;
+        const VK_3: u16 = 0x33;
+        const VK_4: u16 = 0x34;
+        const VK_5: u16 = 0x35;
         let mut accel_uninit = [
             core::mem::MaybeUninit::<Accel>::uninit(),
             core::mem::MaybeUninit::<Accel>::uninit(),
@@ -170,14 +214,25 @@ pub(crate) fn run(
             core::mem::MaybeUninit::<Accel>::uninit(),
             core::mem::MaybeUninit::<Accel>::uninit(),
             core::mem::MaybeUninit::<Accel>::uninit(),
+            core::mem::MaybeUninit::<Accel>::uninit(),
+            core::mem::MaybeUninit::<Accel>::uninit(),
+            core::mem::MaybeUninit::<Accel>::uninit(),
+            core::mem::MaybeUninit::<Accel>::uninit(),
+            core::mem::MaybeUninit::<Accel>::uninit(),
         ];
-        let accel_data: [(u8, u16, u16); 6] = [
+        let accel_data: [(u8, u16, u16); 11] = [
             (FVIRTKEY, VK_RETURN, CMD_SCAN),
             (FVIRTKEY, VK_ESCAPE, CMD_CANCEL_SCAN),
             (FVIRTKEY, VK_DELETE, CMD_DELETE_SEL),
             (FVIRTKEY | FCONTROL, 'F' as u16, CMD_FOCUS_SEARCH),
             (FVIRTKEY | FCONTROL, 'E' as u16, CMD_EXPORT),
             (FVIRTKEY, VK_F5, CMD_REFRESH),
+            // Ctrl+1..5 → tab Details..Errors (POL-02 / D-12).
+            (FVIRTKEY | FCONTROL, VK_1, ID_TAB_DETAILS as u16),
+            (FVIRTKEY | FCONTROL, VK_2, ID_TAB_TOP as u16),
+            (FVIRTKEY | FCONTROL, VK_3, ID_TAB_EXTENSIONS as u16),
+            (FVIRTKEY | FCONTROL, VK_4, ID_TAB_DUPLICATES as u16),
+            (FVIRTKEY | FCONTROL, VK_5, ID_TAB_ERRORS as u16),
         ];
         for (slot, (fvirt, key, cmd)) in accel_uninit.iter_mut().zip(accel_data.iter()) {
             // SAFETY: MaybeUninit::as_mut_ptr() gives a valid pointer to write the value.
@@ -186,9 +241,9 @@ pub(crate) fn run(
             core::ptr::write_unaligned(core::ptr::addr_of_mut!((*ptr).key), *key);
             core::ptr::write_unaligned(core::ptr::addr_of_mut!((*ptr).cmd), *cmd);
         }
-        // SAFETY: all six slots were initialized via write_unaligned above.
-        let accels: [Accel; 6] = core::mem::transmute(accel_uninit);
-        let haccel = CreateAcceleratorTableW(accels.as_ptr(), 6);
+        // SAFETY: all eleven slots were initialized via write_unaligned above.
+        let accels: [Accel; 11] = core::mem::transmute(accel_uninit);
+        let haccel = CreateAcceleratorTableW(accels.as_ptr(), 11);
         with_state_mut(|s| s.accel_table = haccel);
 
         let mut message: Msg = zeroed();
@@ -344,31 +399,70 @@ unsafe extern "system" fn window_proc(
                 ID_EXPAND_BUTTON => expand_all_directories(),
                 ID_COLLAPSE_BUTTON => collapse_to_root(),
                 ID_COLUMNS_BUTTON => toggle_path_column(),
-                ID_FILES_CHECK => {
-                    with_state_mut(|state| {
-                        state.show_files = button_checked(state.files_check);
-                        render_list(state);
-                    });
-                }
-                ID_DARK_CHECK => {
+                // Phase 02.1-05 — 5 content-tab command arms (D-08 / SET-01).
+                // REENTRANCY DISCIPLINE (WARNING 2 gate, T-02.1-05-05):
+                //   activate_tab runs INSIDE with_state_mut (try_lock; non-blocking).
+                //   save_settings_if_dirty runs OUTSIDE the closure at function-body indentation.
+                //   save MUST NEVER run inside the closure — it would deadlock (PATTERNS.md).
+                ID_TAB_DETAILS => {
                     let snap = with_state_mut(|state| {
-                        state.dark_mode = button_checked(state.dark_check);
+                        activate_tab(state, ActiveTab::Details);
+                        state::snapshot_for_save(state)
+                    })
+                    .flatten();
+                    if let Some(snap) = snap {
+                        state::save_settings_if_dirty(snap);
+                    }
+                }
+                ID_TAB_TOP => {
+                    let snap = with_state_mut(|state| {
+                        activate_tab(state, ActiveTab::Top);
+                        state::snapshot_for_save(state)
+                    })
+                    .flatten();
+                    if let Some(snap) = snap {
+                        state::save_settings_if_dirty(snap);
+                    }
+                }
+                ID_TAB_EXTENSIONS => {
+                    let snap = with_state_mut(|state| {
+                        activate_tab(state, ActiveTab::Extensions);
+                        state::snapshot_for_save(state)
+                    })
+                    .flatten();
+                    if let Some(snap) = snap {
+                        state::save_settings_if_dirty(snap);
+                    }
+                }
+                ID_TAB_DUPLICATES => {
+                    let snap = with_state_mut(|state| {
+                        activate_tab(state, ActiveTab::Duplicates);
+                        state::snapshot_for_save(state)
+                    })
+                    .flatten();
+                    if let Some(snap) = snap {
+                        state::save_settings_if_dirty(snap);
+                    }
+                }
+                ID_TAB_ERRORS => {
+                    let snap = with_state_mut(|state| {
+                        activate_tab(state, ActiveTab::Errors);
+                        state::snapshot_for_save(state)
+                    })
+                    .flatten();
+                    if let Some(snap) = snap {
+                        state::save_settings_if_dirty(snap);
+                    }
+                }
+                // Phase 02.1-05 — 3 View-menu toggle arms (replace old ID_*_CHECK button arms).
+                ID_VIEW_DARK_MODE => {
+                    let snap = with_state_mut(|state| {
+                        state.dark_mode = !state.dark_mode;
                         state.settings.dark_mode = state.dark_mode;
                         DARK_MODE_ATOMIC.store(state.dark_mode, Ordering::Relaxed);
                         apply_theme(state);
                         let _ = render_list(state);
-                        state::snapshot_for_save(state)
-                    })
-                    .flatten();
-                    // Save OUTSIDE the lock (reentrancy discipline, PATTERNS.md §"Save-pattern rule").
-                    if let Some(snap) = snap {
-                        state::save_settings_if_dirty(snap);
-                    }
-                }
-                ID_HIDDEN_CHECK => {
-                    let snap = with_state_mut(|state| {
-                        let checked = button_checked(state.hidden_check);
-                        state.settings.show_hidden = checked;
+                        InvalidateRect(state.hwnd, null(), 1);
                         state::snapshot_for_save(state)
                     })
                     .flatten();
@@ -376,10 +470,20 @@ unsafe extern "system" fn window_proc(
                         state::save_settings_if_dirty(snap);
                     }
                 }
-                ID_FOLLOW_CHECK => {
+                ID_VIEW_SHOW_HIDDEN => {
                     let snap = with_state_mut(|state| {
-                        let checked = button_checked(state.follow_check);
-                        state.settings.follow_symlinks = checked;
+                        state.settings.show_hidden = !state.settings.show_hidden;
+                        state::snapshot_for_save(state)
+                    })
+                    .flatten();
+                    if let Some(snap) = snap {
+                        state::save_settings_if_dirty(snap);
+                    }
+                }
+                ID_VIEW_SHOW_FILES => {
+                    let snap = with_state_mut(|state| {
+                        state.show_files = !state.show_files;
+                        let _ = render_list(state);
                         state::snapshot_for_save(state)
                     })
                     .flatten();
@@ -513,6 +617,39 @@ unsafe extern "system" fn window_proc(
             let _ = lparam;
             0
         }
+        // Phase 02.1-05 — sync View-menu check marks before the popup renders (D-12 / Pitfall 7).
+        // The `hmenu == state.view_menu` guard is mandatory: WM_INITMENUPOPUP fires for EVERY
+        // popup including Shell context menus built by shell.rs. Without this guard,
+        // CheckMenuItem would corrupt arbitrary Shell context-menu state on each right-click.
+        WM_INITMENUPOPUP => {
+            let hmenu = wparam as Hmenu;
+            with_state_mut(|state| {
+                if hmenu == state.view_menu {
+                    let check = |id: isize, on: bool| {
+                        CheckMenuItem(
+                            hmenu,
+                            id as Uint,
+                            MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED },
+                        );
+                    };
+                    check(ID_VIEW_SHOW_HIDDEN, state.settings.show_hidden);
+                    check(ID_VIEW_SHOW_FILES, state.show_files);
+                    check(ID_VIEW_DARK_MODE, state.settings.dark_mode);
+                }
+            });
+            0
+        }
+        // Phase 02.1-05 — refresh accent color when the user changes Windows accent (D-09).
+        WM_DWMCOLORIZATIONCOLORCHANGED => {
+            with_state_mut(|state| {
+                theme::refresh_accent(state);
+                // Only the tab strip shows the accent underline — no need for a full repaint.
+                if state.tab_strip != 0 {
+                    InvalidateRect(state.tab_strip, null(), 1);
+                }
+            });
+            0
+        }
         // Drag-coalesce flush: end of mouse drag or window resize (Plan 02-04, D-03).
         WM_LBUTTONUP => {
             state::flush_pending_persist(hwnd);
@@ -598,8 +735,15 @@ unsafe fn create_controls(hwnd: Hwnd) {
             );
         }
         // Populate the drive picker with all non-empty drives.
+        // Initial call uses initial_path; the post-ShowWindow block in run() re-calls
+        // with settings.last_path to restore the last drive (D-11 two-stage fix).
         if state.drive_picker != 0 {
-            populate_drive_picker(state.drive_picker, &path_to_string(&state.initial_path));
+            let init_path = if !state.settings.last_path.is_empty() {
+                state.settings.last_path.clone()
+            } else {
+                path_to_string(&state.initial_path)
+            };
+            populate_drive_picker(state.drive_picker, &init_path);
         }
 
         // Create path edit EDIT control (Plan 02-03).
@@ -690,42 +834,122 @@ unsafe fn create_controls(hwnd: Hwnd) {
             0,
             ID_COLUMNS_BUTTON,
         );
-        state.hidden_check = create_child(
-            hwnd,
-            h_instance,
-            "BUTTON",
-            "Hidden",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            0,
-            ID_HIDDEN_CHECK,
-        );
-        state.files_check = create_child(
-            hwnd,
-            h_instance,
-            "BUTTON",
-            "Files",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            0,
-            ID_FILES_CHECK,
-        );
-        state.follow_check = create_child(
-            hwnd,
-            h_instance,
-            "BUTTON",
-            "Links",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            0,
-            ID_FOLLOW_CHECK,
-        );
-        state.dark_check = create_child(
-            hwnd,
-            h_instance,
-            "BUTTON",
-            "Dark",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            0,
-            ID_DARK_CHECK,
-        );
+        // Phase 02.1-05 — toolbar checkboxes removed in favor of View menu (D-06).
+        // hidden_check / files_check / follow_check / dark_check HWND fields remain
+        // on DesktopState as 0 for binary compat — no HWND is ever created for them.
+        // Build the View menu bar (D-08 / WM_INITMENUPOPUP sync via Pitfall 7 guard).
+        {
+            let main_menu = CreateMenu();
+            let view_menu = CreatePopupMenu();
+            let label_show_hidden = crate::io::wide("&Show Hidden");
+            AppendMenuW(
+                view_menu,
+                MF_STRING,
+                ID_VIEW_SHOW_HIDDEN as usize,
+                label_show_hidden.as_ptr(),
+            );
+            let label_show_files = crate::io::wide("Show &Files");
+            AppendMenuW(
+                view_menu,
+                MF_STRING,
+                ID_VIEW_SHOW_FILES as usize,
+                label_show_files.as_ptr(),
+            );
+            let label_dark = crate::io::wide("&Dark Mode");
+            AppendMenuW(
+                view_menu,
+                MF_STRING,
+                ID_VIEW_DARK_MODE as usize,
+                label_dark.as_ptr(),
+            );
+            let label_view = crate::io::wide("&View");
+            AppendMenuW(main_menu, MF_POPUP, view_menu as usize, label_view.as_ptr());
+            SetMenu(state.hwnd, main_menu);
+            // Cache the view_menu handle for WM_INITMENUPOPUP filter (Pitfall 7):
+            // without this guard CheckMenuItem fires on every popup including Shell
+            // context menus, corrupting their state.
+            state.view_menu = view_menu;
+        }
+        // Create the tab strip and 5 content panels (Plan 02.1-05, D-08).
+        // register_class is idempotent (OnceLock inside tabs.rs) — safe to call here.
+        tabs::register_class(h_instance);
+        {
+            let class = crate::io::wide(tabs::TAB_CLASS_NAME);
+            state.tab_strip = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                null(),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                10,
+                10,
+                hwnd,
+                ID_TAB_STRIP as Hmenu,
+                h_instance,
+                null_mut(),
+            );
+            apply_dark_mode_to_window(state.tab_strip, state.dark_mode);
+        }
+        // Details tab (index 0) — alias the existing list content area (no list HWND yet;
+        // the list is created on first scan). Set panel[0] to 0 for now; it will be
+        // re-assigned in render_list once the list HWND exists.
+        // Panels 1–4 are simple STATIC placeholder windows.
+        for i in 0..5usize {
+            let panel = if i == 0 {
+                // Panel 0 will hold the scan list — created as a lightweight container.
+                let class = crate::io::wide("STATIC");
+                let text = crate::io::wide(""); // no text for the details panel
+                CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    text.as_ptr(),
+                    WS_CHILD | SS_LEFT | SS_NOPREFIX,
+                    0,
+                    0,
+                    10,
+                    10,
+                    hwnd,
+                    0,
+                    h_instance,
+                    null_mut(),
+                )
+            } else {
+                let class = crate::io::wide("STATIC");
+                let labels = [
+                    "",
+                    "Coming soon — Top files",
+                    "Coming soon — Extensions",
+                    "Coming soon — Duplicates",
+                    "Coming soon — Errors",
+                ];
+                let text = crate::io::wide(labels[i]);
+                CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    text.as_ptr(),
+                    WS_CHILD | SS_LEFT | SS_NOPREFIX,
+                    0,
+                    0,
+                    10,
+                    10,
+                    hwnd,
+                    0,
+                    h_instance,
+                    null_mut(),
+                )
+            };
+            state.tab_panels[i] = panel;
+            if panel != 0 {
+                apply_dark_mode_to_window(panel, state.dark_mode);
+                // Show only the active tab's panel on startup; hide the rest.
+                if i == state.active_tab as usize {
+                    ShowWindow(panel, SW_SHOW);
+                } else {
+                    ShowWindow(panel, SW_HIDE);
+                }
+            }
+        }
         // Create the 5-pane msctls_statusbar32 status bar (Plan 02-04, UI-SPEC §"Status bar").
         // ICC_BAR_CLASSES must be set in InitCommonControlsEx (already done in run()).
         // Coordinates are ignored — the status bar auto-sizes to the bottom of the parent.
@@ -756,28 +980,9 @@ unsafe fn create_controls(hwnd: Hwnd) {
         }
         state.list = 0;
 
-        // Restore settings-persisted checkbox states.
-        let hidden_check = if state.settings.show_hidden {
-            BST_CHECKED
-        } else {
-            0
-        };
-        let follow_check = if state.settings.follow_symlinks {
-            BST_CHECKED
-        } else {
-            0
-        };
-        let dark_check = if state.settings.dark_mode {
-            BST_CHECKED
-        } else {
-            0
-        };
-        SendMessageW(state.hidden_check, BM_SETCHECK, hidden_check, 0);
-        SendMessageW(state.files_check, BM_SETCHECK, BST_CHECKED, 0);
-        SendMessageW(state.follow_check, BM_SETCHECK, follow_check, 0);
-        SendMessageW(state.dark_check, BM_SETCHECK, dark_check, 0);
         // Sync runtime state with loaded settings.
         state.dark_mode = state.settings.dark_mode;
+        state.show_files = state.settings.show_hidden; // initialize from persisted state
         DARK_MODE_ATOMIC.store(state.dark_mode, Ordering::Relaxed);
         for control in [
             state.drive_picker,
@@ -789,10 +994,6 @@ unsafe fn create_controls(hwnd: Hwnd) {
             state.expand_button,
             state.collapse_button,
             state.columns_button,
-            state.hidden_check,
-            state.files_check,
-            state.follow_check,
-            state.dark_check,
             state.status,
         ] {
             if control != 0 {
@@ -831,6 +1032,30 @@ unsafe fn create_child(
     )
 }
 
+/// Switch the visible content panel to the given tab.
+///
+/// REENTRANCY DISCIPLINE (T-02.1-05-05 / PATTERNS.md WARNING 2):
+///   This function MUST be called INSIDE a `with_state_mut` closure.
+///   It MUST NOT call `save_settings_if_dirty` — that save runs at function-body
+///   indentation OUTSIDE the closure, after the lock is released. Violating this
+///   order causes a deadlock because `save_settings_if_dirty` would try to re-enter
+///   the state lock that the closure already holds.
+fn activate_tab(state: &mut DesktopState, tab: ActiveTab) {
+    state.active_tab = tab;
+    state.settings.active_tab = tab.as_str().to_string();
+    // Show only the matching panel; hide the rest.
+    for (i, &panel) in state.tab_panels.iter().enumerate() {
+        if panel != 0 {
+            let show = if i == tab as usize { SW_SHOW } else { SW_HIDE };
+            unsafe { ShowWindow(panel, show) };
+        }
+    }
+    // Invalidate the tab strip to repaint the active-tab accent underline.
+    if state.tab_strip != 0 {
+        unsafe { InvalidateRect(state.tab_strip, null(), 1) };
+    }
+}
+
 unsafe fn resize_controls(hwnd: Hwnd) {
     let mut rect: Rect = zeroed();
     if GetClientRect(hwnd, &mut rect) == 0 {
@@ -844,7 +1069,7 @@ unsafe fn resize_controls(hwnd: Hwnd) {
         let browse_w = 110;
         let button_h = 26;
         let path_y = 38;
-        let actions_y = 74;
+        let _actions_y = 74; // retained for reference; no longer used since toolbar removed
         let _status_h = 26;
 
         // Drive picker: 80 logical px wide (UI-SPEC), left-inset of `margin` (8px sm spacing)
@@ -877,110 +1102,56 @@ unsafe fn resize_controls(hwnd: Hwnd) {
             1,
         );
 
-        // Dynamically layout row 2 controls based on active tab
-        let tab = state.active_tab as usize;
-        let mut current_x = margin;
-        let spacing = 6;
-        let show = 5;
-        let hide = 0;
-
-        // 1. Home tab controls (Scan, Stop, Refresh, Expand, Collapse)
-        if tab == 1 {
-            ShowWindow(state.scan_button, show);
-            MoveWindow(state.scan_button, current_x, actions_y, 75, button_h, 1);
-            current_x += 75 + spacing;
-
-            ShowWindow(state.stop_button, show);
-            MoveWindow(state.stop_button, current_x, actions_y, 75, button_h, 1);
-            current_x += 75 + spacing;
-
-            ShowWindow(state.refresh_button, show);
-            MoveWindow(state.refresh_button, current_x, actions_y, 80, button_h, 1);
-            current_x += 80 + spacing;
-
-            ShowWindow(state.expand_button, show);
-            MoveWindow(state.expand_button, current_x, actions_y, 80, button_h, 1);
-            current_x += 80 + spacing;
-
-            ShowWindow(state.collapse_button, show);
-            MoveWindow(state.collapse_button, current_x, actions_y, 90, button_h, 1);
-        } else {
-            ShowWindow(state.scan_button, hide);
-            ShowWindow(state.stop_button, hide);
-            ShowWindow(state.refresh_button, hide);
-            ShowWindow(state.expand_button, hide);
-            ShowWindow(state.collapse_button, hide);
+        // Phase 02.1-05 — Tab strip + content panels replace the old toolbar row.
+        // Layout: path bar → tab strip (30 px DPI-scaled) → content panel → status bar.
+        let dpi = GetDpiForWindow(hwnd);
+        let dpi = if dpi == 0 { 96 } else { dpi };
+        let strip_h = MulDiv(30, dpi as i32, 96);
+        // Path bar bottom edge determines where the tab strip begins.
+        let path_bar_bottom = path_y + bar_h;
+        // Status bar height (msctls_statusbar32 sizes itself; use 26 logical px as budget).
+        let status_h = MulDiv(26, dpi as i32, 96);
+        let client_h = (rect.bottom - rect.top).max(300);
+        // Tab strip: full width, directly below the path bar.
+        let strip_y = path_bar_bottom + 4; // 4px gap below the path bar
+        if state.tab_strip != 0 {
+            MoveWindow(state.tab_strip, 0, strip_y, width, strip_h, 1);
+            // Trigger WM_SIZE on the strip so it recomputes tab_rects.
+            let rects = tabs::recompute_rects(state.tab_strip, width, dpi, state.font);
+            state.tab_rects = rects;
         }
-
-        // 2. Scan tab controls (Hidden, Files, Links)
-        if tab == 2 {
-            ShowWindow(state.hidden_check, show);
-            MoveWindow(state.hidden_check, current_x, actions_y, 92, button_h, 1);
-            current_x += 92 + spacing;
-
-            ShowWindow(state.files_check, show);
-            MoveWindow(state.files_check, current_x, actions_y, 78, button_h, 1);
-            current_x += 78 + spacing;
-
-            ShowWindow(state.follow_check, show);
-            MoveWindow(state.follow_check, current_x, actions_y, 78, button_h, 1);
-        } else if tab != 4 && tab != 3 {
-            ShowWindow(state.hidden_check, hide);
-            ShowWindow(state.files_check, hide);
-            ShowWindow(state.follow_check, hide);
-        }
-
-        // 3. View tab controls (Columns, Files, Dark)
-        if tab == 3 {
-            ShowWindow(state.columns_button, show);
-            MoveWindow(state.columns_button, current_x, actions_y, 100, button_h, 1);
-            current_x += 100 + spacing;
-
-            ShowWindow(state.files_check, show);
-            MoveWindow(state.files_check, current_x, actions_y, 78, button_h, 1);
-            current_x += 78 + spacing;
-
-            ShowWindow(state.dark_check, show);
-            MoveWindow(state.dark_check, current_x, actions_y, 72, button_h, 1);
-        } else if tab != 4 {
-            ShowWindow(state.columns_button, hide);
-            if tab != 2 {
-                ShowWindow(state.files_check, hide);
+        // Content panels: fill from below the strip to above the status bar.
+        let panel_y = strip_y + strip_h;
+        let panel_h = (client_h - panel_y - status_h).max(1);
+        for &panel in &state.tab_panels {
+            if panel != 0 {
+                MoveWindow(panel, 0, panel_y, width, panel_h, 1);
             }
-            ShowWindow(state.dark_check, hide);
         }
-
-        // 4. Options tab controls (Hidden, Files, Links, Dark)
-        if tab == 4 {
-            ShowWindow(state.hidden_check, show);
-            MoveWindow(state.hidden_check, current_x, actions_y, 92, button_h, 1);
-            current_x += 92 + spacing;
-
-            ShowWindow(state.files_check, show);
-            MoveWindow(state.files_check, current_x, actions_y, 78, button_h, 1);
-            current_x += 78 + spacing;
-
-            ShowWindow(state.follow_check, show);
-            MoveWindow(state.follow_check, current_x, actions_y, 78, button_h, 1);
-            current_x += 78 + spacing;
-
-            ShowWindow(state.dark_check, show);
-            MoveWindow(state.dark_check, current_x, actions_y, 72, button_h, 1);
-        }
-
-        // 5. Help / File tabs (No specific controls shown)
-        if tab == 0 || tab == 5 {
-            ShowWindow(state.scan_button, hide);
-            ShowWindow(state.stop_button, hide);
-            ShowWindow(state.refresh_button, hide);
-            ShowWindow(state.expand_button, hide);
-            ShowWindow(state.collapse_button, hide);
-            ShowWindow(state.columns_button, hide);
-            ShowWindow(state.hidden_check, hide);
-            ShowWindow(state.files_check, hide);
-            ShowWindow(state.follow_check, hide);
-            ShowWindow(state.dark_check, hide);
-        }
+        // Also show the action buttons in the path-bar row (Scan/Stop/Refresh/Expand/Collapse/Columns).
+        // These are placed to the right of the browse button, or visible at all times.
+        // For simplicity in this phase: show all action buttons always; they sit in the path bar row.
+        let btn_y = path_y;
+        let btn_x_start = path_edit_x + path_edit_w + 8 + browse_w + 8;
+        let mut btn_x = btn_x_start;
+        let btn_w = 75;
+        ShowWindow(state.scan_button, SW_SHOW);
+        MoveWindow(state.scan_button, btn_x, btn_y, btn_w, button_h, 1);
+        btn_x += btn_w + 4;
+        ShowWindow(state.stop_button, SW_SHOW);
+        MoveWindow(state.stop_button, btn_x, btn_y, btn_w, button_h, 1);
+        btn_x += btn_w + 4;
+        ShowWindow(state.refresh_button, SW_SHOW);
+        MoveWindow(state.refresh_button, btn_x, btn_y, btn_w, button_h, 1);
+        btn_x += btn_w + 4;
+        ShowWindow(state.expand_button, SW_SHOW);
+        MoveWindow(state.expand_button, btn_x, btn_y, 70, button_h, 1);
+        btn_x += 70 + 4;
+        ShowWindow(state.collapse_button, SW_SHOW);
+        MoveWindow(state.collapse_button, btn_x, btn_y, 80, button_h, 1);
+        btn_x += 80 + 4;
+        ShowWindow(state.columns_button, SW_SHOW);
+        MoveWindow(state.columns_button, btn_x, btn_y, 90, button_h, 1);
 
         // msctls_statusbar32 auto-positions itself at the bottom when WM_SIZE is sent.
         // We also recompute the pane layout for the current width and DPI.
@@ -988,8 +1159,6 @@ unsafe fn resize_controls(hwnd: Hwnd) {
             // Send WM_SIZE to the status bar so it repositions itself.
             SendMessageW(state.status, WM_SIZE, 0, 0);
             // Recompute pane right-edge x-coordinates for the current DPI.
-            let dpi = GetDpiForWindow(hwnd);
-            let dpi = if dpi == 0 { 96 } else { dpi };
             let parts = compute_status_parts(width, dpi);
             SendMessageW(state.status, SB_SETPARTS, 5, parts.as_ptr() as Lparam);
         }
@@ -1016,7 +1185,8 @@ pub(super) unsafe fn start_scan_from_controls(hwnd: Hwnd) {
                 DestroyIcon(icon);
             }
         }
-        state.show_files = button_checked(state.files_check);
+        // show_files is now managed via ID_VIEW_SHOW_FILES menu toggle (no checkbox HWND).
+        // state.show_files is already up to date from the last toggle; no reset needed here.
         state.status_idle = false;
         state.last_scan_bytes = 0;
         state.last_scan_elapsed_ms = 0;
@@ -1025,8 +1195,10 @@ pub(super) unsafe fn start_scan_from_controls(hwnd: Hwnd) {
 
         let options = ScanOptions {
             root: PathBuf::from(path),
-            include_hidden: button_checked(state.hidden_check),
-            follow_links: button_checked(state.follow_check),
+            // Phase 02.1-05: hidden/follow toggles moved from checkboxes to View menu.
+            // Read from settings (source of truth) rather than now-removed checkbox HWNDs.
+            include_hidden: state.settings.show_hidden,
+            follow_links: state.settings.follow_symlinks,
             exclude_patterns: Vec::new(),
             max_depth: None,
             threads: default_thread_count(),
@@ -1356,32 +1528,8 @@ unsafe fn browse_for_directory(hwnd: Hwnd) -> Option<String> {
 unsafe fn handle_mouse_click(hwnd: Hwnd, lparam: Lparam, double_click: bool) {
     let x = loword_signed(lparam);
     let y = hiword_signed(lparam);
-
-    let mut tab_clicked = None;
-    if y >= 0 && y < 30 {
-        if x >= 10 && x < 60 {
-            tab_clicked = Some(0);
-        } else if x >= 60 && x < 120 {
-            tab_clicked = Some(1);
-        } else if x >= 120 && x < 180 {
-            tab_clicked = Some(2);
-        } else if x >= 180 && x < 240 {
-            tab_clicked = Some(3);
-        } else if x >= 240 && x < 310 {
-            tab_clicked = Some(4);
-        } else if x >= 310 && x < 370 {
-            tab_clicked = Some(5);
-        }
-    }
-
-    if let Some(tab_idx) = tab_clicked {
-        with_state_mut(|state| {
-            state.active_tab = ActiveTab::from_index(tab_idx).unwrap_or(ActiveTab::Details);
-        });
-        resize_controls(hwnd);
-        InvalidateRect(hwnd, null(), 0);
-        return;
-    }
+    // Phase 02.1-05 — tab clicks are now handled by tabs.rs (FileTreeTabStrip HWND).
+    // The main window no longer receives tab-strip clicks directly.
 
     with_state_mut(|state| {
         let row_top = table_top() + 30;
