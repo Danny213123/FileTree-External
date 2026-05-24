@@ -26,7 +26,9 @@ use crate::scan::scan_path_with_progress;
 
 mod icons;
 mod state;
-use state::{DesktopState, STATE, ScanDone, ScanProgressInfo, handle_copy_data, with_state_mut};
+use state::{
+    ActiveTab, DesktopState, STATE, ScanDone, ScanProgressInfo, handle_copy_data, with_state_mut,
+};
 pub(crate) mod ffi;
 use ffi::*;
 mod theme;
@@ -876,7 +878,7 @@ unsafe fn resize_controls(hwnd: Hwnd) {
         );
 
         // Dynamically layout row 2 controls based on active tab
-        let tab = state.active_tab;
+        let tab = state.active_tab as usize;
         let mut current_x = margin;
         let spacing = 6;
         let show = 5;
@@ -1374,7 +1376,7 @@ unsafe fn handle_mouse_click(hwnd: Hwnd, lparam: Lparam, double_click: bool) {
 
     if let Some(tab_idx) = tab_clicked {
         with_state_mut(|state| {
-            state.active_tab = tab_idx;
+            state.active_tab = ActiveTab::from_index(tab_idx).unwrap_or(ActiveTab::Details);
         });
         resize_controls(hwnd);
         InvalidateRect(hwnd, null(), 0);

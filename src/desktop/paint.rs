@@ -130,7 +130,7 @@ pub(super) unsafe fn draw_toolbar_background(hdc: Hdc, client: Rect, state: &Des
     SetBkMode(hdc, TRANSPARENT);
 
     for (i, &(name, left, right)) in tabs.iter().enumerate() {
-        let is_active = state.active_tab == i;
+        let is_active = state.active_tab as usize == i;
         let tab_rect = Rect {
             left,
             top: 0,
