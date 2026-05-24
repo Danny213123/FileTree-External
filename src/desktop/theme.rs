@@ -196,3 +196,66 @@ pub(super) fn palette_percent_fill(state: &DesktopState) -> Dword {
         rgb(65, 122, 232)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// WCAG relative luminance contract per UI-SPEC: selection-fill text flips to
+    /// black when accent luminance > 0.6, else white. Cases pinned by VALIDATION.md.
+    #[test]
+    fn accent_luminance() {
+        // pure white (lum = 1.0)
+        assert_eq!(selected_text_for_accent(255, 255, 255), rgb(0, 0, 0));
+        // pure black (lum = 0.0)
+        assert_eq!(selected_text_for_accent(0, 0, 0), rgb(255, 255, 255));
+        // pale yellow (lum ≈ 0.9278)
+        assert_eq!(selected_text_for_accent(255, 255, 0), rgb(0, 0, 0));
+        // Win11 default blue accent (lum ≈ 0.196)
+        assert_eq!(selected_text_for_accent(0, 120, 215), rgb(255, 255, 255));
+        // pale grey-blue just under 0.6 (lum ≈ 0.5919) — must stay white
+        assert_eq!(selected_text_for_accent(180, 200, 220), rgb(255, 255, 255));
+        // slightly lighter, just over 0.6 (lum ≈ 0.6437) — flips to black
+        assert_eq!(selected_text_for_accent(190, 210, 220), rgb(0, 0, 0));
+    }
+
+    /// Threshold edge: verify the 0.6 luminance boundary is the flip point.
+    /// Picks two close shades; the lower returns white, the higher returns black.
+    #[test]
+    fn selected_text_threshold() {
+        // Below threshold (lum ≈ 0.591)
+        let below = selected_text_for_accent(180, 200, 220);
+        // Above threshold (lum ≈ 0.643)
+        let above = selected_text_for_accent(190, 210, 220);
+        assert_eq!(below, rgb(255, 255, 255));
+        assert_eq!(above, rgb(0, 0, 0));
+        // The two must differ — they straddle the boundary.
+        assert_ne!(below, above);
+    }
+
+    /// Palette regression guard (Pitfall 9 closure). Every dark-mode palette
+    /// value must match UI-SPEC exact RGB. Light-mode palette_line override is
+    /// explicit per UI-SPEC ("Light mode — system-color delegation EXCEPT line").
+    #[test]
+    fn palette_matches_spec() {
+        let mut state = DesktopState::new(PathBuf::from("."));
+        state.dark_mode = true;
+        assert_eq!(palette_bg(&state), rgb(30, 30, 30), "dark bg #1e1e1e");
+        assert_eq!(palette_panel(&state), rgb(45, 45, 45), "dark panel #2d2d2d");
+        assert_eq!(palette_text(&state), rgb(204, 204, 204), "dark text #cccccc");
+        assert_eq!(palette_line(&state), rgb(58, 58, 58), "dark line #3a3a3a");
+        assert_eq!(
+            palette_disabled(&state),
+            rgb(122, 122, 122),
+            "dark disabled #7a7a7a"
+        );
+
+        state.dark_mode = false;
+        assert_eq!(
+            palette_line(&state),
+            rgb(229, 229, 229),
+            "light line #e5e5e5 (explicit override per UI-SPEC)"
+        );
+    }
+}
