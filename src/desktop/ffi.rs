@@ -383,6 +383,36 @@ pub(super) struct ComboBoxExItemW {
     pub(super) lParam: Lparam,
 }
 
+// Plan 02.1-01 — LOGFONTW constants for draw_icon
+pub(super) const DEFAULT_CHARSET: Dword = 1;
+pub(super) const OUT_DEFAULT_PRECIS: Dword = 0;
+pub(super) const CLIP_DEFAULT_PRECIS: Dword = 0;
+pub(super) const DEFAULT_QUALITY: Dword = 0;
+pub(super) const DEFAULT_PITCH: Dword = 0;
+pub(super) const FW_NORMAL: i32 = 400;
+pub(super) const DT_TOP: Uint = 0x0000_0000;
+
+/// LOGFONTW — Win32 logical font descriptor used by CreateFontIndirectW.
+/// Layout matches the Win32 LOGFONTW struct exactly (60 bytes for the fixed
+/// fields + 32 × 2 bytes for lfFaceName = 124 bytes total).
+#[repr(C)]
+pub(super) struct LOGFONTW {
+    pub(super) lfHeight: i32,
+    pub(super) lfWidth: i32,
+    pub(super) lfEscapement: i32,
+    pub(super) lfOrientation: i32,
+    pub(super) lfWeight: i32,
+    pub(super) lfItalic: u8,
+    pub(super) lfUnderline: u8,
+    pub(super) lfStrikeOut: u8,
+    pub(super) lfCharSet: u8,
+    pub(super) lfOutPrecision: u8,
+    pub(super) lfClipPrecision: u8,
+    pub(super) lfQuality: u8,
+    pub(super) lfPitchAndFamily: u8,
+    pub(super) lfFaceName: [u16; 32],
+}
+
 /// Win32 ACCEL struct for CreateAcceleratorTableW.
 ///
 /// **This is the ONLY packed struct in ffi.rs** (winuser.h uses #pragma pack(1) for ACCEL).
@@ -457,6 +487,14 @@ unsafe extern "system" {
         ySrc: i32,
         rop: Dword,
     ) -> Bool;
+    // Plan 02.1-01 — Bootstrap Icons font registration (T-02.1-01-02: static bytes, no heap copy)
+    pub(super) fn AddFontMemResourceEx(
+        pFileView: *const c_void,
+        cjSize: Dword,
+        pvResrved: *mut c_void,
+        pNumFonts: *mut Dword,
+    ) -> Handle;
+    pub(super) fn CreateFontIndirectW(lplf: *const LOGFONTW) -> Hfont;
 }
 
 #[link(name = "Kernel32")]

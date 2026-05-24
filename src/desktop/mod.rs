@@ -24,6 +24,7 @@ use crate::io::{default_thread_count, path_to_string, reveal_path};
 use crate::model::*;
 use crate::scan::scan_path_with_progress;
 
+mod icons;
 mod state;
 use state::{DesktopState, STATE, ScanDone, ScanProgressInfo, handle_copy_data, with_state_mut};
 pub(crate) mod ffi;
@@ -117,6 +118,10 @@ pub(crate) fn run(
             lpszClassName: class_name.as_ptr(),
         };
         RegisterClassW(&window_class);
+
+        // Register Bootstrap Icons font before any child window creates or paints
+        // (POL-03 prerequisite — Plans 02.1-04 and 02.1-06 depend on this).
+        icons::register_icon_font();
 
         let title = crate::io::wide(&format!("{APP_NAME} - Native Disk Explorer"));
         // Use geometry restored from settings (clamped to work area) — no CW_USEDEFAULT.
