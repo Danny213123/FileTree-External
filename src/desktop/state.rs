@@ -16,7 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::model::ScanResult;
 
 use super::ffi::{
-    CopyDataStruct, FILETREE_PATH_MSG_ID, Handle, Hfont, Hicon, Hwnd, Lparam, Lresult,
+    CopyDataStruct, Dword, FILETREE_PATH_MSG_ID, Handle, Hfont, Hicon, Hwnd, Lparam, Lresult,
     MAX_COPYDATA_BYTES, SetForegroundWindow, SetWindowTextW,
 };
 
@@ -55,6 +55,16 @@ pub(super) struct DesktopState {
     pub(super) show_files: bool,
     pub(super) scanning: bool,
     pub(super) dark_mode: bool,
+    /// Cached system accent color (Plan 02.1-03, D-05). Raw COLORREF refreshed
+    /// from `DwmGetColorizationColor` on startup and on
+    /// `WM_DWMCOLORIZATIONCOLORCHANGED`. Initialized to 0 — paint code that
+    /// reads this before the first `refresh_accent` call sees black, which is
+    /// visually degraded but not a crash (T-02.1-03-03).
+    pub(super) accent_color: Dword,
+    /// Text color to use ON TOP of `accent_color` selection fills. Computed by
+    /// `theme::selected_text_for_accent` (WCAG luminance > 0.6 → black, else white).
+    /// Initialized to 0; recomputed alongside `accent_color`.
+    pub(super) selected_text_color: Dword,
     pub(super) path_column_visible: bool,
     pub(super) selected_id: usize,
     pub(super) scroll_row: usize,
@@ -119,6 +129,8 @@ impl DesktopState {
             show_files: true,
             scanning: false,
             dark_mode: true,
+            accent_color: 0,
+            selected_text_color: 0,
             path_column_visible: true,
             selected_id: 0,
             scroll_row: 0,
