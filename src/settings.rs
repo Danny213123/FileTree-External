@@ -228,6 +228,9 @@ pub(crate) fn push_settings_json(output: &mut String, settings: &Settings) {
     }
     output.push('}');
 
+    output.push_str(",\"active_tab\":");
+    crate::export::push_json_string(output, &settings.active_tab);
+
     // Emit unknown top-level keys verbatim (CONTEXT D-02 forward-compat round-trip).
     for (key, raw) in &settings.unknown {
         output.push(',');
@@ -376,6 +379,12 @@ fn parse_top_object(
             }
             "window" => {
                 parse_window_object(bytes, pos, &mut settings.window)?;
+            }
+            "active_tab" => {
+                let v = parse_value(bytes, pos, 1)?;
+                if let RawJsonValue::Str(s) = v {
+                    settings.active_tab = s;
+                }
             }
             _ => {
                 let raw = parse_value(bytes, pos, 1)?;
@@ -1002,8 +1011,10 @@ mod tests {
 
     #[test]
     fn active_tab_roundtrip() {
-        let mut s = Settings::default();
-        s.active_tab = "errors".to_string();
+        let s = Settings {
+            active_tab: "errors".to_string(),
+            ..Settings::default()
+        };
         let mut buf = String::new();
         push_settings_json(&mut buf, &s);
         // Writer-block sanity check: the literal key/value must appear in output.
