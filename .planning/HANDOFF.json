@@ -1,0 +1,58 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-05-24T20:45:04.975Z",
+  "phase": "02.1",
+  "phase_name": "ui-polish-dark-mode-chrome-persistence",
+  "phase_dir": ".planning/phases/02.1-ui-polish-dark-mode-chrome-persistence",
+  "plan": 8,
+  "task": 2,
+  "total_tasks": 3,
+  "status": "blocked",
+  "completed_tasks": [
+    {"id": "02.1-01", "name": "Bootstrap Icons font + register + draw_icon", "status": "done", "commit": "b4d43d3"},
+    {"id": "02.1-02", "name": "settings.active_tab field with JSON round-trip", "status": "done", "commit": "pre-existing"},
+    {"id": "02.1-03", "name": "Theme primitives (palette, accent, uxtheme, luminance)", "status": "done", "commit": "pre-existing"},
+    {"id": "02.1-04", "name": "ActiveTab enum + tab-strip window class + draw_tab_strip", "status": "done", "commit": "1d77a12"},
+    {"id": "02.1-05", "name": "Rewire mod.rs — View menu, tab strip, accelerators, restore", "status": "done", "commit": "b6fbb99"},
+    {"id": "02.1-06", "name": "Owner-draw menu + custom FileTreeStatusFooter", "status": "done", "commit": "d2aecc1"},
+    {"id": "02.1-07", "name": "First-paint flash fix (pre-window bootstrap + per-HWND dark)", "status": "done", "commit": "9718603"},
+    {"id": "02.1-08-T1", "name": "Finalize ROADMAP Phase 02.1 goal + plans list", "status": "done", "commit": "c617ffe"}
+  ],
+  "remaining_tasks": [
+    {"id": "02.1-08-T2", "name": "Capture post-state light + dark screenshots (human-action)", "status": "blocked"},
+    {"id": "02.1-08-T3", "name": "Visual diff sign-off against D-01..D-13 + SET/POL requirements (human-verify)", "status": "blocked"},
+    {"id": "FIX", "name": "Restore scan-result rendering into tab_panels[0] (Details)", "status": "not_started"}
+  ],
+  "blockers": [
+    {
+      "description": "Details tab shows empty after scan completes. src/desktop/mod.rs:1154 sets state.list = 0 and replaces the prior scan-list HWND with an empty STATIC placeholder (lines 1075-1093). The comment claims the list will be 're-assigned in render_list once the list HWND exists' but grep finds no such re-assignment anywhere in src/desktop/. Panels 1-4 are also stub STATIC controls ('Coming soon -- Top files', etc.).",
+      "type": "technical",
+      "workaround": "None. Phase goal is not met until scan results render into tab_panels[0]. Wave 6 screenshots cannot be captured because the Details tab is blank."
+    }
+  ],
+  "human_actions_pending": [
+    {
+      "action": "Capture two PNG screenshots (light + dark) per plan 02.1-08 Task 2",
+      "context": "Blocked by the rendering bug above. Cannot screenshot an empty tab.",
+      "blocking": true
+    },
+    {
+      "action": "Visual diff sign-off per plan 02.1-08 Task 3",
+      "context": "Blocked by the rendering bug; many D-XX items (D-08 5 content tabs with content) cannot be confirmed.",
+      "blocking": true
+    },
+    {
+      "action": "Optionally kill stray filetree.exe processes (PID 17828, 36896) holding target/debug/filetree.exe",
+      "context": "Release builds work fine; debug builds blocked by OS file lock. Not blocking the actual fix work.",
+      "blocking": false
+    }
+  ],
+  "decisions": [
+    {"decision": "Treated 02.1-01 mid-plan resumption as safe (Task 1 commit ddf30b9 pre-existing from human-action checkpoint)", "rationale": "Plan was explicitly structured for resumption after the TTF download checkpoint", "phase": "02.1"},
+    {"decision": "Used Sonnet for all wave executors", "rationale": "Per .planning/config.json executor_model = sonnet", "phase": "02.1"},
+    {"decision": "Switched post-merge test gate to `cargo test --release` after Wave 4", "rationale": "Two stray filetree.exe processes hold target/debug/filetree.exe; release artifact lives elsewhere and is unaffected", "phase": "02.1"}
+  ],
+  "uncommitted_files": [],
+  "next_action": "Spawn /gsd-debug with the rendering-gap description above. After fix lands, re-run /gsd-execute-phase 02.1 --wave 6 to redo Task 2 + Task 3.",
+  "context_notes": "All 8 plans technically complete by their own acceptance criteria; phase-level goal is NOT met because the integration between the scan engine and the new tab_panels was never wired. Plans 02.1-04 and 02.1-05 both passed their unit tests in isolation -- there is no integration test that renders an actual scan into the panels. This is the harness-engineering Generator self-evaluation blind spot called out in execute-phase.md step 5.6 (post-merge build & test gate) and 5.8 (test-gate failures). The post-merge gate caught nothing because no test exercises the render path."
+}
