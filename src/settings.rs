@@ -23,6 +23,7 @@ pub(crate) struct Settings {
     pub(crate) follow_symlinks: bool,
     pub(crate) columns: Vec<u32>,
     pub(crate) window: WindowGeometry,
+    pub(crate) active_tab: String,
     // Unknown top-level keys are captured here for forward-compatible
     // round-trip (CONTEXT D-02).
     pub(crate) unknown: BTreeMap<String, RawJsonValue>,
@@ -41,6 +42,7 @@ impl Default for Settings {
             follow_symlinks: false,
             columns: Vec::new(),
             window: WindowGeometry::default(),
+            active_tab: "details".to_string(),
             unknown: BTreeMap::new(),
             loaded_from_future: false,
         }
@@ -815,6 +817,7 @@ mod tests {
                 h: 800,
                 unknown: BTreeMap::new(),
             },
+            active_tab: "details".to_string(),
             unknown: BTreeMap::new(),
             loaded_from_future: false,
         };
@@ -831,6 +834,7 @@ mod tests {
         assert_eq!(parsed.window.y, original.window.y);
         assert_eq!(parsed.window.w, original.window.w);
         assert_eq!(parsed.window.h, original.window.h);
+        assert_eq!(parsed.active_tab, original.active_tab);
     }
 
     #[test]
@@ -986,5 +990,48 @@ mod tests {
         assert_eq!(parsed.window.w, original.window.w);
         assert_eq!(parsed.window.h, original.window.h);
         assert!(!parsed.loaded_from_future);
+    }
+
+    // Phase 02.1 — active_tab persistence (Plan 02.1-02, D-13)
+
+    #[test]
+    fn active_tab_default() {
+        let s = Settings::default();
+        assert_eq!(s.active_tab, "details");
+    }
+
+    #[test]
+    fn active_tab_roundtrip() {
+        let mut s = Settings::default();
+        s.active_tab = "errors".to_string();
+        let mut buf = String::new();
+        push_settings_json(&mut buf, &s);
+        // Writer-block sanity check: the literal key/value must appear in output.
+        assert!(
+            buf.contains("\"active_tab\":\"errors\""),
+            "serialized JSON missing active_tab writer block: {buf}",
+        );
+        let parsed = parse_settings_json(&buf).unwrap();
+        assert_eq!(parsed.active_tab, "errors");
+        // All other fields round-trip unchanged.
+        assert_eq!(parsed.schema_version, s.schema_version);
+        assert_eq!(parsed.last_path, s.last_path);
+        assert_eq!(parsed.dark_mode, s.dark_mode);
+        assert_eq!(parsed.show_hidden, s.show_hidden);
+        assert_eq!(parsed.follow_symlinks, s.follow_symlinks);
+        assert_eq!(parsed.columns, s.columns);
+        assert_eq!(parsed.window.x, s.window.x);
+        assert_eq!(parsed.window.y, s.window.y);
+        assert_eq!(parsed.window.w, s.window.w);
+        assert_eq!(parsed.window.h, s.window.h);
+    }
+
+    #[test]
+    fn backward_compat_no_active_tab() {
+        // Old settings.json (pre-Phase-02.1) has no active_tab key.
+        let json = r#"{"schema_version":1,"dark_mode":true}"#;
+        let parsed = parse_settings_json(json).unwrap();
+        assert_eq!(parsed.active_tab, "details");
+        assert!(parsed.dark_mode);
     }
 }
