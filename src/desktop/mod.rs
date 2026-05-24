@@ -40,6 +40,28 @@ use shell::*;
 mod tabs;
 mod treemap;
 
+/// Pre-window dark-mode bootstrap (POL-03 / D-04 first-paint flash mitigation).
+///
+/// Called by cli.rs BEFORE desktop::run so that uxtheme's process-wide AppMode
+/// is set before the first window class is registered. This prevents the OS from
+/// defaulting to light chrome when it allocates the window's internal theme state.
+///
+/// On Win10 1809 (ordinal 135 = AllowDarkModeForApp), calling with arg = 1
+/// (PREFERRED_APP_MODE_ALLOW_DARK) works accidentally because BOOL TRUE = 1.
+/// On Win10 1903+ / Win11, ordinal 135 = SetPreferredAppMode(AllowDark = 1).
+/// The Option<fn> wrapper from uxtheme_ordinals() is a no-op when None,
+/// producing graceful degradation (window opens light then re-themes) per Pitfall 2.
+pub(crate) fn bootstrap_dark_mode(enabled: bool) {
+    let mode = if enabled {
+        theme::PREFERRED_APP_MODE_ALLOW_DARK
+    } else {
+        theme::PREFERRED_APP_MODE_DEFAULT
+    };
+    if let Some(set_mode_fn) = theme::uxtheme_ordinals().set_preferred_app_mode {
+        unsafe { set_mode_fn(mode) };
+    }
+}
+
 unsafe fn enable_visual_styles() {
     let manifest_content = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
@@ -129,11 +151,15 @@ pub(crate) fn run(
         // Use geometry restored from settings (clamped to work area) — no CW_USEDEFAULT.
         // This is the no-jank invariant: geometry feeds directly into CreateWindowExW
         // so there is never a SetWindowPos flicker after the window appears.
+        // WS_VISIBLE is intentionally stripped here (POL-03 / D-04 first-paint flash fix).
+        // The window is NOT auto-shown inside CreateWindowExW; instead apply_dark_mode_to_window
+        // is called immediately below BEFORE the explicit ShowWindow(hwnd, SW_SHOW) at line ~193.
+        // This guarantees DWM dark chrome is applied before the first paint frame.
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            WS_OVERLAPPEDWINDOW,
             clamped_geom.x,
             clamped_geom.y,
             clamped_geom.w,
@@ -151,8 +177,12 @@ pub(crate) fn run(
             return Err(io::Error::last_os_error());
         }
 
+        // POL-03 / D-04: apply full dark chrome (DWM attr 20+19 + AllowDarkModeForWindow +
+        // SetWindowTheme) to the main HWND BEFORE ShowWindow so the very first paint
+        // uses the correct chrome. set_window_dark_mode alone is insufficient —
+        // apply_dark_mode_to_window (Plan 02.1-03) is the canonical triad helper.
         let initial_dark = with_state_mut(|s| s.settings.dark_mode).unwrap_or(true);
-        set_window_dark_mode(hwnd, initial_dark);
+        apply_dark_mode_to_window(hwnd, initial_dark);
 
         // Phase 02.1-06 (POL-03): hide mnemonic underlines until the user presses ALT.
         // WM_CHANGEUISTATE propagates down to child windows so the entire UI is in sync.
@@ -837,6 +867,11 @@ unsafe fn create_controls(hwnd: Hwnd) {
                 null_mut(),
             );
         }
+        // POL-03 / D-04: apply full dark triad (DWM + AllowDark + SetWindowTheme) to
+        // drive_picker before first show, so it doesn't flash light on launch.
+        if state.drive_picker != 0 {
+            apply_dark_mode_to_window(state.drive_picker, state.dark_mode);
+        }
         // Populate the drive picker with all non-empty drives.
         // Initial call uses initial_path; the post-ShowWindow block in run() re-calls
         // with settings.last_path to restore the last drive (D-11 two-stage fix).
@@ -865,6 +900,10 @@ unsafe fn create_controls(hwnd: Hwnd) {
             0,
             ID_PATH_EDIT,
         );
+        // POL-03 / D-04: pre-show dark apply for path edit.
+        if state.path_edit != 0 {
+            apply_dark_mode_to_window(state.path_edit, state.dark_mode);
+        }
         // SHAutoComplete MUST be called AFTER CreateWindowExW returns a non-zero HWND
         // (Pitfall #3 — calling before the edit HWND is valid silently fails).
         // This wires the Explorer-style filesystem autocomplete dropdown to the path edit.
@@ -883,6 +922,9 @@ unsafe fn create_controls(hwnd: Hwnd) {
             0,
             ID_BROWSE_BUTTON,
         );
+        if state.browse_button != 0 {
+            apply_dark_mode_to_window(state.browse_button, state.dark_mode);
+        }
         state.scan_button = create_child(
             hwnd,
             h_instance,
@@ -892,6 +934,9 @@ unsafe fn create_controls(hwnd: Hwnd) {
             0,
             ID_SCAN_BUTTON,
         );
+        if state.scan_button != 0 {
+            apply_dark_mode_to_window(state.scan_button, state.dark_mode);
+        }
         state.stop_button = create_child(
             hwnd,
             h_instance,
@@ -901,6 +946,9 @@ unsafe fn create_controls(hwnd: Hwnd) {
             0,
             ID_STOP_BUTTON,
         );
+        if state.stop_button != 0 {
+            apply_dark_mode_to_window(state.stop_button, state.dark_mode);
+        }
         state.refresh_button = create_child(
             hwnd,
             h_instance,
@@ -910,6 +958,9 @@ unsafe fn create_controls(hwnd: Hwnd) {
             0,
             ID_REFRESH_BUTTON,
         );
+        if state.refresh_button != 0 {
+            apply_dark_mode_to_window(state.refresh_button, state.dark_mode);
+        }
         state.expand_button = create_child(
             hwnd,
             h_instance,
@@ -919,6 +970,9 @@ unsafe fn create_controls(hwnd: Hwnd) {
             0,
             ID_EXPAND_BUTTON,
         );
+        if state.expand_button != 0 {
+            apply_dark_mode_to_window(state.expand_button, state.dark_mode);
+        }
         state.collapse_button = create_child(
             hwnd,
             h_instance,
@@ -928,6 +982,9 @@ unsafe fn create_controls(hwnd: Hwnd) {
             0,
             ID_COLLAPSE_BUTTON,
         );
+        if state.collapse_button != 0 {
+            apply_dark_mode_to_window(state.collapse_button, state.dark_mode);
+        }
         state.columns_button = create_child(
             hwnd,
             h_instance,
@@ -937,6 +994,9 @@ unsafe fn create_controls(hwnd: Hwnd) {
             0,
             ID_COLUMNS_BUTTON,
         );
+        if state.columns_button != 0 {
+            apply_dark_mode_to_window(state.columns_button, state.dark_mode);
+        }
         // Phase 02.1-05 — toolbar checkboxes removed in favor of View menu (D-06).
         // hidden_check / files_check / follow_check / dark_check HWND fields remain
         // on DesktopState as 0 for binary compat — no HWND is ever created for them.
