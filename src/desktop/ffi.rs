@@ -70,6 +70,11 @@ pub(super) const SHGFI_SMALLICON: Uint = 0x0000_0001;
 pub(super) const SHGFI_ICON: Uint = 0x0000_0100;
 pub(super) const SHGFI_USEFILEATTRIBUTES: Uint = 0x0000_0010;
 pub(super) const SW_SHOW: i32 = 5;
+pub(super) const SW_HIDE: i32 = 0;
+pub(super) const MF_POPUP: Uint = 0x0010;
+// STATIC control styles used for placeholder tab panels (Plan 02.1-05).
+pub(super) const SS_LEFT: Dword = 0x0000_0000;
+pub(super) const SS_NOPREFIX: Dword = 0x0000_0080;
 pub(super) const TRANSPARENT: i32 = 1;
 pub(super) const WM_APP: Uint = 0x8000;
 pub(super) const WM_COMMAND: Uint = 0x0111;
@@ -155,6 +160,12 @@ pub(super) const ID_MENU_REVEAL: isize = 3002;
 pub(super) const ID_MENU_COPY_PATH: isize = 3003;
 pub(super) const ID_MENU_DELETE: isize = 3004;
 pub(super) const ID_MENU_PROPERTIES: isize = 3005;
+
+// Phase 02.1-05 — View-menu item IDs (D-06 / D-08)
+// Range 3010–3012: View-submenu toggles (replace toolbar checkboxes from D-06).
+pub(super) const ID_VIEW_SHOW_HIDDEN: isize = 3010;
+pub(super) const ID_VIEW_SHOW_FILES: isize = 3011;
+pub(super) const ID_VIEW_DARK_MODE: isize = 3012;
 
 pub(super) const WM_SCAN_DONE: Uint = WM_APP + 7;
 pub(super) const WM_SCAN_PROGRESS: Uint = WM_APP + 8;
