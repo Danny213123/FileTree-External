@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.1.0
 milestone_name: milestone
 status: executing
-last_updated: "2026-05-24T04:35:48.958Z"
+last_updated: "2026-05-24T06:03:10.930Z"
 progress:
   total_phases: 9
   completed_phases: 1
   total_plans: 16
-  completed_plans: 7
-  percent: 11
+  completed_plans: 9
+  percent: 56
 ---
 
 # STATE: FileTree v1
@@ -20,16 +20,16 @@ progress:
 
 **Project:** FileTree
 **Core Value:** Point at a folder, see what's taking space, and clean it up — fast, on a single Windows machine, with no install footprint beyond a single .exe.
-**Current Focus:** Phase 02 — settings-polish
+**Current Focus:** Phase 02.1 — ui-polish-dark-mode-chrome-persistence
 
 ## Current Position
 
-Phase: 02 (settings-polish) — EXECUTING
-Plan: 1 of 5
+Phase: 02.1 (ui-polish-dark-mode-chrome-persistence) — EXECUTING
+Plan: 1 of 8
 **Milestone:** v1 (TreeSize-Personal-tier coverage atop v0.1.0 brownfield)
 **Phase:** 2
 **Plan:** 4 (next to execute)
-**Status:** Executing Phase 02
+**Status:** Executing Phase 02.1
 **Progress:** [█████████░] 86% (6/7 plans complete across active phases)
 
 ## Phase Index
