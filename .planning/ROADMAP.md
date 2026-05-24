@@ -1,6 +1,6 @@
 # Roadmap: FileTree v1
 
-**Created:** 2026-05-22
+**Created:** 2009-05-22
 **Mode:** Vertical MVP (each phase ships a usable end-to-end slice; Phase 1 is the documented refactor exception)
 **Granularity:** standard
 **Core Value:** Point at a folder, see what's taking space, and clean it up — fast, on a single Windows machine, with no install footprint beyond a single .exe.
@@ -57,6 +57,23 @@ Plans:
 - [x] 02-04-PLAN.md — 5-pane msctls_statusbar32 with live scan stats + settings save-on-mutate with drag-coalesce + window geometry restore + manual QA checkpoint
 - [ ] 02-05-PLAN.md — Gap closure: column-width persistence (paint::columns reads DesktopState; mouse-drag hit-test on header dividers; flush_pending_persist writes settings.columns; startup seed from settings)
 **UI hint**: yes
+
+### Phase 02.1: UI polish — dark mode, chrome, persistence (INSERTED)
+
+**Goal:** Dark mode that actually looks dark (#1e1e1e neutral palette, no brown tint, no first-paint flash), modern chrome that replaces the toolbar checkbox row with a View menu plus a 5-tab content strip (Details/Treemap/Extensions/Top Files/Duplicates), settings persistence for the active tab and drive picker selection, and Windows-native mnemonic accessibility (Alt-to-reveal underlines via UISF_HIDEACCEL).
+**Requirements**: SET-01, POL-01, POL-02, POL-03
+**Depends on:** Phase 2
+**Plans:** 8 plans
+
+Plans:
+- [ ] 02.1-01-PLAN.md — Embed Bootstrap Icons 1.11.3 TTF via AddFontMemResourceEx; new `src/desktop/icons.rs` exposes glyph constants for menu/tab/status iconography (BLOCKING checkpoint for license-clean TTF download)
+- [ ] 02.1-02-PLAN.md — Extend `Settings` with `active_tab: String` field (default "details"); JSON round-trip preserved after `dark_mode`, before unknown-key passthrough
+- [ ] 02.1-03-PLAN.md — Theme primitives: rewrite palette to UI-SPEC RGB (#1e1e1e neutral, no brown), wire `uxtheme_ordinals()` OnceLock (135/133/136), `refresh_accent()` via DwmGetColorizationColor, WCAG-luminance `selected_text_for_accent()`, consolidated `apply_dark_mode_to_window()` (dual DWM 20/19 attribute call)
+- [ ] 02.1-04-PLAN.md — `src/desktop/tabs.rs` window class `FileTreeTabStrip` with owner-painted tab strip, `ActiveTab` enum, `tab_cell_width()` + `hit_test_tab_index()` pure functions, `draw_tab_strip()` in paint.rs
+- [ ] 02.1-05-PLAN.md — Delete 4 toolbar checkboxes; build View popup menu (Show Hidden / Show Files / Dark Mode); create tab_strip + 5 tab_panels; wire WM_INITMENUPOPUP filter (Pitfall 7), WM_DWMCOLORIZATIONCOLORCHANGED accent refresh, Ctrl+1..5 accelerators, activate_tab + persist active_tab; restore active tab on startup
+- [ ] 02.1-06-PLAN.md — Owner-draw View menu + footer status bar with mnemonic accessibility: `MF_OWNERDRAW` items, `MIM_BACKGROUND`, WM_DRAWITEM/WM_MEASUREITEM, `FileTreeStatusFooter` custom class replacing msctls_statusbar32, WM_UPDATEUISTATE + UISF_HIDEACCEL initialize for Alt-to-reveal underlines
+- [ ] 02.1-07-PLAN.md — Close D-04 (first-paint flash) + D-10 (light theme honored): `bootstrap_dark_mode()` wrapper called from cli.rs before desktop::run; strip WS_VISIBLE from main CreateWindowExW; apply_dark_mode_to_window on HWND and per-child BEFORE ShowWindow
+- [ ] 02.1-08-PLAN.md — ROADMAP finalize + BLOCKING dual-screenshot capture (light + dark, public test directory only) + final visual sign-off checkpoint against all 13 D-XX decisions and SET-01/POL-01..03
 
 ### Phase 3: Search & Filter
 **Goal**: User can narrow a loaded scan to what matters by name / size / date / extension / category combinations, save useful combinations as named views, and watch results update live without re-scanning.
@@ -147,6 +164,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 1. Module Split | 0/3 | Planned | - |
 | 2. Settings & Polish | 4/5 | In Progress|  |
+| 02.1. UI polish — dark mode, chrome, persistence | 0/8 | Planned | - |
 | 3. Search & Filter | 0/0 | Not started | - |
 | 4. Multi-Select Infrastructure | 0/0 | Not started | - |
 | 5. Cleanup Workflow + Hardened API | 0/0 | Not started | - |
@@ -180,7 +198,3 @@ These constraints apply across all phases and override anything in PROJECT.md on
 - **Cleanup, exports, snapshot save/diff all run on background threads.** Never block the UI message loop. `PostMessage` (not `SendMessage`) for cross-thread results; LPARAM payloads are heap-allocated `Box::into_raw`.
 - **Selection state is keyed by full-path string, not by `usize` index.** Indices change between scans; paths survive.
 - **No `std::fs::remove_*` for user-facing destructive ops.** Single code path through `IFileOperation` with explicit flags.
-
----
-*Roadmap created: 2026-05-22*
-*Last updated: 2026-05-23 (Phase 2 gap-closure plan 02-05 added)*
