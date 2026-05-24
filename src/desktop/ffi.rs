@@ -209,6 +209,20 @@ pub(super) const CMD_REFRESH: u16 = 0xA006;
 // New ID for drive picker control — must not collide with existing ID_* values (101–112, 201, 3001–3005)
 pub(super) const ID_DRIVE_PICKER: isize = 113;
 
+// Tab strip control ID and per-tab command IDs (Plan 02.1-04, D-08).
+// ID_TAB_STRIP uses the drive-picker adjacent slot; tab command IDs occupy 3020–3024
+// (vacant; menu IDs are 3001–3005).
+pub(super) const ID_TAB_STRIP: isize = 114;
+pub(super) const ID_TAB_DETAILS: isize = 3020;
+pub(super) const ID_TAB_TOP: isize = 3021;
+pub(super) const ID_TAB_EXTENSIONS: isize = 3022;
+pub(super) const ID_TAB_DUPLICATES: isize = 3023;
+pub(super) const ID_TAB_ERRORS: isize = 3024;
+
+// Cursor + hit-testing constants (Plan 02.1-04)
+pub(super) const IDC_HAND: usize = 32649;
+pub(super) const WM_SETCURSOR: Uint = 0x0020;
+
 // WM_ constants used by drag-coalesce flush (Plan 02-03; also consumed by Plan 02-04)
 pub(super) const WM_EXITSIZEMOVE: Uint = 0x0232;
 pub(super) const WM_LBUTTONUP: Uint = 0x0202;

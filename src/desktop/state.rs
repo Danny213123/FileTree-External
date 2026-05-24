@@ -17,8 +17,71 @@ use crate::model::ScanResult;
 
 use super::ffi::{
     CopyDataStruct, Dword, FILETREE_PATH_MSG_ID, Handle, Hfont, Hicon, Hwnd, Lparam, Lresult,
-    MAX_COPYDATA_BYTES, SetForegroundWindow, SetWindowTextW,
+    MAX_COPYDATA_BYTES, Rect, SetForegroundWindow, SetWindowTextW,
 };
+
+// ---------------------------------------------------------------------------
+// Tab identity — single source of truth (Plan 02.1-04, D-08)
+// ---------------------------------------------------------------------------
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum ActiveTab {
+    Details = 0,
+    Top = 1,
+    Extensions = 2,
+    Duplicates = 3,
+    Errors = 4,
+}
+
+/// Lowercase persistence keys — used by settings save/restore in Plan 02.1-05.
+pub(super) const TAB_NAMES: [&str; 5] = ["details", "top", "extensions", "duplicates", "errors"];
+
+/// Display labels — used by draw_tab_strip in paint.rs.
+pub(super) const TAB_LABELS: [&str; 5] = ["Details", "Top", "Extensions", "Duplicates", "Errors"];
+
+/// Bootstrap Icons codepoints per tab — imported from icons.rs so this array
+/// is the single consumer; do not write the literals elsewhere.
+pub(super) const TAB_ICONS: [char; 5] = [
+    super::icons::ICON_LIST_NESTED,
+    super::icons::ICON_BAR_CHART,
+    super::icons::ICON_FILES,
+    super::icons::ICON_COPY,
+    super::icons::ICON_EXCLAMATION_TRIANGLE,
+];
+
+impl ActiveTab {
+    pub(super) const COUNT: usize = 5;
+
+    pub(super) fn as_str(self) -> &'static str {
+        TAB_NAMES[self as usize]
+    }
+
+    pub(super) fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "details" => Some(Self::Details),
+            "top" => Some(Self::Top),
+            "extensions" => Some(Self::Extensions),
+            "duplicates" => Some(Self::Duplicates),
+            "errors" => Some(Self::Errors),
+            _ => None,
+        }
+    }
+
+    pub(super) fn from_index(i: usize) -> Option<Self> {
+        match i {
+            0 => Some(Self::Details),
+            1 => Some(Self::Top),
+            2 => Some(Self::Extensions),
+            3 => Some(Self::Duplicates),
+            4 => Some(Self::Errors),
+            _ => None,
+        }
+    }
+
+    pub(super) fn from_command_id(id: isize) -> Option<Self> {
+        Self::from_index((id - super::ffi::ID_TAB_DETAILS) as usize)
+    }
+}
 
 pub(super) static STATE: OnceLock<Mutex<DesktopState>> = OnceLock::new();
 
@@ -69,7 +132,17 @@ pub(super) struct DesktopState {
     pub(super) selected_id: usize,
     pub(super) scroll_row: usize,
     pub(super) hovered_id: Option<usize>,
-    pub(super) active_tab: usize,
+    /// Active content tab. Use `as usize` when an index is needed for legacy toolbar
+    /// rendering (draw_toolbar_background); Plan 02.1-05 replaces that code with the
+    /// new tab strip so the `as usize` casts will be removed then.
+    pub(super) active_tab: ActiveTab,
+    // Tab strip HWNDs + layout — populated by Plan 02.1-05 create_controls.
+    pub(super) tab_strip: Hwnd,
+    pub(super) tab_panels: [Hwnd; 5],
+    pub(super) tab_rects: [Rect; 5],
+    /// Separate font handle for the Bootstrap Icons glyph font (Plan 02.1-04).
+    /// Distinct from `font` (body text) so callers can select either independently.
+    pub(super) icon_font: Hfont,
     // Settings persistence (Plan 02-04)
     /// Loaded settings; mutated in place by toggle/drag handlers.
     pub(super) settings: crate::settings::Settings,
@@ -135,7 +208,16 @@ impl DesktopState {
             selected_id: 0,
             scroll_row: 0,
             hovered_id: None,
-            active_tab: 1,
+            active_tab: ActiveTab::Details,
+            tab_strip: 0,
+            tab_panels: [0; 5],
+            tab_rects: [Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            }; 5],
+            icon_font: 0,
             settings: crate::settings::Settings::default(),
             settings_store: None,
             pending_persist: false,
@@ -289,6 +371,33 @@ pub(crate) fn handle_copy_data(hwnd: Hwnd, lparam: Lparam) -> Lresult {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn active_tab_enum() {
+        // as_str round-trips
+        assert_eq!(ActiveTab::Details.as_str(), "details");
+        assert_eq!(ActiveTab::Top.as_str(), "top");
+        assert_eq!(ActiveTab::Errors.as_str(), "errors");
+
+        // from_str happy path
+        assert_eq!(ActiveTab::from_str("details"), Some(ActiveTab::Details));
+        assert_eq!(ActiveTab::from_str("errors"), Some(ActiveTab::Errors));
+
+        // from_str unknown / empty
+        assert_eq!(ActiveTab::from_str("unknown"), None);
+        assert_eq!(ActiveTab::from_str(""), None);
+
+        // All TAB_NAMES entries round-trip
+        for name in TAB_NAMES {
+            let tab = ActiveTab::from_str(name).expect("all TAB_NAMES should parse");
+            assert_eq!(tab.as_str(), name, "round-trip failed for {name}");
+        }
+
+        // from_index
+        assert_eq!(ActiveTab::from_index(0), Some(ActiveTab::Details));
+        assert_eq!(ActiveTab::from_index(4), Some(ActiveTab::Errors));
+        assert_eq!(ActiveTab::from_index(5), None);
+    }
 
     /// snapshot_for_save returns None when no store is configured.
     #[test]
