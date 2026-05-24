@@ -16,8 +16,8 @@ use std::sync::{Mutex, OnceLock};
 use crate::model::ScanResult;
 
 use super::ffi::{
-    CopyDataStruct, Dword, FILETREE_PATH_MSG_ID, Handle, Hfont, Hicon, Hwnd, Lparam, Lresult,
-    MAX_COPYDATA_BYTES, Rect, SetForegroundWindow, SetWindowTextW,
+    CopyDataStruct, Dword, FILETREE_PATH_MSG_ID, Handle, Hfont, Hicon, Hmenu, Hwnd, Lparam,
+    Lresult, MAX_COPYDATA_BYTES, Rect, SetForegroundWindow, SetWindowTextW,
 };
 
 // ---------------------------------------------------------------------------
@@ -140,6 +140,11 @@ pub(super) struct DesktopState {
     pub(super) tab_strip: Hwnd,
     pub(super) tab_panels: [Hwnd; 5],
     pub(super) tab_rects: [Rect; 5],
+    /// Cached View-submenu handle — used to filter WM_INITMENUPOPUP so that
+    /// Shell context menus (right-click via shell.rs) are not corrupted when
+    /// their popups fire the same message (Pitfall 7).
+    /// Initialized to 0 in DesktopState::new; set in create_controls after SetMenu.
+    pub(super) view_menu: Hmenu,
     /// Separate font handle for the Bootstrap Icons glyph font (Plan 02.1-04).
     /// Distinct from `font` (body text) so callers can select either independently.
     pub(super) icon_font: Hfont,
@@ -217,6 +222,7 @@ impl DesktopState {
                 right: 0,
                 bottom: 0,
             }; 5],
+            view_menu: 0,
             icon_font: 0,
             settings: crate::settings::Settings::default(),
             settings_store: None,
@@ -367,10 +373,69 @@ pub(crate) fn handle_copy_data(hwnd: Hwnd, lparam: Lparam) -> Lresult {
     1
 }
 
+/// Extract the drive letter from a Windows path string.
+///
+/// Handles:
+///   - `"C:\\Users\\..."` → `Some('C')` (standard absolute path)
+///   - `"c:/users/..."` → `Some('C')` (lowercase, forward slashes — uppercased)
+///   - `"D:\\"` → `Some('D')` (bare root)
+///   - `"\\\\?\\E:\\very\\long\\path"` → `Some('E')` (long-path prefix stripped)
+///   - `"\\\\server\\share\\folder"` → `None` (UNC share — no single letter; caller falls back to 'C')
+///   - `""` → `None`
+///   - `"/home/user/foo"` → `None` (POSIX path — no drive letter)
+///   - `"1:\\foo"` → `None` (non-alphabetic first byte)
+///   - `":"` → `None` (degenerate — no leading alphabetic char)
+///
+/// Pure byte parsing — no dependency on `Path::new` or Windows APIs, so it is
+/// safely testable on any platform and usable in the settings-restore path.
+pub(super) fn drive_letter_from_path(path: &str) -> Option<char> {
+    // Strip the long-path prefix "\\?\" if present.
+    let s = path.strip_prefix("\\\\?\\").unwrap_or(path);
+    // After stripping, require at least 2 bytes: alpha + ':'
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    // First byte must be an ASCII alphabetic character.
+    if !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    // Second byte must be a colon.
+    if bytes[1] != b':' {
+        return None;
+    }
+    Some((bytes[0] as char).to_ascii_uppercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn drive_letter_from_path_cases() {
+        // Standard absolute path — uppercase
+        assert_eq!(drive_letter_from_path("C:\\Users\\foo"), Some('C'));
+        // Lowercase input → uppercase output
+        assert_eq!(drive_letter_from_path("c:/users/foo"), Some('C'));
+        // Bare root drive
+        assert_eq!(drive_letter_from_path("D:\\"), Some('D'));
+        // Long-path prefix stripped
+        assert_eq!(
+            drive_letter_from_path("\\\\?\\E:\\very\\long\\path"),
+            Some('E')
+        );
+        // UNC path — no single drive letter; caller falls back to 'C'
+        assert_eq!(drive_letter_from_path("\\\\server\\share\\folder"), None);
+        // Empty string
+        assert_eq!(drive_letter_from_path(""), None);
+        // POSIX path (non-Windows; no drive letter)
+        assert_eq!(drive_letter_from_path("/home/user/foo"), None);
+        // Non-alpha first character
+        assert_eq!(drive_letter_from_path("1:\\foo"), None);
+        // Degenerate single-char
+        assert_eq!(drive_letter_from_path(":"), None);
+    }
 
     #[test]
     fn active_tab_enum() {
