@@ -577,8 +577,18 @@ unsafe extern "system" {
         bInheritHandle: Bool,
         lpName: *const u16,
     ) -> Handle;
-    pub(super) fn CloseHandle(hObject: Handle) -> Bool;
     pub(super) fn GetLastError() -> Dword;
+}
+
+// CloseHandle is also declared in server.rs with a *mut c_void signature (same ABI on all Windows targets).
+#[link(name = "Kernel32")]
+#[allow(clashing_extern_declarations)]
+unsafe extern "system" {
+    pub(super) fn CloseHandle(hObject: Handle) -> Bool;
+}
+
+#[link(name = "Kernel32")]
+unsafe extern "system" {
     // Path canonicalization for WM_COPYDATA payload validation (D-06.3)
     pub(super) fn GetFullPathNameW(
         lpFileName: *const u16,

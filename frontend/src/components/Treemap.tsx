@@ -291,15 +291,14 @@ export const Treemap = memo(function Treemap({
   const topItems = useMemo(() => {
     const allKids = (childrenMap.get(viewId) ?? [])
       .map(id => nodeById.get(id))
-      .filter((n): n is NodeRecord => n !== undefined && getValue(n, metric) > 0);
-    const dirs  = allKids.filter(n => n.dir);
-    const files = allKids.filter(n => !n.dir);
-    console.log(`[treemap] viewId=${viewId} total_children=${allKids.length} dirs=${dirs.length} files=${files.length} showSingleFiles=${showSingleFiles} maxTop=${maxTop}`);
-    const kids = allKids
+      .filter((n): n is NodeRecord =>
+        n !== undefined &&
+        getValue(n, metric) > 0 &&
+        (showSingleFiles || n.dir)
+      );
+    return allKids
       .sort((a, b) => getValue(b, metric) - getValue(a, metric))
       .slice(0, maxTop);
-    console.log(`[treemap] after slice: ${kids.length} items rendered (${kids.filter(n=>n.dir).length} dirs, ${kids.filter(n=>!n.dir).length} files)`);
-    return kids;
   }, [viewId, nodeById, childrenMap, metric, maxTop, showSingleFiles]);
 
   const flatRects = useMemo(() => {

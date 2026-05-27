@@ -1,4 +1,5 @@
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
 
 use crate::analytics::{
@@ -8,152 +9,146 @@ use crate::cli::{APP_NAME, APP_VERSION};
 use crate::io::{default_thread_count, epoch_ms_to_utc, path_to_string};
 use crate::model::{AppState, ScanResult};
 
-pub(crate) fn scan_result_to_json(result: &ScanResult) -> String {
+/// Write scan result JSON directly to any `Write` impl (e.g. a TCP stream).
+/// Avoids materialising a 300-400 MB intermediate String for large scans.
+pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -> std::io::Result<()> {
     let top_files = top_file_ids(&result.nodes, 100);
     let largest_dirs = largest_dir_ids(&result.nodes, 100);
     let extension_stats = extension_stats(&result.nodes, 80);
     let age_stats = age_stats(&result.nodes, result.scanned_at_ms);
     let duplicate_candidates = duplicate_candidates(&result.nodes, 100);
 
-    let mut output = String::with_capacity(result.nodes.len().saturating_mul(380));
-    output.push('{');
-    output.push_str("\"app\":");
-    push_json_string(&mut output, APP_NAME);
-    output.push_str(",\"version\":");
-    push_json_string(&mut output, APP_VERSION);
-    output.push_str(",\"rootPath\":");
-    push_json_string(&mut output, &result.root_path);
-    output.push_str(",\"scannedAt\":");
-    output.push_str(&result.scanned_at_ms.to_string());
-    output.push_str(",\"elapsedMs\":");
-    output.push_str(&result.elapsed_ms.to_string());
-    output.push_str(",\"threadCount\":");
-    output.push_str(&result.thread_count.to_string());
-    output.push_str(",\"nodeCount\":");
-    output.push_str(&result.nodes.len().to_string());
-    output.push_str(",\"errorCount\":");
-    output.push_str(&result.errors.len().to_string());
+    // Use a 64 KB write buffer so we're not calling the underlying writer for every field.
+    let mut buf = Vec::with_capacity(65536);
 
-    output.push_str(",\"nodes\":[");
+    macro_rules! e {
+        ($($arg:tt)*) => {{ write!(buf, $($arg)*)?; }}
+    }
+
+    e!("{{");
+    e!("\"app\":"); emit_json_str(&mut buf, APP_NAME);
+    e!(",\"version\":"); emit_json_str(&mut buf, APP_VERSION);
+    e!(",\"rootPath\":"); emit_json_str(&mut buf, &result.root_path);
+    e!(",\"scannedAt\":{}", result.scanned_at_ms);
+    e!(",\"elapsedMs\":{}", result.elapsed_ms);
+    e!(",\"threadCount\":{}", result.thread_count);
+    e!(",\"nodeCount\":{}", result.nodes.len());
+    e!(",\"errorCount\":{}", result.errors.len());
+
+    e!(",\"nodes\":[");
     for (index, node) in result.nodes.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
-        }
-        output.push('{');
-        output.push_str("\"id\":");
-        output.push_str(&node.id.to_string());
-        output.push_str(",\"parent\":");
+        if index > 0 { e!(","); }
+        e!("{{\"id\":{}", node.id);
         match node.parent {
-            Some(parent) => output.push_str(&parent.to_string()),
-            None => output.push_str("null"),
+            Some(p) => { e!(",\"parent\":{p}"); }
+            None    => { e!(",\"parent\":null"); }
         }
-        output.push_str(",\"name\":");
-        push_json_string(&mut output, &node.name);
-        output.push_str(",\"dir\":");
-        output.push_str(if node.is_dir { "true" } else { "false" });
-        output.push_str(",\"link\":");
-        output.push_str(if node.is_link { "true" } else { "false" });
-        output.push_str(",\"hidden\":");
-        output.push_str(if node.hidden { "true" } else { "false" });
-        output.push_str(",\"readonly\":");
-        output.push_str(if node.readonly { "true" } else { "false" });
-        output.push_str(",\"size\":");
-        output.push_str(&node.size.to_string());
-        output.push_str(",\"allocated\":");
-        output.push_str(&node.allocated.to_string());
-        output.push_str(",\"files\":");
-        output.push_str(&node.files.to_string());
-        output.push_str(",\"folders\":");
-        output.push_str(&node.folders.to_string());
-        output.push_str(",\"modified\":");
-        output.push_str(&node.modified_ms.to_string());
-        output.push_str(",\"created\":");
-        output.push_str(&node.created_ms.to_string());
-        output.push_str(",\"accessed\":");
-        output.push_str(&node.accessed_ms.to_string());
-        output.push_str(",\"depth\":");
-        output.push_str(&node.depth.to_string());
-        output.push_str(",\"errors\":");
-        output.push_str(&node.errors.to_string());
-        output.push_str(",\"extension\":");
-        push_json_string(&mut output, &node.extension);
-        output.push('}');
-    }
-    output.push(']');
+        e!(",\"name\":"); emit_json_str(&mut buf, &node.name);
+        e!(",\"dir\":{}", if node.is_dir { "true" } else { "false" });
+        e!(",\"link\":{}", if node.is_link { "true" } else { "false" });
+        e!(",\"hidden\":{}", if node.hidden { "true" } else { "false" });
+        e!(",\"readonly\":{}", if node.readonly { "true" } else { "false" });
+        e!(",\"size\":{}", node.size);
+        e!(",\"allocated\":{}", node.allocated);
+        e!(",\"files\":{}", node.files);
+        e!(",\"folders\":{}", node.folders);
+        e!(",\"modified\":{}", node.modified_ms);
+        e!(",\"created\":{}", node.created_ms);
+        e!(",\"accessed\":{}", node.accessed_ms);
+        e!(",\"depth\":{}", node.depth);
+        e!(",\"errors\":{}", node.errors);
+        e!(",\"extension\":"); emit_json_str(&mut buf, &node.extension);
+        e!(",\"path\":"); emit_json_str(&mut buf, &node.path);
+        e!("}}");
 
-    output.push_str(",\"topFiles\":");
-    push_id_array(&mut output, &top_files);
-    output.push_str(",\"largestDirs\":");
-    push_id_array(&mut output, &largest_dirs);
-
-    output.push_str(",\"extensionStats\":[");
-    for (index, stat) in extension_stats.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
+        // Flush every 8192 nodes to keep the buffer bounded (~3 MB at a time).
+        if index % 8192 == 8191 {
+            w.write_all(&buf)?;
+            buf.clear();
         }
-        output.push('{');
-        output.push_str("\"ext\":");
-        push_json_string(&mut output, &stat.ext);
-        output.push_str(",\"bytes\":");
-        output.push_str(&stat.bytes.to_string());
-        output.push_str(",\"allocated\":");
-        output.push_str(&stat.allocated.to_string());
-        output.push_str(",\"files\":");
-        output.push_str(&stat.files.to_string());
-        output.push('}');
     }
-    output.push(']');
+    e!("]");
+    w.write_all(&buf)?;
+    buf.clear();
 
-    output.push_str(",\"ageStats\":[");
-    for (index, stat) in age_stats.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
+    e!(",\"topFiles\":"); emit_id_array_w(&mut buf, &top_files);
+    e!(",\"largestDirs\":"); emit_id_array_w(&mut buf, &largest_dirs);
+
+    e!(",\"extensionStats\":[");
+    for (i, stat) in extension_stats.iter().enumerate() {
+        if i > 0 { e!(","); }
+        e!("{{\"ext\":"); emit_json_str(&mut buf, &stat.ext);
+        e!(",\"bytes\":{},\"allocated\":{},\"files\":{}}}", stat.bytes, stat.allocated, stat.files);
+    }
+    e!("]");
+
+    e!(",\"ageStats\":[");
+    for (i, stat) in age_stats.iter().enumerate() {
+        if i > 0 { e!(","); }
+        e!("{{\"label\":"); emit_json_str(&mut buf, stat.label);
+        e!(",\"bytes\":{},\"files\":{}}}", stat.bytes, stat.files);
+    }
+    e!("]");
+
+    e!(",\"duplicateCandidates\":[");
+    for (i, group) in duplicate_candidates.iter().enumerate() {
+        if i > 0 { e!(","); }
+        e!("{{\"name\":"); emit_json_str(&mut buf, &group.name);
+        e!(",\"size\":{},\"waste\":{},\"ids\":", group.size, group.waste);
+        emit_id_array_w(&mut buf, &group.ids);
+        e!("}}");
+    }
+    e!("]");
+
+    e!(",\"scanErrors\":[");
+    for (i, error) in result.errors.iter().take(500).enumerate() {
+        if i > 0 { e!(","); }
+        e!("{{\"path\":"); emit_json_str(&mut buf, &error.path);
+        e!(",\"message\":"); emit_json_str(&mut buf, &error.message);
+        e!("}}");
+    }
+    e!("]}}");
+
+    w.write_all(&buf)?;
+    Ok(())
+}
+
+/// Convenience wrapper that collects write_scan_result_json output into a String.
+/// Only called for small/cached scans and exports; prefer write_scan_result_json for live scans.
+pub(crate) fn scan_result_to_json(result: &ScanResult) -> String {
+    let mut buf = Vec::with_capacity(result.nodes.len().saturating_mul(400));
+    write_scan_result_json(&mut buf, result).expect("vec write cannot fail");
+    String::from_utf8(buf).expect("json is valid utf8")
+}
+
+fn emit_json_str(buf: &mut Vec<u8>, value: &str) {
+    buf.push(b'"');
+    for ch in value.chars() {
+        match ch {
+            '"'  => buf.extend_from_slice(b"\\\""),
+            '\\' => buf.extend_from_slice(b"\\\\"),
+            '\n' => buf.extend_from_slice(b"\\n"),
+            '\r' => buf.extend_from_slice(b"\\r"),
+            '\t' => buf.extend_from_slice(b"\\t"),
+            ch if (ch as u32) < 0x20 => {
+                let _ = write!(buf, "\\u{:04x}", ch as u32);
+            }
+            ch => {
+                let mut tmp = [0u8; 4];
+                buf.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+            }
         }
-        output.push('{');
-        output.push_str("\"label\":");
-        push_json_string(&mut output, stat.label);
-        output.push_str(",\"bytes\":");
-        output.push_str(&stat.bytes.to_string());
-        output.push_str(",\"files\":");
-        output.push_str(&stat.files.to_string());
-        output.push('}');
     }
-    output.push(']');
+    buf.push(b'"');
+}
 
-    output.push_str(",\"duplicateCandidates\":[");
-    for (index, group) in duplicate_candidates.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
-        }
-        output.push('{');
-        output.push_str("\"name\":");
-        push_json_string(&mut output, &group.name);
-        output.push_str(",\"size\":");
-        output.push_str(&group.size.to_string());
-        output.push_str(",\"waste\":");
-        output.push_str(&group.waste.to_string());
-        output.push_str(",\"ids\":");
-        push_id_array(&mut output, &group.ids);
-        output.push('}');
+fn emit_id_array_w(buf: &mut Vec<u8>, ids: &[usize]) {
+    buf.push(b'[');
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 { buf.push(b','); }
+        let _ = write!(buf, "{id}");
     }
-    output.push(']');
-
-    output.push_str(",\"scanErrors\":[");
-    for (index, error) in result.errors.iter().take(500).enumerate() {
-        if index > 0 {
-            output.push(',');
-        }
-        output.push('{');
-        output.push_str("\"path\":");
-        push_json_string(&mut output, &error.path);
-        output.push_str(",\"message\":");
-        push_json_string(&mut output, &error.message);
-        output.push('}');
-    }
-    output.push(']');
-
-    output.push('}');
-    output
+    buf.push(b']');
 }
 
 pub(crate) fn scan_result_to_csv(result: &ScanResult) -> String {

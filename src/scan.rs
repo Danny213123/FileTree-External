@@ -847,6 +847,12 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
         });
         nodes[dir_id].children = children;
     }
+
+    // Children are only needed for aggregation and sorting above.
+    // Free the Vecs now to reduce peak RSS before JSON serialisation.
+    for node in nodes.iter_mut() {
+        node.children = Vec::new();
+    }
 }
 
 #[cfg(test)]

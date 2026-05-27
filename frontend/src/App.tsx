@@ -41,7 +41,7 @@ export default function App() {
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [treemapPosition, setTreemapPosition] = useState<"bottom" | "right">("bottom");
   const [treemapDetail, setTreemapDetail] = useState(3);
-  const [tmShowSingleFiles, setTmShowSingleFiles] = useState(false);
+  const [tmShowSingleFiles, setTmShowSingleFiles] = useState(true);
   const [tmShow3D, setTmShow3D] = useState(false);
   const [tmShowHierarchy, setTmShowHierarchy] = useState(true);
   const [tmShowLegend, setTmShowLegend] = useState(true);
