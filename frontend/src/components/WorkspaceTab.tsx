@@ -331,9 +331,10 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   const handleDblClick = useCallback((id: number) => {
     const node = tree.nodeById.get(id);
     if (!node) return;
-    if (node.dir) tree.toggleExpand(id);
+    if (node.dir) handleScanPath(node.path);
     else openPath(node.path);
-  }, [tree]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tree, handleScanPath]);
 
   const handleNavigate = useCallback((id: number) => {
     let node = tree.nodeById.get(id);
@@ -377,6 +378,11 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
       alert(`Could not create folder: ${e instanceof Error ? e.message : e}`);
     }
   }, [tree, scanPath, doScan]);
+
+  const handleTreemapOpen = useCallback((id: number) => {
+    const node = tree.nodeById.get(id);
+    if (node && !node.dir && node.path) openPath(node.path);
+  }, [tree]);
 
   const selectedNode = tree.nodeById.get(tree.selectedId);
   const runReveal   = useCallback(() => { if (selectedNode) revealPath(selectedNode.path); }, [selectedNode]);
@@ -518,6 +524,7 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
               dragDrop={tmDragDrop}
               onSelect={tree.setSelectedId}
               onNavigate={handleNavigate}
+              onOpen={handleTreemapOpen}
               onClose3D={onClose3D}
             />
           ) : (
@@ -600,6 +607,7 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
             dragDrop={tmDragDrop}
             onSelect={tree.setSelectedId}
             onNavigate={handleNavigate}
+            onOpen={handleTreemapOpen}
             onClose3D={onClose3D}
           />
         </div>

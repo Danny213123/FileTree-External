@@ -760,6 +760,7 @@ unsafe extern "system" {
     pub(super) fn SetClipboardData(uFormat: Uint, hMem: isize) -> isize;
     pub(super) fn GetCursorPos(lpPoint: *mut Point) -> Bool;
     pub(super) fn ScreenToClient(hWnd: Hwnd, lpPoint: *mut Point) -> Bool;
+    pub(super) fn ClientToScreen(hWnd: Hwnd, lpPoint: *mut Point) -> Bool;
     pub(super) fn GetDpiForWindow(hwnd: Hwnd) -> Uint;
     // Single-instance foreground + window discovery (Plan 02-02, Pattern 2)
     pub(super) fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> Hwnd;
