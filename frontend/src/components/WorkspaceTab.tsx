@@ -331,10 +331,25 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   const handleDblClick = useCallback((id: number) => {
     const node = tree.nodeById.get(id);
     if (!node) return;
-    if (node.dir) handleScanPath(node.path);
-    else openPath(node.path);
+    if (node.dir) {
+      // Navigate into this folder within the current tab only.
+      // Do NOT call handleScanPath here — that propagates via onScanPath up to
+      // App.handleScanPath → getActiveRef()?.doScanPath(), which may target the
+      // wrong tab if the active-ref closure is stale.
+      setScanPathState(node.path);
+      cancelScan();
+      startScan({
+        path: node.path,
+        threads,
+        includeHidden,
+        followLinks,
+        excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
+      });
+    } else {
+      openPath(node.path);
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tree, handleScanPath]);
+  }, [tree, threads, includeHidden, followLinks, exclude, cancelScan, startScan]);
 
   const handleNavigate = useCallback((id: number) => {
     let node = tree.nodeById.get(id);
