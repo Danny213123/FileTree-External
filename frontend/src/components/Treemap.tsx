@@ -249,7 +249,7 @@ interface TreemapProps {
 
 export const Treemap = memo(function Treemap({
   nodeById, selectedId, metric, unit, detail,
-  show3D, showHierarchy, showLegend, showLabels, dragDrop,
+  showSingleFiles, show3D, showHierarchy, showLegend, showLabels, dragDrop,
   onSelect, onNavigate, onOpen, onClose3D,
 }: TreemapProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -289,13 +289,18 @@ export const Treemap = memo(function Treemap({
   }, [selectedId, nodeById]);
 
   const topItems = useMemo(() => {
-    const kids = (childrenMap.get(viewId) ?? [])
+    const allKids = (childrenMap.get(viewId) ?? [])
       .map(id => nodeById.get(id))
-      .filter((n): n is NodeRecord => n !== undefined && getValue(n, metric) > 0)
+      .filter((n): n is NodeRecord => n !== undefined && getValue(n, metric) > 0);
+    const dirs  = allKids.filter(n => n.dir);
+    const files = allKids.filter(n => !n.dir);
+    console.log(`[treemap] viewId=${viewId} total_children=${allKids.length} dirs=${dirs.length} files=${files.length} showSingleFiles=${showSingleFiles} maxTop=${maxTop}`);
+    const kids = allKids
       .sort((a, b) => getValue(b, metric) - getValue(a, metric))
       .slice(0, maxTop);
+    console.log(`[treemap] after slice: ${kids.length} items rendered (${kids.filter(n=>n.dir).length} dirs, ${kids.filter(n=>!n.dir).length} files)`);
     return kids;
-  }, [viewId, nodeById, childrenMap, metric, maxTop]);
+  }, [viewId, nodeById, childrenMap, metric, maxTop, showSingleFiles]);
 
   const flatRects = useMemo(() => {
     const topRects = layoutTreemap(topItems, containerSize.w, containerSize.h, metric);

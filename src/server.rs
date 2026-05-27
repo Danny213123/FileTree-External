@@ -268,11 +268,18 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
 
             match scan_path(options) {
                 Ok(result) => {
+                    let node_count = result.nodes.len();
                     let result = Arc::new(result);
                     *state.last_scan.lock().expect("scan lock poisoned") =
                         Some(Arc::clone(&result));
-                    state.scan_cache.lock().expect("scan_cache lock")
-                        .insert(cache_key, (Arc::clone(&result), Instant::now()));
+                    let (cache_entries, cache_keys) = {
+                        let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                        cache.insert(cache_key.clone(), (Arc::clone(&result), Instant::now()));
+                        let entries = cache.len();
+                        let keys: Vec<String> = cache.keys().cloned().collect();
+                        (entries, keys)
+                    };
+                    eprintln!("[mem] scan done: path={cache_key:?} nodes={node_count} cache_entries={cache_entries} keys={cache_keys:?}");
                     let body = scan_result_to_json(&result);
                     respond_json(&mut stream, 200, "OK", &body)
                 }
@@ -777,8 +784,13 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             };
             let x: i32 = query.get("x").and_then(|v| v.parse().ok()).unwrap_or(0);
             let y: i32 = query.get("y").and_then(|v| v.parse().ok()).unwrap_or(0);
+            eprintln!("[ctx-server] path={path:?} x={x} y={y}");
             #[cfg(windows)]
-            crate::desktop::post_shell_context_menu(path.clone(), x, y);
+            {
+                let hwnd = crate::desktop::main_hwnd();
+                eprintln!("[ctx-server] MAIN_HWND={hwnd} posting WM_SHELL_CONTEXT_MENU");
+                crate::desktop::post_shell_context_menu(path.clone(), x, y);
+            }
             #[cfg(not(windows))]
             let _ = (path, x, y);
             respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
@@ -1313,8 +1325,10 @@ fn serve_thumbnail(stream: &mut TcpStream, path: &str) -> sio::Result<()> {
 
     let is_video = matches!(ext.as_str(), "mp4"|"mkv"|"mov"|"avi"|"wmv"|"webm"|"m4v"|"flv");
     let is_image = matches!(ext.as_str(), "jpg"|"jpeg"|"png"|"gif"|"webp"|"bmp"|"svg"|"tif"|"tiff"|"avif"|"heic");
+    eprintln!("[thumb-route] path={path:?} ext={ext:?} is_video={is_video} is_image={is_image}");
 
     if !is_video && !is_image {
+        eprintln!("[thumb-route] 404: unsupported extension");
         return respond_text(stream, 404, "Not Found", "Unsupported type");
     }
 
@@ -1322,6 +1336,7 @@ fn serve_thumbnail(stream: &mut TcpStream, path: &str) -> sio::Result<()> {
         // Use the Windows Shell thumbnail cache to render a frame server-side.
         // This works for all codecs the OS has installed (HEVC, AV1, etc.) and
         // avoids streaming raw video bytes to Chromium, which can't decode HEVC.
+        eprintln!("[thumb-route] requesting shell thumbnail for video");
         #[cfg(windows)]
         if let Some(jpeg) = shell_thumbnail_jpeg(path, 480) {
             return respond_bytes(stream, 200, "OK", "image/jpeg", &jpeg,
@@ -1444,7 +1459,8 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
 
     unsafe {
         // Initialize COM on this thread (may already be initialized — that's fine)
-        CoInitializeEx(std::ptr::null_mut(), 0 /* COINIT_APARTMENTTHREADED */);
+        let com_hr = CoInitializeEx(std::ptr::null_mut(), 0 /* COINIT_APARTMENTTHREADED */);
+        eprintln!("[thumb] path={path:?} size={size} CoInitializeEx=0x{com_hr:08X}");
 
         // Create IShellItem for the path
         let mut item_ptr: *mut c_void = std::ptr::null_mut();
@@ -1454,7 +1470,9 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
             &IID_IShellItem,
             &mut item_ptr,
         );
+        eprintln!("[thumb] SHCreateItemFromParsingName hr=0x{hr:08X} item_null={}", item_ptr.is_null());
         if hr < 0 || item_ptr.is_null() {
+            eprintln!("[thumb] FAIL at SHCreateItemFromParsingName");
             CoUninitialize();
             return None;
         }
@@ -1463,7 +1481,9 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
         // QueryInterface for IShellItemImageFactory
         let mut factory_ptr: *mut c_void = std::ptr::null_mut();
         let hr2 = ((*item_vtbl).QueryInterface)(item_ptr, &IID_IShellItemImageFactory, &mut factory_ptr);
+        eprintln!("[thumb] QueryInterface(IShellItemImageFactory) hr=0x{hr2:08X} factory_null={}", factory_ptr.is_null());
         if hr2 < 0 || factory_ptr.is_null() {
+            eprintln!("[thumb] FAIL at QueryInterface");
             ((*item_vtbl).Release)(item_ptr);
             CoUninitialize();
             return None;
@@ -1474,10 +1494,12 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
         let mut hbm: isize = 0;
         let thumb_size = SIZE { cx: size, cy: size };
         let hr3 = ((*factory_vtbl).GetImage)(factory_ptr, thumb_size, SIIGBF_RESIZETOFIT, &mut hbm);
+        eprintln!("[thumb] GetImage hr=0x{hr3:08X} hbm={hbm}");
         ((*factory_vtbl).Release)(factory_ptr);
         ((*item_vtbl).Release)(item_ptr);
 
         if hr3 < 0 || hbm == 0 {
+            eprintln!("[thumb] FAIL at GetImage");
             CoUninitialize();
             return None;
         }
@@ -1503,7 +1525,9 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
         GetDIBits(hdc, hbm, 0, 0, std::ptr::null_mut(), &mut bmi, DIB_RGB_COLORS);
         let w = bmi.bmiHeader.biWidth.abs();
         let h = bmi.bmiHeader.biHeight.abs();
+        eprintln!("[thumb] bitmap dims: {w}x{h}");
         if w == 0 || h == 0 {
+            eprintln!("[thumb] FAIL: zero-size bitmap");
             DeleteDC(hdc);
             DeleteObject(hbm);
             CoUninitialize();
@@ -1519,8 +1543,12 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
         DeleteDC(hdc);
         DeleteObject(hbm);
         CoUninitialize();
+        eprintln!("[thumb] GetDIBits rows={rows} → PNG {w}x{h} ({} bytes)", n * 4);
 
-        if rows == 0 { return None; }
+        if rows == 0 {
+            eprintln!("[thumb] FAIL: GetDIBits returned 0 rows");
+            return None;
+        }
 
         // Convert BGRA → RGBA (swap B and R channels)
         let mut rgba = vec![0u8; n * 4];
