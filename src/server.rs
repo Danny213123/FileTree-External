@@ -19,7 +19,7 @@ use crate::dupes::{
 };
 use crate::export::{
     app_config_json, drives_json, push_json_string, scan_result_to_csv, scan_result_to_json,
-    special_folders_json, write_scan_result_json,
+    special_folders_json, write_scan_result_json, write_scan_result_ndjson,
 };
 use crate::io::{default_thread_count, open_path, parse_bool, reveal_path, split_patterns};
 use crate::model::{AppState, DupesProgress, HttpRequest, ScanOptions};
@@ -842,10 +842,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                             stream,
                             "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
                         )?;
-                        // Stream JSON directly then append newline in a separate chunk.
+                        // Stream as per-node NDJSON so the browser never parses a giant string.
                         let mut cw = ChunkedWriter::new(&mut stream);
-                        write_scan_result_json(&mut cw, &result)?;
-                        cw.write_all(b"\n")?;
+                        write_scan_result_ndjson(&mut cw, &result)?;
                         cw.finish()?;
                         return Ok(());
                     }
@@ -904,14 +903,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         }
                         cache.insert(cache_key, (Arc::clone(&result), Instant::now()));
                     }
-                    // Stream JSON directly; no intermediate String.
+                    // Stream as per-node NDJSON so the browser never parses a giant string.
                     let mut cw = ChunkedWriter::new(&mut stream);
-                    write_scan_result_json(&mut cw, &result)?;
-                    cw.write_all(b"\n")?;
+                    write_scan_result_ndjson(&mut cw, &result)?;
                     cw.finish()?;
+                    return Ok(());
                 }
                 Err(error) => {
-                    let mut body = String::from("{\"error\":");
+                    let mut body = String::from("{\"type\":\"error\",\"error\":");
                     push_json_string(&mut body, &error.to_string());
                     body.push_str("}\n");
                     write_chunk(&mut stream, body.as_bytes())?;

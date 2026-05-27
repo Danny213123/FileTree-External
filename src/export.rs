@@ -112,6 +112,115 @@ pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -
     Ok(())
 }
 
+/// Stream scan result as newline-delimited JSON so the browser never has to parse
+/// a single giant string.  Protocol:
+///   {"type":"meta","rootPath":"...","scannedAt":N,...all analytics...}
+///   {"type":"node","id":N,"parent":N|null,...}   ← one per node
+///   {"type":"done"}
+pub(crate) fn write_scan_result_ndjson<W: Write>(w: &mut W, result: &ScanResult) -> std::io::Result<()> {
+    let top_files        = top_file_ids(&result.nodes, 100);
+    let largest_dirs     = largest_dir_ids(&result.nodes, 100);
+    let ext_stats        = extension_stats(&result.nodes, 80);
+    let age_st           = age_stats(&result.nodes, result.scanned_at_ms);
+    let dup_cands        = duplicate_candidates(&result.nodes, 100);
+
+    let mut buf = Vec::with_capacity(65536);
+
+    macro_rules! e {
+        ($($arg:tt)*) => {{ write!(buf, $($arg)*)?; }}
+    }
+
+    // ── meta line ──────────────────────────────────────────────────────────
+    e!("{{\"type\":\"meta\"");
+    e!(",\"app\":"); emit_json_str(&mut buf, APP_NAME);
+    e!(",\"version\":"); emit_json_str(&mut buf, APP_VERSION);
+    e!(",\"rootPath\":"); emit_json_str(&mut buf, &result.root_path);
+    e!(",\"scannedAt\":{}", result.scanned_at_ms);
+    e!(",\"elapsedMs\":{}", result.elapsed_ms);
+    e!(",\"threadCount\":{}", result.thread_count);
+    e!(",\"nodeCount\":{}", result.nodes.len());
+    e!(",\"errorCount\":{}", result.errors.len());
+
+    e!(",\"topFiles\":"); emit_id_array_w(&mut buf, &top_files);
+    e!(",\"largestDirs\":"); emit_id_array_w(&mut buf, &largest_dirs);
+
+    e!(",\"extensionStats\":[");
+    for (i, stat) in ext_stats.iter().enumerate() {
+        if i > 0 { e!(","); }
+        e!("{{\"ext\":"); emit_json_str(&mut buf, &stat.ext);
+        e!(",\"bytes\":{},\"allocated\":{},\"files\":{}}}", stat.bytes, stat.allocated, stat.files);
+    }
+    e!("]");
+
+    e!(",\"ageStats\":[");
+    for (i, stat) in age_st.iter().enumerate() {
+        if i > 0 { e!(","); }
+        e!("{{\"label\":"); emit_json_str(&mut buf, stat.label);
+        e!(",\"bytes\":{},\"files\":{}}}", stat.bytes, stat.files);
+    }
+    e!("]");
+
+    e!(",\"duplicateCandidates\":[");
+    for (i, group) in dup_cands.iter().enumerate() {
+        if i > 0 { e!(","); }
+        e!("{{\"name\":"); emit_json_str(&mut buf, &group.name);
+        e!(",\"size\":{},\"waste\":{},\"ids\":", group.size, group.waste);
+        emit_id_array_w(&mut buf, &group.ids);
+        e!("}}");
+    }
+    e!("]");
+
+    e!(",\"scanErrors\":[");
+    for (i, error) in result.errors.iter().take(500).enumerate() {
+        if i > 0 { e!(","); }
+        e!("{{\"path\":"); emit_json_str(&mut buf, &error.path);
+        e!(",\"message\":"); emit_json_str(&mut buf, &error.message);
+        e!("}}");
+    }
+    e!("]}}");
+    buf.push(b'\n');
+    w.write_all(&buf)?;
+    buf.clear();
+
+    // ── node lines ─────────────────────────────────────────────────────────
+    for (index, node) in result.nodes.iter().enumerate() {
+        e!("{{\"type\":\"node\"");
+        e!(",\"id\":{}", node.id);
+        match node.parent {
+            Some(p) => { e!(",\"parent\":{p}"); }
+            None    => { e!(",\"parent\":null"); }
+        }
+        e!(",\"name\":"); emit_json_str(&mut buf, &node.name);
+        e!(",\"dir\":{}", if node.is_dir { "true" } else { "false" });
+        e!(",\"link\":{}", if node.is_link { "true" } else { "false" });
+        e!(",\"hidden\":{}", if node.hidden { "true" } else { "false" });
+        e!(",\"readonly\":{}", if node.readonly { "true" } else { "false" });
+        e!(",\"size\":{}", node.size);
+        e!(",\"allocated\":{}", node.allocated);
+        e!(",\"files\":{}", node.files);
+        e!(",\"folders\":{}", node.folders);
+        e!(",\"modified\":{}", node.modified_ms);
+        e!(",\"created\":{}", node.created_ms);
+        e!(",\"accessed\":{}", node.accessed_ms);
+        e!(",\"depth\":{}", node.depth);
+        e!(",\"errors\":{}", node.errors);
+        e!(",\"extension\":"); emit_json_str(&mut buf, &node.extension);
+        e!("}}");
+        buf.push(b'\n');
+
+        // Flush every 4096 nodes (~1.2 MB) so the TCP window stays full.
+        if index % 4096 == 4095 {
+            w.write_all(&buf)?;
+            buf.clear();
+        }
+    }
+
+    // ── done line ──────────────────────────────────────────────────────────
+    buf.extend_from_slice(b"{\"type\":\"done\"}\n");
+    w.write_all(&buf)?;
+    Ok(())
+}
+
 /// Convenience wrapper that collects write_scan_result_json output into a String.
 /// Only called for small/cached scans and exports; prefer write_scan_result_json for live scans.
 pub(crate) fn scan_result_to_json(result: &ScanResult) -> String {
