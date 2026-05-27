@@ -152,8 +152,7 @@ export function TreeTable({
                 onClick={(e) => {
                   if (isBundle) {
                     onToggleExpand(node.id);
-                    // Select the parent so the treemap shows the parent folder
-                    if (node.parent != null) onSelect(node.parent);
+                    onSelect(node.id);
                     return;
                   }
                   if (e.ctrlKey) { onCtrlClick(node.id); return; }
