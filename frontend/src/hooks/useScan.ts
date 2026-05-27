@@ -31,10 +31,11 @@ export function reconstructChildren<T extends ScanResult>(result: T): T {
     const queue: (typeof nodes)[0][] = [root];
     for (let qi = 0; qi < queue.length; qi++) {
       const parent = queue[qi];
+      const sep = parent.path.endsWith("\\") || parent.path.endsWith("/") ? "" : "\\";
       for (const childId of parent.children) {
         const child = byId.get(childId);
         if (child) {
-          child.path = parent.path + "\\" + child.name;
+          child.path = parent.path + sep + child.name;
           queue.push(child);
         }
       }

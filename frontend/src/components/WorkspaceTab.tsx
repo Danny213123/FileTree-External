@@ -324,15 +324,8 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   const handleContextMenu = useCallback((id: number, x: number, y: number) => {
     tree.setSelectedId(id);
     const node = tree.nodeById.get(id);
-    console.log(`[ctx] id=${id} node=${node?.name ?? "none"} id_val=${node?.id} x=${x} y=${y} dpr=${window.devicePixelRatio}`);
-    if (!node || node.id < 0) {
-      console.warn(`[ctx] skipped: node missing or id<0 (id=${node?.id})`);
-      return;
-    }
-    console.log(`[ctx] calling shellContextMenu path="${node.path}"`);
-    shellContextMenu(node.path, x, y)
-      .then(() => console.log("[ctx] shellContextMenu fetch OK"))
-      .catch((e) => console.error("[ctx] shellContextMenu fetch failed:", e));
+    if (!node || node.id < 0 || !node.path) return;
+    shellContextMenu(node.path, x, y).catch(() => {});
   }, [tree]);
 
   const handleDblClick = useCallback((id: number) => {
