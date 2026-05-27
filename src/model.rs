@@ -30,9 +30,9 @@ pub(crate) struct NodeRecord {
     pub(crate) allocated: u64,
     pub(crate) files: u64,
     pub(crate) folders: u64,
-    pub(crate) modified_ms: u128,
-    pub(crate) created_ms: u128,
-    pub(crate) accessed_ms: u128,
+    pub(crate) modified_ms: u64,
+    pub(crate) created_ms: u64,
+    pub(crate) accessed_ms: u64,
     pub(crate) depth: usize,
     pub(crate) errors: u64,
     pub(crate) children: Vec<usize>,
@@ -48,8 +48,8 @@ pub(crate) struct ScanError {
 #[derive(Clone, Debug)]
 pub(crate) struct ScanResult {
     pub(crate) root_path: String,
-    pub(crate) scanned_at_ms: u128,
-    pub(crate) elapsed_ms: u128,
+    pub(crate) scanned_at_ms: u64,
+    pub(crate) elapsed_ms: u64,
     pub(crate) thread_count: usize,
     pub(crate) nodes: Vec<NodeRecord>,
     pub(crate) errors: Vec<ScanError>,

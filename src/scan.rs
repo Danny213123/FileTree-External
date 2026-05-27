@@ -41,7 +41,7 @@ fn join_path(parent: &str, name: &str) -> String {
 }
 
 pub(crate) fn scan_path(options: ScanOptions) -> io::Result<ScanResult> {
-    scan_path_with_progress(options, Arc::new(AtomicBool::new(false)), |_, _, _| {})
+    scan_path_with_progress(options, Arc::new(AtomicBool::new(false)), |_, _| {})
 }
 
 pub(crate) fn scan_path_with_progress<F>(
@@ -50,7 +50,7 @@ pub(crate) fn scan_path_with_progress<F>(
     mut progress: F,
 ) -> io::Result<ScanResult>
 where
-    F: FnMut(usize, u128, Option<ScanResult>),
+    F: FnMut(usize, u64),
 {
     if !options.root.exists() {
         return Err(io::Error::new(
@@ -60,7 +60,7 @@ where
     }
 
     let started = Instant::now();
-    let scanned_at_ms = now_ms();
+    let scanned_at_ms: u64 = now_ms();
     let root_metadata = fs::symlink_metadata(&options.root)?;
     let root_is_link = root_metadata.file_type().is_symlink();
     let root_is_dir = root_metadata.is_dir();
@@ -146,18 +146,7 @@ where
         };
         let current_count = node_count_shared.load(Ordering::Relaxed);
         if current_count != last_progress_nodes || scan_done {
-            // Only produce a partial snapshot when not done (it's expensive).
-            let partial = if !scan_done {
-                Some(snapshot_scan_result(
-                    &shared,
-                    scanned_at_ms,
-                    started.elapsed().as_millis(),
-                    thread_count,
-                ))
-            } else {
-                None
-            };
-            progress(current_count, started.elapsed().as_millis(), partial);
+            progress(current_count, started.elapsed().as_millis() as u64);
             last_progress_nodes = current_count;
         }
         if scan_done {
@@ -172,15 +161,15 @@ where
     Ok(snapshot_scan_result(
         &shared,
         scanned_at_ms,
-        started.elapsed().as_millis(),
+        started.elapsed().as_millis() as u64,
         thread_count,
     ))
 }
 
 pub(crate) fn snapshot_scan_result(
     shared: &WorkerShared,
-    scanned_at_ms: u128,
-    elapsed_ms: u128,
+    scanned_at_ms: u64,
+    elapsed_ms: u64,
     thread_count: usize,
 ) -> ScanResult {
     // Clone nodes and errors while holding their locks, then drop locks
@@ -191,11 +180,10 @@ pub(crate) fn snapshot_scan_result(
     // Aggregation is O(n) and must not hold any shared lock.
     aggregate_nodes(&mut nodes);
 
+    let root_path = nodes.first().map(|node| node.path.clone()).unwrap_or_default();
+
     ScanResult {
-        root_path: nodes
-            .first()
-            .map(|node| node.path.clone())
-            .unwrap_or_default(),
+        root_path,
         scanned_at_ms,
         elapsed_ms,
         thread_count,
@@ -392,11 +380,11 @@ fn scan_directory_win32(
     }
 
     // Helper: FILETIME (100-ns ticks since 1601-01-01) → Unix ms
-    let filetime_to_ms = |hi: u32, lo: u32| -> u128 {
+    let filetime_to_ms = |hi: u32, lo: u32| -> u64 {
         let ft = ((hi as u64) << 32) | lo as u64;
         ft.saturating_sub(116_444_736_000_000_000)
             .checked_div(10_000)
-            .unwrap_or(0) as u128
+            .unwrap_or(0)
     };
 
     // Accumulate all entries for this directory before touching any locks.
@@ -458,9 +446,9 @@ fn scan_directory_win32(
                         let s = m.len();
                         let a = platform_allocated_size_raw(&PathBuf::from(&entry_path_str), s);
                         let t = metadata_modified_ms(&m);
-                        (s, a, t, 0u128, 0u128)
+                        (s, a, t, 0u64, 0u64)
                     }
-                    Err(_) => (0u64, 0u64, 0u128, 0u128, 0u128),
+                    Err(_) => (0u64, 0u64, 0u64, 0u64, 0u64),
                 }
             } else if is_dir {
                 (0u64, 0u64,
@@ -1080,7 +1068,7 @@ mod tests {
         let mut progress_called = false;
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let _res = scan_path_with_progress(options, cancel, |node_count, _elapsed_ms, _partial| {
+        let _res = scan_path_with_progress(options, cancel, |node_count, _elapsed_ms| {
             progress_called = true;
             assert!(node_count >= 1);
         });

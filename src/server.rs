@@ -396,10 +396,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 };
                 let cancel = Arc::new(AtomicBool::new(false));
                 let prog2 = Arc::clone(&prog);
-                match scan_path_with_progress(options, cancel, move |_dirs, _files, partial| {
-                    if let Some(snap) = partial {
-                        prog2.files_scanned.store(snap.nodes.len() as u64, Ordering::Relaxed);
-                    }
+                match scan_path_with_progress(options, cancel, move |node_count, _elapsed_ms| {
+                    prog2.files_scanned.store(node_count as u64, Ordering::Relaxed);
                 }) {
                     Ok(result) => {
                         prog.files_scanned.fetch_add(result.nodes.len() as u64, Ordering::Relaxed);
@@ -512,10 +510,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 };
                 let cancel = Arc::new(AtomicBool::new(false));
                 let prog2 = Arc::clone(&prog);
-                match scan_path_with_progress(options, cancel, move |_, _, partial| {
-                    if let Some(snap) = partial {
-                        prog2.files_scanned.store(snap.nodes.len() as u64, Ordering::Relaxed);
-                    }
+                match scan_path_with_progress(options, cancel, move |node_count, _elapsed_ms| {
+                    prog2.files_scanned.store(node_count as u64, Ordering::Relaxed);
                 }) {
                     Ok(result) => {
                         let offset = all_nodes.len();
@@ -885,12 +881,11 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
 
             let cancel = Arc::new(AtomicBool::new(false));
             let s = &mut stream;
-            let scan_result = scan_path_with_progress(options, cancel, |_, _, partial| {
-                if let Some(snap) = partial {
-                    let mut line = scan_result_to_json(&snap);
-                    line.push('\n');
-                    let _ = write_chunk(s, line.as_bytes());
-                }
+            let scan_result = scan_path_with_progress(options, cancel, |node_count, elapsed_ms| {
+                // Send a lightweight progress line instead of a full snapshot.
+                // For 1.5M nodes a full snapshot would clone ~450 MB and serialize another ~450 MB.
+                let line = format!("{{\"scanning\":true,\"nodeCount\":{node_count},\"elapsedMs\":{elapsed_ms}}}\n");
+                let _ = write_chunk(s, line.as_bytes());
             });
             match scan_result {
                 Ok(result) => {
