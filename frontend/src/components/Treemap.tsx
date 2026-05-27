@@ -281,7 +281,10 @@ export const Treemap = memo(function Treemap({
   const { maxTop, maxChildren, maxDepth } = useMemo(() => detailLimits(detail), [detail]);
   const childrenMap = useMemo(() => buildChildrenMap(nodeById), [nodeById]);
 
+  // Bundle nodes have negative IDs: id = -(parentId + 1), so parentId = -id - 1.
+  const isBundleSelected = selectedId < 0;
   const viewId = useMemo(() => {
+    if (selectedId < 0) return -selectedId - 1; // bundle → its parent folder id
     const node = nodeById.get(selectedId);
     if (!node) return 0;
     if (node.dir) return node.id;
@@ -291,15 +294,16 @@ export const Treemap = memo(function Treemap({
   const topItems = useMemo(() => {
     const allKids = (childrenMap.get(viewId) ?? [])
       .map(id => nodeById.get(id))
-      .filter((n): n is NodeRecord =>
-        n !== undefined &&
-        getValue(n, metric) > 0 &&
-        (showSingleFiles || n.dir)
-      );
+      .filter((n): n is NodeRecord => {
+        if (n === undefined || getValue(n, metric) <= 0) return false;
+        // When a bundle is selected, show only files (that's what the bundle contains).
+        if (isBundleSelected) return !n.dir;
+        return showSingleFiles || n.dir;
+      });
     return allKids
       .sort((a, b) => getValue(b, metric) - getValue(a, metric))
       .slice(0, maxTop);
-  }, [viewId, nodeById, childrenMap, metric, maxTop, showSingleFiles]);
+  }, [viewId, isBundleSelected, nodeById, childrenMap, metric, maxTop, showSingleFiles]);
 
   const flatRects = useMemo(() => {
     const topRects = layoutTreemap(topItems, containerSize.w, containerSize.h, metric);
