@@ -117,8 +117,14 @@ export function useScan(): UseScanReturn {
           for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-            const parsed = reconstructChildren(JSON.parse(trimmed) as ScanResult & { error?: string });
-            if (parsed.error) throw new Error(parsed.error);
+            const raw = JSON.parse(trimmed) as ScanResult & { error?: string; scanning?: boolean };
+            if (raw.error) throw new Error(raw.error);
+            if (raw.scanning) {
+              // Lightweight progress ping — no nodes array, just update counter.
+              setProgress({ nodes: raw.nodeCount ?? 0, elapsed: raw.elapsedMs ?? 0 });
+              continue;
+            }
+            const parsed = reconstructChildren(raw);
             setData(parsed);
             setProgress({ nodes: parsed.nodeCount, elapsed: parsed.elapsedMs });
             lastResult = parsed;
@@ -172,8 +178,13 @@ export function useScan(): UseScanReturn {
           for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-            const parsed = reconstructChildren(JSON.parse(trimmed) as ScanResult & { error?: string });
-            if (parsed.error) throw new Error(parsed.error);
+            const raw = JSON.parse(trimmed) as ScanResult & { error?: string; scanning?: boolean };
+            if (raw.error) throw new Error(raw.error);
+            if (raw.scanning) {
+              setProgress({ nodes: raw.nodeCount ?? 0, elapsed: raw.elapsedMs ?? 0 });
+              continue;
+            }
+            const parsed = reconstructChildren(raw);
             // Update progress counter but don't update the tree yet
             setProgress({ nodes: parsed.nodeCount, elapsed: parsed.elapsedMs });
             lastResult = parsed;
