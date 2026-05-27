@@ -269,6 +269,16 @@ pub(crate) fn special_folders_json() -> String {
         }
     }
 
+    // Recycle Bin (Windows only — always at <SYSTEMDRIVE>\$Recycle.Bin)
+    #[cfg(windows)]
+    {
+        let drive = env::var("SYSTEMDRIVE").unwrap_or_else(|_| "C:".to_string());
+        let recycle = PathBuf::from(format!("{}\\$Recycle.Bin", drive));
+        if recycle.is_dir() {
+            folders.push(("Recycle Bin".to_string(), recycle.display().to_string()));
+        }
+    }
+
     // Fallback for HOME on non-Windows
     add(&mut folders, "HOME", "Home");
 

@@ -192,6 +192,7 @@ export interface AppSettings {
   sortKey?: string;
   sortDir?: number;
   openTabs?: string[];
+  recentPaths?: string[];
 }
 
 export async function fetchSettings(): Promise<AppSettings> {
