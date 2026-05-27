@@ -34,21 +34,33 @@ static SHELL_MENU_REQUEST: OnceLock<Mutex<Option<ShellMenuRequest>>> = OnceLock:
 const WM_SHELL_CONTEXT_MENU: Uint = WM_APP + 1;
 
 /// Called from the HTTP server thread to request a shell context menu on the UI thread.
+pub(crate) fn main_hwnd() -> isize {
+    MAIN_HWND.get()
+        .and_then(|m| m.lock().ok())
+        .map(|g| *g)
+        .unwrap_or(0)
+}
+
 pub(crate) fn post_shell_context_menu(path: String, screen_x: i32, screen_y: i32) {
     *SHELL_MENU_REQUEST
         .get_or_init(|| Mutex::new(None))
         .lock()
         .expect("shell menu lock") = Some(ShellMenuRequest {
-        path,
+        path: path.clone(),
         screen_x,
         screen_y,
     });
 
     if let Some(hwnd_lock) = MAIN_HWND.get() {
         let hwnd = *hwnd_lock.lock().expect("hwnd lock");
+        eprintln!("[ctx-desktop] posting WM_SHELL_CONTEXT_MENU to hwnd={hwnd} path={path:?}");
         if hwnd != 0 {
             unsafe { PostMessageW(hwnd, WM_SHELL_CONTEXT_MENU, 0, 0) };
+        } else {
+            eprintln!("[ctx-desktop] ERROR: hwnd is 0, message not sent");
         }
+    } else {
+        eprintln!("[ctx-desktop] ERROR: MAIN_HWND not initialised yet");
     }
 }
 
@@ -306,8 +318,11 @@ unsafe extern "system" fn window_proc(
                 .lock()
                 .expect("shell menu lock")
                 .take();
+            eprintln!("[ctx-wndproc] WM_SHELL_CONTEXT_MENU received hwnd={hwnd} req={}", req.is_some());
             if let Some(r) = req {
+                eprintln!("[ctx-wndproc] calling show_shell_context_menu path={:?}", r.path);
                 show_shell_context_menu(hwnd, &r.path, r.screen_x, r.screen_y);
+                eprintln!("[ctx-wndproc] show_shell_context_menu returned");
             }
             0
         }
@@ -360,6 +375,7 @@ unsafe fn show_shell_context_menu(hwnd: Hwnd, path: &str, _x: i32, _y: i32) {
     let mut pt = ffi::Point { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     let (sx, sy) = (pt.x, pt.y);
+    eprintln!("[ctx-show] path={path:?} cursor=({sx},{sy})");
 
     // Convert path to wide string.
     let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
@@ -374,7 +390,9 @@ unsafe fn show_shell_context_menu(hwnd: Hwnd, path: &str, _x: i32, _y: i32) {
         0,
         &mut attr_out,
     );
+    eprintln!("[ctx-show] SHParseDisplayName hr=0x{hr:08X} pidl_null={}", pidl.is_null());
     if hr < 0 || pidl.is_null() {
+        eprintln!("[ctx-show] FAIL: SHParseDisplayName returned hr=0x{hr:08X}");
         return;
     }
 
@@ -387,7 +405,9 @@ unsafe fn show_shell_context_menu(hwnd: Hwnd, path: &str, _x: i32, _y: i32) {
         &mut folder_ptr,
         &mut child_pidl,
     );
+    eprintln!("[ctx-show] SHBindToParent hr=0x{hr2:08X} folder_null={}", folder_ptr.is_null());
     if hr2 < 0 || folder_ptr.is_null() {
+        eprintln!("[ctx-show] FAIL: SHBindToParent returned hr=0x{hr2:08X}");
         CoTaskMemFree(pidl as *mut c_void);
         return;
     }
@@ -406,14 +426,17 @@ unsafe fn show_shell_context_menu(hwnd: Hwnd, path: &str, _x: i32, _y: i32) {
         std::ptr::null_mut(),
         &mut ctx_ptr,
     );
+    eprintln!("[ctx-show] GetUIObjectOf hr=0x{hr3:08X} ctx_null={}", ctx_ptr.is_null());
 
     if hr3 >= 0 && !ctx_ptr.is_null() {
         let ctx = ctx_ptr as *mut *mut ffi::IContextMenuVtbl;
         let hmenu = CreatePopupMenu();
         const CMF_NORMAL: u32 = 0x0000;
-        ((**ctx).QueryContextMenu)(ctx_ptr, hmenu, 0, 1, 0x7FFF, CMF_NORMAL);
+        let qcm_hr = ((**ctx).QueryContextMenu)(ctx_ptr, hmenu, 0, 1, 0x7FFF, CMF_NORMAL);
+        eprintln!("[ctx-show] QueryContextMenu hr=0x{qcm_hr:08X} hmenu={hmenu}");
 
         SetForegroundWindow(hwnd);
+        eprintln!("[ctx-show] calling TrackPopupMenu at ({sx},{sy})");
         let cmd = TrackPopupMenu(
             hmenu,
             TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
@@ -423,6 +446,7 @@ unsafe fn show_shell_context_menu(hwnd: Hwnd, path: &str, _x: i32, _y: i32) {
             hwnd,
             std::ptr::null(),
         );
+        eprintln!("[ctx-show] TrackPopupMenu cmd={cmd}");
 
         if cmd > 0 {
             let ici = ffi::CMINVOKECOMMANDINFO {
