@@ -348,15 +348,17 @@ unsafe extern "system" fn window_proc(
 }
 
 /// Shows the Windows shell context menu for `path`.
-/// x/y are WebView2 viewport-relative (client) coordinates; we convert to screen.
+/// x/y are browser CSS pixels (logical, DPI-unaware) — we ignore them and use
+/// GetCursorPos instead, which always returns real screen coordinates.
 /// Must be called on the UI thread (from the message loop).
-unsafe fn show_shell_context_menu(hwnd: Hwnd, path: &str, x: i32, y: i32) {
+unsafe fn show_shell_context_menu(hwnd: Hwnd, path: &str, _x: i32, _y: i32) {
     use std::ffi::c_void;
 
-    // The coordinates arrive as WebView2 client-area pixels.
-    // TrackPopupMenu needs screen coordinates, so convert via ClientToScreen.
-    let mut pt = ffi::Point { x, y };
-    ClientToScreen(hwnd, &mut pt);
+    // Use the actual cursor position. clientX/clientY from the browser are CSS
+    // pixels which differ from physical pixels on HiDPI screens, so converting
+    // them with ClientToScreen gives wrong results at any scale other than 100%.
+    let mut pt = ffi::Point { x: 0, y: 0 };
+    GetCursorPos(&mut pt);
     let (sx, sy) = (pt.x, pt.y);
 
     // Convert path to wide string.
