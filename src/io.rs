@@ -75,19 +75,19 @@ pub(crate) fn path_to_string(path: &Path) -> String {
 }
 
 
-pub(crate) fn metadata_modified_ms(metadata: &Metadata) -> u128 {
+pub(crate) fn metadata_modified_ms(metadata: &Metadata) -> u64 {
     metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis())
+        .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
 
-pub(crate) fn now_ms() -> u128 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -276,7 +276,7 @@ fn windows_compressed_file_size(path: &Path) -> Option<u64> {
     Some(((high as u64) << 32) | low as u64)
 }
 
-pub(crate) fn epoch_ms_to_utc(ms: u128) -> String {
+pub(crate) fn epoch_ms_to_utc(ms: u64) -> String {
     if ms == 0 {
         return String::new();
     }

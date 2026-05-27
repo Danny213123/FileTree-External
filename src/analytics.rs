@@ -19,9 +19,9 @@ pub(crate) struct DupeFilter {
     /// When true, name_pattern must match the whole filename (case-insensitive), not just a substring
     pub(crate) name_exact: bool,
     /// Modified-after threshold in ms since Unix epoch, 0 = no filter
-    pub(crate) date_from: u128,
+    pub(crate) date_from: u64,
     /// Modified-before threshold in ms since Unix epoch, 0 = no filter
-    pub(crate) date_to: u128,
+    pub(crate) date_to: u64,
     /// Path prefix for "original" files (keep side). Empty = no directional filter.
     pub(crate) keep_prefix: String,
     /// Path prefix for "duplicate" files (search side). Empty = no directional filter.
@@ -281,7 +281,7 @@ pub(crate) fn extension_stats(nodes: &[NodeRecord], limit: usize) -> Vec<Extensi
     stats
 }
 
-pub(crate) fn age_stats(nodes: &[NodeRecord], scanned_at_ms: u128) -> Vec<AgeBucket> {
+pub(crate) fn age_stats(nodes: &[NodeRecord], scanned_at_ms: u64) -> Vec<AgeBucket> {
     let mut buckets = vec![
         AgeBucket {
             label: "7 days",
