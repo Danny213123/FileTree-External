@@ -19,7 +19,7 @@ use crate::dupes::{
 };
 use crate::export::{
     app_config_json, drives_json, push_json_string, scan_result_to_csv, scan_result_to_json,
-    special_folders_json,
+    special_folders_json, write_scan_result_json,
 };
 use crate::io::{default_thread_count, open_path, parse_bool, reveal_path, split_patterns};
 use crate::model::{AppState, DupesProgress, HttpRequest, ScanOptions};
@@ -272,16 +272,28 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     let result = Arc::new(result);
                     *state.last_scan.lock().expect("scan lock poisoned") =
                         Some(Arc::clone(&result));
-                    let (cache_entries, cache_keys) = {
+                    {
                         let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                        // Keep only the most recent entry to cap peak memory.
+                        if cache.len() >= 2 {
+                            // evict the oldest entry that isn't the current path
+                            let to_remove: Vec<String> = cache.keys()
+                                .filter(|k| k.as_str() != cache_key.as_str())
+                                .cloned()
+                                .collect();
+                            for k in to_remove { cache.remove(&k); }
+                        }
                         cache.insert(cache_key.clone(), (Arc::clone(&result), Instant::now()));
-                        let entries = cache.len();
-                        let keys: Vec<String> = cache.keys().cloned().collect();
-                        (entries, keys)
-                    };
-                    eprintln!("[mem] scan done: path={cache_key:?} nodes={node_count} cache_entries={cache_entries} keys={cache_keys:?}");
-                    let body = scan_result_to_json(&result);
-                    respond_json(&mut stream, 200, "OK", &body)
+                        eprintln!("[mem] scan done: path={cache_key:?} nodes={node_count} cache_entries={}", cache.len());
+                    }
+                    // Stream JSON directly to avoid building a 300-400 MB intermediate String.
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                    )?;
+                    let mut cw = ChunkedWriter::new(&mut stream);
+                    write_scan_result_json(&mut cw, &result)?;
+                    cw.finish()
                 }
                 Err(error) => {
                     let mut body = String::from("{\"error\":");
@@ -834,10 +846,12 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                             stream,
                             "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
                         )?;
-                        let mut line = scan_result_to_json(&result);
-                        line.push('\n');
-                        write_chunk(&mut stream, line.as_bytes())?;
-                        return write_final_chunk(&mut stream);
+                        // Stream JSON directly then append newline in a separate chunk.
+                        let mut cw = ChunkedWriter::new(&mut stream);
+                        write_scan_result_json(&mut cw, &result)?;
+                        cw.write_all(b"\n")?;
+                        cw.finish()?;
+                        return Ok(());
                     }
                     cache.remove(&cache_key);
                 }
@@ -883,11 +897,23 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     let result = Arc::new(result);
                     *state.last_scan.lock().expect("scan lock poisoned") =
                         Some(Arc::clone(&result));
-                    state.scan_cache.lock().expect("scan_cache lock")
-                        .insert(cache_key, (Arc::clone(&result), Instant::now()));
-                    let mut line = scan_result_to_json(&result);
-                    line.push('\n');
-                    write_chunk(&mut stream, line.as_bytes())?;
+                    {
+                        let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                        // Keep only the most recent entry to cap peak memory.
+                        if cache.len() >= 2 {
+                            let to_remove: Vec<String> = cache.keys()
+                                .filter(|k| k.as_str() != cache_key.as_str())
+                                .cloned()
+                                .collect();
+                            for k in to_remove { cache.remove(&k); }
+                        }
+                        cache.insert(cache_key, (Arc::clone(&result), Instant::now()));
+                    }
+                    // Stream JSON directly; no intermediate String.
+                    let mut cw = ChunkedWriter::new(&mut stream);
+                    write_scan_result_json(&mut cw, &result)?;
+                    cw.write_all(b"\n")?;
+                    cw.finish()?;
                 }
                 Err(error) => {
                     let mut body = String::from("{\"error\":");
@@ -964,6 +990,49 @@ fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> sio::Result<()> {
 fn write_final_chunk(stream: &mut TcpStream) -> sio::Result<()> {
     stream.write_all(b"0\r\n\r\n")?;
     stream.flush()
+}
+
+/// A `Write` adapter that encodes each `write_all` call as an HTTP chunked-transfer chunk.
+/// Buffers data internally and flushes in 64 KB chunks to minimise system calls.
+struct ChunkedWriter<'a> {
+    stream: &'a mut TcpStream,
+    buf: Vec<u8>,
+}
+
+impl<'a> ChunkedWriter<'a> {
+    fn new(stream: &'a mut TcpStream) -> Self {
+        Self { stream, buf: Vec::with_capacity(65536) }
+    }
+
+    fn flush_buf(&mut self) -> sio::Result<()> {
+        if self.buf.is_empty() { return Ok(()); }
+        write!(self.stream, "{:X}\r\n", self.buf.len())?;
+        self.stream.write_all(&self.buf)?;
+        self.stream.write_all(b"\r\n")?;
+        self.buf.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> sio::Result<()> {
+        self.flush_buf()?;
+        self.stream.write_all(b"0\r\n\r\n")?;
+        self.stream.flush()
+    }
+}
+
+impl<'a> sio::Write for ChunkedWriter<'a> {
+    fn write(&mut self, data: &[u8]) -> sio::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= 65536 {
+            self.flush_buf()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> sio::Result<()> {
+        self.flush_buf()?;
+        self.stream.flush()
+    }
 }
 
 /// Returns the path to %APPDATA%\FileTree\bookmarks.json (Windows) or
@@ -1379,6 +1448,7 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
     //   Data2 0x1A8E     → LE bytes: 8E 1A
     //   Data3 0x11D2     → LE bytes: D2 11
     //   Data4 (BE)       → 87 96 00 00 7F 75 A2 D0
+    #[allow(non_upper_case_globals)]
     const IID_IShellItem: [u8; 16] = [
         0x7F, 0x6D, 0x82, 0x43, 0x8E, 0x1A, 0xD2, 0x11,
         0x87, 0x96, 0x00, 0x00, 0x7F, 0x75, 0xA2, 0xD0,
@@ -1388,6 +1458,7 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
     //   Data2 0xBA16     → LE bytes: 16 BA
     //   Data3 0x442F     → LE bytes: 2F 44
     //   Data4 (BE)       → 80 C4 8A 59 C3 0C 46 3B
+    #[allow(non_upper_case_globals)]
     const IID_IShellItemImageFactory: [u8; 16] = [
         0x79, 0x8B, 0xC1, 0xBC, 0x16, 0xBA, 0x2F, 0x44,
         0x80, 0xC4, 0x8A, 0x59, 0xC3, 0x0C, 0x46, 0x3B,
@@ -1415,9 +1486,6 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
     }
     #[link(name = "Gdi32")] unsafe extern "system" {
         fn CreateCompatibleDC(hdc: isize) -> isize;
-        fn CreateDIBSection(hdc: isize, bmi: *const BitmapInfo, usage: u32,
-                            bits: *mut *mut c_void, section: *mut c_void, offset: u32) -> isize;
-        fn SelectObject(hdc: isize, obj: isize) -> isize;
         fn GetDIBits(hdc: isize, hbm: isize, start: u32, lines: u32,
                      bits: *mut c_void, bmi: *mut BitmapInfo, usage: u32) -> i32;
         fn DeleteDC(hdc: isize) -> i32;
@@ -1649,108 +1717,6 @@ fn save_settings_json(body: &[u8]) -> sio::Result<()> {
     fs::rename(&tmp, &path)
 }
 
-// ── Smart watch (lightweight mtime token) ───────────────────
-//
-// We do NOT use ReadDirectoryChangesW here because the server runs on an
-// arbitrary thread and managing an overlapped handle across threads needs
-// significant FFI plumbing. Instead we use a fast heuristic: hash the
-// mtime + size of each immediate child of the watched directory. When the
-// Accepts a JSON body of the form:
-//   [{"path":"C:\\foo","mtime":1234567890}, ...]
-// Stats each directory and returns a JSON array of paths whose mtime changed.
-// O(#dirs) stat calls only — no BFS, no reading file contents.
-fn watch_changed_dirs(body: &[u8]) -> String {
-    // Minimal JSON parse: extract all "path" and "mtime" string/number pairs.
-    // Format is a flat array of objects [{path, mtime}, ...].
-    let body = std::str::from_utf8(body).unwrap_or("");
-    let entries = parse_watch_body(body);
-    let mut changed = Vec::new();
-    for (path, cached_mtime) in &entries {
-        let Ok(meta) = fs::metadata(path) else { continue };
-        if !meta.is_dir() { continue }
-        let current_mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if current_mtime != *cached_mtime {
-            changed.push(path.as_str());
-        }
-    }
-    let mut out = String::from("{\"changed\":[");
-    for (i, p) in changed.iter().enumerate() {
-        if i > 0 { out.push(','); }
-        push_json_string(&mut out, p);
-    }
-    out.push_str("]}");
-    out
-}
-
-// Very small hand-rolled parser for [{path:str, mtime:u64}, ...].
-// Only handles the exact shape we write on the frontend; no general JSON needed.
-fn parse_watch_body(body: &str) -> Vec<(String, u64)> {
-    let mut result = Vec::new();
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    // Skip to first '['
-    while i < bytes.len() && bytes[i] != b'[' { i += 1; }
-    while i < bytes.len() {
-        // Find next "path" key
-        let Some(p) = find_str(body, "\"path\"", i) else { break };
-        let Some(path_val) = extract_string(body, p + 6) else { break };
-        // Find "mtime" after the path key
-        let Some(m) = find_str(body, "\"mtime\"", p) else { break };
-        let mtime_val = extract_number(body, m + 7);
-        i = m + 7;
-        result.push((path_val, mtime_val));
-    }
-    result
-}
-
-fn find_str(haystack: &str, needle: &str, from: usize) -> Option<usize> {
-    haystack[from..].find(needle).map(|pos| from + pos)
-}
-
-// Extract the string value after a colon (skips whitespace and quotes).
-fn extract_string(s: &str, from: usize) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut i = from;
-    while i < bytes.len() && bytes[i] != b'"' { i += 1; }
-    if i >= bytes.len() { return None; }
-    i += 1; // skip opening quote
-    let mut out = String::new();
-    while i < bytes.len() && bytes[i] != b'"' {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            i += 1;
-            match bytes[i] {
-                b'"'  => out.push('"'),
-                b'\\' => out.push('\\'),
-                b'n'  => out.push('\n'),
-                b'r'  => out.push('\r'),
-                b't'  => out.push('\t'),
-                c     => { out.push('\\'); out.push(c as char); }
-            }
-        } else {
-            out.push(bytes[i] as char);
-        }
-        i += 1;
-    }
-    Some(out)
-}
-
-// Extract a u64 number value after a colon (skips whitespace and colon).
-fn extract_number(s: &str, from: usize) -> u64 {
-    let bytes = s.as_bytes();
-    let mut i = from;
-    while i < bytes.len() && (bytes[i] == b':' || bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
-    let mut n: u64 = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        n = n.saturating_mul(10).saturating_add((bytes[i] - b'0') as u64);
-        i += 1;
-    }
-    n
-}
 
 // ── Real-time filesystem event stream ───────────────────────
 //
