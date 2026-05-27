@@ -1,26 +1,60 @@
 # FileTree
 
-FileTree is a standalone Windows disk-usage explorer written in Rust. It scans directories with a native threaded scanner and opens a native desktop UI by default.
+A standalone Windows disk-usage explorer — point at a folder, see what's taking space, and clean it up. Single `.exe`, no installer.
 
-Current version: `0.1.0`
+**Current version:** `0.2.0`
+
+## Features
+
+- Multi-threaded recursive directory scanner with real-time progress streaming
+- React-based web UI served over a local embedded HTTP server, embedded in the binary at compile time
+- Explorer-style tree table: size, allocated size, file count, folder count, percent-of-parent, modified date
+- Treemap visualization and extension breakdown
+- Real-time filesystem watch — tree updates within ~100ms of changes on disk
+- In-tree search/filter by name, extension, or size range
+- Export to CSV or JSON directly from the toolbar
+- Open Location — reveals selected file in Windows Explorer
+- Recycle Bin quick link in the directory picker
+- Recent scan paths persisted across restarts
+- Dark mode (default), hidden-file and symlink-follow toggles
+- Context menu with Open, Reveal in Explorer, Move to Recycle Bin, Delete
+- Duplicate file detection with FNV-1a hashing
+- Native Win32 window with no external GUI toolkit
+
+## Build
+
+Prerequisites: Rust stable (1.85+), Node.js 18+.
+
+```powershell
+# Build the frontend first (output goes to frontend/dist/, embedded at compile time)
+cd frontend
+npm install
+npm run build
+cd ..
+
+# Build the binary
+cargo build --release
+```
+
+The release executable is at `.\target\release\filetree.exe`.
 
 ## Run
 
+Double-click the exe, or from a terminal:
+
 ```powershell
-cargo run -- desktop --path D:\FileTree
+.\target\release\filetree.exe
 ```
 
-Or run the built executable directly:
+Optional CLI modes:
 
 ```powershell
-.\target\release\filetree.exe desktop --path D:\Data
-```
+# Headless scan — write JSON or CSV report
+.\target\release\filetree.exe scan D:\Data --format json --out scan.json
+.\target\release\filetree.exe scan D:\Data --format csv --out scan.csv
 
-## CLI Reports
-
-```powershell
-.\target\debug\filetree.exe scan D:\Data --format json --out scan.json
-.\target\debug\filetree.exe scan D:\Data --format csv --out scan.csv
+# Serve the web UI only (no native window)
+.\target\release\filetree.exe serve --port 7878
 ```
 
 ## Development
@@ -29,25 +63,16 @@ Or run the built executable directly:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo build --release
 ```
 
-The release executable is written to `.\target\release\filetree.exe`. A convenience copy can be placed at `.\FileTree.exe` for local testing.
+Frontend hot-reload during development:
 
-## Current Features
+```powershell
+cd frontend && npm run dev
+```
 
-- Threaded recursive scans.
-- Native Win32 desktop window.
-- Explorer-style expandable tree table.
-- Size, allocated size, file count, folder count, percent-of-parent, and modified date columns.
-- Windows allocated-size support through `GetCompressedFileSizeW`.
-- Real-time scan progress: the table fills in while worker threads are still scanning.
-- Select Directory, Scan, Stop, Refresh, Expand, Collapse, and Path Column controls.
-- Dark mode by default, with a Dark toggle.
-- Native shell icons for folders and file types.
-- Hidden-file, file visibility, and symlink-follow toggles.
-- CSV and JSON CLI exports.
+Then open the URL printed by Vite (the Rust server must also be running on port 7878).
 
 ## Notes
 
-This project is not affiliated with JAM Software or TreeSize. It is an independent Rust implementation inspired by disk-usage explorer workflows.
+Not affiliated with JAM Software or TreeSize. Independent Rust implementation.
