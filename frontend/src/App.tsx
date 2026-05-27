@@ -10,7 +10,7 @@ import {
 } from "./api/client";
 import type { DriveEntry, SpecialFolder, SortKey } from "./api/types";
 import { DEFAULT_VISIBLE_COLUMNS } from "./components/TreeTable";
-import { RibbonBar } from "./components/RibbonBar";
+import { RibbonBar, pushRecent, loadRecentPaths, setRecentPaths } from "./components/RibbonBar";
 import { StatusBar } from "./components/StatusBar";
 import { TabBar } from "./components/TabBar";
 import type { WorkspaceTab as WorkspaceTabMeta } from "./components/TabBar";
@@ -86,6 +86,7 @@ export default function App() {
         metric: rs?.metric ?? "size",
         unit: rs?.unit ?? "auto",
         showFiles: rs?.showFiles ?? true,
+        recentPaths: loadRecentPaths(),
       }).catch(() => {});
     }, SETTINGS_DEBOUNCE_MS);
   }, [settingsLoaded, darkMode, threads, includeHidden, followLinks, exclude, getActiveRef]);
@@ -167,6 +168,8 @@ export default function App() {
       if (settings.includeHidden !== undefined) setIncludeHidden(settings.includeHidden);
       if (settings.followLinks !== undefined) setFollowLinks(settings.followLinks);
       if (settings.exclude !== undefined) setExclude(settings.exclude);
+      // Restore recent paths into localStorage so the dropdown shows them immediately
+      if (settings.recentPaths?.length) setRecentPaths(settings.recentPaths);
 
       setDrives(driveList.drives ?? []);
       setSpecialFolders(folderList.folders ?? []);
@@ -209,7 +212,11 @@ export default function App() {
 
   const handleScanPath = useCallback((path: string) => {
     getActiveRef()?.doScanPath(path);
-  }, [getActiveRef]);
+    if (path.trim()) {
+      pushRecent(path.trim());
+      scheduleSaveSettings();
+    }
+  }, [getActiveRef, scheduleSaveSettings]);
 
   const handleCloseTab = useCallback((id: string) => {
     setTabs((prev) => {
@@ -295,6 +302,8 @@ export default function App() {
         onExpand={(level) => activeRef?.doExpand(level)}
         onNewFolder={() => activeRef?.doNewFolder()}
         onOpenFilter={() => activeRef?.doOpenFilter()}
+        onExport={(format) => activeRef?.doExport(format)}
+        onOpenLocation={() => activeRef?.doReveal()}
         filterActive={ribbonFilterActive}
         bookmarks={bookmarkList}
         darkMode={darkMode}

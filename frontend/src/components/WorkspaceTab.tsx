@@ -41,6 +41,8 @@ export interface WorkspaceTabHandle {
   doExpand: (level: number) => void;
   doNewFolder: () => void;
   doOpenFilter: () => void;
+  doReveal: () => void;
+  doExport: (format: "csv" | "json") => void;
   // State readers for ribbon props
   getRibbonState: () => RibbonState;
   // State setters called from ribbon
@@ -397,6 +399,20 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     doExpand: handleExpand,
     doNewFolder: handleNewFolder,
     doOpenFilter: () => setFilterDialogOpen(true),
+    doReveal: () => { if (selectedNode) revealPath(selectedNode.path); },
+    doExport: (format) => {
+      if (!data) return;
+      const path = encodeURIComponent(data.rootPath);
+      const url = format === "csv"
+        ? `/api/export.csv?path=${path}`
+        : `/api/export.json?path=${path}`;
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    },
     getRibbonState: () => ({
       scanPath,
       scanning: status === "scanning",
@@ -422,7 +438,7 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     showDetailsPane: () => setActiveTab("details"),
     showTreemapPane: () => setActiveTab("chart"),
   }), [status, data, progress, errorMessage, scanPath, activeTab, tree, cancelScan,
-       doScan, handleNavigateParent, handleExpand, handleNewFolder]);
+       doScan, handleNavigateParent, handleExpand, handleNewFolder, selectedNode]);
 
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();

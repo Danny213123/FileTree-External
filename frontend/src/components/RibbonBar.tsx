@@ -33,6 +33,8 @@ export interface RibbonBarProps {
   onExpand: (level: number) => void;
   onNewFolder: () => void;
   onOpenFilter: () => void;
+  onExport: (format: "csv" | "json") => void;
+  onOpenLocation: () => void;
   bookmarks: string[];
   filterActive: boolean;
   darkMode: boolean;
@@ -307,9 +309,17 @@ function loadRecent(): string[] {
   }
 }
 
+export function loadRecentPaths(): string[] {
+  return loadRecent();
+}
+
 export function pushRecent(path: string) {
   const list = [path, ...loadRecent().filter((p) => p !== path)].slice(0, MAX_RECENT);
   try { localStorage.setItem(RECENT_KEY, JSON.stringify(list)); } catch { /* ignore */ }
+}
+
+export function setRecentPaths(paths: string[]) {
+  try { localStorage.setItem(RECENT_KEY, JSON.stringify(paths.slice(0, MAX_RECENT))); } catch { /* ignore */ }
 }
 
 // Inline SVG icons matching TreeSize's dropdown icon style
@@ -359,6 +369,14 @@ function IcoOneDriveSmall() {
   );
 }
 
+function IcoRecycleBinSmall() {
+  return (
+    <svg width="14" height="16" viewBox="0 0 14 16" fill="currentColor" style={{ display: "block" }}>
+      <path d="M1 3.5h12M4.5 1.5h5M2 3.5l1 10h6l1-10M5.5 6v5M8.5 6v5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" fill="none"/>
+    </svg>
+  );
+}
+
 function ScanDropdown({
   drives,
   specialFolders,
@@ -387,13 +405,14 @@ function ScanDropdown({
     close();
   };
 
-  // Separate OneDrive entries from regular special folders
+  // Separate OneDrive entries from regular special folders and Recycle Bin
   const cloudFolders = specialFolders.filter((f) =>
     f.label.toLowerCase().startsWith("onedrive")
   );
   const docFolders = specialFolders.filter((f) =>
-    !f.label.toLowerCase().startsWith("onedrive")
+    !f.label.toLowerCase().startsWith("onedrive") && f.label !== "Recycle Bin"
   );
+  const recycleBin = specialFolders.find((f) => f.label === "Recycle Bin");
   const hasCloud = cloudFolders.length > 0 || docFolders.length > 0;
 
   return (
@@ -456,6 +475,17 @@ function ScanDropdown({
                 <span className="rb-dd-text">{f.label}</span>
               </button>
             ))}
+          </>
+        )}
+
+        {recycleBin && (
+          <>
+            <div className="rb-dropdown-sep" />
+            <div className="rb-dd-section">System</div>
+            <button onClick={() => pick(recycleBin.path)} title={recycleBin.path}>
+              <IcoRecycleBinSmall />
+              <span className="rb-dd-text">Recycle Bin</span>
+            </button>
           </>
         )}
 
@@ -653,6 +683,27 @@ function HomeRibbon({
   );
 }
 
+function ExportDropdown({ onExport, disabled }: { onExport: (f: "csv" | "json") => void; disabled: boolean }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  return (
+    <div className="rb-dropdown-wrap" ref={ref}>
+      <RbBtn icon={<IcoFolder />} label="Export ▾" disabled={disabled} onClick={() => setOpen((o) => !o)} />
+      <FixedDropdown anchorRef={ref} open={open} onClose={() => setOpen(false)}>
+        <div className="rb-dd-section">Export scan as</div>
+        <button onClick={() => { onExport("csv"); setOpen(false); }}>
+          <IcoDocSmall />
+          <span className="rb-dd-text">CSV (.csv)</span>
+        </button>
+        <button onClick={() => { onExport("json"); setOpen(false); }}>
+          <IcoDocSmall />
+          <span className="rb-dd-text">JSON (.json)</span>
+        </button>
+      </FixedDropdown>
+    </div>
+  );
+}
+
 function ScanRibbon({
   drives,
   specialFolders,
@@ -675,12 +726,15 @@ function ScanRibbon({
   onNavigateParent,
   onExpand,
   onOpenFilter,
+  onExport,
+  onOpenLocation,
+  hasScan,
 }: Pick<RibbonBarProps,
-  | "drives" | "specialFolders" | "scanning" | "filter" | "exclude"
+  | "drives" | "specialFolders" | "scanning" | "hasScan" | "filter" | "exclude"
   | "includeHidden" | "followLinks" | "threads" | "bookmarks" | "filterActive"
   | "onScan" | "onCancel" | "onScanPath" | "onFilterChange" | "onExcludeChange"
   | "onHiddenChange" | "onFollowLinksChange" | "onThreadsChange" | "onNavigateParent"
-  | "onExpand" | "onOpenFilter"
+  | "onExpand" | "onOpenFilter" | "onExport" | "onOpenLocation"
 >) {
   return (
     <>
@@ -736,13 +790,13 @@ function ScanRibbon({
 
       <RbGroup label="Directory Tree">
         <ExpandDropdown onExpand={onExpand} />
-        <RbBtn icon={<IcoSearch />} label="Search Tree" disabled />
+        <RbBtn icon={<IcoSearch />} label="Search Tree" onClick={onOpenFilter} active={filterActive} />
       </RbGroup>
 
       <RbGroup label="Tools">
         <RbBtn icon={<IcoParent />} label="Parent Folder"  onClick={onNavigateParent} />
-        <RbBtn icon={<IcoFolder />} label="Export"         disabled />
-        <RbBtn icon={<IcoFolderOpen />} label="Open Location" disabled />
+        <ExportDropdown onExport={onExport} disabled={!hasScan} />
+        <RbBtn icon={<IcoFolderOpen />} label="Open Location" onClick={onOpenLocation} disabled={!hasScan} />
       </RbGroup>
 
       <RbGroup label="Threads">
@@ -1441,6 +1495,9 @@ export function RibbonBar(props: RibbonBarProps) {
             onThreadsChange={props.onThreadsChange}
             onNavigateParent={props.onNavigateParent}
             onOpenFilter={props.onOpenFilter}
+            onExport={props.onExport}
+            onOpenLocation={props.onOpenLocation}
+            hasScan={props.hasScan}
           />
         )}
         {ribbonTab === "view" && (
