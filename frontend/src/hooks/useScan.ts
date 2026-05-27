@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from "react";
 import { scanStreamUrl } from "../api/client";
-import type { ScanResult } from "../api/types";
+import type { NodeRecord, ScanResult } from "../api/types";
 import type { ScanOptions } from "../api/client";
 import { getCached, setCached } from "../lib/scanCache";
 
@@ -63,6 +63,77 @@ export interface UseScanReturn {
   cancelScan: () => void;
 }
 
+// ── NDJSON stream parser ──────────────────────────────────────────────────────
+// The server sends three line types:
+//   {"type":"scanning","nodeCount":N,"elapsedMs":E}   — progress ping
+//   {"type":"meta", "rootPath":"...", ...analytics...} — result header
+//   {"type":"node", "id":N, "parent":N|null, ...}      — one per node
+//   {"type":"done"}                                    — stream complete
+//   {"type":"error","error":"..."}                     — scan failed
+//
+// Each line is a small JSON object (< 2 KB), so JSON.parse never sees a
+// giant string and V8 never hits the string-length limit.
+
+interface MetaLine extends Omit<ScanResult, "nodes"> {
+  type: "meta";
+}
+interface NodeLine extends NodeRecord {
+  type: "node";
+}
+interface DoneLine { type: "done"; }
+interface ScanningLine { type: "scanning"; nodeCount: number; elapsedMs: number; }
+interface ErrorLine { type: "error"; error: string; }
+
+type StreamLine = MetaLine | NodeLine | DoneLine | ScanningLine | ErrorLine;
+
+async function readNdjsonStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  onProgress: (nodeCount: number, elapsed: number) => void,
+): Promise<ScanResult> {
+  const decoder = new TextDecoder();
+  let buf = "";
+  let meta: MetaLine | null = null;
+  const nodes: NodeRecord[] = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const raw = JSON.parse(trimmed) as StreamLine;
+
+      if (raw.type === "error") throw new Error(raw.error);
+      if (raw.type === "scanning") {
+        onProgress(raw.nodeCount, raw.elapsedMs);
+        continue;
+      }
+      if (raw.type === "meta") {
+        meta = raw;
+        continue;
+      }
+      if (raw.type === "node") {
+        const { type: _t, ...node } = raw;
+        nodes.push(node as NodeRecord);
+        continue;
+      }
+      if (raw.type === "done") break;
+    }
+  }
+
+  if (!meta) throw new Error("Stream ended without meta line");
+
+  const { type: _t, ...metaFields } = meta;
+  const result: ScanResult = { ...metaFields, nodes };
+  return reconstructChildren(result);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 export function useScan(): UseScanReturn {
   const [data, setData] = useState<ScanResult | null>(null);
   const [status, setStatus] = useState<ScanStatus>("idle");
@@ -99,38 +170,16 @@ export function useScan(): UseScanReturn {
     setData(null);
 
     const url = scanStreamUrl(opts);
-    let lastResult: ScanResult | null = null;
 
     fetch(url, { signal: controller.signal })
       .then(async (res) => {
         if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
         const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          const lines = buf.split("\n");
-          buf = lines.pop() ?? "";
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            const raw = JSON.parse(trimmed) as ScanResult & { error?: string; scanning?: boolean };
-            if (raw.error) throw new Error(raw.error);
-            if (raw.scanning) {
-              // Lightweight progress ping — no nodes array, just update counter.
-              setProgress({ nodes: raw.nodeCount ?? 0, elapsed: raw.elapsedMs ?? 0 });
-              continue;
-            }
-            const parsed = reconstructChildren(raw);
-            setData(parsed);
-            setProgress({ nodes: parsed.nodeCount, elapsed: parsed.elapsedMs });
-            lastResult = parsed;
-          }
-        }
-        if (lastResult) setCached(opts.path, lastResult);
+        const result = await readNdjsonStream(reader, (nodeCount, elapsed) => {
+          setProgress({ nodes: nodeCount, elapsed });
+        });
+        setCached(opts.path, result);
+        setData(result);
         setStatus("done");
         setProgress(null);
       })
@@ -165,38 +214,16 @@ export function useScan(): UseScanReturn {
       .then(async (res) => {
         if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
         const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = "";
-        let lastResult: ScanResult | null = null;
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          const lines = buf.split("\n");
-          buf = lines.pop() ?? "";
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            const raw = JSON.parse(trimmed) as ScanResult & { error?: string; scanning?: boolean };
-            if (raw.error) throw new Error(raw.error);
-            if (raw.scanning) {
-              setProgress({ nodes: raw.nodeCount ?? 0, elapsed: raw.elapsedMs ?? 0 });
-              continue;
-            }
-            const parsed = reconstructChildren(raw);
-            // Update progress counter but don't update the tree yet
-            setProgress({ nodes: parsed.nodeCount, elapsed: parsed.elapsedMs });
-            lastResult = parsed;
-          }
-        }
+        const result = await readNdjsonStream(reader, (nodeCount, elapsed) => {
+          setProgress({ nodes: nodeCount, elapsed });
+        });
         // Publish the final result so useEffect([data]) in WorkspaceTab can
         // drive the tree update through the same code path as startScan.
         // We do NOT clear data first (no setData(null)), so the tree never blanks.
-        if (lastResult) setData(lastResult);
+        setData(result);
         setStatus("done");
         setProgress(null);
-        return lastResult;
+        return result;
       })
       .catch((err: unknown) => {
         if (err instanceof Error && err.name === "AbortError") return null;
