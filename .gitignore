@@ -7,12 +7,11 @@
 /.claude/
 /.planning/
 
-# Frontend build artifacts (embedded in binary at compile time)
+# Frontend build artifacts
 /frontend/node_modules/
-/frontend/dist/
 
 # Local dev helper
 run.bat
 
-# Large media files
-/images/*.mp4
+# Local media / screenshots
+/images/
