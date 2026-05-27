@@ -1311,7 +1311,26 @@ fn serve_thumbnail(stream: &mut TcpStream, path: &str) -> sio::Result<()> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let is_video = matches!(ext.as_str(), "mp4"|"mkv"|"mov"|"avi"|"wmv"|"webm"|"m4v");
+    let is_video = matches!(ext.as_str(), "mp4"|"mkv"|"mov"|"avi"|"wmv"|"webm"|"m4v"|"flv");
+    let is_image = matches!(ext.as_str(), "jpg"|"jpeg"|"png"|"gif"|"webp"|"bmp"|"svg"|"tif"|"tiff"|"avif"|"heic");
+
+    if !is_video && !is_image {
+        return respond_text(stream, 404, "Not Found", "Unsupported type");
+    }
+
+    if is_video {
+        // Use the Windows Shell thumbnail cache to render a frame server-side.
+        // This works for all codecs the OS has installed (HEVC, AV1, etc.) and
+        // avoids streaming raw video bytes to Chromium, which can't decode HEVC.
+        #[cfg(windows)]
+        if let Some(jpeg) = shell_thumbnail_jpeg(path, 480) {
+            return respond_bytes(stream, 200, "OK", "image/jpeg", &jpeg,
+                &[("Cache-Control", "private, max-age=300")]);
+        }
+        return respond_text(stream, 404, "Not Found", "Thumbnail unavailable");
+    }
+
+    // Images: serve the raw file directly.
     let content_type = match ext.as_str() {
         "jpg" | "jpeg" => "image/jpeg",
         "png"          => "image/png",
@@ -1319,46 +1338,196 @@ fn serve_thumbnail(stream: &mut TcpStream, path: &str) -> sio::Result<()> {
         "webp"         => "image/webp",
         "bmp"          => "image/bmp",
         "svg"          => "image/svg+xml",
-        "mp4" | "m4v"  => "video/mp4",
-        "mkv"          => "video/x-matroska",
-        "mov"          => "video/quicktime",
-        "avi"          => "video/x-msvideo",
-        "wmv"          => "video/x-ms-wmv",
-        "webm"         => "video/webm",
-        _ => return respond_text(stream, 404, "Not Found", "Unsupported type"),
+        "tif" | "tiff" => "image/tiff",
+        "avif"         => "image/avif",
+        "heic"         => "image/heic",
+        _              => "application/octet-stream",
     };
-
-    if is_video {
-        // Stream video with chunked encoding so the browser can seek without
-        // loading the entire file into the server's memory.
-        let file_size = match fs::metadata(p) {
-            Ok(m) => m.len(),
-            Err(_) => return respond_text(stream, 404, "Not Found", "File not readable"),
-        };
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {file_size}\r\n\
-             Accept-Ranges: bytes\r\nCache-Control: private, max-age=60\r\nConnection: close\r\n\r\n"
-        )?;
-        let mut f = match fs::File::open(p) {
-            Ok(f) => f,
-            Err(_) => return Ok(()),
-        };
-        let mut buf = [0u8; 65536];
-        loop {
-            use std::io::Read;
-            let n = f.read(&mut buf)?;
-            if n == 0 { break; }
-            stream.write_all(&buf[..n])?;
-        }
-        return stream.flush();
-    }
-
     let data = match fs::read(p) {
         Ok(d) => d,
         Err(_) => return respond_text(stream, 404, "Not Found", "File not readable"),
     };
     respond_bytes(stream, 200, "OK", content_type, &data, &[("Cache-Control", "private, max-age=60")])
+}
+
+/// Extract a thumbnail for any file using the Windows Shell thumbnail cache.
+/// Returns JPEG bytes, or None if the OS cannot produce a thumbnail.
+/// Works for HEVC, AV1, and any codec installed on the system.
+#[cfg(windows)]
+#[allow(non_snake_case, non_camel_case_types)]
+fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
+    use std::ffi::c_void;
+
+    // GUIDs
+    const CLSID_LocalThumbnailCache: [u8; 16] = [
+        0x50, 0xef, 0x4b, 0x9c, 0x4c, 0xf6, 0xd4, 0x11,
+        0x87, 0x33, 0x00, 0x00, 0xf8, 0x1f, 0xec, 0xef,
+    ];
+    const IID_IShellItem: [u8; 16] = [
+        0x43, 0x82, 0x6D, 0x7F, 0x8E, 0x1A, 0xD2, 0x11,
+        0x87, 0x96, 0x00, 0x00, 0xF8, 0x75, 0x7A, 0x2D,
+    ];
+    const IID_IShellItemImageFactory: [u8; 16] = [
+        0x79, 0x8B, 0xC1, 0xBC, 0x16, 0xBA, 0x42, 0x44,
+        0x80, 0xC4, 0x8A, 0x59, 0xC3, 0x0C, 0x46, 0x3B,
+    ];
+
+    #[repr(C)]
+    struct SIZE { cx: i32, cy: i32 }
+
+    #[repr(C)]
+    struct BitmapInfoHeader {
+        biSize: u32, biWidth: i32, biHeight: i32, biPlanes: u16,
+        biBitCount: u16, biCompression: u32, biSizeImage: u32,
+        biXPelsPerMeter: i32, biYPelsPerMeter: i32, biClrUsed: u32, biClrImportant: u32,
+    }
+    #[repr(C)]
+    struct BitmapInfo { bmiHeader: BitmapInfoHeader, bmiColors: [u32; 1] }
+
+    #[link(name = "Shell32")] unsafe extern "system" {
+        fn SHCreateItemFromParsingName(
+            pszPath: *const u16,
+            pbc: *mut c_void,
+            riid: *const [u8; 16],
+            ppv: *mut *mut c_void,
+        ) -> i32;
+    }
+    #[link(name = "Gdi32")] unsafe extern "system" {
+        fn CreateCompatibleDC(hdc: isize) -> isize;
+        fn CreateDIBSection(hdc: isize, bmi: *const BitmapInfo, usage: u32,
+                            bits: *mut *mut c_void, section: *mut c_void, offset: u32) -> isize;
+        fn SelectObject(hdc: isize, obj: isize) -> isize;
+        fn GetDIBits(hdc: isize, hbm: isize, start: u32, lines: u32,
+                     bits: *mut c_void, bmi: *mut BitmapInfo, usage: u32) -> i32;
+        fn DeleteDC(hdc: isize) -> i32;
+        fn DeleteObject(h: isize) -> i32;
+    }
+    #[link(name = "Ole32")] unsafe extern "system" {
+        fn CoInitializeEx(pvReserved: *mut c_void, dwCoInit: u32) -> i32;
+        fn CoUninitialize();
+    }
+
+    // IShellItem vtable (we only need QueryInterface + Release + BindToHandler)
+    #[repr(C)]
+    struct IShellItemVtbl {
+        QueryInterface:  unsafe extern "system" fn(*mut c_void, *const [u8;16], *mut *mut c_void) -> i32,
+        AddRef:          unsafe extern "system" fn(*mut c_void) -> u32,
+        Release:         unsafe extern "system" fn(*mut c_void) -> u32,
+        BindToHandler:   unsafe extern "system" fn(*mut c_void, *mut c_void, *const [u8;16], *const [u8;16], *mut *mut c_void) -> i32,
+        GetParent:       unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
+        GetDisplayName:  unsafe extern "system" fn(*mut c_void, u32, *mut *mut u16) -> i32,
+        GetAttributes:   unsafe extern "system" fn(*mut c_void, u32, *mut u32) -> i32,
+        Compare:         unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut i32) -> i32,
+    }
+
+    // IShellItemImageFactory vtable (GetImage is slot 3)
+    #[repr(C)]
+    struct IShellItemImageFactoryVtbl {
+        QueryInterface: unsafe extern "system" fn(*mut c_void, *const [u8;16], *mut *mut c_void) -> i32,
+        AddRef:         unsafe extern "system" fn(*mut c_void) -> u32,
+        Release:        unsafe extern "system" fn(*mut c_void) -> u32,
+        GetImage:       unsafe extern "system" fn(*mut c_void, SIZE, u32, *mut isize) -> i32,
+    }
+
+    // BHID_ThumbnailHandler: {7B2E6F5A-9E35-4B57-9B91-A6E7F1B6C8BD}  <-- wrong
+    // Use BindToHandler with IID_IShellItemImageFactory directly via QueryInterface
+    const SIIGBF_RESIZETOFIT: u32 = 0x00000000;
+    const DIB_RGB_COLORS: u32 = 0;
+
+    let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+
+    unsafe {
+        // Initialize COM on this thread (may already be initialized — that's fine)
+        CoInitializeEx(std::ptr::null_mut(), 0 /* COINIT_APARTMENTTHREADED */);
+
+        // Create IShellItem for the path
+        let mut item_ptr: *mut c_void = std::ptr::null_mut();
+        let hr = SHCreateItemFromParsingName(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            &IID_IShellItem,
+            &mut item_ptr,
+        );
+        if hr < 0 || item_ptr.is_null() {
+            CoUninitialize();
+            return None;
+        }
+        let item_vtbl = *(item_ptr as *mut *mut IShellItemVtbl);
+
+        // QueryInterface for IShellItemImageFactory
+        let mut factory_ptr: *mut c_void = std::ptr::null_mut();
+        let hr2 = ((*item_vtbl).QueryInterface)(item_ptr, &IID_IShellItemImageFactory, &mut factory_ptr);
+        if hr2 < 0 || factory_ptr.is_null() {
+            ((*item_vtbl).Release)(item_ptr);
+            CoUninitialize();
+            return None;
+        }
+        let factory_vtbl = *(factory_ptr as *mut *mut IShellItemImageFactoryVtbl);
+
+        // Get the thumbnail bitmap
+        let mut hbm: isize = 0;
+        let thumb_size = SIZE { cx: size, cy: size };
+        let hr3 = ((*factory_vtbl).GetImage)(factory_ptr, thumb_size, SIIGBF_RESIZETOFIT, &mut hbm);
+        ((*factory_vtbl).Release)(factory_ptr);
+        ((*item_vtbl).Release)(item_ptr);
+
+        if hr3 < 0 || hbm == 0 {
+            CoUninitialize();
+            return None;
+        }
+
+        // Read the bitmap dimensions
+        let hdc = CreateCompatibleDC(0);
+        if hdc == 0 {
+            DeleteObject(hbm);
+            CoUninitialize();
+            return None;
+        }
+
+        // First call GetDIBits with null bits to query width/height
+        let mut bmi = BitmapInfo {
+            bmiHeader: BitmapInfoHeader {
+                biSize: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                biWidth: 0, biHeight: 0, biPlanes: 1, biBitCount: 32,
+                biCompression: 0, biSizeImage: 0,
+                biXPelsPerMeter: 0, biYPelsPerMeter: 0, biClrUsed: 0, biClrImportant: 0,
+            },
+            bmiColors: [0],
+        };
+        GetDIBits(hdc, hbm, 0, 0, std::ptr::null_mut(), &mut bmi, DIB_RGB_COLORS);
+        let w = bmi.bmiHeader.biWidth.abs();
+        let h = bmi.bmiHeader.biHeight.abs();
+        if w == 0 || h == 0 {
+            DeleteDC(hdc);
+            DeleteObject(hbm);
+            CoUninitialize();
+            return None;
+        }
+
+        // Read pixels top-down (negative biHeight)
+        bmi.bmiHeader.biHeight = -h;
+        let n = (w * h) as usize;
+        let mut bgra = vec![0u8; n * 4];
+        let rows = GetDIBits(hdc, hbm, 0, h as u32,
+                             bgra.as_mut_ptr() as *mut c_void, &mut bmi, DIB_RGB_COLORS);
+        DeleteDC(hdc);
+        DeleteObject(hbm);
+        CoUninitialize();
+
+        if rows == 0 { return None; }
+
+        // Convert BGRA → RGBA (swap B and R channels)
+        let mut rgba = vec![0u8; n * 4];
+        for (i, chunk) in bgra.chunks_exact(4).enumerate() {
+            let base = i * 4;
+            rgba[base]     = chunk[2]; // R
+            rgba[base + 1] = chunk[1]; // G
+            rgba[base + 2] = chunk[0]; // B
+            rgba[base + 3] = 255;      // A (always opaque)
+        }
+
+        Some(encode_rgba_png(w as u32, h as u32, &rgba))
+    }
 }
 
 fn split_target(target: &str) -> (String, HashMap<String, String>) {

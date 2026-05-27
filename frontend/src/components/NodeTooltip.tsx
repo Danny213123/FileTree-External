@@ -16,69 +16,12 @@ interface Props {
   anchorY: number;
 }
 
-// VideoThumb: captures a frame from a video at 2s using canvas
-function VideoThumb({ path }: { path: string }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [dataUrl, setDataUrl] = useState<string | null>(null);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    const onLoaded = () => {
-      // Seek to 2s or 10% into the video, whichever is smaller
-      video.currentTime = Math.min(2, video.duration * 0.1);
-    };
-    const onSeeked = () => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      canvas.width = video.videoWidth || 240;
-      canvas.height = video.videoHeight || 135;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      setDataUrl(canvas.toDataURL("image/jpeg", 0.8));
-    };
-
-    video.addEventListener("loadedmetadata", onLoaded);
-    video.addEventListener("seeked", onSeeked);
-    video.addEventListener("error", () => setFailed(true));
-
-    return () => {
-      video.removeEventListener("loadedmetadata", onLoaded);
-      video.removeEventListener("seeked", onSeeked);
-    };
-  }, [path]);
-
-  if (failed) return null;
-
-  return (
-    <>
-      {/* Hidden video element for frame extraction */}
-      <video
-        ref={videoRef}
-        src={`/api/thumbnail?path=${encodeURIComponent(path)}`}
-        preload="metadata"
-        muted
-        crossOrigin="anonymous"
-        style={{ display: "none" }}
-      />
-      <canvas ref={canvasRef} style={{ display: "none" }} />
-      {dataUrl && (
-        <img src={dataUrl} alt="" style={{ maxWidth: "100%", maxHeight: 320, display: "block" }} />
-      )}
-    </>
-  );
-}
-
 export function NodeTooltip({ node, unit, anchorX, anchorY }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ left: anchorX + 16, top: anchorY + 8 });
   const ext = (node.extension ?? "").toLowerCase();
-  const showImage = !node.dir && isImage(ext) && !!node.path;
-  const showVideo = !node.dir && isVideo(ext) && !!node.path;
+  // Both images and videos are served as image/png from the server-side thumbnail route.
+  const showThumb = !node.dir && (isImage(ext) || isVideo(ext)) && !!node.path;
   const [thumbLoaded, setThumbLoaded] = useState(false);
   const [thumbError, setThumbError] = useState(false);
 
@@ -103,20 +46,15 @@ export function NodeTooltip({ node, unit, anchorX, anchorY }: Props) {
     >
       <div className="node-tooltip-name">{node.name}</div>
 
-      {showImage && !thumbError && (
+      {showThumb && !thumbError && (
         <div className="node-tooltip-thumb">
           <img
             src={`/api/thumbnail?path=${encodeURIComponent(node.path)}`}
             alt=""
             onLoad={() => setThumbLoaded(true)}
             onError={() => setThumbError(true)}
+            style={{ maxWidth: "100%", maxHeight: 320, display: "block" }}
           />
-        </div>
-      )}
-
-      {showVideo && (
-        <div className="node-tooltip-thumb">
-          <VideoThumb path={node.path} />
         </div>
       )}
 

@@ -243,13 +243,14 @@ interface TreemapProps {
   dragDrop: boolean;
   onSelect: (id: number) => void;
   onNavigate: (id: number) => void;
+  onOpen?: (id: number) => void;
   onClose3D?: () => void;
 }
 
 export const Treemap = memo(function Treemap({
   nodeById, selectedId, metric, unit, detail,
   show3D, showHierarchy, showLegend, showLabels, dragDrop,
-  onSelect, onNavigate, onClose3D,
+  onSelect, onNavigate, onOpen, onClose3D,
 }: TreemapProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -414,8 +415,11 @@ export const Treemap = memo(function Treemap({
 
   const handleDoubleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const hit = getHit(e);
-    if (hit && nodeById.get(hit.nodeId)?.dir) onNavigate(hit.nodeId);
-  }, [getHit, onNavigate, nodeById]);
+    if (!hit) return;
+    const node = nodeById.get(hit.nodeId);
+    if (node?.dir) onNavigate(hit.nodeId);
+    else if (node && onOpen) onOpen(hit.nodeId);
+  }, [getHit, onNavigate, onOpen, nodeById]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!dragDrop) return;

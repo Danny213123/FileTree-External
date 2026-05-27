@@ -31,7 +31,25 @@ pub(crate) fn reveal_path(path: &str) -> io::Result<()> {
 pub(crate) fn open_path(path: &str) -> io::Result<()> {
     #[cfg(windows)]
     {
-        Command::new("explorer.exe").arg(path).spawn()?;
+        // ShellExecuteW with "open" verb launches the registered default handler
+        // for any file type or folder. explorer.exe alone opens Explorer for
+        // files instead of their associated app.
+        let path_w: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let verb_w: Vec<u16> = "open\0".encode_utf16().collect();
+        #[link(name = "Shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(
+                hwnd: isize, op: *const u16, file: *const u16,
+                params: *const u16, dir: *const u16, show: i32,
+            ) -> isize;
+        }
+        unsafe {
+            ShellExecuteW(
+                0, verb_w.as_ptr(), path_w.as_ptr(),
+                std::ptr::null(), std::ptr::null(),
+                1, // SW_SHOWNORMAL
+            );
+        }
     }
     #[cfg(target_os = "macos")]
     {

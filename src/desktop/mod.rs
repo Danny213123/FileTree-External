@@ -347,10 +347,17 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-/// Shows the Windows shell context menu for `path` at screen coordinates.
+/// Shows the Windows shell context menu for `path`.
+/// x/y are WebView2 viewport-relative (client) coordinates; we convert to screen.
 /// Must be called on the UI thread (from the message loop).
 unsafe fn show_shell_context_menu(hwnd: Hwnd, path: &str, x: i32, y: i32) {
     use std::ffi::c_void;
+
+    // The coordinates arrive as WebView2 client-area pixels.
+    // TrackPopupMenu needs screen coordinates, so convert via ClientToScreen.
+    let mut pt = ffi::Point { x, y };
+    ClientToScreen(hwnd, &mut pt);
+    let (sx, sy) = (pt.x, pt.y);
 
     // Convert path to wide string.
     let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
@@ -408,8 +415,8 @@ unsafe fn show_shell_context_menu(hwnd: Hwnd, path: &str, x: i32, y: i32) {
         let cmd = TrackPopupMenu(
             hmenu,
             TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
-            x,
-            y,
+            sx,
+            sy,
             0,
             hwnd,
             std::ptr::null(),
