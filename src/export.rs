@@ -1,5 +1,5 @@
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::analytics::{
     age_stats, duplicate_candidates, extension_stats, largest_dir_ids, top_file_ids,
@@ -15,7 +15,7 @@ pub(crate) fn scan_result_to_json(result: &ScanResult) -> String {
     let age_stats = age_stats(&result.nodes, result.scanned_at_ms);
     let duplicate_candidates = duplicate_candidates(&result.nodes, 100);
 
-    let mut output = String::with_capacity(result.nodes.len().saturating_mul(260));
+    let mut output = String::with_capacity(result.nodes.len().saturating_mul(380));
     output.push('{');
     output.push_str("\"app\":");
     push_json_string(&mut output, APP_NAME);
@@ -49,8 +49,6 @@ pub(crate) fn scan_result_to_json(result: &ScanResult) -> String {
         }
         output.push_str(",\"name\":");
         push_json_string(&mut output, &node.name);
-        output.push_str(",\"path\":");
-        push_json_string(&mut output, &node.path);
         output.push_str(",\"dir\":");
         output.push_str(if node.is_dir { "true" } else { "false" });
         output.push_str(",\"link\":");
@@ -69,20 +67,17 @@ pub(crate) fn scan_result_to_json(result: &ScanResult) -> String {
         output.push_str(&node.folders.to_string());
         output.push_str(",\"modified\":");
         output.push_str(&node.modified_ms.to_string());
+        output.push_str(",\"created\":");
+        output.push_str(&node.created_ms.to_string());
+        output.push_str(",\"accessed\":");
+        output.push_str(&node.accessed_ms.to_string());
         output.push_str(",\"depth\":");
         output.push_str(&node.depth.to_string());
         output.push_str(",\"errors\":");
         output.push_str(&node.errors.to_string());
         output.push_str(",\"extension\":");
         push_json_string(&mut output, &node.extension);
-        output.push_str(",\"children\":[");
-        for (child_index, child) in node.children.iter().enumerate() {
-            if child_index > 0 {
-                output.push(',');
-            }
-            output.push_str(&child.to_string());
-        }
-        output.push_str("]}");
+        output.push('}');
     }
     output.push(']');
 
@@ -216,42 +211,169 @@ pub(crate) fn app_config_json(state: &AppState) -> String {
 }
 
 pub(crate) fn drives_json() -> String {
-    let mut roots = Vec::new();
+    // Build list of {root, label} objects.
+    let drives = enumerate_drives();
+    let mut output = String::from("{\"drives\":[");
+    for (index, (root, label)) in drives.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str("{\"root\":");
+        push_json_string(&mut output, root);
+        output.push_str(",\"label\":");
+        push_json_string(&mut output, label);
+        output.push('}');
+    }
+    output.push_str("]}");
+    output
+}
+
+pub(crate) fn special_folders_json() -> String {
+    let mut folders: Vec<(String, String)> = Vec::new(); // (label, path)
+
+    let add = |folders: &mut Vec<(String, String)>, var: &str, label: &str| {
+        if let Some(val) = env::var_os(var) {
+            let path = PathBuf::from(val);
+            if path.is_dir() {
+                folders.push((label.to_string(), path.display().to_string()));
+            }
+        }
+    };
+
+    // OneDrive
+    if let Some(od) = env::var_os("OneDrive").or_else(|| env::var_os("OneDriveConsumer")) {
+        let path = PathBuf::from(od);
+        if path.is_dir() {
+            // Use the folder name as label (e.g. "OneDrive - Contoso")
+            let label = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("OneDrive")
+                .to_string();
+            folders.push((label, path.display().to_string()));
+        }
+    }
+
+    // User profile sub-folders
+    if let Some(profile) = env::var_os("USERPROFILE") {
+        let base = PathBuf::from(profile);
+        for (name, label) in &[
+            ("Documents", "Documents"),
+            ("Desktop", "Desktop"),
+            ("Downloads", "Downloads"),
+        ] {
+            let path = base.join(name);
+            if path.is_dir() {
+                folders.push((label.to_string(), path.display().to_string()));
+            }
+        }
+    }
+
+    // Fallback for HOME on non-Windows
+    add(&mut folders, "HOME", "Home");
+
+    let mut output = String::from("{\"folders\":[");
+    for (index, (label, path)) in folders.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str("{\"label\":");
+        push_json_string(&mut output, label);
+        output.push_str(",\"path\":");
+        push_json_string(&mut output, path);
+        output.push('}');
+    }
+    output.push_str("]}");
+    output
+}
+
+/// Returns (root_path, volume_label) for each available drive.
+fn enumerate_drives() -> Vec<(String, String)> {
+    let mut result = Vec::new();
 
     #[cfg(windows)]
-    {
-        for letter in b'A'..=b'Z' {
-            let root = format!("{}:\\", letter as char);
-            if Path::new(&root).exists() {
-                roots.push(root);
+    unsafe {
+        // Load Kernel32 functions at runtime to keep this cross-compilable.
+        unsafe extern "system" {
+            fn GetLogicalDrives() -> u32;
+            fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
+            fn GetVolumeInformationW(
+                lpRootPathName: *const u16,
+                lpVolumeNameBuffer: *mut u16,
+                nVolumeNameSize: u32,
+                lpVolumeSerialNumber: *mut u32,
+                lpMaximumComponentLength: *mut u32,
+                lpFileSystemFlags: *mut u32,
+                lpFileSystemNameBuffer: *mut u16,
+                nFileSystemNameSize: u32,
+            ) -> i32;
+        }
+
+        const DRIVE_REMOVABLE: u32 = 2;
+        const DRIVE_CDROM: u32 = 5;
+
+        let mask = GetLogicalDrives();
+        for bit in 0u32..26 {
+            if mask & (1 << bit) == 0 {
+                continue;
             }
+            let letter = (b'A' + bit as u8) as char;
+            let root = format!("{letter}:\\");
+            let wide_root: Vec<u16> = root.encode_utf16().chain(Some(0)).collect();
+
+            let dtype = GetDriveTypeW(wide_root.as_ptr());
+            if !(DRIVE_REMOVABLE..=DRIVE_CDROM).contains(&dtype) {
+                continue; // skip DRIVE_UNKNOWN / DRIVE_NO_ROOT_DIR
+            }
+
+            // Get volume label.
+            let mut vol_buf = vec![0u16; 256];
+            let ok = GetVolumeInformationW(
+                wide_root.as_ptr(),
+                vol_buf.as_mut_ptr(),
+                vol_buf.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            );
+
+            let label = if ok != 0 {
+                let end = vol_buf
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(vol_buf.len());
+                String::from_utf16_lossy(&vol_buf[..end])
+            } else {
+                match dtype {
+                    DRIVE_REMOVABLE => "Removable Disk".to_string(),
+                    4 => "Network Drive".to_string(),
+                    DRIVE_CDROM => "CD Drive".to_string(),
+                    _ => "Local Disk".to_string(),
+                }
+            };
+
+            // Format: "Windows (C:)" or "Local Disk (C:)"
+            let display = if label.is_empty() {
+                "Local Disk".to_string()
+            } else {
+                label
+            };
+            result.push((root, format!("{display} ({letter}:)")));
         }
     }
 
     #[cfg(not(windows))]
     {
-        roots.push("/".to_string());
+        result.push(("/".to_string(), "Root (/)".to_string()));
         if let Some(home) = env::var_os("HOME") {
-            roots.push(PathBuf::from(home).display().to_string());
+            let path = PathBuf::from(home).display().to_string();
+            result.push((path.clone(), format!("Home ({})", path)));
         }
     }
 
-    if let Some(profile) = env::var_os("USERPROFILE") {
-        let profile = PathBuf::from(profile).display().to_string();
-        if !roots.iter().any(|root| root == &profile) {
-            roots.push(profile);
-        }
-    }
-
-    let mut output = String::from("{\"roots\":[");
-    for (index, root) in roots.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
-        }
-        push_json_string(&mut output, root);
-    }
-    output.push_str("]}");
-    output
+    result
 }
 
 pub(crate) fn push_id_array(output: &mut String, ids: &[usize]) {

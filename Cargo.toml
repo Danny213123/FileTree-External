@@ -1,6 +1,6 @@
 [package]
 name = "filetree"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A standalone Windows disk-usage explorer with real-time threaded scans."
 repository = "https://github.com/Danny213123/FileTree"
@@ -8,3 +8,5 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

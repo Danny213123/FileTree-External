@@ -8,6 +8,146 @@ use crate::model::{
     AgeBucket, DuplicateCandidate, ExtensionStat, NodeRecord, ScanError, ScanResult,
 };
 
+/// Filter parameters for duplicate search.
+pub(crate) struct DupeFilter {
+    pub(crate) min_size: u64,
+    pub(crate) max_size: Option<u64>,
+    /// Comma-separated lowercase extensions (no dot), empty = all
+    pub(crate) extensions: Vec<String>,
+    /// Substring to match in filename (lowercase), empty = all
+    pub(crate) name_pattern: String,
+    /// When true, name_pattern must match the whole filename (case-insensitive), not just a substring
+    pub(crate) name_exact: bool,
+    /// Modified-after threshold in ms since Unix epoch, 0 = no filter
+    pub(crate) date_from: u128,
+    /// Modified-before threshold in ms since Unix epoch, 0 = no filter
+    pub(crate) date_to: u128,
+    /// Path prefix for "original" files (keep side). Empty = no directional filter.
+    pub(crate) keep_prefix: String,
+    /// Path prefix for "duplicate" files (search side). Empty = no directional filter.
+    pub(crate) search_prefix: String,
+}
+
+/// Full-detail duplicate scan. Returns JSON with file paths, names, sizes, dates.
+pub(crate) fn duplicates_full_json(result: &ScanResult, filter: DupeFilter, limit: usize) -> String {
+    let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
+    for node in &result.nodes {
+        if node.is_dir || node.size == 0 || node.size < filter.min_size {
+            continue;
+        }
+        if let Some(max) = filter.max_size {
+            if node.size > max {
+                continue;
+            }
+        }
+        if !filter.extensions.is_empty() {
+            let ext = node.extension.to_lowercase();
+            if !filter.extensions.contains(&ext) {
+                continue;
+            }
+        }
+        if !filter.name_pattern.is_empty() {
+            let lower = node.name.to_lowercase();
+            let matches = if filter.name_exact {
+                lower == filter.name_pattern
+            } else {
+                lower.contains(&filter.name_pattern)
+            };
+            if !matches { continue; }
+        }
+        if filter.date_from > 0 && node.modified_ms < filter.date_from {
+            continue;
+        }
+        if filter.date_to > 0 && node.modified_ms > filter.date_to {
+            continue;
+        }
+        by_size.entry(node.size).or_default().push(node.id);
+    }
+
+    let directional = !filter.keep_prefix.is_empty() || !filter.search_prefix.is_empty();
+
+    let mut groups = Vec::<(u64, u64, Vec<usize>)>::new();
+    let mut hash_errors = Vec::<String>::new();
+    for (size, ids) in by_size.into_iter().filter(|(_, ids)| ids.len() > 1) {
+        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+        for id in ids {
+            match fnv1a_file(Path::new(&result.nodes[id].path)) {
+                Ok(hash) => by_hash.entry(hash).or_default().push(id),
+                Err(error) => hash_errors.push(format!("{}: {}", result.nodes[id].path, error)),
+            }
+        }
+        for (hash, ids) in by_hash.into_iter().filter(|(_, ids)| ids.len() > 1) {
+            if directional {
+                // Require ≥1 file in keep_prefix AND ≥1 file in search_prefix.
+                let has_keep = filter.keep_prefix.is_empty()
+                    || ids.iter().any(|&id| result.nodes[id].path.starts_with(&filter.keep_prefix));
+                let has_search = filter.search_prefix.is_empty()
+                    || ids.iter().any(|&id| result.nodes[id].path.starts_with(&filter.search_prefix));
+                if !has_keep || !has_search { continue; }
+            }
+            groups.push((size, hash, ids));
+        }
+    }
+
+    groups.sort_by(|left, right| {
+        let lw = left.0.saturating_mul(left.2.len().saturating_sub(1) as u64);
+        let rw = right.0.saturating_mul(right.2.len().saturating_sub(1) as u64);
+        rw.cmp(&lw)
+    });
+    groups.truncate(limit);
+
+    let mut output = String::from("{\"groups\":[");
+    for (index, (size, hash, ids)) in groups.iter().enumerate() {
+        if index > 0 { output.push(','); }
+        // For directional mode, count only the search-side files as duplicates.
+        let dupe_count = if directional && !filter.search_prefix.is_empty() {
+            ids.iter().filter(|&&id| result.nodes[id].path.starts_with(&filter.search_prefix)).count()
+        } else {
+            ids.len().saturating_sub(1)
+        };
+        let waste = size.saturating_mul(dupe_count as u64);
+        output.push('{');
+        output.push_str("\"size\":"); output.push_str(&size.to_string());
+        output.push_str(",\"hash\":"); push_json_string(&mut output, &format!("{hash:016x}"));
+        output.push_str(",\"waste\":"); output.push_str(&waste.to_string());
+        output.push_str(",\"count\":"); output.push_str(&ids.len().to_string());
+        output.push_str(",\"directional\":"); output.push_str(if directional { "true" } else { "false" });
+        output.push_str(",\"files\":[");
+        // In directional mode, sort originals first.
+        let mut sorted_ids = ids.clone();
+        if directional && !filter.keep_prefix.is_empty() {
+            sorted_ids.sort_by_key(|&id| {
+                if result.nodes[id].path.starts_with(&filter.keep_prefix) { 0u8 } else { 1u8 }
+            });
+        }
+        for (fi, &id) in sorted_ids.iter().enumerate() {
+            if fi > 0 { output.push(','); }
+            let node = &result.nodes[id];
+            let is_original = if directional && !filter.keep_prefix.is_empty() {
+                node.path.starts_with(&filter.keep_prefix)
+            } else {
+                fi == 0
+            };
+            output.push('{');
+            output.push_str("\"id\":"); output.push_str(&node.id.to_string());
+            output.push_str(",\"name\":"); push_json_string(&mut output, &node.name);
+            output.push_str(",\"path\":"); push_json_string(&mut output, &node.path);
+            output.push_str(",\"size\":"); output.push_str(&node.size.to_string());
+            output.push_str(",\"modified\":"); output.push_str(&node.modified_ms.to_string());
+            output.push_str(",\"original\":"); output.push_str(if is_original { "true" } else { "false" });
+            output.push('}');
+        }
+        output.push_str("]}");
+    }
+    output.push_str("],\"errors\":[");
+    for (ei, err) in hash_errors.iter().take(50).enumerate() {
+        if ei > 0 { output.push(','); }
+        push_json_string(&mut output, err);
+    }
+    output.push_str("]}");
+    output
+}
+
 pub(crate) fn exact_duplicates_json(result: &ScanResult, min_size: u64, limit: usize) -> String {
     let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
     for node in &result.nodes {

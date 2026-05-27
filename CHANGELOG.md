@@ -4,6 +4,90 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [0.2.0] - 2026-05-26
+
+### Added
+
+#### Web UI (React + TypeScript frontend)
+- Complete rewrite of the browser UI in React + TypeScript (Vite + TSC build), replacing the original vanilla JS `web/` surface.
+- Multi-tab workspace: open multiple directories simultaneously, each scanning independently in parallel.
+- **Real-time filesystem watch**: backend streams `ReadDirectoryChangesW` events over SSE (`/api/fs-events`); new files and folders appear in the tree within ~100 ms of being created, moved, or deleted — no manual refresh needed.
+- **Incremental directory patching**: watch-triggered updates rescan only the changed directory (`maxDepth=1`, ~50 ms) and graft results into the live tree without blanking the view.
+- **Smart refresh**: manual Refresh on an already-scanned path preserves expanded folder state.
+- Treemap visualization (recursive binary-split layout) in bottom-panel and right-panel modes; drag-resize handle.
+- Interactive 3D treemap modal.
+- Ribbon toolbar with Scan, Stop, Refresh, metric/unit selectors, expand controls, hidden-file toggle, symlink toggle, and New Folder.
+- Path bar with drive picker and special-folder shortcuts (Desktop, Documents, Downloads, Pictures, Videos).
+- Tab strip side panel: Details, Extensions, Age Distribution, Top Files, Duplicates, Errors, Bookmarks, AI Chat.
+- **Details tab**: size, allocated, file/folder counts, last modified, path, extension, open/reveal/copy-path actions.
+- **Extensions tab**: breakdown by file extension with size bars.
+- **Age tab**: file age bucket histogram (< 1 week through > 2 years).
+- **Top Files tab**: largest files in the scan with navigate-to action.
+- **Duplicates tab**: candidate duplicate groups and exact-match finder.
+- **Bookmarks tab**: pin paths for fast navigation; persisted via `/api/bookmarks`.
+- **AI Chat tab**: embedded Ollama chat against the current scan tree with model picker and streaming responses.
+- **Duplicate Finder**: full-featured dedupe workflow with filter controls, mode selection, and batch delete/move/copy actions.
+- Filter dialog with multi-rule include/exclude patterns applied to the tree table in real time.
+- Column visibility controls (Size, Allocated, File Count, % of Parent, Last Modified, Path).
+- Sort by any column, ascending or descending.
+- Shell context menu integration via right-click (Windows Explorer context menu at cursor).
+- Ctrl+click on a directory row opens it in a new tab.
+- Double-click to expand/collapse directories or open files.
+- Client-side scan result cache with per-path TTL; bypassed for watch-triggered rescans.
+- Dark mode follows system setting; togglable from the ribbon.
+
+#### Backend
+- **`/api/fs-events`**: SSE endpoint using `ReadDirectoryChangesW` with overlapped I/O and 500 ms keep-alive pings. Falls back to 1-second mtime polling on non-Windows.
+- **`/api/scan` (sync)**: non-streaming scan endpoint for shallow/incremental rescans; `nocache=1` param bypasses the 5-minute server-side cache.
+- **`/api/scan-stream`**: NDJSON streaming endpoint (replaces the original `/api/scan`).
+- **`/api/watch`**: POST-based mtime batch check for polling-based watch.
+- **`/api/duplicates` / `/api/dupes-scan` / `/api/dupes-v2`**: exact and fuzzy duplicate detection with FNV-1a hashing, filter params, and grouping.
+- **`/api/dupes-action`**: batch delete/move/copy on duplicate groups.
+- **`/api/special-folders`**: returns OS shell known-folder paths.
+- **`/api/bookmarks`**: GET/POST bookmark list persisted to `%APPDATA%\FileTree\bookmarks.json`.
+- **`/api/settings`**: GET/POST JSON settings store (`%APPDATA%\FileTree\settings.json`) — dark mode, threads, sort, open tabs, last path.
+- **`/api/mkdir`**: create a new directory.
+- **`/api/move`**: rename or move a file or directory.
+- **`/api/shell-context-menu`**: invoke the Windows Shell context menu at screen coordinates.
+- **`/api/ai-models`** / **`/api/ai-chat`**: proxy to a local Ollama instance for AI chat with streaming.
+- **`/api/dupes-progress`**: real-time progress for long-running duplicate scans.
+- Server-side 5-minute scan result cache with path-keyed invalidation on destructive operations.
+- WebView2 embedding: the React frontend is hosted in a `WebView2` control inside the native Win32 window.
+
+#### Native Desktop (Win32)
+- Source decomposed into `src/desktop/` sub-modules: `mod.rs`, `ffi.rs`, `paint.rs`, `theme.rs`, `tabs.rs`, `state.rs`, `shell.rs`, `icons.rs`.
+- Custom tab strip (`FileTreeTabStrip` window class) with keyboard/click switching and `ActiveTab` enum.
+- Owner-drawn menu bar with theme-matched colors for dark and light palettes.
+- Custom status footer bar (`msctls_statusbar32`) with formatted scan stats.
+- Path bar (`ComboBoxEx32` + `SHAutoComplete`) for path history and filesystem autocomplete.
+- Drive picker combo box.
+- Single-instance enforcement via named mutex + `WM_COPYDATA` re-focus.
+- Per-HWND dark mode; pre-window bootstrap eliminates first-paint flash.
+- Persistent window geometry restore from settings.
+- Bootstrap Icons 1.11.3 TTF embedded as a binary asset and loaded via `AddFontMemResourceEx`.
+- DPI-aware primitives and accent-color luminance helpers for theming.
+
+#### Source Refactors
+- `src/main.rs` decomposed into focused modules: `model`, `scan`, `server`, `export`, `analytics`, `io`, `cli`, `settings`, `dupes`.
+- `src/dupes.rs`: exact and fuzzy duplicate engine.
+- `src/settings.rs`: atomic JSON settings store with typed `SettingsStore`.
+- `src/analytics.rs`: extension stats, age buckets, top-N files, largest-dir ranking.
+
+### Removed
+
+- `web/` (vanilla JS / HTML / CSS single-file UI) — replaced by the React frontend in `frontend/`.
+
+### Fixed
+
+- Manual Refresh no longer collapses expanded folders.
+- Watch-triggered refresh no longer overwrites newly detected files with stale full-tree data.
+- `reconstructChildren` applied to shallow-rescan results before grafting into the tree.
+- Ancestor size and file-count recalculation in `patchDirectory` corrected (was double-counting files).
+- Server-side scan cache bypassed for watch-triggered incremental rescans.
+- `maxdepth` query parameter accepted in both lowercase and camelCase forms.
+
+---
+
 ## [0.1.0] - 2026-05-22
 
 ### Added

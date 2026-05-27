@@ -56,12 +56,6 @@ pub(crate) fn path_to_string(path: &Path) -> String {
     path.display().to_string()
 }
 
-pub(crate) fn extension_for(path: &Path) -> String {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("")
-        .to_lowercase()
-}
 
 pub(crate) fn metadata_modified_ms(metadata: &Metadata) -> u128 {
     metadata
@@ -214,6 +208,8 @@ pub(crate) fn is_hidden_entry(path: &Path, _metadata: &Metadata) -> bool {
         .unwrap_or(false)
 }
 
+/// Compressed-aware allocated size. On Windows, always calls GetCompressedFileSizeW
+/// (use only when you don't know whether FILE_ATTRIBUTE_COMPRESSED is set).
 #[cfg(windows)]
 pub(crate) fn platform_allocated_size(path: &Path, metadata: &Metadata) -> u64 {
     windows_compressed_file_size(path).unwrap_or(metadata.len())
@@ -222,6 +218,19 @@ pub(crate) fn platform_allocated_size(path: &Path, metadata: &Metadata) -> u64 {
 #[cfg(not(windows))]
 pub(crate) fn platform_allocated_size(_path: &Path, metadata: &Metadata) -> u64 {
     metadata.len()
+}
+
+/// Raw allocated size given a known logical size — calls GetCompressedFileSizeW
+/// only when needed (caller has already checked FILE_ATTRIBUTE_COMPRESSED).
+/// On non-Windows, logical size == allocated size.
+#[cfg(windows)]
+pub(crate) fn platform_allocated_size_raw(path: &Path, logical_size: u64) -> u64 {
+    windows_compressed_file_size(path).unwrap_or(logical_size)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn platform_allocated_size_raw(_path: &Path, logical_size: u64) -> u64 {
+    logical_size
 }
 
 #[cfg(windows)]

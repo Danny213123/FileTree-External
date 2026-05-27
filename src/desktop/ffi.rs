@@ -93,6 +93,7 @@ pub(super) const WM_SETFONT: Uint = 0x0030;
 pub(super) const WM_SIZE: Uint = 0x0005;
 pub(super) const WS_BORDER: Dword = 0x0080_0000;
 pub(super) const WS_CHILD: Dword = 0x4000_0000;
+pub(super) const WS_CLIPCHILDREN: Dword = 0x0200_0000;
 pub(super) const WS_OVERLAPPEDWINDOW: Dword = 0x00cf_0000;
 pub(super) const WS_TABSTOP: Dword = 0x0001_0000;
 pub(super) const WS_VISIBLE: Dword = 0x1000_0000;

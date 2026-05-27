@@ -14,6 +14,7 @@ use super::ffi::{
     DRAWITEMSTRUCT, DT_CENTER, DT_END_ELLIPSIS, DT_HIDEPREFIX, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
     DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawIconEx, DrawTextW, EndPaint,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FillRect, GetClientRect, GetDpiForWindow, Hdc,
+    InvalidateRect,
     Hgdobj, Hicon, Hwnd, MulDiv, PaintStruct, Rect, SHGFI_ICON, SHGFI_SMALLICON,
     SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SRCCOPY, SelectObject, SendMessageW, SetBkMode,
     SetTextColor, ShFileInfoW, TRANSPARENT, Uint,
@@ -84,13 +85,37 @@ pub(super) unsafe fn paint_window(hwnd: Hwnd) {
             if mem_bmp != 0 {
                 let old_bmp = SelectObject(mem_dc, mem_bmp);
 
-                with_state_mut(|state| {
+                // Only BitBlt if we successfully acquired state. try_lock() inside
+                // with_state_mut returns None when the scan thread holds the lock.
+                // Blitting a blank backbuffer in that case causes a visible white/black
+                // flash in the rows area — skip the blit entirely and let the next
+                // WM_PAINT (re-queued via InvalidateRect below) render with real data.
+                // Only draw what is actually dirty. When only the table rows are
+                // invalidated (hover changes), skip draw_toolbar_background entirely —
+                // touching the toolbar region via BitBlt (even when the screen DC is
+                // clipped to rows-only) causes native child controls (BUTTON, EDIT,
+                // COMBOBOX) in the toolbar to receive spurious repaint/WM_CTLCOLOR
+                // messages that make them flash visibly.
+                let toolbar_bottom = table_top();
+                let need_toolbar = paint.rcPaint.top < toolbar_bottom;
+                let need_table = paint.rcPaint.bottom > toolbar_bottom;
+                let painted = with_state_mut(|state| {
                     fill_rect(mem_dc, rect, palette_bg(state));
-                    draw_toolbar_background(mem_dc, rect, state);
-                    draw_table(mem_dc, rect, state);
+                    if need_toolbar {
+                        draw_toolbar_background(mem_dc, rect, state);
+                    }
+                    if need_table {
+                        draw_table(mem_dc, rect, state);
+                    }
                 });
 
-                BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+                if painted.is_some() {
+                    BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+                } else {
+                    // Re-queue exactly the dirty region so we retry once the lock is free.
+                    // Using null() here would invalidate the full window and flash child windows.
+                    InvalidateRect(hwnd, &paint.rcPaint, 0);
+                }
 
                 SelectObject(mem_dc, old_bmp);
                 DeleteObject(mem_bmp);
@@ -1135,9 +1160,14 @@ pub(super) unsafe extern "system" fn status_footer_window_proc(
     use super::ffi::{DefWindowProcW, WM_ERASEBKGND, WM_PAINT};
     match msg {
         WM_PAINT => {
-            super::state::with_state_mut(|state| {
-                draw_status_footer(hwnd, state);
-            });
+            // draw_status_footer calls BeginPaint/EndPaint internally.
+            // If the lock is contended, we must still call BeginPaint/EndPaint to
+            // clear the update region — otherwise WM_PAINT re-fires in an infinite loop.
+            if super::state::with_state_mut(|state| draw_status_footer(hwnd, state)).is_none() {
+                let mut ps: super::ffi::PaintStruct = std::mem::zeroed();
+                BeginPaint(hwnd, &mut ps);
+                EndPaint(hwnd, &ps);
+            }
             0
         }
         WM_ERASEBKGND => 1,

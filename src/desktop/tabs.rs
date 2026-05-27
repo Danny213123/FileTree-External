@@ -83,7 +83,7 @@ pub(super) unsafe extern "system" fn tab_window_proc(
                             let old_bmp = SelectObject(mem_dc, mem_bmp);
                             // Acquire state inside closure; fall back silently on contention
                             // (T-02.1-04-01 — WM_PAINT reentrancy discipline via try_lock).
-                            with_state_mut(|state| {
+                            let painted = with_state_mut(|state| {
                                 draw_tab_strip(
                                     mem_dc,
                                     client,
@@ -93,7 +93,9 @@ pub(super) unsafe extern "system" fn tab_window_proc(
                                     state,
                                 );
                             });
-                            BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+                            if painted.is_some() {
+                                BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+                            }
                             SelectObject(mem_dc, old_bmp);
                             DeleteObject(mem_bmp);
                         }
