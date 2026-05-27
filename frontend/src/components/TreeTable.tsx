@@ -149,10 +149,18 @@ export function TreeTable({
                 data-index={vItem.index}
                 className={`row${selectedId === node.id ? " selected" : ""}${node.hidden ? " hidden-entry" : ""}`}
                 style={{ position: "absolute", top: vItem.start, left: 0, right: 0, height: ROW_HEIGHT, gridTemplateColumns: gridTemplate }}
-                onClick={(e) => { if (e.ctrlKey && !isBundle) { onCtrlClick(node.id); return; } onSelect(node.id); }}
+                onClick={(e) => {
+                  if (isBundle) {
+                    onToggleExpand(node.id);
+                    // Select the parent so the treemap shows the parent folder
+                    if (node.parent != null) onSelect(node.parent);
+                    return;
+                  }
+                  if (e.ctrlKey) { onCtrlClick(node.id); return; }
+                  onSelect(node.id);
+                }}
                 onDoubleClick={() => {
-                  if (isBundle) onToggleExpand(node.id);
-                  else onDoubleClick(node.id);
+                  if (!isBundle) onDoubleClick(node.id);
                 }}
                 onContextMenu={(e) => {
                   e.preventDefault();
