@@ -2,4 +2,17 @@
 /*.exe
 /*.log
 *.pdb
+
+# Claude AI planning artifacts
 /.claude/
+/.planning/
+
+# Frontend build artifacts (embedded in binary at compile time)
+/frontend/node_modules/
+/frontend/dist/
+
+# Local dev helper
+run.bat
+
+# Large media files
+/images/*.mp4

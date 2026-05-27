@@ -1,100 +1,91 @@
-#![allow(dead_code)]
-#![allow(clippy::manual_is_multiple_of)]
-#![allow(clippy::manual_range_contains)]
-#![allow(clippy::too_many_arguments)]
 #![allow(clippy::upper_case_acronyms)]
 #![allow(non_upper_case_globals)]
 #![allow(non_snake_case)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::collections::BTreeSet;
-use std::fs;
+use std::cell::RefCell;
 use std::io;
-use std::mem::{size_of, zeroed};
+use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::Command;
-use std::ptr::{null, null_mut};
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ptr::null;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use crate::cli::APP_NAME;
-use crate::io::{default_thread_count, path_to_string, reveal_path};
-use crate::model::*;
-use crate::scan::scan_path_with_progress;
-
-mod icons;
-mod state;
-use state::{
-    ActiveTab, DesktopState, STATE, ScanDone, ScanProgressInfo, handle_copy_data, with_state_mut,
-};
 pub(crate) mod ffi;
 use ffi::*;
+
+// ---------------------------------------------------------------------------
+// Global state shared between the HTTP server thread and the UI thread.
+// ---------------------------------------------------------------------------
+
+/// HWND of the main window, set by the UI thread after CreateWindowExW.
+static MAIN_HWND: OnceLock<Mutex<Hwnd>> = OnceLock::new();
+
+#[derive(Clone)]
+pub(crate) struct ShellMenuRequest {
+    pub(crate) path: String,
+    pub(crate) screen_x: i32,
+    pub(crate) screen_y: i32,
+}
+
+static SHELL_MENU_REQUEST: OnceLock<Mutex<Option<ShellMenuRequest>>> = OnceLock::new();
+
+const WM_SHELL_CONTEXT_MENU: Uint = WM_APP + 1;
+
+/// Called from the HTTP server thread to request a shell context menu on the UI thread.
+pub(crate) fn post_shell_context_menu(path: String, screen_x: i32, screen_y: i32) {
+    *SHELL_MENU_REQUEST
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("shell menu lock") = Some(ShellMenuRequest {
+        path,
+        screen_x,
+        screen_y,
+    });
+
+    if let Some(hwnd_lock) = MAIN_HWND.get() {
+        let hwnd = *hwnd_lock.lock().expect("hwnd lock");
+        if hwnd != 0 {
+            unsafe { PostMessageW(hwnd, WM_SHELL_CONTEXT_MENU, 0, 0) };
+        }
+    }
+}
+
 mod theme;
 use theme::*;
-mod paint;
-use paint::*;
-mod shell;
-use shell::*;
-mod tabs;
-mod treemap;
 
-/// Pre-window dark-mode bootstrap (POL-03 / D-04 first-paint flash mitigation).
-///
-/// Called by cli.rs BEFORE desktop::run so that uxtheme's process-wide AppMode
-/// is set before the first window class is registered. This prevents the OS from
-/// defaulting to light chrome when it allocates the window's internal theme state.
-///
-/// On Win10 1809 (ordinal 135 = AllowDarkModeForApp), calling with arg = 1
-/// (PREFERRED_APP_MODE_ALLOW_DARK) works accidentally because BOOL TRUE = 1.
-/// On Win10 1903+ / Win11, ordinal 135 = SetPreferredAppMode(AllowDark = 1).
-/// The Option<fn> wrapper from uxtheme_ordinals() is a no-op when None,
-/// producing graceful degradation (window opens light then re-themes) per Pitfall 2.
+// ---------------------------------------------------------------------------
+// Dark-mode bootstrap — called by cli.rs before desktop::run.
+// ---------------------------------------------------------------------------
+
 pub(crate) fn bootstrap_dark_mode(enabled: bool) {
     let mode = if enabled {
         theme::PREFERRED_APP_MODE_ALLOW_DARK
     } else {
         theme::PREFERRED_APP_MODE_DEFAULT
     };
-    if let Some(set_mode_fn) = theme::uxtheme_ordinals().set_preferred_app_mode {
-        unsafe { set_mode_fn(mode) };
+    if let Some(f) = theme::uxtheme_ordinals().set_preferred_app_mode {
+        unsafe { f(mode) };
     }
 }
 
-unsafe fn enable_visual_styles() {
-    let manifest_content = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-<assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="FileTree" type="win32"/>
-<dependency>
-<dependentAssembly>
-    <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
-</dependentAssembly>
-</dependency>
-</assembly>"#;
+// ---------------------------------------------------------------------------
+// Thread-local storage for the WebView2 controller (COM STA, single thread).
+// ---------------------------------------------------------------------------
 
-    let mut temp_path = std::env::temp_dir();
-    temp_path.push("filetree.manifest");
-    if std::fs::write(&temp_path, manifest_content).is_ok() {
-        let path_wide = crate::io::wide(&temp_path.to_string_lossy());
-        let act_ctx = ACTCTXW {
-            cbSize: size_of::<ACTCTXW>() as Dword,
-            dwFlags: 0,
-            lpSource: path_wide.as_ptr(),
-            wProcessorArchitecture: 0,
-            wLangId: 0,
-            lpAssemblyDirectory: null(),
-            lpResourceName: null(),
-            lpApplicationName: null(),
-            hModule: 0,
-        };
-        let h_ctx = CreateActCtxW(&act_ctx);
-        if h_ctx != -1 {
-            let mut cookie: UlongPtr = 0;
-            ActivateActCtx(h_ctx, &mut cookie);
-        }
-    }
+use webview2_com::Microsoft::Web::WebView2::Win32::{
+    ICoreWebView2Controller, ICoreWebView2Environment,
+};
+
+thread_local! {
+    static CONTROLLER: RefCell<Option<ICoreWebView2Controller>> = const { RefCell::new(None) };
+    static SERVER_PORT: RefCell<u16> = const { RefCell::new(0) };
 }
+
+// ---------------------------------------------------------------------------
+// Public entry point.
+// ---------------------------------------------------------------------------
 
 pub(crate) fn run(
     initial_path: PathBuf,
@@ -102,213 +93,191 @@ pub(crate) fn run(
     settings_store: std::sync::Arc<crate::settings::SettingsStore>,
     clamped_geom: crate::settings::WindowGeometry,
 ) -> io::Result<()> {
-    unsafe {
-        enable_visual_styles();
-        let com_initialized = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED) >= 0;
-        // ICC_USEREX_CLASSES enables ComboBoxEx32; ICC_BAR_CLASSES enables msctls_statusbar32.
-        // Without these, CreateWindowExW for those classes returns 0 silently (RESEARCH anti-pattern).
-        let controls = InitCommonControlsEx {
-            dwSize: size_of::<InitCommonControlsEx>() as Dword,
-            dwICC: ICC_LISTVIEW_CLASSES | ICC_USEREX_CLASSES | ICC_BAR_CLASSES,
-        };
-        InitCommonControlsEx(&controls);
+    // Bind a free port and release it immediately — the server thread rebinds.
+    let port: u16 = {
+        let l = TcpListener::bind("127.0.0.1:0")?;
+        l.local_addr()?.port()
+    };
 
-        let mut initial_state = DesktopState::new(initial_path);
-        initial_state.settings = settings;
-        initial_state.settings_store = Some(settings_store);
-        let _ = STATE.set(Mutex::new(initial_state));
+    SERVER_PORT.with(|p| *p.borrow_mut() = port);
 
-        let h_instance = GetModuleHandleW(null());
-        let class_name = crate::io::wide("FileTreeDesktopWindow");
-        let cursor = LoadCursorW(0, IDC_ARROW as *const u16);
-        let app_icon = LoadImageW(
+    // Start the HTTP server background thread.
+    let server_path = initial_path.clone();
+    thread::spawn(move || {
+        if let Err(e) = crate::server::run_server(server_path, port) {
+            eprintln!("server error: {e}");
+        }
+    });
+
+    unsafe { run_win32(settings, settings_store, clamped_geom, port) }
+}
+
+unsafe fn run_win32(
+    settings: crate::settings::Settings,
+    settings_store: std::sync::Arc<crate::settings::SettingsStore>,
+    clamped_geom: crate::settings::WindowGeometry,
+    port: u16,
+) -> io::Result<()> {
+    let com_initialized = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) >= 0;
+
+    let h_instance = GetModuleHandleW(null());
+    let class_name = crate::io::wide("FileTreeWebView2Window");
+
+    let window_class = WndClassW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(window_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: h_instance,
+        hIcon: LoadImageW(
             0,
             IDI_APPLICATION as *const u16,
             IMAGE_ICON,
             0,
             0,
             LR_SHARED,
-        ) as Hicon;
-        let window_class = WndClassW {
-            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
-            lpfnWndProc: Some(window_proc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: h_instance,
-            hIcon: app_icon,
-            hCursor: cursor,
-            hbrBackground: dark_brush(),
-            lpszMenuName: null(),
-            lpszClassName: class_name.as_ptr(),
-        };
-        RegisterClassW(&window_class);
+        ) as Hicon,
+        hCursor: LoadCursorW(0, IDC_ARROW as *const u16),
+        hbrBackground: 0,
+        lpszMenuName: null(),
+        lpszClassName: class_name.as_ptr(),
+    };
+    RegisterClassW(&window_class);
 
-        // Register Bootstrap Icons font before any child window creates or paints
-        // (POL-03 prerequisite — Plans 02.1-04 and 02.1-06 depend on this).
-        icons::register_icon_font();
+    let title = crate::io::wide(APP_NAME);
+    let hwnd = CreateWindowExW(
+        0,
+        class_name.as_ptr(),
+        title.as_ptr(),
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+        clamped_geom.x,
+        clamped_geom.y,
+        clamped_geom.w,
+        clamped_geom.h,
+        0,
+        0,
+        h_instance,
+        std::ptr::null_mut(),
+    );
 
-        let title = crate::io::wide(&format!("{APP_NAME} - Native Disk Explorer"));
-        // Use geometry restored from settings (clamped to work area) — no CW_USEDEFAULT.
-        // This is the no-jank invariant: geometry feeds directly into CreateWindowExW
-        // so there is never a SetWindowPos flicker after the window appears.
-        // WS_VISIBLE is intentionally stripped here (POL-03 / D-04 first-paint flash fix).
-        // The window is NOT auto-shown inside CreateWindowExW; instead apply_dark_mode_to_window
-        // is called immediately below BEFORE the explicit ShowWindow(hwnd, SW_SHOW) at line ~193.
-        // This guarantees DWM dark chrome is applied before the first paint frame.
-        let hwnd = CreateWindowExW(
-            0,
-            class_name.as_ptr(),
-            title.as_ptr(),
-            WS_OVERLAPPEDWINDOW,
-            clamped_geom.x,
-            clamped_geom.y,
-            clamped_geom.w,
-            clamped_geom.h,
-            0,
-            0,
-            h_instance,
-            null_mut(),
-        );
-
-        if hwnd == 0 {
-            if com_initialized {
-                CoUninitialize();
-            }
-            return Err(io::Error::last_os_error());
-        }
-
-        // POL-03 / D-04: apply full dark chrome (DWM attr 20+19 + AllowDarkModeForWindow +
-        // SetWindowTheme) to the main HWND BEFORE ShowWindow so the very first paint
-        // uses the correct chrome. set_window_dark_mode alone is insufficient —
-        // apply_dark_mode_to_window (Plan 02.1-03) is the canonical triad helper.
-        let initial_dark = with_state_mut(|s| s.settings.dark_mode).unwrap_or(true);
-        apply_dark_mode_to_window(hwnd, initial_dark);
-
-        // Phase 02.1-06 (POL-03): hide mnemonic underlines until the user presses ALT.
-        // WM_CHANGEUISTATE propagates down to child windows so the entire UI is in sync.
-        // UIS_SET | (UISF_HIDEACCEL << 16): action=UIS_SET, flags=UISF_HIDEACCEL.
-        SendMessageW(
-            hwnd,
-            WM_CHANGEUISTATE,
-            MAKEWPARAM(UIS_SET as u16, UISF_HIDEACCEL as u16),
-            0,
-        );
-
-        ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
-
-        // Phase 02.1-05 — D-11: restore drive picker to last_path's drive letter on launch.
-        // populate_drive_picker was called in create_controls with initial_path; here we
-        // re-call it with settings.last_path (non-empty after any prior scan) so the
-        // ComboBoxEx32 pre-selects the correct drive when the user reopens the app.
-        {
-            let (picker, last_path, initial_path_str) = with_state_mut(|s| {
-                (
-                    s.drive_picker,
-                    s.settings.last_path.clone(),
-                    path_to_string(&s.initial_path),
-                )
-            })
-            .unwrap_or((0, String::new(), String::new()));
-            if picker != 0 {
-                let restore_path = if !last_path.is_empty() {
-                    last_path
-                } else {
-                    initial_path_str
-                };
-                populate_drive_picker(picker, &restore_path);
-            }
-        }
-
-        start_scan_from_controls(hwnd);
-
-        // Phase 02.1-05 — D-13 / SET-01: restore active tab from settings.
-        // PostMessageW queues WM_COMMAND through the same ID_TAB_* arm a user click triggers —
-        // single code path, no special-case logic needed. The message is processed after
-        // ShowWindow + UpdateWindow have completed.
-        {
-            let tab_id = with_state_mut(|s| {
-                let tab = ActiveTab::from_str(&s.settings.active_tab).unwrap_or(ActiveTab::Details);
-                ID_TAB_DETAILS + tab as isize
-            })
-            .unwrap_or(ID_TAB_DETAILS);
-            PostMessageW(hwnd, WM_COMMAND, MAKEWPARAM(tab_id as u16, 0), 0);
-        }
-
-        // Build the accelerator table (Plan 02-03, Pattern 6).
-        // Use MaybeUninit + ptr::write to build the packed Accel array without triggering
-        // Rust's unaligned-references lint (fields of packed structs cannot be directly
-        // referenced). TranslateAcceleratorW is called BEFORE TranslateMessage (Pitfall #8):
-        // the accelerator wins over the edit control's default key handling for Enter/Esc/F5.
-        // Phase 02.1-05 — extend accelerator table with Ctrl+1..5 for tab switching (POL-02).
-        // VK_1..VK_5 = 0x31..0x35; FVIRTKEY | FCONTROL = 0x09.
-        const VK_1: u16 = 0x31;
-        const VK_2: u16 = 0x32;
-        const VK_3: u16 = 0x33;
-        const VK_4: u16 = 0x34;
-        const VK_5: u16 = 0x35;
-        let mut accel_uninit = [
-            core::mem::MaybeUninit::<Accel>::uninit(),
-            core::mem::MaybeUninit::<Accel>::uninit(),
-            core::mem::MaybeUninit::<Accel>::uninit(),
-            core::mem::MaybeUninit::<Accel>::uninit(),
-            core::mem::MaybeUninit::<Accel>::uninit(),
-            core::mem::MaybeUninit::<Accel>::uninit(),
-            core::mem::MaybeUninit::<Accel>::uninit(),
-            core::mem::MaybeUninit::<Accel>::uninit(),
-            core::mem::MaybeUninit::<Accel>::uninit(),
-            core::mem::MaybeUninit::<Accel>::uninit(),
-            core::mem::MaybeUninit::<Accel>::uninit(),
-        ];
-        let accel_data: [(u8, u16, u16); 11] = [
-            (FVIRTKEY, VK_RETURN, CMD_SCAN),
-            (FVIRTKEY, VK_ESCAPE, CMD_CANCEL_SCAN),
-            (FVIRTKEY, VK_DELETE, CMD_DELETE_SEL),
-            (FVIRTKEY | FCONTROL, 'F' as u16, CMD_FOCUS_SEARCH),
-            (FVIRTKEY | FCONTROL, 'E' as u16, CMD_EXPORT),
-            (FVIRTKEY, VK_F5, CMD_REFRESH),
-            // Ctrl+1..5 → tab Details..Errors (POL-02 / D-12).
-            (FVIRTKEY | FCONTROL, VK_1, ID_TAB_DETAILS as u16),
-            (FVIRTKEY | FCONTROL, VK_2, ID_TAB_TOP as u16),
-            (FVIRTKEY | FCONTROL, VK_3, ID_TAB_EXTENSIONS as u16),
-            (FVIRTKEY | FCONTROL, VK_4, ID_TAB_DUPLICATES as u16),
-            (FVIRTKEY | FCONTROL, VK_5, ID_TAB_ERRORS as u16),
-        ];
-        for (slot, (fvirt, key, cmd)) in accel_uninit.iter_mut().zip(accel_data.iter()) {
-            // SAFETY: MaybeUninit::as_mut_ptr() gives a valid pointer to write the value.
-            let ptr = slot.as_mut_ptr();
-            core::ptr::write_unaligned(core::ptr::addr_of_mut!((*ptr).fVirt), *fvirt);
-            core::ptr::write_unaligned(core::ptr::addr_of_mut!((*ptr).key), *key);
-            core::ptr::write_unaligned(core::ptr::addr_of_mut!((*ptr).cmd), *cmd);
-        }
-        // SAFETY: all eleven slots were initialized via write_unaligned above.
-        let accels: [Accel; 11] = core::mem::transmute(accel_uninit);
-        let haccel = CreateAcceleratorTableW(accels.as_ptr(), 11);
-        with_state_mut(|s| s.accel_table = haccel);
-
-        let mut message: Msg = zeroed();
-        // TranslateAcceleratorW MUST come before TranslateMessage (Pitfall #8).
-        // When it returns non-zero the accelerator was dispatched as WM_COMMAND;
-        // we skip TranslateMessage + DispatchMessageW for that iteration.
-        while GetMessageW(&mut message, 0, 0, 0) > 0 {
-            if TranslateAcceleratorW(hwnd, haccel, &mut message) == 0 {
-                TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-        }
-
-        // Destroy accelerator table after the message loop exits.
-        if haccel != 0 {
-            DestroyAcceleratorTable(haccel);
-        }
-
+    if hwnd == 0 {
         if com_initialized {
             CoUninitialize();
         }
+        return Err(io::Error::last_os_error());
     }
 
+    // Register HWND so the HTTP server thread can PostMessage to us.
+    *MAIN_HWND
+        .get_or_init(|| Mutex::new(0))
+        .lock()
+        .expect("hwnd lock") = hwnd;
+
+    apply_dark_mode_to_window(hwnd, settings.dark_mode);
+
+    // Initialize WebView2 — the callback fires on this STA thread via the COM pump.
+    init_webview2(hwnd, port);
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    // Standard Win32 message loop — COM async callbacks fire here.
+    let mut message: Msg = std::mem::zeroed();
+    while GetMessageW(&mut message, 0, 0, 0) > 0 {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+
+    // Persist window geometry on exit.
+    let mut rect: Rect = std::mem::zeroed();
+    if GetWindowRect(hwnd, &mut rect) != 0 {
+        let geom = crate::settings::WindowGeometry {
+            x: rect.left,
+            y: rect.top,
+            w: rect.right - rect.left,
+            h: rect.bottom - rect.top,
+            unknown: Default::default(),
+        };
+        let mut s = settings.clone();
+        s.window = geom;
+        let _ = settings_store.save(&s);
+    }
+
+    if com_initialized {
+        CoUninitialize();
+    }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// WebView2 initialization.
+// ---------------------------------------------------------------------------
+
+fn init_webview2(hwnd: Hwnd, port: u16) {
+    use webview2_com::{
+        CreateCoreWebView2ControllerCompletedHandler,
+        CreateCoreWebView2EnvironmentCompletedHandler,
+        Microsoft::Web::WebView2::Win32::CreateCoreWebView2EnvironmentWithOptions,
+    };
+    use windows::core::PCWSTR;
+
+    let user_data_dir: Vec<u16> = {
+        let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+        let path = format!("{base}\\FileTree\\webview2");
+        path.encode_utf16().chain(Some(0)).collect()
+    };
+
+    let hwnd_w = windows::Win32::Foundation::HWND(hwnd as *mut _);
+    let url_w: Vec<u16> = format!("http://127.0.0.1:{port}/\0")
+        .encode_utf16()
+        .collect();
+
+    let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
+        move |_result, env: Option<ICoreWebView2Environment>| {
+            let env = env.ok_or_else(|| windows::core::Error::from(windows::core::HRESULT(-1)))?;
+
+            let url_clone: Vec<u16> = url_w.clone();
+            let ctrl_handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
+                move |_result, ctrl: Option<ICoreWebView2Controller>| {
+                    let ctrl =
+                        ctrl.ok_or_else(|| windows::core::Error::from(windows::core::HRESULT(-1)))?;
+                    unsafe {
+                        // Resize to fill client area.
+                        let mut rc = windows::Win32::Foundation::RECT::default();
+                        windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd_w, &mut rc)?;
+                        ctrl.SetBounds(rc)?;
+
+                        // Navigate to the local server.
+                        if let Ok(wv) = ctrl.CoreWebView2() {
+                            let url_pcwstr = PCWSTR(url_clone.as_ptr());
+                            let _ = wv.Navigate(url_pcwstr);
+                        }
+                    }
+                    CONTROLLER.with(|c| *c.borrow_mut() = Some(ctrl));
+                    Ok(())
+                },
+            ));
+
+            unsafe {
+                env.CreateCoreWebView2Controller(hwnd_w, &ctrl_handler)?;
+            }
+            Ok(())
+        },
+    ));
+
+    let ud_pcwstr = PCWSTR(user_data_dir.as_ptr());
+    let empty: Vec<u16> = vec![0u16];
+    let browser_pcwstr = PCWSTR(empty.as_ptr());
+
+    unsafe {
+        let _ =
+            CreateCoreWebView2EnvironmentWithOptions(browser_pcwstr, ud_pcwstr, None, &env_handler);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window procedure.
+// ---------------------------------------------------------------------------
 
 unsafe extern "system" fn window_proc(
     hwnd: Hwnd,
@@ -317,1821 +286,170 @@ unsafe extern "system" fn window_proc(
     lparam: Lparam,
 ) -> Lresult {
     match msg {
-        WM_CREATE => {
-            create_controls(hwnd);
-            resize_controls(hwnd);
-            0
-        }
-        WM_ERASEBKGND => 1,
-        WM_PAINT => {
-            paint_window(hwnd);
-            0
-        }
         WM_SIZE => {
-            resize_controls(hwnd);
-            InvalidateRect(hwnd, null(), 1);
-            // Mark pending persist so WM_EXITSIZEMOVE flushes the new geometry once (D-03).
-            with_state_mut(|state| state.pending_persist = true);
-            0
-        }
-        WM_LBUTTONDOWN => {
-            handle_mouse_click(hwnd, lparam, false);
-            0
-        }
-        WM_LBUTTONDBLCLK => {
-            handle_mouse_click(hwnd, lparam, true);
-            0
-        }
-        WM_RBUTTONDOWN => {
-            let y = hiword_signed(lparam);
-            with_state_mut(|state| {
-                let row_top = table_top() + 30;
-                if y >= row_top {
-                    let row_h = 27;
-                    let row_index = state.scroll_row + ((y - row_top) / row_h) as usize;
-                    if let Some(node_id) = state.visible_rows.get(row_index).copied() {
-                        state.selected_id = node_id;
-                        InvalidateRect(hwnd, null(), 0);
+            CONTROLLER.with(|c| {
+                if let Some(ctrl) = c.borrow().as_ref() {
+                    let hwnd_w = windows::Win32::Foundation::HWND(hwnd as *mut _);
+                    let mut rc = windows::Win32::Foundation::RECT::default();
+                    if windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd_w, &mut rc)
+                        .is_ok()
+                    {
+                        let _ = ctrl.SetBounds(rc);
                     }
                 }
             });
             0
         }
-        WM_RBUTTONUP => {
-            let x = loword_signed(lparam);
-            let y = hiword_signed(lparam);
-            handle_right_click(hwnd, x, y);
-            0
-        }
-        WM_MOUSEMOVE => {
-            let x = loword_signed(lparam);
-            let y = hiword_signed(lparam);
-            handle_mouse_move(hwnd, x, y);
-            0
-        }
-        WM_MOUSEWHEEL => {
-            handle_mouse_wheel(hwnd, wparam);
-            0
-        }
-        WM_KEYDOWN => {
-            handle_key(hwnd, wparam);
-            0
-        }
-        WM_MEASUREITEM => {
-            // Paint-level spec: each menu item is 22 logical px tall (per status-footer token).
-            // WM_MEASUREITEM fires for every MF_OWNERDRAW item before first display.
-            // SAFETY: lparam points to a valid MEASUREITEMSTRUCT for the lifetime of this call.
-            use ffi::MEASUREITEMSTRUCT;
-            let mis = &mut *(lparam as *mut MEASUREITEMSTRUCT);
-            if mis.CtlType == ODT_MENU as Uint {
-                let dpi = with_state_mut(|s| GetDpiForWindow(s.hwnd)).unwrap_or(96);
-                let dpi = if dpi == 0 { 96 } else { dpi };
-                mis.itemHeight = MulDiv(22, dpi as i32, 96) as Uint;
-                // itemWidth: 0 means "use default menu width" — Win32 respects this for popups.
-                mis.itemWidth = 0;
+        WM_SHELL_CONTEXT_MENU => {
+            let req = SHELL_MENU_REQUEST
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("shell menu lock")
+                .take();
+            if let Some(r) = req {
+                show_shell_context_menu(hwnd, &r.path, r.screen_x, r.screen_y);
             }
             0
-        }
-        WM_DRAWITEM => {
-            // Paint one owner-drawn menu item via draw_menu_item in paint.rs.
-            // SAFETY: lparam points to a valid DRAWITEMSTRUCT for the lifetime of this call.
-            use ffi::DRAWITEMSTRUCT;
-            let dis = &*(lparam as *const DRAWITEMSTRUCT);
-            if dis.CtlType == ODT_MENU as Uint {
-                // Recover the label string from the DRAWITEMSTRUCT.itemData field.
-                // Win32 stores the lpNewItem pointer (wide string) in itemData when using
-                // MF_STRING | MF_OWNERDRAW, making it retrievable here (RESEARCH Pitfall 4).
-                let label_ptr = dis.itemData as *const u16;
-                let label = if label_ptr.is_null() {
-                    String::new()
-                } else {
-                    let mut len = 0usize;
-                    while *label_ptr.add(len) != 0 {
-                        len += 1;
-                    }
-                    String::from_utf16_lossy(std::slice::from_raw_parts(label_ptr, len))
-                };
-                let checked = dis.itemState & ODS_CHECKED != 0;
-                with_state_mut(|state| {
-                    let mnemonics_visible = state.ui_state & UISF_HIDEACCEL == 0;
-                    paint::draw_menu_item(dis, &label, checked, mnemonics_visible, state);
-                });
-            }
-            1
-        }
-        WM_UPDATEUISTATE => {
-            // Sync ui_state mirror and force menu repaint so underlines appear/disappear.
-            // wparam low word = UIS_SET / UIS_CLEAR / UIS_INITIALIZE; high word = flags.
-            let action = (wparam & 0xffff) as Uint;
-            let flags = ((wparam >> 16) & 0xffff) as Uint;
-            with_state_mut(|state| {
-                if action == UIS_SET {
-                    state.ui_state |= flags;
-                } else if action == UIS_CLEAR {
-                    state.ui_state &= !flags;
-                } else if action == UIS_INITIALIZE {
-                    // UIS_INITIALIZE: set bits present in flags, clear bits absent.
-                    state.ui_state = flags;
-                }
-            });
-            // Propagate to DefWindowProcW so child windows also update.
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        WM_COMMAND => {
-            let id = (wparam & 0xffff) as isize;
-            let notify_code = ((wparam >> 16) & 0xffff) as u32;
-            match id {
-                // --- Accelerator-table shortcut commands (Plan 02-03, Pattern 6) ---
-                // CMD_SCAN (Enter): start a scan if none is in flight.
-                // UI-SPEC: no-op when already scanning (button is disabled by EnableWindow).
-                id if id == CMD_SCAN as isize => {
-                    let scanning = with_state_mut(|s| s.scanning).unwrap_or(false);
-                    if !scanning {
-                        start_scan_from_controls(hwnd);
-                    }
-                }
-                // CMD_CANCEL_SCAN (Esc): cancel an active scan; no-op otherwise.
-                id if id == CMD_CANCEL_SCAN as isize => {
-                    let scanning = with_state_mut(|s| s.scanning).unwrap_or(false);
-                    if scanning {
-                        stop_current_scan();
-                    }
-                }
-                // CMD_REFRESH (F5): restart the scan (cancel if in flight, then re-start).
-                id if id == CMD_REFRESH as isize => {
-                    let scanning = with_state_mut(|s| s.scanning).unwrap_or(false);
-                    if scanning {
-                        stop_current_scan();
-                    }
-                    start_scan_from_controls(hwnd);
-                }
-                // CMD_EXPORT (Ctrl+E): route to the existing export entry (no-op stub until
-                // Phase 4 wires the export pipeline; debug-only log confirms dispatch).
-                id if id == CMD_EXPORT as isize => {
-                    #[cfg(debug_assertions)]
-                    eprintln!("CMD_EXPORT fired (stub — Phase 4 wires export pipeline)");
-                }
-                // CMD_FOCUS_SEARCH (Ctrl+F): no-op stub per UI-SPEC (Phase 3 wires focus call).
-                id if id == CMD_FOCUS_SEARCH as isize => {
-                    #[cfg(debug_assertions)]
-                    eprintln!("CMD_FOCUS_SEARCH fired (stub — Phase 3 wires search focus)");
-                }
-                // CMD_DELETE_SEL (Del): focus-conditional per UI-SPEC.
-                // Fires ONLY when the custom tree list has focus; when path edit has focus,
-                // the accelerator handler checks GetFocus() and no-ops so Del falls through
-                // to the edit control's default delete-char behavior.
-                id if id == CMD_DELETE_SEL as isize => {
-                    let list_hwnd = with_state_mut(|s| s.list).unwrap_or(0);
-                    if GetFocus() == list_hwnd && list_hwnd != 0 {
-                        #[cfg(debug_assertions)]
-                        eprintln!("CMD_DELETE_SEL fired (stub — Phase 5 wires IFileOperation)");
-                    }
-                    // When list does not have focus, fall through — let the edit control handle Del.
-                }
-                // Drive picker CBN_SELCHANGE: user selected a drive — set path edit to X:\
-                ID_DRIVE_PICKER if notify_code == CBN_SELCHANGE => {
-                    handle_drive_picker_change(hwnd);
-                }
-                // --- Existing button / menu commands ---
-                ID_BROWSE_BUTTON => choose_and_set_directory(hwnd),
-                ID_SCAN_BUTTON | ID_REFRESH_BUTTON => start_scan_from_controls(hwnd),
-                ID_STOP_BUTTON => stop_current_scan(),
-                ID_EXPAND_BUTTON => expand_all_directories(),
-                ID_COLLAPSE_BUTTON => collapse_to_root(),
-                ID_COLUMNS_BUTTON => toggle_path_column(),
-                // Phase 02.1-05 — 5 content-tab command arms (D-08 / SET-01).
-                // REENTRANCY DISCIPLINE (WARNING 2 gate, T-02.1-05-05):
-                //   activate_tab runs INSIDE with_state_mut (try_lock; non-blocking).
-                //   save_settings_if_dirty runs OUTSIDE the closure at function-body indentation.
-                //   save MUST NEVER run inside the closure — it would deadlock (PATTERNS.md).
-                ID_TAB_DETAILS => {
-                    let snap = with_state_mut(|state| {
-                        activate_tab(state, ActiveTab::Details);
-                        state::snapshot_for_save(state)
-                    })
-                    .flatten();
-                    if let Some(snap) = snap {
-                        state::save_settings_if_dirty(snap);
-                    }
-                }
-                ID_TAB_TOP => {
-                    let snap = with_state_mut(|state| {
-                        activate_tab(state, ActiveTab::Top);
-                        state::snapshot_for_save(state)
-                    })
-                    .flatten();
-                    if let Some(snap) = snap {
-                        state::save_settings_if_dirty(snap);
-                    }
-                }
-                ID_TAB_EXTENSIONS => {
-                    let snap = with_state_mut(|state| {
-                        activate_tab(state, ActiveTab::Extensions);
-                        state::snapshot_for_save(state)
-                    })
-                    .flatten();
-                    if let Some(snap) = snap {
-                        state::save_settings_if_dirty(snap);
-                    }
-                }
-                ID_TAB_DUPLICATES => {
-                    let snap = with_state_mut(|state| {
-                        activate_tab(state, ActiveTab::Duplicates);
-                        state::snapshot_for_save(state)
-                    })
-                    .flatten();
-                    if let Some(snap) = snap {
-                        state::save_settings_if_dirty(snap);
-                    }
-                }
-                ID_TAB_ERRORS => {
-                    let snap = with_state_mut(|state| {
-                        activate_tab(state, ActiveTab::Errors);
-                        state::snapshot_for_save(state)
-                    })
-                    .flatten();
-                    if let Some(snap) = snap {
-                        state::save_settings_if_dirty(snap);
-                    }
-                }
-                // Phase 02.1-05 — 3 View-menu toggle arms (replace old ID_*_CHECK button arms).
-                ID_VIEW_DARK_MODE => {
-                    let (snap, main_menu, view_menu, dark_mode) = with_state_mut(|state| {
-                        state.dark_mode = !state.dark_mode;
-                        state.settings.dark_mode = state.dark_mode;
-                        DARK_MODE_ATOMIC.store(state.dark_mode, Ordering::Relaxed);
-                        apply_theme(state);
-                        let _ = render_list(state);
-                        InvalidateRect(state.hwnd, null(), 1);
-                        // Retrieve menu handles for apply_menu_bg outside the lock.
-                        let main_menu = GetMenu(state.hwnd);
-                        let view_menu = state.view_menu;
-                        let dark = state.dark_mode;
-                        (state::snapshot_for_save(state), main_menu, view_menu, dark)
-                    })
-                    .unwrap_or((None, 0, 0, true));
-                    // Phase 02.1-06 (D-03): refresh menu-bar gutter brush on dark/light toggle.
-                    if main_menu != 0 {
-                        apply_menu_bg(main_menu, dark_mode);
-                    }
-                    if view_menu != 0 {
-                        apply_menu_bg(view_menu, dark_mode);
-                    }
-                    DrawMenuBar(hwnd);
-                    if let Some(snap) = snap {
-                        state::save_settings_if_dirty(snap);
-                    }
-                }
-                ID_VIEW_SHOW_HIDDEN => {
-                    let snap = with_state_mut(|state| {
-                        state.settings.show_hidden = !state.settings.show_hidden;
-                        state::snapshot_for_save(state)
-                    })
-                    .flatten();
-                    if let Some(snap) = snap {
-                        state::save_settings_if_dirty(snap);
-                    }
-                }
-                ID_VIEW_SHOW_FILES => {
-                    let snap = with_state_mut(|state| {
-                        state.show_files = !state.show_files;
-                        let _ = render_list(state);
-                        state::snapshot_for_save(state)
-                    })
-                    .flatten();
-                    if let Some(snap) = snap {
-                        state::save_settings_if_dirty(snap);
-                    }
-                }
-                ID_MENU_OPEN => {
-                    let path = with_state_mut(|state| {
-                        let scan = state.current_scan.as_ref()?;
-                        let node = scan.nodes.get(state.selected_id)?;
-                        Some(node.path.clone())
-                    })
-                    .flatten();
-                    if let Some(p) = path {
-                        thread::spawn(move || unsafe {
-                            ShellExecuteW(
-                                0,
-                                crate::io::wide("open").as_ptr(),
-                                crate::io::wide(&p).as_ptr(),
-                                null(),
-                                null(),
-                                5,
-                            );
-                        });
-                    }
-                }
-                ID_MENU_REVEAL => {
-                    let path = with_state_mut(|state| {
-                        let scan = state.current_scan.as_ref()?;
-                        let node = scan.nodes.get(state.selected_id)?;
-                        Some(node.path.clone())
-                    })
-                    .flatten();
-                    if let Some(p) = path {
-                        thread::spawn(move || {
-                            let _ = reveal_path(&p);
-                        });
-                    }
-                }
-                ID_MENU_COPY_PATH => {
-                    let path = with_state_mut(|state| {
-                        let scan = state.current_scan.as_ref()?;
-                        let node = scan.nodes.get(state.selected_id)?;
-                        Some(node.path.clone())
-                    })
-                    .flatten();
-                    if let Some(p) = path {
-                        unsafe {
-                            copy_to_clipboard(&p);
-                        }
-                    }
-                }
-                ID_MENU_DELETE => {
-                    let path = with_state_mut(|state| {
-                        let scan = state.current_scan.as_ref()?;
-                        let node = scan.nodes.get(state.selected_id)?;
-                        Some(node.path.clone())
-                    })
-                    .flatten();
-                    if let Some(p) = path {
-                        unsafe {
-                            let title = crate::io::wide("Confirm Delete");
-                            let msg = crate::io::wide(&format!(
-                                "Are you sure you want to permanently delete this item?\n\n{}",
-                                p
-                            ));
-                            let response = MessageBoxW(
-                                hwnd,
-                                msg.as_ptr(),
-                                title.as_ptr(),
-                                0x00000004 | 0x00000020, // MB_YESNO | MB_ICONQUESTION
-                            );
-                            if response == 6 {
-                                // IDYES is 6
-                                thread::spawn(move || {
-                                    let path_buf = PathBuf::from(p);
-                                    let delete_result = if path_buf.is_dir() {
-                                        fs::remove_dir_all(&path_buf)
-                                    } else {
-                                        fs::remove_file(&path_buf)
-                                    };
-                                    match delete_result {
-                                        Ok(_) => {
-                                            PostMessageW(
-                                                hwnd,
-                                                WM_COMMAND,
-                                                ID_REFRESH_BUTTON as Wparam,
-                                                0,
-                                            );
-                                        }
-                                        Err(err) => {
-                                            let err_msg =
-                                                format!("Failed to delete item:\n{}", err);
-                                            show_error_in_thread(hwnd, err_msg);
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    }
-                }
-                ID_MENU_PROPERTIES => {
-                    let path = with_state_mut(|state| {
-                        let scan = state.current_scan.as_ref()?;
-                        let node = scan.nodes.get(state.selected_id)?;
-                        Some(node.path.clone())
-                    })
-                    .flatten();
-                    if let Some(p) = path {
-                        thread::spawn(move || {
-                            use std::os::windows::process::CommandExt;
-                            const CREATE_NO_WINDOW: u32 = 0x08000000;
-                            let script = format!(
-                                "(New-Object -ComObject Shell.Application).NameSpace((Split-Path '{}')).ParseName((Split-Path '{}' -Leaf)).InvokeVerb('Properties')",
-                                p.replace("'", "''"),
-                                p.replace("'", "''")
-                            );
-                            let _ = Command::new("powershell")
-                                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-                                .creation_flags(CREATE_NO_WINDOW)
-                                .spawn();
-                        });
-                    }
-                }
-                _ => {}
-            }
-            0
-        }
-        WM_NOTIFY => {
-            let _ = lparam;
-            0
-        }
-        // Phase 02.1-05 — sync View-menu check marks before the popup renders (D-12 / Pitfall 7).
-        // The `hmenu == state.view_menu` guard is mandatory: WM_INITMENUPOPUP fires for EVERY
-        // popup including Shell context menus built by shell.rs. Without this guard,
-        // CheckMenuItem would corrupt arbitrary Shell context-menu state on each right-click.
-        WM_INITMENUPOPUP => {
-            let hmenu = wparam as Hmenu;
-            with_state_mut(|state| {
-                if hmenu == state.view_menu {
-                    let check = |id: isize, on: bool| {
-                        CheckMenuItem(
-                            hmenu,
-                            id as Uint,
-                            MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED },
-                        );
-                    };
-                    check(ID_VIEW_SHOW_HIDDEN, state.settings.show_hidden);
-                    check(ID_VIEW_SHOW_FILES, state.show_files);
-                    check(ID_VIEW_DARK_MODE, state.settings.dark_mode);
-                }
-            });
-            0
-        }
-        // Phase 02.1-05 — refresh accent color when the user changes Windows accent (D-09).
-        WM_DWMCOLORIZATIONCOLORCHANGED => {
-            with_state_mut(|state| {
-                theme::refresh_accent(state);
-                // Only the tab strip shows the accent underline — no need for a full repaint.
-                if state.tab_strip != 0 {
-                    InvalidateRect(state.tab_strip, null(), 1);
-                }
-            });
-            0
-        }
-        // Drag-coalesce flush: end of mouse drag or window resize (Plan 02-04, D-03).
-        WM_LBUTTONUP => {
-            state::flush_pending_persist(hwnd);
-            0
-        }
-        WM_EXITSIZEMOVE => {
-            state::flush_pending_persist(hwnd);
-            0
-        }
-        WM_COPYDATA => handle_copy_data(hwnd, lparam),
-        WM_SCAN_DONE => {
-            if lparam != 0 {
-                let payload = Box::from_raw(lparam as *mut ScanDone);
-                finish_scan(hwnd, payload.result, payload.canceled);
-            }
-            0
-        }
-        WM_SCAN_PROGRESS => {
-            if lparam != 0 {
-                let payload = Box::from_raw(lparam as *mut ScanProgressInfo);
-                apply_scan_progress(
-                    payload.node_count,
-                    payload.elapsed_ms,
-                    payload.partial_result,
-                );
-            }
-            0
-        }
-        WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-            // Must NOT acquire the STATE mutex here Ã¢â‚¬â€ this message is sent
-            // synchronously by child controls during repaint, which can
-            // happen while the mutex is already held (reentrant call).
-            // Using Mutex::lock() here would deadlock.
-            let hdc = wparam as Hdc;
-            if DARK_MODE_ATOMIC.load(Ordering::Relaxed) {
-                SetTextColor(hdc, rgb(238, 242, 246));
-                SetBkColor(hdc, rgb(24, 26, 30));
-                dark_brush() as Lresult
-            } else {
-                SetTextColor(hdc, rgb(18, 22, 27));
-                SetBkColor(hdc, rgb(242, 244, 247));
-                light_brush() as Lresult
-            }
         }
         WM_DESTROY => {
-            stop_current_scan();
-            // Final flush: capture any pending drag-coalesced changes before exit.
-            // Handles window-close via X button that may not have fired WM_LBUTTONUP.
-            state::flush_pending_persist(hwnd);
-            destroy_cached_icons();
             PostQuitMessage(0);
             0
+        }
+        WM_COPYDATA => {
+            // Second instance forwarded a path — navigate the WebView2.
+            if lparam != 0 {
+                let cds = &*(lparam as *const CopyDataStruct);
+                if cds.dwData == FILETREE_PATH_MSG_ID && cds.cbData > 0 {
+                    let char_count = cds.cbData as usize / 2;
+                    let slice = std::slice::from_raw_parts(cds.lpData as *const u16, char_count);
+                    let end = slice.iter().position(|&c| c == 0).unwrap_or(char_count);
+                    if let Ok(path) = String::from_utf16(&slice[..end]) {
+                        let port = SERVER_PORT.with(|p| *p.borrow());
+                        let url_str = format!(
+                            "http://127.0.0.1:{port}/?path={}\0",
+                            urlencoding_encode(&path)
+                        );
+                        let url_w: Vec<u16> = url_str.encode_utf16().collect();
+                        CONTROLLER.with(|c| {
+                            if let Some(ctrl) = c.borrow().as_ref()
+                                && let Ok(wv) = ctrl.CoreWebView2()
+                            {
+                                let _ = wv.Navigate(windows::core::PCWSTR(url_w.as_ptr()));
+                            }
+                        });
+                    }
+                }
+            }
+            SetForegroundWindow(hwnd);
+            1
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
-/// Set MIM_BACKGROUND on `menu` so Win32 uses the dark or light panel brush for the
-/// menu gutter, eliminating the white strip visible in dark mode (D-03).
-///
-/// Called once after SetMenu in create_controls and again in ID_VIEW_DARK_MODE on toggle.
-///
-/// SAFETY: `menu` must be a valid HMENU handle.
-unsafe fn apply_menu_bg(menu: Hmenu, dark: bool) {
-    use std::mem::size_of;
-    let brush = if dark { dark_brush() } else { light_brush() };
-    let info = MENUINFO {
-        cbSize: size_of::<MENUINFO>() as Dword,
-        fMask: MIM_BACKGROUND,
-        dwStyle: 0,
-        cyMax: 0,
-        hbrBack: brush,
-        dwContextHelpID: 0,
-        dwMenuData: 0,
-    };
-    SetMenuInfo(menu, &info);
-}
+/// Shows the Windows shell context menu for `path` at screen coordinates.
+/// Must be called on the UI thread (from the message loop).
+unsafe fn show_shell_context_menu(hwnd: Hwnd, path: &str, x: i32, y: i32) {
+    use std::ffi::c_void;
 
-unsafe fn create_controls(hwnd: Hwnd) {
-    let h_instance = GetModuleHandleW(null());
-    with_state_mut(|state| {
-        state.hwnd = hwnd;
-        let face = crate::io::wide("Segoe UI");
-        state.font = CreateFontW(-15, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
-        state.bold_font = CreateFontW(-15, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
+    // Convert path to wide string.
+    let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
 
-        // Create drive picker (ComboBoxEx32) — left of the path edit (Plan 02-03, Pattern 4).
-        // Positioned at placeholder coords (0, 0, 10, 10); resize_controls does final layout.
-        {
-            let class = crate::io::wide("ComboBoxEx32");
-            state.drive_picker = CreateWindowExW(
-                0,
-                class.as_ptr(),
-                null(),
-                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-                0,
-                0,
-                10,
-                10,
-                hwnd,
-                ID_DRIVE_PICKER as Hmenu,
-                h_instance,
-                null_mut(),
-            );
-        }
-        // POL-03 / D-04: apply full dark triad (DWM + AllowDark + SetWindowTheme) to
-        // drive_picker before first show, so it doesn't flash light on launch.
-        if state.drive_picker != 0 {
-            apply_dark_mode_to_window(state.drive_picker, state.dark_mode);
-        }
-        // Populate the drive picker with all non-empty drives.
-        // Initial call uses initial_path; the post-ShowWindow block in run() re-calls
-        // with settings.last_path to restore the last drive (D-11 two-stage fix).
-        if state.drive_picker != 0 {
-            let init_path = if !state.settings.last_path.is_empty() {
-                state.settings.last_path.clone()
-            } else {
-                path_to_string(&state.initial_path)
-            };
-            populate_drive_picker(state.drive_picker, &init_path);
-        }
-
-        // Create path edit EDIT control (Plan 02-03).
-        // Use last_path from settings if non-empty; fall back to initial_path (command-line arg).
-        let initial_path_text = if !state.settings.last_path.is_empty() {
-            state.settings.last_path.clone()
-        } else {
-            path_to_string(&state.initial_path)
-        };
-        state.path_edit = create_child(
-            hwnd,
-            h_instance,
-            "EDIT",
-            &initial_path_text,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-            0,
-            ID_PATH_EDIT,
-        );
-        // POL-03 / D-04: pre-show dark apply for path edit.
-        if state.path_edit != 0 {
-            apply_dark_mode_to_window(state.path_edit, state.dark_mode);
-        }
-        // SHAutoComplete MUST be called AFTER CreateWindowExW returns a non-zero HWND
-        // (Pitfall #3 — calling before the edit HWND is valid silently fails).
-        // This wires the Explorer-style filesystem autocomplete dropdown to the path edit.
-        if state.path_edit != 0 {
-            SHAutoComplete(
-                state.path_edit,
-                SHACF_FILESYS_DIRS | SHACF_AUTOSUGGEST_FORCE_ON | SHACF_AUTOAPPEND_FORCE_ON,
-            );
-        }
-        state.browse_button = create_child(
-            hwnd,
-            h_instance,
-            "BUTTON",
-            "Select Directory",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            ID_BROWSE_BUTTON,
-        );
-        if state.browse_button != 0 {
-            apply_dark_mode_to_window(state.browse_button, state.dark_mode);
-        }
-        state.scan_button = create_child(
-            hwnd,
-            h_instance,
-            "BUTTON",
-            "Scan",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            ID_SCAN_BUTTON,
-        );
-        if state.scan_button != 0 {
-            apply_dark_mode_to_window(state.scan_button, state.dark_mode);
-        }
-        state.stop_button = create_child(
-            hwnd,
-            h_instance,
-            "BUTTON",
-            "Stop",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            ID_STOP_BUTTON,
-        );
-        if state.stop_button != 0 {
-            apply_dark_mode_to_window(state.stop_button, state.dark_mode);
-        }
-        state.refresh_button = create_child(
-            hwnd,
-            h_instance,
-            "BUTTON",
-            "Refresh",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            ID_REFRESH_BUTTON,
-        );
-        if state.refresh_button != 0 {
-            apply_dark_mode_to_window(state.refresh_button, state.dark_mode);
-        }
-        state.expand_button = create_child(
-            hwnd,
-            h_instance,
-            "BUTTON",
-            "Expand",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            ID_EXPAND_BUTTON,
-        );
-        if state.expand_button != 0 {
-            apply_dark_mode_to_window(state.expand_button, state.dark_mode);
-        }
-        state.collapse_button = create_child(
-            hwnd,
-            h_instance,
-            "BUTTON",
-            "Collapse",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            ID_COLLAPSE_BUTTON,
-        );
-        if state.collapse_button != 0 {
-            apply_dark_mode_to_window(state.collapse_button, state.dark_mode);
-        }
-        state.columns_button = create_child(
-            hwnd,
-            h_instance,
-            "BUTTON",
-            "Path Column",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            ID_COLUMNS_BUTTON,
-        );
-        if state.columns_button != 0 {
-            apply_dark_mode_to_window(state.columns_button, state.dark_mode);
-        }
-        // Phase 02.1-05 — toolbar checkboxes removed in favor of View menu (D-06).
-        // hidden_check / files_check / follow_check / dark_check HWND fields remain
-        // on DesktopState as 0 for binary compat — no HWND is ever created for them.
-        // Build the View menu bar (D-08 / WM_INITMENUPOPUP sync via Pitfall 7 guard).
-        // Phase 02.1-06: All AppendMenuW calls use MF_OWNERDRAW so WM_DRAWITEM paints
-        // them with dark palette + accent hover (D-03 owner-draw requirement).
-        {
-            let main_menu = CreateMenu();
-            let view_menu = CreatePopupMenu();
-            // MF_STRING | MF_OWNERDRAW: Win32 uses the label string for accessibility;
-            // visual rendering goes through WM_DRAWITEM (RESEARCH Pitfall 4).
-            let label_show_hidden = crate::io::wide("&Show Hidden");
-            AppendMenuW(
-                view_menu,
-                MF_STRING | MF_OWNERDRAW,
-                ID_VIEW_SHOW_HIDDEN as usize,
-                label_show_hidden.as_ptr(),
-            );
-            let label_show_files = crate::io::wide("Show &Files");
-            AppendMenuW(
-                view_menu,
-                MF_STRING | MF_OWNERDRAW,
-                ID_VIEW_SHOW_FILES as usize,
-                label_show_files.as_ptr(),
-            );
-            let label_dark = crate::io::wide("&Dark Mode");
-            AppendMenuW(
-                view_menu,
-                MF_STRING | MF_OWNERDRAW,
-                ID_VIEW_DARK_MODE as usize,
-                label_dark.as_ptr(),
-            );
-            // Top-level "&View" item is also owner-drawn (MF_POPUP | MF_OWNERDRAW).
-            let label_view = crate::io::wide("&View");
-            AppendMenuW(
-                main_menu,
-                MF_POPUP | MF_OWNERDRAW,
-                view_menu as usize,
-                label_view.as_ptr(),
-            );
-            SetMenu(state.hwnd, main_menu);
-            // MIM_BACKGROUND: paint the menu-bar gutter with dark/light brush so no
-            // white strip appears in dark mode (D-03 closure).
-            apply_menu_bg(main_menu, state.dark_mode);
-            apply_menu_bg(view_menu, state.dark_mode);
-            // Cache the view_menu handle for WM_INITMENUPOPUP filter (Pitfall 7):
-            // without this guard CheckMenuItem fires on every popup including Shell
-            // context menus, corrupting their state.
-            state.view_menu = view_menu;
-        }
-        // Create the tab strip and 5 content panels (Plan 02.1-05, D-08).
-        // register_class is idempotent (OnceLock inside tabs.rs) — safe to call here.
-        tabs::register_class(h_instance);
-        {
-            let class = crate::io::wide(tabs::TAB_CLASS_NAME);
-            state.tab_strip = CreateWindowExW(
-                0,
-                class.as_ptr(),
-                null(),
-                WS_CHILD | WS_VISIBLE,
-                0,
-                0,
-                10,
-                10,
-                hwnd,
-                ID_TAB_STRIP as Hmenu,
-                h_instance,
-                null_mut(),
-            );
-            apply_dark_mode_to_window(state.tab_strip, state.dark_mode);
-        }
-        // Details tab (index 0) — alias the existing list content area (no list HWND yet;
-        // the list is created on first scan). Set panel[0] to 0 for now; it will be
-        // re-assigned in render_list once the list HWND exists.
-        // Panels 1–4 are simple STATIC placeholder windows.
-        for i in 0..5usize {
-            let panel = if i == 0 {
-                // Panel 0 will hold the scan list — created as a lightweight container.
-                let class = crate::io::wide("STATIC");
-                let text = crate::io::wide(""); // no text for the details panel
-                CreateWindowExW(
-                    0,
-                    class.as_ptr(),
-                    text.as_ptr(),
-                    WS_CHILD | SS_LEFT | SS_NOPREFIX,
-                    0,
-                    0,
-                    10,
-                    10,
-                    hwnd,
-                    0,
-                    h_instance,
-                    null_mut(),
-                )
-            } else {
-                let class = crate::io::wide("STATIC");
-                let labels = [
-                    "",
-                    "Coming soon — Top files",
-                    "Coming soon — Extensions",
-                    "Coming soon — Duplicates",
-                    "Coming soon — Errors",
-                ];
-                let text = crate::io::wide(labels[i]);
-                CreateWindowExW(
-                    0,
-                    class.as_ptr(),
-                    text.as_ptr(),
-                    WS_CHILD | SS_LEFT | SS_NOPREFIX,
-                    0,
-                    0,
-                    10,
-                    10,
-                    hwnd,
-                    0,
-                    h_instance,
-                    null_mut(),
-                )
-            };
-            state.tab_panels[i] = panel;
-            if panel != 0 {
-                apply_dark_mode_to_window(panel, state.dark_mode);
-                // Show only the active tab's panel on startup; hide the rest.
-                if i == state.active_tab as usize {
-                    ShowWindow(panel, SW_SHOW);
-                } else {
-                    ShowWindow(panel, SW_HIDE);
-                }
-            }
-        }
-        // Phase 02.1-06 (D-07): Replace msctls_statusbar32 with a custom-painted
-        // FileTreeStatusFooter child window. No sizing grip, no Win9x visual cruft.
-        // Status content is pulled directly from state fields in draw_status_footer.
-        {
-            paint::register_status_footer_class(h_instance);
-            let class = crate::io::wide(STATUS_FOOTER_CLASS_NAME);
-            state.status_footer = CreateWindowExW(
-                0,
-                class.as_ptr(),
-                null(),
-                WS_CHILD | WS_VISIBLE,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                ID_STATUS_FOOTER as Hmenu,
-                h_instance,
-                null_mut(),
-            );
-            if state.status_footer != 0 {
-                apply_dark_mode_to_window(state.status_footer, state.dark_mode);
-            }
-        }
-        state.list = 0;
-
-        // Sync runtime state with loaded settings.
-        state.dark_mode = state.settings.dark_mode;
-        state.show_files = state.settings.show_hidden; // initialize from persisted state
-        DARK_MODE_ATOMIC.store(state.dark_mode, Ordering::Relaxed);
-        for control in [
-            state.drive_picker,
-            state.path_edit,
-            state.browse_button,
-            state.scan_button,
-            state.stop_button,
-            state.refresh_button,
-            state.expand_button,
-            state.collapse_button,
-            state.columns_button,
-        ] {
-            if control != 0 {
-                SendMessageW(control, WM_SETFONT, state.font as Wparam, 1);
-            }
-        }
-        apply_theme(state);
-        EnableWindow(state.stop_button, 0);
-    });
-}
-
-unsafe fn create_child(
-    parent: Hwnd,
-    h_instance: Hinstance,
-    class_name: &str,
-    text: &str,
-    style: Dword,
-    ex_style: Dword,
-    id: isize,
-) -> Hwnd {
-    let class = crate::io::wide(class_name);
-    let text = crate::io::wide(text);
-    CreateWindowExW(
-        ex_style,
-        class.as_ptr(),
-        text.as_ptr(),
-        style,
+    // Parse the path into an ITEMIDLIST.
+    let mut pidl: *mut ffi::ITEMIDLIST = std::ptr::null_mut();
+    let mut attr_out: u32 = 0;
+    let hr = SHParseDisplayName(
+        wide.as_ptr(),
+        std::ptr::null_mut(),
+        &mut pidl,
         0,
-        0,
-        10,
-        10,
-        parent,
-        id as Hmenu,
-        h_instance,
-        null_mut(),
-    )
-}
-
-/// Switch the visible content panel to the given tab.
-///
-/// REENTRANCY DISCIPLINE (T-02.1-05-05 / PATTERNS.md WARNING 2):
-///   This function MUST be called INSIDE a `with_state_mut` closure.
-///   It MUST NOT call `save_settings_if_dirty` — that save runs at function-body
-///   indentation OUTSIDE the closure, after the lock is released. Violating this
-///   order causes a deadlock because `save_settings_if_dirty` would try to re-enter
-///   the state lock that the closure already holds.
-fn activate_tab(state: &mut DesktopState, tab: ActiveTab) {
-    state.active_tab = tab;
-    state.settings.active_tab = tab.as_str().to_string();
-    // Show only the matching panel; hide the rest.
-    for (i, &panel) in state.tab_panels.iter().enumerate() {
-        if panel != 0 {
-            let show = if i == tab as usize { SW_SHOW } else { SW_HIDE };
-            unsafe { ShowWindow(panel, show) };
-        }
-    }
-    // Invalidate the tab strip to repaint the active-tab accent underline.
-    if state.tab_strip != 0 {
-        unsafe { InvalidateRect(state.tab_strip, null(), 1) };
-    }
-}
-
-unsafe fn resize_controls(hwnd: Hwnd) {
-    let mut rect: Rect = zeroed();
-    if GetClientRect(hwnd, &mut rect) == 0 {
-        return;
-    }
-
-    let width = (rect.right - rect.left).max(500);
-    let _height = (rect.bottom - rect.top).max(300);
-    with_state_mut(|state| {
-        let margin = 10;
-        let browse_w = 110;
-        let button_h = 26;
-        let path_y = 38;
-        let _actions_y = 74; // retained for reference; no longer used since toolbar removed
-        let _status_h = 26;
-
-        // Drive picker: 80 logical px wide (UI-SPEC), left-inset of `margin` (8px sm spacing)
-        let picker_w = 80;
-        let picker_gap = 4; // xs spacing between picker and path edit
-        let bar_h = 32; // xl token — path bar height
-
-        // Layout drive picker + path edit:
-        //   [margin] [picker_w] [picker_gap] [path_edit_w] [8] [browse_w] [margin]
-        let path_edit_x = margin + picker_w + picker_gap;
-        let path_edit_w = (width - path_edit_x - 8 - browse_w - margin).max(100);
-
-        if state.drive_picker != 0 {
-            MoveWindow(state.drive_picker, margin, path_y, picker_w, bar_h, 1);
-        }
-        MoveWindow(
-            state.path_edit,
-            path_edit_x,
-            path_y,
-            path_edit_w,
-            button_h,
-            1,
-        );
-        MoveWindow(
-            state.browse_button,
-            path_edit_x + path_edit_w + 8,
-            path_y,
-            browse_w,
-            button_h,
-            1,
-        );
-
-        // Phase 02.1-05 — Tab strip + content panels replace the old toolbar row.
-        // Layout: path bar → tab strip (30 px DPI-scaled) → content panel → status footer.
-        let dpi = GetDpiForWindow(hwnd);
-        let dpi = if dpi == 0 { 96 } else { dpi };
-        let strip_h = MulDiv(30, dpi as i32, 96);
-        // Path bar bottom edge determines where the tab strip begins.
-        let path_bar_bottom = path_y + bar_h;
-        // Phase 02.1-06 (D-07): footer height token = 22 logical px (matches menu-item token).
-        let footer_h = MulDiv(22, dpi as i32, 96);
-        let client_h = (rect.bottom - rect.top).max(300);
-        // Tab strip: full width, directly below the path bar.
-        let strip_y = path_bar_bottom + 4; // 4px gap below the path bar
-        if state.tab_strip != 0 {
-            MoveWindow(state.tab_strip, 0, strip_y, width, strip_h, 1);
-            // Trigger WM_SIZE on the strip so it recomputes tab_rects.
-            let rects = tabs::recompute_rects(state.tab_strip, width, dpi, state.font);
-            state.tab_rects = rects;
-        }
-        // Content panels: fill from below the strip to above the status footer.
-        let panel_y = strip_y + strip_h;
-        let panel_h = (client_h - panel_y - footer_h).max(1);
-        for &panel in &state.tab_panels {
-            if panel != 0 {
-                MoveWindow(panel, 0, panel_y, width, panel_h, 1);
-            }
-        }
-        // Also show the action buttons in the path-bar row (Scan/Stop/Refresh/Expand/Collapse/Columns).
-        // These are placed to the right of the browse button, or visible at all times.
-        // For simplicity in this phase: show all action buttons always; they sit in the path bar row.
-        let btn_y = path_y;
-        let btn_x_start = path_edit_x + path_edit_w + 8 + browse_w + 8;
-        let mut btn_x = btn_x_start;
-        let btn_w = 75;
-        ShowWindow(state.scan_button, SW_SHOW);
-        MoveWindow(state.scan_button, btn_x, btn_y, btn_w, button_h, 1);
-        btn_x += btn_w + 4;
-        ShowWindow(state.stop_button, SW_SHOW);
-        MoveWindow(state.stop_button, btn_x, btn_y, btn_w, button_h, 1);
-        btn_x += btn_w + 4;
-        ShowWindow(state.refresh_button, SW_SHOW);
-        MoveWindow(state.refresh_button, btn_x, btn_y, btn_w, button_h, 1);
-        btn_x += btn_w + 4;
-        ShowWindow(state.expand_button, SW_SHOW);
-        MoveWindow(state.expand_button, btn_x, btn_y, 70, button_h, 1);
-        btn_x += 70 + 4;
-        ShowWindow(state.collapse_button, SW_SHOW);
-        MoveWindow(state.collapse_button, btn_x, btn_y, 80, button_h, 1);
-        btn_x += 80 + 4;
-        ShowWindow(state.columns_button, SW_SHOW);
-        MoveWindow(state.columns_button, btn_x, btn_y, 90, button_h, 1);
-
-        // Phase 02.1-06 (D-07): position custom FileTreeStatusFooter at the bottom.
-        if state.status_footer != 0 {
-            MoveWindow(
-                state.status_footer,
-                0,
-                client_h - footer_h,
-                width,
-                footer_h,
-                1,
-            );
-            InvalidateRect(state.status_footer, null(), 1);
-        }
-    });
-}
-
-pub(super) unsafe fn start_scan_from_controls(hwnd: Hwnd) {
-    // Collect everything we need from state, then release the mutex
-    // BEFORE calling any Win32 APIs that could send messages back.
-    let scan_setup = with_state_mut(|state| {
-        if state.scanning {
-            return None;
-        }
-        let path = get_window_text(state.path_edit);
-        // Persist the last scanned path immediately (discrete mutation, D-03).
-        state.settings.last_path = path.clone();
-        state.scanning = true;
-        state.current_scan = None;
-        state.visible_rows.clear();
-        state.expanded.clear();
-        state.expanded.insert(0);
-        for (_key, icon) in state.icon_cache.drain() {
-            if icon != 0 {
-                DestroyIcon(icon);
-            }
-        }
-        // show_files is now managed via ID_VIEW_SHOW_FILES menu toggle (no checkbox HWND).
-        // state.show_files is already up to date from the last toggle; no reset needed here.
-        state.status_idle = false;
-        state.last_scan_bytes = 0;
-        state.last_scan_elapsed_ms = 0;
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        state.current_cancel = Some(Arc::clone(&cancel_flag));
-
-        let options = ScanOptions {
-            root: PathBuf::from(path),
-            // Phase 02.1-05: hidden/follow toggles moved from checkboxes to View menu.
-            // Read from settings (source of truth) rather than now-removed checkbox HWNDs.
-            include_hidden: state.settings.show_hidden,
-            follow_links: state.settings.follow_symlinks,
-            exclude_patterns: Vec::new(),
-            max_depth: None,
-            threads: default_thread_count(),
-        };
-        let controls = (
-            state.status_footer,
-            state.path_edit,
-            state.browse_button,
-            state.scan_button,
-            state.refresh_button,
-            state.stop_button,
-        );
-        let snap = state::snapshot_for_save(state);
-        Some((options, cancel_flag, controls, snap))
-    })
-    .flatten();
-
-    let Some((options, cancel, controls, path_snap)) = scan_setup else {
-        return;
-    };
-    // Save last_path OUTSIDE the lock (reentrancy discipline).
-    if let Some(snap) = path_snap {
-        state::save_settings_if_dirty(snap);
-    }
-
-    // Win32 calls OUTSIDE the mutex Ã¢â‚¬â€ safe from deadlock.
-    // Phase 02.1-06 (D-07): custom footer paints from state fields; invalidate to repaint.
-    if controls.0 != 0 {
-        InvalidateRect(controls.0, null(), 1);
-    }
-    EnableWindow(controls.1, 0);
-    EnableWindow(controls.2, 0);
-    EnableWindow(controls.3, 0);
-    EnableWindow(controls.4, 0);
-    EnableWindow(controls.5, 1);
-    InvalidateRect(hwnd, null(), 1);
-
-    thread::spawn(move || {
-        let progress_cancel = Arc::clone(&cancel);
-        let result = scan_path_with_progress(
-            options,
-            Arc::clone(&cancel),
-            |node_count, elapsed_ms, partial| {
-                if !progress_cancel.load(Ordering::Relaxed) {
-                    let payload = Box::new(ScanProgressInfo {
-                        node_count,
-                        elapsed_ms,
-                        partial_result: partial,
-                    });
-                    unsafe {
-                        PostMessageW(hwnd, WM_SCAN_PROGRESS, 0, Box::into_raw(payload) as Lparam);
-                    }
-                }
-            },
-        )
-        .map_err(|error| error.to_string());
-        let canceled = cancel.load(Ordering::Relaxed);
-        let payload = Box::new(ScanDone { result, canceled });
-        unsafe {
-            PostMessageW(hwnd, WM_SCAN_DONE, 0, Box::into_raw(payload) as Lparam);
-        }
-    });
-}
-
-unsafe fn finish_scan(hwnd: Hwnd, result: Result<ScanResult, String>, canceled: bool) {
-    // Collect deferred Win32 actions from state, then execute them
-    // AFTER releasing the mutex to avoid deadlock.
-    let deferred = with_state_mut(|state| {
-        state.scanning = false;
-        state.current_cancel = None;
-        // Mark status idle so throughput pane resets to "-- MB/s" immediately (UI-SPEC).
-        state.status_idle = true;
-        let controls = (
-            state.status_footer,
-            state.path_edit,
-            state.browse_button,
-            state.scan_button,
-            state.refresh_button,
-            state.stop_button,
-        );
-
-        match result {
-            Ok(scan) => {
-                let elapsed = scan.elapsed_ms;
-                let node_count = scan.nodes.len();
-                let file_count = scan.nodes.iter().filter(|n| !n.is_dir).count() as u64;
-                let folder_count = scan.nodes.iter().filter(|n| n.is_dir).count() as u64;
-                let error_count = scan.errors.len() as u64;
-                let root_size = scan.nodes.first().map(|node| node.size).unwrap_or(0);
-                state.current_scan = Some(Arc::new(scan));
-                state.expanded.clear();
-                state.expanded.insert(0);
-                let _ = render_list(state);
-                (
-                    controls,
-                    Some((
-                        file_count,
-                        folder_count,
-                        error_count,
-                        elapsed,
-                        canceled,
-                        node_count,
-                        root_size,
-                    )),
-                    None::<String>,
-                )
-            }
-            Err(message) => (controls, None, Some(message)),
-        }
-    });
-
-    if let Some((controls, scan_info, error_msg)) = deferred {
-        // Win32 calls OUTSIDE the mutex.
-        EnableWindow(controls.1, 1);
-        EnableWindow(controls.2, 1);
-        EnableWindow(controls.3, 1);
-        EnableWindow(controls.4, 1);
-        EnableWindow(controls.5, 0);
-        if let Some((_files, _folders, _errors, _elapsed, was_canceled, node_count, root_size)) =
-            scan_info
-        {
-            // Phase 02.1-06 (D-07): footer reads from state.current_scan; just invalidate.
-            let footer = controls.0;
-            if footer != 0 {
-                InvalidateRect(footer, null(), 1);
-            }
-            let _ = (was_canceled, node_count, root_size);
-        } else if error_msg.is_none() {
-            // Scan failed path — invalidate footer to show idle markers.
-            let footer = controls.0;
-            if footer != 0 {
-                InvalidateRect(footer, null(), 1);
-            }
-        }
-        if let Some(msg) = error_msg {
-            show_error(hwnd, &msg);
-        }
-    }
-}
-
-unsafe fn apply_scan_progress(
-    node_count: usize,
-    elapsed_ms: u128,
-    partial_result: Option<ScanResult>,
-) {
-    // Update the scan result inside state and trigger render_list if a partial result is present.
-    // Also capture bytes and elapsed for the throughput formula.
-    let status_info = with_state_mut(|state| {
-        if !state.scanning {
-            return None;
-        }
-        let bytes = if let Some(scan) = partial_result {
-            let root_size = scan.nodes.first().map(|n| n.size).unwrap_or(0);
-            state.current_scan = Some(Arc::new(scan));
-            let _ = render_list(state);
-            root_size
-        } else {
-            state
-                .current_scan
-                .as_ref()
-                .and_then(|s| s.nodes.first())
-                .map(|n| n.size)
-                .unwrap_or(0)
-        };
-        state.last_scan_bytes = bytes;
-        state.last_scan_elapsed_ms = elapsed_ms;
-        // files/folders/errors are now read directly by draw_status_footer from state;
-        // we no longer need to pass them through the tuple. Suppress unused-variable lint.
-        let _ = node_count;
-        Some((state.status_footer, bytes, elapsed_ms))
-    })
-    .flatten();
-
-    // Win32 calls OUTSIDE the mutex — safe from deadlock.
-    // Phase 02.1-06 (D-07): custom footer reads from state fields; just invalidate.
-    if let Some((footer, _bytes, _elapsed)) = status_info
-        && footer != 0
-    {
-        InvalidateRect(footer, null(), 1);
-    }
-}
-
-unsafe fn stop_current_scan() {
-    let footer = with_state_mut(|state| {
-        if let Some(cancel) = &state.current_cancel {
-            cancel.store(true, Ordering::Relaxed);
-            // Phase 02.1-06 (D-07): footer auto-paints; just invalidate on cancel.
-            Some(state.status_footer)
-        } else {
-            None
-        }
-    })
-    .flatten();
-    if let Some(footer) = footer
-        && footer != 0
-    {
-        InvalidateRect(footer, null(), 1);
-    }
-}
-
-unsafe fn destroy_cached_icons() {
-    with_state_mut(|state| {
-        for (_key, icon) in state.icon_cache.drain() {
-            if icon != 0 {
-                DestroyIcon(icon);
-            }
-        }
-    });
-}
-
-unsafe fn expand_all_directories() {
-    let deferred = with_state_mut(|state| {
-        if let Some(scan) = &state.current_scan {
-            state.expanded = scan
-                .nodes
-                .iter()
-                .filter(|node| node.is_dir)
-                .map(|node| node.id)
-                .collect();
-            render_list(state)
-        } else {
-            None
-        }
-    })
-    .flatten();
-    // Phase 02.1-06 (D-07): status text is reflected through draw_status_footer;
-    // invalidate the footer HWND so it repaints from current state.
-    let _ = deferred; // status text no longer sent to footer; it auto-paints from state
-    with_state_mut(|state| {
-        if state.status_footer != 0 {
-            InvalidateRect(state.status_footer, null(), 1);
-        }
-    });
-}
-
-unsafe fn collapse_to_root() {
-    let deferred = with_state_mut(|state| {
-        state.expanded.clear();
-        state.expanded.insert(0);
-        render_list(state)
-    })
-    .flatten();
-    let _ = deferred;
-    with_state_mut(|state| {
-        if state.status_footer != 0 {
-            InvalidateRect(state.status_footer, null(), 1);
-        }
-    });
-}
-
-unsafe fn toggle_path_column() {
-    let deferred = with_state_mut(|state| {
-        state.path_column_visible = !state.path_column_visible;
-        update_column_widths(state);
-        let msg = if state.path_column_visible {
-            "Path column shown"
-        } else {
-            "Path column hidden"
-        };
-        (state.status_footer, msg.to_string())
-    });
-    if let Some((footer, _msg)) = deferred {
-        // Phase 02.1-06 (D-07): footer auto-paints from state; just invalidate.
-        if footer != 0 {
-            InvalidateRect(footer, null(), 1);
-        }
-    }
-}
-
-unsafe fn choose_and_set_directory(hwnd: Hwnd) {
-    if let Some(path) = browse_for_directory(hwnd) {
-        let hwnds = with_state_mut(|state| (state.path_edit, state.status_footer));
-        if let Some((path_edit, footer)) = hwnds {
-            set_window_text(path_edit, &path);
-            // Phase 02.1-06 (D-07): footer auto-paints; invalidate to refresh.
-            if footer != 0 {
-                InvalidateRect(footer, null(), 1);
-            }
-        }
-    }
-}
-
-unsafe fn browse_for_directory(hwnd: Hwnd) -> Option<String> {
-    let title = crate::io::wide("Select a directory to scan");
-    let mut display_name = [0u16; 260];
-    let mut info = BrowseInfoW {
-        hwndOwner: hwnd,
-        pidlRoot: null_mut(),
-        pszDisplayName: display_name.as_mut_ptr(),
-        lpszTitle: title.as_ptr(),
-        ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
-        lpfn: None,
-        lParam: 0,
-        iImage: 0,
-    };
-    let pidl = SHBrowseForFolderW(&mut info);
-    if pidl.is_null() {
-        return None;
-    }
-
-    let mut path = [0u16; 260];
-    let ok = SHGetPathFromIDListW(pidl, path.as_mut_ptr()) != 0;
-    CoTaskMemFree(pidl);
-    if !ok {
-        return None;
-    }
-
-    let len = path.iter().position(|ch| *ch == 0).unwrap_or(path.len());
-    Some(String::from_utf16_lossy(&path[..len]))
-}
-
-unsafe fn handle_mouse_click(hwnd: Hwnd, lparam: Lparam, double_click: bool) {
-    let x = loword_signed(lparam);
-    let y = hiword_signed(lparam);
-    // Phase 02.1-05 — tab clicks are now handled by tabs.rs (FileTreeTabStrip HWND).
-    // The main window no longer receives tab-strip clicks directly.
-
-    with_state_mut(|state| {
-        let row_top = table_top() + 30;
-        if y < row_top {
-            return;
-        }
-        let row_h = 27;
-        let row_index = state.scroll_row + ((y - row_top) / row_h) as usize;
-        let Some(node_id) = state.visible_rows.get(row_index).copied() else {
-            return;
-        };
-        state.selected_id = node_id;
-
-        let Some(scan) = state.current_scan.clone() else {
-            InvalidateRect(hwnd, null(), 0);
-            return;
-        };
-        let Some(node) = scan.nodes.get(node_id) else {
-            InvalidateRect(hwnd, null(), 0);
-            return;
-        };
-        let twist_x = 10 + 8 + (node.depth as i32 * 18);
-        let in_twist = x >= twist_x && x <= twist_x + 20;
-        if node.is_dir && (double_click || in_twist) {
-            if state.expanded.contains(&node_id) {
-                state.expanded.remove(&node_id);
-            } else {
-                state.expanded.insert(node_id);
-            }
-            render_list(state);
-        } else {
-            if !node.is_dir && double_click {
-                let path_clone = node.path.clone();
-                thread::spawn(move || unsafe {
-                    ShellExecuteW(
-                        0,
-                        crate::io::wide("open").as_ptr(),
-                        crate::io::wide(&path_clone).as_ptr(),
-                        null(),
-                        null(),
-                        5,
-                    );
-                });
-            }
-            InvalidateRect(hwnd, null(), 0);
-        }
-    });
-}
-
-unsafe fn handle_mouse_wheel(hwnd: Hwnd, wparam: Wparam) {
-    let delta = ((wparam >> 16) as i16) as i32;
-    with_state_mut(|state| {
-        if state.visible_rows.is_empty() {
-            return;
-        }
-        let step = if delta > 0 { -3 } else { 3 };
-        scroll_rows(state, step);
-        InvalidateRect(hwnd, null(), 0);
-    });
-}
-
-unsafe fn handle_mouse_move(hwnd: Hwnd, _client_x: i32, client_y: i32) {
-    let hovered = with_state_mut(|state| {
-        let row_top = table_top() + 30;
-        if client_y < row_top {
-            let old = state.hovered_id;
-            state.hovered_id = None;
-            return (old, None);
-        }
-        let row_h = 27;
-        let row_index = state.scroll_row + ((client_y - row_top) / row_h) as usize;
-        let node_id = state.visible_rows.get(row_index).copied();
-        let old = state.hovered_id;
-        state.hovered_id = node_id;
-        (old, node_id)
-    });
-
-    if let Some((old_hover, new_hover)) = hovered
-        && old_hover != new_hover
-    {
-        InvalidateRect(hwnd, null(), 0);
-    }
-}
-
-unsafe fn handle_key(hwnd: Hwnd, key: Wparam) {
-    with_state_mut(|state| {
-        match key {
-            VK_UP => move_selection(state, -1),
-            VK_DOWN => move_selection(state, 1),
-            VK_PRIOR => scroll_rows(state, -20),
-            VK_NEXT => scroll_rows(state, 20),
-            VK_HOME => state.scroll_row = 0,
-            VK_END => state.scroll_row = state.visible_rows.len().saturating_sub(1),
-            _ => {}
-        }
-        InvalidateRect(hwnd, null(), 0);
-    });
-}
-
-fn move_selection(state: &mut DesktopState, delta: isize) {
-    if state.visible_rows.is_empty() {
-        return;
-    }
-    let current = state
-        .visible_rows
-        .iter()
-        .position(|id| *id == state.selected_id)
-        .unwrap_or(0);
-    let next = current
-        .saturating_add_signed(delta)
-        .min(state.visible_rows.len().saturating_sub(1));
-    state.selected_id = state.visible_rows[next];
-    if next < state.scroll_row {
-        state.scroll_row = next;
-    }
-}
-
-fn scroll_rows(state: &mut DesktopState, delta: isize) {
-    let max = state.visible_rows.len().saturating_sub(1);
-    state.scroll_row = state.scroll_row.saturating_add_signed(delta).min(max);
-}
-
-fn loword_signed(value: Lparam) -> i32 {
-    (value as u32 & 0xffff) as i16 as i32
-}
-
-fn hiword_signed(value: Lparam) -> i32 {
-    ((value as u32 >> 16) & 0xffff) as i16 as i32
-}
-
-/// Rebuilds the visible_rows list and invalidates the window.
-/// Returns a status message string that should be set on the status
-/// bar AFTER the mutex is released (to avoid deadlock from
-/// SetWindowTextW sending synchronous messages back to our proc).
-unsafe fn render_list(state: &mut DesktopState) -> Option<String> {
-    state.visible_rows.clear();
-
-    let Some(scan) = state.current_scan.clone() else {
-        state.scroll_row = 0;
-        InvalidateRect(state.hwnd, null(), 1);
-        return None;
-    };
-
-    collect_rows(
-        &scan,
-        0,
-        &state.expanded,
-        state.show_files,
-        &mut state.visible_rows,
+        &mut attr_out,
     );
-    if state.scroll_row >= state.visible_rows.len() {
-        state.scroll_row = state.visible_rows.len().saturating_sub(1);
-    }
-
-    InvalidateRect(state.hwnd, null(), 0);
-
-    scan.nodes.first().map(|root| {
-        format!(
-            "{} | {} | {} files | {} folders | {} visible rows",
-            root.path,
-            format_bytes_ui(root.size),
-            format_count_ui(root.files),
-            format_count_ui(root.folders),
-            format_count_ui(state.visible_rows.len() as u64)
-        )
-    })
-}
-
-fn collect_rows(
-    scan: &ScanResult,
-    id: usize,
-    expanded: &BTreeSet<usize>,
-    show_files: bool,
-    rows: &mut Vec<usize>,
-) {
-    let Some(node) = scan.nodes.get(id) else {
-        return;
-    };
-
-    if rows.len() >= MAX_VISIBLE_ROWS {
+    if hr < 0 || pidl.is_null() {
         return;
     }
 
-    if node.is_dir || show_files {
-        rows.push(id);
+    // Bind to the parent folder, getting a child PIDL.
+    let mut folder_ptr: *mut c_void = std::ptr::null_mut();
+    let mut child_pidl: *const ffi::ITEMIDLIST = std::ptr::null();
+    let hr2 = SHBindToParent(
+        pidl,
+        &ffi::IID_IShellFolder,
+        &mut folder_ptr,
+        &mut child_pidl,
+    );
+    if hr2 < 0 || folder_ptr.is_null() {
+        CoTaskMemFree(pidl as *mut c_void);
+        return;
     }
 
-    if node.is_dir && expanded.contains(&id) {
-        for child in &node.children {
-            if rows.len() >= MAX_VISIBLE_ROWS {
-                break;
-            }
-            collect_rows(scan, *child, expanded, show_files, rows);
-        }
-    }
-}
+    let folder = folder_ptr as *mut *mut ffi::IShellFolderVtbl;
 
-unsafe fn get_window_text(hwnd: Hwnd) -> String {
-    let len = GetWindowTextLengthW(hwnd).max(0);
-    let mut buffer = vec![0u16; len as usize + 1];
-    let read = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
-    String::from_utf16_lossy(&buffer[..read.max(0) as usize])
-}
+    // GetUIObjectOf needs *mut *const ITEMIDLIST.
+    let mut child_arr: [*const ffi::ITEMIDLIST; 1] = [child_pidl];
+    let mut ctx_ptr: *mut c_void = std::ptr::null_mut();
+    let hr3 = ((**folder).GetUIObjectOf)(
+        folder_ptr,
+        hwnd,
+        1,
+        child_arr.as_mut_ptr(),
+        &ffi::IID_IContextMenu,
+        std::ptr::null_mut(),
+        &mut ctx_ptr,
+    );
 
-unsafe fn set_window_text(hwnd: Hwnd, text: &str) {
-    let text = crate::io::wide(text);
-    SetWindowTextW(hwnd, text.as_ptr());
-}
+    if hr3 >= 0 && !ctx_ptr.is_null() {
+        let ctx = ctx_ptr as *mut *mut ffi::IContextMenuVtbl;
+        let hmenu = CreatePopupMenu();
+        const CMF_NORMAL: u32 = 0x0000;
+        ((**ctx).QueryContextMenu)(ctx_ptr, hmenu, 0, 1, 0x7FFF, CMF_NORMAL);
 
-unsafe fn show_error(hwnd: Hwnd, message: &str) {
-    let title = crate::io::wide(APP_NAME);
-    let message = crate::io::wide(message);
-    MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
-}
-
-// ---------------------------------------------------------------------------
-// Drive picker helpers (Plan 02-03, Pattern 4)
-// ---------------------------------------------------------------------------
-
-/// Filters the `GetLogicalDrives` bitmask using a caller-supplied drive-type probe.
-///
-/// Returns letters ('A'..='Z') for every bit that is set in `mask` whose drive type
-/// (returned by the `drive_type` closure) is NOT `DRIVE_UNKNOWN` or `DRIVE_NO_ROOT_DIR`.
-///
-/// Pure-Rust; no Win32 calls. The closure abstraction makes the function unit-testable
-/// without hitting the OS (tests supply a mock closure).
-fn pure_filter_drive_letters(mask: u32, drive_type: impl Fn(char) -> Uint) -> Vec<char> {
-    ('A'..='Z')
-        .enumerate()
-        .filter_map(|(bit, letter)| {
-            if (mask >> bit) & 1 == 0 {
-                return None;
-            }
-            let dt = drive_type(letter);
-            if dt == DRIVE_UNKNOWN || dt == DRIVE_NO_ROOT_DIR {
-                return None;
-            }
-            Some(letter)
-        })
-        .collect()
-}
-
-/// Formats a drive picker entry string per UI-SPEC copywriting contract.
-///
-/// - If `label` is `Some` and non-empty, returns `"X: <label>"`.
-/// - Otherwise falls back to the drive-type name.
-fn format_drive_entry(letter: char, dt: Uint, label: Option<&str>) -> String {
-    let fallback = match dt {
-        DRIVE_FIXED => "Local Disk",
-        DRIVE_REMOVABLE => "Removable",
-        DRIVE_CDROM => "CD/DVD",
-        DRIVE_REMOTE => "Network",
-        DRIVE_RAMDISK => "RAM Disk",
-        _ => "Disk",
-    };
-    let display_label = match label {
-        Some(s) if !s.is_empty() => s,
-        _ => fallback,
-    };
-    format!("{letter}: {display_label}")
-}
-
-/// Populates the drive picker with entries for every enumerable drive.
-///
-/// Reads `GetLogicalDrives`, filters via `pure_filter_drive_letters` + `GetDriveTypeW`,
-/// fetches each volume label via `GetVolumeInformationW`, formats via `format_drive_entry`,
-/// and inserts via `CBEM_INSERTITEMW`.
-///
-/// `initial_path` is used to pre-select the matching drive letter (falls back to C: or first).
-unsafe fn populate_drive_picker(picker: Hwnd, initial_path: &str) {
-    let mask = GetLogicalDrives();
-    let letters = pure_filter_drive_letters(mask, |letter| {
-        let root: Vec<u16> = format!("{letter}:\\")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        GetDriveTypeW(root.as_ptr())
-    });
-
-    // Determine the initial drive letter from the path (first char if alpha).
-    let initial_letter = initial_path
-        .chars()
-        .next()
-        .filter(|c| c.is_ascii_alphabetic())
-        .map(|c| c.to_ascii_uppercase());
-
-    let mut sel_index: i32 = 0;
-    for (index, &letter) in letters.iter().enumerate() {
-        let root: Vec<u16> = format!("{letter}:\\")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        let dt = GetDriveTypeW(root.as_ptr());
-
-        // Try to read the volume label.
-        let mut name_buf = [0u16; 256];
-        let label_ok = GetVolumeInformationW(
-            root.as_ptr(),
-            name_buf.as_mut_ptr(),
-            256,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
+        SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(
+            hmenu,
+            TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
+            x,
+            y,
             0,
+            hwnd,
+            std::ptr::null(),
         );
-        let label: Option<String> = if label_ok != 0 {
-            let len = name_buf.iter().position(|&c| c == 0).unwrap_or(0);
-            if len > 0 {
-                Some(String::from_utf16_lossy(&name_buf[..len]).to_string())
-            } else {
-                None
+
+        if cmd > 0 {
+            let ici = ffi::CMINVOKECOMMANDINFO {
+                cbSize: std::mem::size_of::<ffi::CMINVOKECOMMANDINFO>() as u32,
+                fMask: 0,
+                hwnd,
+                lpVerb: (cmd - 1) as usize as *const u8,
+                lpParameters: std::ptr::null(),
+                lpDirectory: std::ptr::null(),
+                nShow: 1,
+                dwHotKey: 0,
+                hIcon: 0,
+            };
+            ((**ctx).InvokeCommand)(ctx_ptr, &ici);
+        }
+
+        DestroyMenu(hmenu);
+        ((**ctx).Release)(ctx_ptr);
+    }
+
+    ((**folder).Release)(folder_ptr);
+    CoTaskMemFree(pidl as *mut c_void);
+}
+
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
             }
-        } else {
-            None
-        };
-
-        let entry = format_drive_entry(letter, dt, label.as_deref());
-        let mut entry_wide: Vec<u16> = entry.encode_utf16().chain(Some(0)).collect();
-
-        let mut item = ComboBoxExItemW {
-            mask: CBEIF_TEXT,
-            iItem: -1,
-            pszText: entry_wide.as_mut_ptr(),
-            cchTextMax: entry_wide.len() as i32,
-            iImage: 0,
-            iSelectedImage: 0,
-            iOverlay: 0,
-            iIndent: 0,
-            lParam: 0,
-        };
-        SendMessageW(
-            picker,
-            CBEM_INSERTITEMW as Uint,
-            0,
-            &mut item as *mut _ as Lparam,
-        );
-
-        // Track which index to pre-select.
-        if initial_letter == Some(letter) {
-            sel_index = index as i32;
+            other => {
+                out.push('%');
+                out.push_str(&format!("{other:02X}"));
+            }
         }
     }
-
-    // If no match found and letters is non-empty, prefer C: if present, else 0.
-    let no_match = initial_letter.is_none() || !letters.contains(&initial_letter.unwrap_or('_'));
-    if no_match && let Some(c_pos) = letters.iter().position(|&l| l == 'C') {
-        sel_index = c_pos as i32;
-    }
-
-    if !letters.is_empty() {
-        SendMessageW(picker, CB_SETCURSEL as Uint, sel_index as Wparam, 0);
-    }
-}
-
-/// Handles drive picker CBN_SELCHANGE: reads the selected letter and sets the path edit to `X:\`.
-unsafe fn handle_drive_picker_change(hwnd: Hwnd) {
-    let (picker, path_edit) = match with_state_mut(|s| (s.drive_picker, s.path_edit)) {
-        Some(pair) => pair,
-        None => return,
-    };
-    if picker == 0 || path_edit == 0 {
-        return;
-    }
-
-    // Retrieve the text of the currently selected item (first char is the letter).
-    let len = GetWindowTextLengthW(picker).max(0);
-    let mut buf = vec![0u16; len as usize + 2];
-    let read = GetWindowTextW(picker, buf.as_mut_ptr(), buf.len() as i32);
-    if read < 1 {
-        return;
-    }
-    let text = String::from_utf16_lossy(&buf[..read as usize]);
-    if let Some(letter) = text.chars().next().filter(|c| c.is_ascii_alphabetic()) {
-        let path_str = format!("{letter}:\\");
-        let path_wide: Vec<u16> = path_str.encode_utf16().chain(Some(0)).collect();
-        SetWindowTextW(path_edit, path_wide.as_ptr());
-        // SHAutoComplete is already wired; it will suggest first-level folders from X:\.
-        // Per UI-SPEC: do NOT auto-start a scan on drive selection.
-        // Persist the drive path immediately (discrete mutation, D-03).
-        let snap = with_state_mut(|state| {
-            state.settings.last_path = path_str;
-            state::snapshot_for_save(state)
-        })
-        .flatten();
-        if let Some(snap) = snap {
-            state::save_settings_if_dirty(snap);
-        }
-    }
-    let _ = hwnd;
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests for pure-Rust drive picker helpers (Plan 02-03, Task 2 behavior)
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-#[cfg(windows)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pure_filter_drive_letters_includes_cdrom() {
-        // C: fixed, D: CDROM — both should be included (only UNKNOWN/NO_ROOT_DIR excluded).
-        let mask = 0b0000_0000_0000_1100u32; // bits 2 and 3 = C and D
-        let letters = pure_filter_drive_letters(mask, |letter| match letter {
-            'C' => DRIVE_FIXED,
-            'D' => DRIVE_CDROM,
-            _ => DRIVE_UNKNOWN,
-        });
-        assert_eq!(letters, vec!['C', 'D']);
-    }
-
-    #[test]
-    fn pure_filter_drive_letters_excludes_unknown() {
-        let mask = 0b0000_0000_0000_0100u32; // bit 2 = C
-        let letters = pure_filter_drive_letters(mask, |_| DRIVE_UNKNOWN);
-        assert!(letters.is_empty(), "DRIVE_UNKNOWN should be excluded");
-    }
-
-    #[test]
-    fn pure_filter_drive_letters_excludes_no_root_dir() {
-        let mask = 0b0000_0000_0000_0100u32; // bit 2 = C
-        let letters = pure_filter_drive_letters(mask, |_| DRIVE_NO_ROOT_DIR);
-        assert!(letters.is_empty(), "DRIVE_NO_ROOT_DIR should be excluded");
-    }
-
-    #[test]
-    fn format_drive_entry_uses_label() {
-        let s = format_drive_entry('C', DRIVE_FIXED, Some("Windows"));
-        assert_eq!(s, "C: Windows");
-    }
-
-    #[test]
-    fn format_drive_entry_falls_back_to_type_name() {
-        assert_eq!(format_drive_entry('C', DRIVE_FIXED, None), "C: Local Disk");
-        assert_eq!(
-            format_drive_entry('D', DRIVE_REMOVABLE, None),
-            "D: Removable"
-        );
-        assert_eq!(format_drive_entry('E', DRIVE_CDROM, None), "E: CD/DVD");
-        assert_eq!(format_drive_entry('Z', DRIVE_REMOTE, None), "Z: Network");
-        assert_eq!(format_drive_entry('R', DRIVE_RAMDISK, None), "R: RAM Disk");
-    }
+    out
 }

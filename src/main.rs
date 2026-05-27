@@ -3,6 +3,7 @@
 mod analytics;
 mod cli;
 mod diff;
+mod dupes;
 mod export;
 mod io;
 mod model;

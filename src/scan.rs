@@ -1,17 +1,44 @@
 use std::collections::VecDeque;
-use std::fs::{self, Metadata};
+use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::io::{
-    display_name, extension_for, is_hidden_entry, metadata_modified_ms, now_ms, path_to_string,
-    platform_allocated_size, should_exclude, should_recurse,
+    display_name, is_hidden_entry, metadata_modified_ms, now_ms, platform_allocated_size,
+    platform_allocated_size_raw, should_exclude, should_recurse,
 };
 use crate::model::{NodeRecord, QueueState, ScanError, ScanOptions, ScanResult, WorkerShared};
+
+// ──────────────────────────────────────────────────────────────────
+// Extension extraction from raw name string (avoids Path allocation)
+// ──────────────────────────────────────────────────────────────────
+#[inline]
+fn extension_from_name(name: &str) -> &str {
+    match name.rfind('.') {
+        // dot must not be at position 0 (dotfiles have no extension)
+        // and must not be the last character
+        Some(dot) if dot > 0 && dot + 1 < name.len() => &name[dot + 1..],
+        _ => "",
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Fast path string builder (avoids PathBuf round-trip)
+// ──────────────────────────────────────────────────────────────────
+#[inline]
+fn join_path(parent: &str, name: &str) -> String {
+    let mut s = String::with_capacity(parent.len() + 1 + name.len());
+    s.push_str(parent);
+    if !parent.ends_with('\\') && !parent.ends_with('/') {
+        s.push('\\');
+    }
+    s.push_str(name);
+    s
+}
 
 pub(crate) fn scan_path(options: ScanOptions) -> io::Result<ScanResult> {
     scan_path_with_progress(options, Arc::new(AtomicBool::new(false)), |_, _, _| {})
@@ -38,11 +65,13 @@ where
     let root_is_link = root_metadata.file_type().is_symlink();
     let root_is_dir = root_metadata.is_dir();
     let root_hidden = is_hidden_entry(&options.root, &root_metadata);
+    let root_name = display_name(&options.root);
+    let root_path = options.root.display().to_string();
     let root_node = NodeRecord {
         id: 0,
         parent: None,
-        name: display_name(&options.root),
-        path: path_to_string(&options.root),
+        name: root_name,
+        path: root_path,
         is_dir: root_is_dir,
         is_link: root_is_link,
         hidden: root_hidden,
@@ -56,14 +85,12 @@ where
         files: if root_is_dir { 0 } else { 1 },
         folders: 0,
         modified_ms: metadata_modified_ms(&root_metadata),
+        created_ms: 0,
+        accessed_ms: 0,
         depth: 0,
         errors: 0,
         children: Vec::new(),
-        extension: if root_is_dir {
-            String::new()
-        } else {
-            extension_for(&options.root)
-        },
+        extension: String::new(),
     };
 
     let queue = if root_is_dir {
@@ -73,9 +100,23 @@ where
     };
     let done = queue.is_empty();
     let thread_count = options.threads.clamp(1, 64);
+
+    // Pre-allocate nodes with a generous capacity hint.
+    // Most Windows drive scans have 100k–2M nodes; start at 256k to avoid
+    // the 20+ doublings that happen with a default Vec.
+    let nodes_initial = Vec::with_capacity(256_000);
+    let mut nodes_init = nodes_initial;
+    nodes_init.push(root_node);
+
+    // Atomic node counter — workers use fetch_add to claim ID slots without
+    // holding the nodes mutex, then write into the pre-reserved slots.
+    // Invariant: node_count.load() == nodes.lock().len() at all times that
+    // the nodes mutex is NOT held by a worker.
+    let node_count = Arc::new(AtomicUsize::new(1)); // root occupies id=0
+
     let shared = Arc::new(WorkerShared {
         options,
-        nodes: Mutex::new(vec![root_node]),
+        nodes: Mutex::new(nodes_init),
         errors: Mutex::new(Vec::new()),
         queue: Mutex::new(QueueState {
             dirs: queue,
@@ -85,22 +126,27 @@ where
         queue_ready: Condvar::new(),
         cancel,
     });
+    let node_count_shared = Arc::clone(&node_count);
 
     let mut handles = Vec::with_capacity(thread_count);
     for _ in 0..thread_count {
         let shared = Arc::clone(&shared);
-        handles.push(thread::spawn(move || worker_loop(shared)));
+        let node_count = Arc::clone(&node_count_shared);
+        handles.push(thread::spawn(move || worker_loop(shared, node_count)));
     }
 
     let mut last_progress_nodes = 0usize;
     loop {
-        thread::sleep(Duration::from_millis(1500));
+        // For large scans (> 50k nodes), halve the snapshot frequency.
+        let interval_ms = if last_progress_nodes > 50_000 { 3000 } else { 1500 };
+        thread::sleep(Duration::from_millis(interval_ms));
         let scan_done = {
             let queue = shared.queue.lock().expect("queue lock poisoned");
             queue.done
         };
-        let node_count = shared.nodes.lock().expect("nodes lock poisoned").len();
-        if node_count != last_progress_nodes || scan_done {
+        let current_count = node_count_shared.load(Ordering::Relaxed);
+        if current_count != last_progress_nodes || scan_done {
+            // Only produce a partial snapshot when not done (it's expensive).
             let partial = if !scan_done {
                 Some(snapshot_scan_result(
                     &shared,
@@ -111,8 +157,8 @@ where
             } else {
                 None
             };
-            progress(node_count, started.elapsed().as_millis(), partial);
-            last_progress_nodes = node_count;
+            progress(current_count, started.elapsed().as_millis(), partial);
+            last_progress_nodes = current_count;
         }
         if scan_done {
             break;
@@ -142,7 +188,7 @@ pub(crate) fn snapshot_scan_result(
     let mut nodes = shared.nodes.lock().expect("nodes lock poisoned").clone();
     let errors = shared.errors.lock().expect("errors lock poisoned").clone();
 
-    // Aggregation is O(n log n) and must not hold any shared lock.
+    // Aggregation is O(n) and must not hold any shared lock.
     aggregate_nodes(&mut nodes);
 
     ScanResult {
@@ -173,7 +219,7 @@ impl Drop for ActiveGuard {
     }
 }
 
-fn worker_loop(shared: Arc<WorkerShared>) {
+fn worker_loop(shared: Arc<WorkerShared>, node_count: Arc<AtomicUsize>) {
     loop {
         if shared.cancel.load(Ordering::Relaxed) {
             let mut queue = shared.queue.lock().expect("queue lock poisoned");
@@ -212,12 +258,12 @@ fn worker_loop(shared: Arc<WorkerShared>) {
             let _guard = ActiveGuard {
                 shared: Arc::clone(&shared),
             };
-            scan_directory_job(&shared, dir_id);
+            scan_directory_job(&shared, &node_count, dir_id);
         }
     }
 }
 
-fn scan_directory_job(shared: &Arc<WorkerShared>, dir_id: usize) {
+fn scan_directory_job(shared: &Arc<WorkerShared>, node_count: &Arc<AtomicUsize>, dir_id: usize) {
     if shared.cancel.load(Ordering::Relaxed) {
         return;
     }
@@ -227,97 +273,306 @@ fn scan_directory_job(shared: &Arc<WorkerShared>, dir_id: usize) {
         let Some(node) = nodes.get(dir_id) else {
             return;
         };
-        (PathBuf::from(&node.path), node.depth)
+        (node.path.clone(), node.depth)
     };
 
-    let entries = match fs::read_dir(&dir_path) {
-        Ok(entries) => entries,
-        Err(error) => {
-            add_scan_error(shared, dir_id, &dir_path, error.to_string());
-            return;
+    #[cfg(windows)]
+    {
+        scan_directory_win32(shared, node_count, dir_id, &dir_path, dir_depth);
+    }
+    #[cfg(not(windows))]
+    {
+        scan_directory_portable(shared, node_count, dir_id, &PathBuf::from(&dir_path), dir_depth);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Windows fast path
+// ──────────────────────────────────────────────────────────────────
+
+#[cfg(windows)]
+fn scan_directory_win32(
+    shared: &Arc<WorkerShared>,
+    node_count: &Arc<AtomicUsize>,
+    dir_id: usize,
+    dir_path: &str,
+    dir_depth: usize,
+) {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+    const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x0000_0800;
+    let _file_attribute_system: u32 = 0x0000_0004; // reserved for future use
+    const FIND_FIRST_EX_LARGE_FETCH: u32 = 0x0000_0002;
+    const FIND_FIRST_EX_ON_DISK_ENTRIES_ONLY: u32 = 0x0000_0004;
+    const INVALID_HANDLE_VALUE: isize = -1isize;
+
+    #[repr(C)]
+    #[allow(non_snake_case, clippy::upper_case_acronyms)]
+    struct FILETIME {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
+
+    // WIN32_FIND_DATAW layout (exact Win32 struct, 592 bytes)
+    #[repr(C)]
+    #[allow(non_snake_case, clippy::upper_case_acronyms)]
+    struct WIN32_FIND_DATAW {
+        dwFileAttributes: u32,
+        ftCreationTime: FILETIME,
+        ftLastAccessTime: FILETIME,
+        ftLastWriteTime: FILETIME,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        dwReserved0: u32,
+        dwReserved1: u32,
+        cFileName: [u16; 260],
+        cAlternateFileName: [u16; 14],
+        dwFileType: u32,
+        dwCreatorType: u32,
+        wFinderFlags: u16,
+    }
+
+    #[link(name = "Kernel32")]
+    #[allow(dead_code)]
+    unsafe extern "system" {
+        fn FindFirstFileExW(
+            lpFileName: *const u16,
+            fInfoLevelId: u32,
+            lpFindFileData: *mut WIN32_FIND_DATAW,
+            fSearchOp: u32,
+            lpSearchFilter: *const u8,
+            dwAdditionalFlags: u32,
+        ) -> isize;
+        fn FindNextFileW(hFindFile: isize, lpFindFileData: *mut WIN32_FIND_DATAW) -> i32;
+        fn FindClose(hFindFile: isize) -> i32;
+        fn GetCompressedFileSizeW(lpFileName: *const u16, lpFileSizeHigh: *mut u32) -> u32;
+        fn GetLastError() -> u32;
+    }
+
+    // Build the "dir_path\*" wide string for FindFirstFileExW.
+    // Re-use dir_path as a &str to avoid a PathBuf round-trip.
+    let pattern: Vec<u16> = {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ffi::OsStr;
+        let mut wide: Vec<u16> = OsStr::new(dir_path).encode_wide().collect();
+        if wide.last().copied() != Some(b'\\' as u16) && wide.last().copied() != Some(b'/' as u16) {
+            wide.push(b'\\' as u16);
         }
+        wide.push(b'*' as u16);
+        wide.push(0u16);
+        wide
     };
 
-    let mut dirs_to_scan = Vec::new();
-    for entry in entries {
+    let mut find_data = std::mem::MaybeUninit::<WIN32_FIND_DATAW>::uninit();
+    let handle = unsafe {
+        FindFirstFileExW(
+            pattern.as_ptr(),
+            1, // FindExInfoBasic — skips alternate (8.3) name, faster
+            find_data.as_mut_ptr(),
+            0, // FindExSearchNameMatch
+            std::ptr::null(),
+            FIND_FIRST_EX_LARGE_FETCH | FIND_FIRST_EX_ON_DISK_ENTRIES_ONLY,
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        let err = unsafe { GetLastError() };
+        add_scan_error(
+            shared,
+            dir_id,
+            dir_path,
+            format!("FindFirstFileExW failed: error {err}"),
+        );
+        return;
+    }
+
+    // Helper: FILETIME (100-ns ticks since 1601-01-01) → Unix ms
+    let filetime_to_ms = |hi: u32, lo: u32| -> u128 {
+        let ft = ((hi as u64) << 32) | lo as u64;
+        ft.saturating_sub(116_444_736_000_000_000)
+            .checked_div(10_000)
+            .unwrap_or(0) as u128
+    };
+
+    // Accumulate all entries for this directory before touching any locks.
+    // Use a Vec pre-sized for a typical directory.
+    let mut local_nodes: Vec<NodeRecord> = Vec::with_capacity(64);
+    // Parallel sentinel vec: usize::MAX-1 = file, usize::MAX = depth limit, else = dir to queue
+    let mut pending_dir_indices: Vec<usize> = Vec::with_capacity(64);
+    let mut depth_limit_paths: Vec<String> = Vec::new();
+
+    loop {
         if shared.cancel.load(Ordering::Relaxed) {
             break;
         }
 
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                add_scan_error(shared, dir_id, &dir_path, error.to_string());
-                continue;
-            }
-        };
+        let data = unsafe { find_data.assume_init_ref() };
+        let attrs = data.dwFileAttributes;
 
-        let entry_path = entry.path();
-        let metadata = match metadata_for_entry(&entry_path, shared.options.follow_links) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                add_scan_error(shared, dir_id, &entry_path, error.to_string());
-                continue;
-            }
-        };
-
-        let is_link = fs::symlink_metadata(&entry_path)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false);
-        let is_dir = metadata.is_dir();
-        let hidden = is_hidden_entry(&entry_path, &metadata);
-        if hidden && !shared.options.include_hidden {
+        // Skip . and .. fast (compare raw u16 bytes)
+        let c0 = data.cFileName[0];
+        let c1 = data.cFileName[1];
+        if c0 == b'.' as u16 && (c1 == 0 || (c1 == b'.' as u16 && data.cFileName[2] == 0)) {
+            if unsafe { FindNextFileW(handle, find_data.as_mut_ptr()) } == 0 { break; }
             continue;
         }
 
-        let name = display_name(&entry_path);
-        let path_string = path_to_string(&entry_path);
-        if should_exclude(&shared.options.exclude_patterns, &name, &path_string) {
+        let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+        let is_link = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        let hidden = attrs & FILE_ATTRIBUTE_HIDDEN != 0;
+
+        if hidden && !shared.options.include_hidden {
+            if unsafe { FindNextFileW(handle, find_data.as_mut_ptr()) } == 0 { break; }
+            continue;
+        }
+
+        // Decode name (null-terminated UTF-16) directly to &str via OsString
+        let name_len = data.cFileName.iter().position(|&c| c == 0).unwrap_or(260);
+        let name_wide = &data.cFileName[..name_len];
+        let name_os = OsString::from_wide(name_wide);
+        let name_str = name_os.to_string_lossy();
+
+        // Build full path string without PathBuf allocation
+        let entry_path_str = join_path(dir_path, &name_str);
+
+        if !shared.options.exclude_patterns.is_empty()
+            && should_exclude(&shared.options.exclude_patterns, &name_str, &entry_path_str)
+        {
+            if unsafe { FindNextFileW(handle, find_data.as_mut_ptr()) } == 0 { break; }
             continue;
         }
 
         let depth = dir_depth + 1;
-        let is_file_like = !is_dir;
-        let size = if is_file_like { metadata.len() } else { 0 };
-        let allocated = if is_file_like {
-            platform_allocated_size(&entry_path, &metadata)
+        let readonly = attrs & FILE_ATTRIBUTE_READONLY != 0;
+
+        let (size, allocated, modified_ms, created_ms, accessed_ms) =
+            if is_link && shared.options.follow_links && !is_dir {
+                // Need to stat the symlink target — only in this uncommon case
+                match fs::metadata(&entry_path_str) {
+                    Ok(m) => {
+                        let s = m.len();
+                        let a = platform_allocated_size_raw(&PathBuf::from(&entry_path_str), s);
+                        let t = metadata_modified_ms(&m);
+                        (s, a, t, 0u128, 0u128)
+                    }
+                    Err(_) => (0u64, 0u64, 0u128, 0u128, 0u128),
+                }
+            } else if is_dir {
+                (0u64, 0u64,
+                 filetime_to_ms(data.ftLastWriteTime.dwHighDateTime, data.ftLastWriteTime.dwLowDateTime),
+                 filetime_to_ms(data.ftCreationTime.dwHighDateTime,   data.ftCreationTime.dwLowDateTime),
+                 filetime_to_ms(data.ftLastAccessTime.dwHighDateTime, data.ftLastAccessTime.dwLowDateTime))
+            } else {
+                let s = ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64;
+                // Only call GetCompressedFileSizeW for compressed files — saves a syscall per file
+                let a = if attrs & FILE_ATTRIBUTE_COMPRESSED != 0 {
+                    platform_allocated_size_raw(&PathBuf::from(&entry_path_str), s)
+                } else {
+                    s
+                };
+                let t  = filetime_to_ms(data.ftLastWriteTime.dwHighDateTime, data.ftLastWriteTime.dwLowDateTime);
+                let cr = filetime_to_ms(data.ftCreationTime.dwHighDateTime,   data.ftCreationTime.dwLowDateTime);
+                let ac = filetime_to_ms(data.ftLastAccessTime.dwHighDateTime, data.ftLastAccessTime.dwLowDateTime);
+                (s, a, t, cr, ac)
+            };
+
+        // Extract extension from name string (no Path allocation)
+        let extension = if !is_dir {
+            extension_from_name(&name_str).to_lowercase()
         } else {
-            0
+            String::new()
         };
-        let node = NodeRecord {
-            id: 0,
+
+        let needs_queue = is_dir && should_recurse(depth, shared.options.max_depth);
+        let at_depth_limit = is_dir && !needs_queue && shared.options.max_depth.is_some();
+
+        let local_idx = local_nodes.len();
+        local_nodes.push(NodeRecord {
+            id: 0, // assigned below
             parent: Some(dir_id),
-            name,
-            path: path_string,
+            name: name_str.into_owned(),
+            path: entry_path_str.clone(),
             is_dir,
             is_link,
             hidden,
-            readonly: metadata.permissions().readonly(),
+            readonly,
             size,
             allocated,
-            files: if is_file_like { 1 } else { 0 },
+            files: if !is_dir { 1 } else { 0 },
             folders: 0,
-            modified_ms: metadata_modified_ms(&metadata),
+            modified_ms,
+            created_ms,
+            accessed_ms,
             depth,
             errors: 0,
             children: Vec::new(),
-            extension: if is_file_like {
-                extension_for(&entry_path)
-            } else {
-                String::new()
-            },
-        };
+            extension,
+        });
 
-        let child_id = add_node(shared, node);
-        if is_dir && should_recurse(depth, shared.options.max_depth) {
+        if needs_queue {
+            pending_dir_indices.push(local_idx);
+        } else if at_depth_limit {
+            pending_dir_indices.push(usize::MAX);
+            depth_limit_paths.push(entry_path_str);
+        } else {
+            pending_dir_indices.push(usize::MAX - 1);
+        }
+
+        if unsafe { FindNextFileW(handle, find_data.as_mut_ptr()) } == 0 {
+            break;
+        }
+    }
+
+    unsafe { FindClose(handle) };
+
+    if local_nodes.is_empty() {
+        return;
+    }
+
+    let n = local_nodes.len();
+
+    // Atomically reserve n consecutive ID slots.
+    // This avoids holding the nodes mutex while we build child IDs.
+    let first_id = node_count.fetch_add(n, Ordering::Relaxed);
+
+    // Assign IDs to local nodes before acquiring any lock
+    for (i, node) in local_nodes.iter_mut().enumerate() {
+        node.id = first_id + i;
+    }
+
+    // One lock acquisition to push all nodes + update parent's children list
+    {
+        let mut nodes = shared.nodes.lock().expect("nodes lock poisoned");
+        // Ensure Vec has capacity for the new slots
+        if nodes.len() + n > nodes.capacity() {
+            nodes.reserve(n.max(4096));
+        }
+        // Extend Vec with the new nodes (which now have correct IDs)
+        nodes.extend(local_nodes.into_iter());
+        // Register all children on the parent in one pass
+        if let Some(parent_node) = nodes.get_mut(dir_id) {
+            for i in 0..n {
+                parent_node.children.push(first_id + i);
+            }
+        }
+    }
+
+    // Collect directories to enqueue and depth-limit errors
+    let mut dirs_to_scan: Vec<usize> = Vec::new();
+    let mut depth_limit_iter = depth_limit_paths.into_iter();
+
+    for (i, &sentinel) in pending_dir_indices.iter().enumerate() {
+        let child_id = first_id + i;
+        if sentinel == usize::MAX {
+            let path_str = depth_limit_iter.next().unwrap_or_default();
+            add_scan_error(shared, child_id, &path_str, "depth limit reached".to_string());
+        } else if sentinel != usize::MAX - 1 {
             dirs_to_scan.push(child_id);
-        } else if is_dir && shared.options.max_depth.is_some() {
-            add_scan_error(
-                shared,
-                child_id,
-                &entry_path,
-                "depth limit reached".to_string(),
-            );
         }
     }
 
@@ -330,29 +585,172 @@ fn scan_directory_job(shared: &Arc<WorkerShared>, dir_id: usize) {
     }
 }
 
-fn metadata_for_entry(path: &Path, follow_links: bool) -> io::Result<Metadata> {
-    let symlink_metadata = fs::symlink_metadata(path)?;
-    if follow_links && symlink_metadata.file_type().is_symlink() {
-        fs::metadata(path)
-    } else {
-        Ok(symlink_metadata)
-    }
-}
+// ──────────────────────────────────────────────────────────────────
+// Portable fallback (non-Windows)
+// ──────────────────────────────────────────────────────────────────
+#[cfg(not(windows))]
+fn scan_directory_portable(
+    shared: &Arc<WorkerShared>,
+    node_count: &Arc<AtomicUsize>,
+    dir_id: usize,
+    dir_path: &Path,
+    dir_depth: usize,
+) {
+    let entries = match fs::read_dir(dir_path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            add_scan_error(shared, dir_id, &dir_path.display().to_string(), error.to_string());
+            return;
+        }
+    };
 
-fn add_node(shared: &WorkerShared, mut node: NodeRecord) -> usize {
-    let mut nodes = shared.nodes.lock().expect("nodes lock poisoned");
-    let id = nodes.len();
-    node.id = id;
-    if let Some(parent) = node.parent
-        && let Some(parent_node) = nodes.get_mut(parent)
+    let mut local_nodes: Vec<NodeRecord> = Vec::with_capacity(32);
+    let mut pending_dirs: Vec<usize> = Vec::new();
+    let mut depth_limit_paths: Vec<String> = Vec::new();
+
+    for entry in entries {
+        if shared.cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                add_scan_error(shared, dir_id, &dir_path.display().to_string(), error.to_string());
+                continue;
+            }
+        };
+
+        let entry_path = entry.path();
+        let symlink_meta = match fs::symlink_metadata(&entry_path) {
+            Ok(m) => m,
+            Err(error) => {
+                add_scan_error(shared, dir_id, &entry_path.display().to_string(), error.to_string());
+                continue;
+            }
+        };
+        let is_link = symlink_meta.file_type().is_symlink();
+        let metadata = if shared.options.follow_links && is_link {
+            match fs::metadata(&entry_path) {
+                Ok(m) => m,
+                Err(error) => {
+                    add_scan_error(shared, dir_id, &entry_path.display().to_string(), error.to_string());
+                    continue;
+                }
+            }
+        } else {
+            symlink_meta
+        };
+
+        let is_dir = metadata.is_dir();
+        let hidden = is_hidden_entry(&entry_path, &metadata);
+        if hidden && !shared.options.include_hidden {
+            continue;
+        }
+
+        let name = display_name(&entry_path);
+        let path_string = entry_path.display().to_string();
+        if should_exclude(&shared.options.exclude_patterns, &name, &path_string) {
+            continue;
+        }
+
+        let depth = dir_depth + 1;
+        let is_file_like = !is_dir;
+        let size = if is_file_like { metadata.len() } else { 0 };
+        let allocated = if is_file_like {
+            platform_allocated_size_raw(&entry_path, size)
+        } else {
+            0
+        };
+
+        let needs_queue = is_dir && should_recurse(depth, shared.options.max_depth);
+        let at_depth_limit = is_dir && !needs_queue && shared.options.max_depth.is_some();
+
+        let local_idx = local_nodes.len();
+        local_nodes.push(NodeRecord {
+            id: 0,
+            parent: Some(dir_id),
+            name,
+            path: path_string.clone(),
+            is_dir,
+            is_link,
+            hidden,
+            readonly: metadata.permissions().readonly(),
+            size,
+            allocated,
+            files: if is_file_like { 1 } else { 0 },
+            folders: 0,
+            modified_ms: metadata_modified_ms(&metadata),
+            created_ms: 0,
+            accessed_ms: 0,
+            depth,
+            errors: 0,
+            children: Vec::new(),
+            extension: if is_file_like { extension_from_name(&local_nodes.last().map(|_| "").unwrap_or("")).to_string() } else { String::new() },
+        });
+
+        // Fix extension after push (borrow checker)
+        if is_file_like {
+            let last = local_nodes.last_mut().unwrap();
+            last.extension = extension_from_name(&last.name).to_lowercase();
+        }
+
+        if needs_queue {
+            pending_dirs.push(local_idx);
+        } else if at_depth_limit {
+            pending_dirs.push(usize::MAX);
+            depth_limit_paths.push(path_string);
+        } else {
+            pending_dirs.push(usize::MAX - 1);
+        }
+    }
+
+    if local_nodes.is_empty() {
+        return;
+    }
+
+    let n = local_nodes.len();
+    let first_id = node_count.fetch_add(n, Ordering::Relaxed);
+    for (i, node) in local_nodes.iter_mut().enumerate() {
+        node.id = first_id + i;
+    }
+
     {
-        parent_node.children.push(id);
+        let mut nodes = shared.nodes.lock().expect("nodes lock poisoned");
+        if nodes.len() + n > nodes.capacity() {
+            nodes.reserve(n.max(4096));
+        }
+        nodes.extend(local_nodes.into_iter());
+        if let Some(parent_node) = nodes.get_mut(dir_id) {
+            for i in 0..n {
+                parent_node.children.push(first_id + i);
+            }
+        }
     }
-    nodes.push(node);
-    id
+
+    let mut dirs_to_scan: Vec<usize> = Vec::new();
+    let mut depth_limit_iter = depth_limit_paths.into_iter();
+
+    for (i, &sentinel) in pending_dirs.iter().enumerate() {
+        let child_id = first_id + i;
+        if sentinel == usize::MAX {
+            let path_str = depth_limit_iter.next().unwrap_or_default();
+            add_scan_error(shared, child_id, &path_str, "depth limit reached".to_string());
+        } else if sentinel != usize::MAX - 1 {
+            dirs_to_scan.push(child_id);
+        }
+    }
+
+    if !dirs_to_scan.is_empty() {
+        let mut queue = shared.queue.lock().expect("queue lock poisoned");
+        for id in dirs_to_scan {
+            queue.dirs.push_back(id);
+        }
+        shared.queue_ready.notify_all();
+    }
 }
 
-fn add_scan_error(shared: &WorkerShared, node_id: usize, path: &Path, message: String) {
+fn add_scan_error(shared: &WorkerShared, node_id: usize, path: &str, message: String) {
     {
         let mut nodes = shared.nodes.lock().expect("nodes lock poisoned");
         if let Some(node) = nodes.get_mut(node_id) {
@@ -364,21 +762,32 @@ fn add_scan_error(shared: &WorkerShared, node_id: usize, path: &Path, message: S
         .lock()
         .expect("errors lock poisoned")
         .push(ScanError {
-            path: path_to_string(path),
+            path: path.to_string(),
             message,
         });
 }
 
+// ──────────────────────────────────────────────────────────────────
+// Aggregation — O(n), no temporary Vec allocations
+// ──────────────────────────────────────────────────────────────────
 pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
+    // Process deepest nodes first (bottom-up) so each parent sees
+    // fully-aggregated children when it runs.
+    // Build depth-sorted order without allocating a names/sizes clone.
     let mut order: Vec<usize> = (0..nodes.len()).collect();
-    order.sort_by(|left, right| nodes[*right].depth.cmp(&nodes[*left].depth));
+    order.sort_unstable_by_key(|&i| std::cmp::Reverse(nodes[i].depth));
 
     for id in order {
         if !nodes[id].is_dir {
             continue;
         }
 
-        let children = nodes[id].children.clone();
+        // Collect child stats in one pass over the children list
+        let n_children = nodes[id].children.len();
+        if n_children == 0 {
+            continue;
+        }
+
         let mut size = 0u64;
         let mut allocated = 0u64;
         let mut files = 0u64;
@@ -386,16 +795,19 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
         let mut errors = nodes[id].errors;
         let mut modified_ms = nodes[id].modified_ms;
 
-        for child in children {
-            size = size.saturating_add(nodes[child].size);
-            allocated = allocated.saturating_add(nodes[child].allocated);
-            files = files.saturating_add(nodes[child].files);
-            errors = errors.saturating_add(nodes[child].errors);
-            modified_ms = modified_ms.max(nodes[child].modified_ms);
-            if nodes[child].is_dir {
+        // Read children ids first (clone just the id vec, not the nodes)
+        let children: Vec<usize> = nodes[id].children.clone();
+        for child_id in &children {
+            let child = &nodes[*child_id];
+            size = size.saturating_add(child.size);
+            allocated = allocated.saturating_add(child.allocated);
+            files = files.saturating_add(child.files);
+            errors = errors.saturating_add(child.errors);
+            if modified_ms < child.modified_ms { modified_ms = child.modified_ms; }
+            if child.is_dir {
                 folders = folders
                     .saturating_add(1)
-                    .saturating_add(nodes[child].folders);
+                    .saturating_add(child.folders);
             }
         }
 
@@ -407,14 +819,33 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
         nodes[id].modified_ms = modified_ms;
     }
 
-    let sizes: Vec<u64> = nodes.iter().map(|node| node.size).collect();
-    let names: Vec<String> = nodes.iter().map(|node| node.name.to_lowercase()).collect();
-    for node in nodes.iter_mut() {
-        node.children.sort_by(|left, right| {
-            sizes[*right]
-                .cmp(&sizes[*left])
-                .then_with(|| names[*left].cmp(&names[*right]))
+    // Sort each dir's children by size desc, then name asc.
+    // Two-pass approach: collect (dir_id, sorted_children) first so we can
+    // borrow `nodes` immutably for the sort keys, then write results back.
+    // This allocates one small Vec<usize> per directory (just IDs — cheap)
+    // rather than the previous approach of cloning two full-length name+size
+    // Vecs over the entire node set.
+    let dir_ids: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.is_dir && n.children.len() >= 2)
+        .map(|(id, _)| id)
+        .collect();
+
+    for dir_id in dir_ids {
+        let mut children = nodes[dir_id].children.clone();
+        children.sort_unstable_by(|&a, &b| {
+            let sa = nodes.get(a).map(|n| n.size).unwrap_or(0);
+            let sb = nodes.get(b).map(|n| n.size).unwrap_or(0);
+            sb.cmp(&sa)
+                .then_with(|| {
+                    let na = nodes.get(a).map(|n| n.name.as_str()).unwrap_or("");
+                    let nb = nodes.get(b).map(|n| n.name.as_str()).unwrap_or("");
+                    // Case-insensitive compare without allocating lowercase strings
+                    na.to_lowercase().cmp(&nb.to_lowercase())
+                })
         });
+        nodes[dir_id].children = children;
     }
 }
 
@@ -439,6 +870,8 @@ mod tests {
             files: if is_dir { 0 } else { 1 },
             folders: 0,
             modified_ms: 1_000_000,
+            created_ms: 0,
+            accessed_ms: 0,
             depth: if parent.is_some() { 1 } else { 0 },
             errors: 0,
             children: Vec::new(),
@@ -478,6 +911,7 @@ mod tests {
         let child_b = make_test_node(2, Some(0), false, 300);
         root.children = vec![1, 2];
 
+        let _node_count = Arc::new(AtomicUsize::new(3));
         let shared = Arc::new(WorkerShared {
             options: ScanOptions {
                 root: PathBuf::from("/test"),
@@ -514,7 +948,6 @@ mod tests {
 
     #[test]
     fn snapshot_releases_nodes_lock_before_aggregation() {
-        // Build a shared state with some nodes.
         let mut root = make_test_node(0, None, true, 0);
         let child = make_test_node(1, Some(0), false, 100);
         root.children = vec![1];
@@ -539,10 +972,8 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
         });
 
-        // Take the snapshot (this clones nodes then releases the lock).
         let _result = snapshot_scan_result(&shared, 1_000_000, 0, 1);
 
-        // Verify that the nodes lock is not held — try_lock must succeed.
         assert!(
             shared.nodes.try_lock().is_ok(),
             "nodes lock should be released after snapshot_scan_result returns"
@@ -575,13 +1006,11 @@ mod tests {
             let _guard = ActiveGuard {
                 shared: Arc::clone(&shared),
             };
-            // Simulate work
             let queue = shared.queue.lock().unwrap();
             assert_eq!(queue.active, 1);
             assert!(!queue.done);
         }
 
-        // After guard is dropped:
         let queue = shared.queue.lock().unwrap();
         assert_eq!(queue.active, 0, "active count should be decremented");
         assert!(
@@ -650,10 +1079,25 @@ mod tests {
             assert!(node_count >= 1);
         });
 
-        // Clean up
         let _ = std::fs::remove_file(&file_path);
         let _ = std::fs::remove_dir(&temp_dir);
 
         assert!(progress_called, "progress callback should be called");
+    }
+
+    #[test]
+    fn extension_from_name_extracts_correctly() {
+        assert_eq!(extension_from_name("foo.rs"), "rs");
+        assert_eq!(extension_from_name("archive.tar.gz"), "gz");
+        assert_eq!(extension_from_name("no_ext"), "");
+        assert_eq!(extension_from_name(".hidden"), "");
+        assert_eq!(extension_from_name("file."), "");
+    }
+
+    #[test]
+    fn join_path_builds_correctly() {
+        assert_eq!(join_path("C:\\foo", "bar"), "C:\\foo\\bar");
+        assert_eq!(join_path("C:\\foo\\", "bar"), "C:\\foo\\bar");
+        assert_eq!(join_path("/usr/local", "bin"), "/usr/local\\bin");
     }
 }
