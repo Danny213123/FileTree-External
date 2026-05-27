@@ -58,7 +58,6 @@ pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -
         e!(",\"depth\":{}", node.depth);
         e!(",\"errors\":{}", node.errors);
         e!(",\"extension\":"); emit_json_str(&mut buf, &node.extension);
-        e!(",\"path\":"); emit_json_str(&mut buf, &node.path);
         e!("}}");
 
         // Flush every 8192 nodes to keep the buffer bounded (~3 MB at a time).
