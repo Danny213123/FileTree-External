@@ -5,7 +5,7 @@ const electron_1 = require("electron");
 electron_1.contextBridge.exposeInMainWorld("electronAPI", {
     // sendSync keeps startDrag inside the dragstart event context (required by Electron).
     startDrag: (filePath) => electron_1.ipcRenderer.sendSync("ondragstart", filePath),
-    // Call after dragend to delete the dragged source (always-move behavior).
+    // Call after dragend to move the dragged source to the OS trash.
     deleteAfterDrag: (filePath) => electron_1.ipcRenderer.invoke("deleteAfterDrag", filePath),
     // Clipboard: copy file path as text.
     copyText: (text) => electron_1.ipcRenderer.invoke("copyText", text),

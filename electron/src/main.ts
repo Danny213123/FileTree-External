@@ -130,32 +130,34 @@ function createWindow(port: number): void {
 // Official Electron pattern: https://www.electronjs.org/docs/latest/tutorial/native-file-drag-drop
 ipcMain.on("ondragstart", (event, arg: string | string[]) => {
   const filePath = Array.isArray(arg) ? arg[0] : arg;
-  if (!filePath || !fs.existsSync(filePath)) { event.returnValue = "none"; return; }
-  const repoRoot = path.join(app.getAppPath(), "..");
-  const iconPath = path.join(repoRoot, "assets", "drag-icon.png");
-  console.log("[electron] ondragstart file=", filePath, "icon=", iconPath);
-  event.sender.startDrag({ file: filePath, icon: iconPath });
-  // Wait for the OS to complete the drop, then check if the file was moved by the OS.
-  // Explorer native-move removes the source; copy leaves it intact.
-  setTimeout(() => {
-    const moved = !fs.existsSync(filePath);
-    console.log("[electron] drag completed, filePath=", filePath, "moved=", moved);
-    event.returnValue = moved ? "moved" : "copy";
-  }, 200);
+  if (!filePath || !fs.existsSync(filePath)) {
+    event.returnValue = { ok: false, status: "missing" };
+    return;
+  }
+
+  try {
+    const repoRoot = path.join(app.getAppPath(), "..");
+    const iconPath = path.join(repoRoot, "assets", "drag-icon.png");
+    console.log("[electron] ondragstart file=", filePath, "icon=", iconPath);
+    event.sender.startDrag({ file: filePath, icon: iconPath });
+    event.returnValue = { ok: true, status: "started" };
+  } catch (e) {
+    console.log("[electron] startDrag failed:", e);
+    event.returnValue = { ok: false, status: "error", error: String(e) };
+  }
 });
 
-// Called by renderer after dragend — deletes source file for always-move behavior.
+// Called by renderer after dragend; move the source to the OS trash for move-like drag-out.
 ipcMain.handle("deleteAfterDrag", async (_event, filePath: string) => {
   if (!filePath) return { ok: false };
   try {
-    const stat = fs.statSync(filePath);
-    if (stat.isDirectory()) {
-      fs.rmSync(filePath, { recursive: true, force: true });
-    } else {
-      fs.unlinkSync(filePath);
+    const resolvedPath = path.resolve(filePath);
+    if (!fs.existsSync(resolvedPath)) {
+      return { ok: true, status: "already-gone" };
     }
-    console.log("[electron] deleteAfterDrag deleted:", filePath);
-    return { ok: true };
+    await shell.trashItem(resolvedPath);
+    console.log("[electron] deleteAfterDrag trashed:", resolvedPath);
+    return { ok: true, status: "trashed" };
   } catch (e) {
     console.log("[electron] deleteAfterDrag failed:", e);
     return { ok: false, error: String(e) };

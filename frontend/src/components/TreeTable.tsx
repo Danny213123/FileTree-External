@@ -89,7 +89,13 @@ export function TreeTable({
 }: TreeTableProps) {
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
   const dragPathRef = useRef<string | null>(null);
-  type ElectronAPI = { startDrag: (filePath: string) => string | null; deleteAfterDrag: (filePath: string) => Promise<{ ok: boolean }> };
+  const pendingExternalDragRef = useRef<{ path: string; completed: boolean; cancelled: boolean } | null>(null);
+  type DragStartResult = { ok: boolean; status: string; error?: string };
+  type DeleteAfterDragResult = { ok: boolean; status?: string; error?: string };
+  type ElectronAPI = {
+    startDrag: (filePath: string) => DragStartResult;
+    deleteAfterDrag: (filePath: string) => Promise<DeleteAfterDragResult>;
+  };
   const electronAPI = () => (window as unknown as { electronAPI?: ElectronAPI }).electronAPI;
   const cols = useMemo(
     () => ALL_COLUMNS.filter((c) => visibleColumns.has(c.key)),
@@ -138,6 +144,40 @@ export function TreeTable({
   });
 
   const rootNode = nodeById.get(0);
+
+  const finishExternalDrag = useCallback(async (src: string, reason: string) => {
+    const pending = pendingExternalDragRef.current;
+    if (!pending || pending.path !== src || pending.completed || pending.cancelled) return;
+
+    pending.completed = true;
+    dragPathRef.current = null;
+    setDropTargetId(null);
+
+    const api = electronAPI();
+    if (!api?.deleteAfterDrag) {
+      pendingExternalDragRef.current = null;
+      return;
+    }
+
+    try {
+      const result = await api.deleteAfterDrag(src);
+      if (!result.ok) {
+        const message = result.error ?? "unknown error";
+        console.error("[TreeTable] deleteAfterDrag failed", { src, reason, message });
+        window.alert(`Could not remove the original after drag-out: ${message}`);
+        return;
+      }
+
+      console.log("[TreeTable] external drag cleanup complete", { src, reason, status: result.status });
+      onExternalMove?.([]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error("[TreeTable] deleteAfterDrag threw", { src, reason, error });
+      window.alert(`Could not remove the original after drag-out: ${message}`);
+    } finally {
+      pendingExternalDragRef.current = null;
+    }
+  }, [onExternalMove]);
 
   return (
     <div
@@ -217,23 +257,37 @@ export function TreeTable({
                   e.dataTransfer.setData("application/x-filetree-path", node.path);
                   e.dataTransfer.effectAllowed = "move";
                   dragPathRef.current = node.path;
+                  pendingExternalDragRef.current = { path: node.path, completed: false, cancelled: false };
                   const api = electronAPI();
                   if (api) {
                     // External drag-out via Electron native drag (blocks until drop/cancel).
                     e.preventDefault(); // suppress Chromium's HTML5 drag to avoid double-drag crash
-                    const effect = api.startDrag(node.path) as string | null | undefined;
-                    console.log("[TreeTable] dragstart effect=", effect, "src=", node.path);
-                    if (effect === "moved") {
-                      // OS already moved the file (Explorer native move). Just rescan.
+                    const result = api.startDrag(node.path);
+                    console.log("[TreeTable] dragstart result=", result, "src=", node.path);
+                    if (!result?.ok) {
+                      console.error("[TreeTable] startDrag failed", { src: node.path, result });
                       dragPathRef.current = null;
-                      onExternalMove?.([]);
-                    } else if (effect === "copy") {
-                      // File still exists — always-move: delete source then rescan.
-                      dragPathRef.current = null;
-                      onExternalMove?.([node.path]);
+                      pendingExternalDragRef.current = null;
+                      return;
                     }
-                    // "none" or unexpected: drag was cancelled, do nothing.
+                    window.setTimeout(() => { void finishExternalDrag(node.path, "native-return"); }, 0);
                   }
+                }}
+                onDragEnd={(e) => {
+                  const src = dragPathRef.current;
+                  setDropTargetId(null);
+                  if (!src) return;
+
+                  if (e.dataTransfer.dropEffect === "none") {
+                    const pending = pendingExternalDragRef.current;
+                    if (pending?.path === src) pending.cancelled = true;
+                    pendingExternalDragRef.current = null;
+                    dragPathRef.current = null;
+                    console.log("[TreeTable] external drag cancelled", { src });
+                    return;
+                  }
+
+                  void finishExternalDrag(src, `dragend:${e.dataTransfer.dropEffect}`);
                 }}
                 onDragOver={(e) => {
                   if (!node.dir || !node.path || isBundle) return;
