@@ -277,9 +277,75 @@ export async function* streamAiChat(
   }
 }
 
+type ElectronAPI = {
+  copyText?: (text: string) => Promise<void>;
+  copyFiles?: (paths: string[]) => Promise<void>;
+  shellContextMenu?: (path: string, x: number, y: number) => Promise<void>;
+};
+const eAPI = (): ElectronAPI =>
+  (window as unknown as { electronAPI?: ElectronAPI }).electronAPI ?? {};
+
+export async function copyPath(path: string): Promise<void> {
+  if (eAPI().copyText) {
+    await eAPI().copyText!(path);
+  } else {
+    await fetch("/api/copy-path", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+  }
+}
+
+export async function renameItem(path: string, newName: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch("/api/rename", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, newName }),
+  });
+  if (res.ok) return { ok: true };
+  const text = await res.text();
+  return { ok: false, error: text };
+}
+
+export async function moveItems(paths: string[], destination: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch("/api/move-items", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ paths, destination }),
+  });
+  if (res.ok) return { ok: true };
+  const text = await res.text();
+  return { ok: false, error: text };
+}
+
+export async function copyFiles(paths: string[]): Promise<void> {
+  if (eAPI().copyFiles) {
+    await eAPI().copyFiles!(paths);
+  } else {
+    await fetch("/api/copy-files", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths }),
+    });
+  }
+}
+
+export async function dragOut(paths: string[]): Promise<void> {
+  await fetch("/api/drag-out", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ paths }),
+  });
+}
+
 export async function shellContextMenu(path: string, x: number, y: number): Promise<void> {
-  const params = new URLSearchParams({ path, x: String(Math.round(x)), y: String(Math.round(y)) });
-  await fetch(`/api/shell-context-menu?${params}`);
+  if (eAPI().shellContextMenu) {
+    await eAPI().shellContextMenu!(path, x, y);
+  } else {
+    const params = new URLSearchParams({ path, x: String(Math.round(x)), y: String(Math.round(y)) });
+    await fetch(`/api/shell-context-menu?${params}`);
+  }
 }
 
 export function exportCsvUrl(path: string): string {

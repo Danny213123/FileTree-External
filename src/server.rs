@@ -159,10 +159,14 @@ fn build_dupe_filter(query: &std::collections::HashMap<String, String>) -> DupeF
 
 const SCAN_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
-/// Evict cache entries whose path starts with `prefix` (case-insensitive, forward-slash normalised).
+/// Evict cache entries that are descendants of `path` OR ancestors of `path`.
+/// A move/rename affects both the subtree and all parent aggregates up to the root.
 fn invalidate_scan_cache(cache: &mut HashMap<String, (Arc<crate::model::ScanResult>, Instant)>, path: &str) {
     let norm = path.replace('\\', "/").to_lowercase();
-    cache.retain(|k, _| !k.starts_with(&norm));
+    cache.retain(|k, _| {
+        // Keep only entries that are neither descendants nor ancestors of `norm`.
+        !k.starts_with(&norm) && !norm.starts_with(k.as_str())
+    });
 }
 
 fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()> {
@@ -177,7 +181,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
     let (route, query) = split_target(&request.target);
 
     // Allow POST for bookmarks and settings routes; all others are GET-only.
-    let post_routes = ["/api/bookmarks", "/api/settings", "/api/ai-chat", "/api/watch", "/api/delete"];
+    let post_routes = [
+        "/api/bookmarks", "/api/settings", "/api/ai-chat", "/api/watch", "/api/delete",
+        "/api/copy-path", "/api/rename", "/api/move-items", "/api/copy-files", "/api/drag-out",
+    ];
     if request.method != "GET" && !(request.method == "POST" && post_routes.contains(&route.as_str())) {
         respond_text(
             &mut stream,
@@ -767,6 +774,108 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 }
             }
         }
+        "/api/copy-path" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let path = extract_json_str(&body_str, "path").unwrap_or_default();
+            if path.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing path");
+            }
+            // Clipboard is handled by the Electron main process via IPC.
+            let ok = false;
+            if ok {
+                respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
+            } else {
+                respond_json(&mut stream, 500, "Internal server error", "{\"ok\":false}")
+            }
+        }
+        "/api/copy-files" | "/api/drag-out" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let paths = extract_json_str_array(&body_str, "paths");
+            if paths.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing paths");
+            }
+            // Clipboard is handled by the Electron main process via IPC.
+            let ok = false;
+            if ok {
+                respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
+            } else {
+                respond_json(&mut stream, 500, "Internal server error", "{\"ok\":false}")
+            }
+        }
+        "/api/rename" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let path = extract_json_str(&body_str, "path").unwrap_or_default();
+            let new_name = extract_json_str(&body_str, "newName").unwrap_or_default();
+            if path.is_empty() || new_name.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing path or newName");
+            }
+            if new_name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
+                return respond_text(&mut stream, 400, "Bad request", "Invalid characters in newName");
+            }
+            let src = PathBuf::from(&path);
+            let Some(parent) = src.parent() else {
+                return respond_text(&mut stream, 400, "Bad request", "Path has no parent");
+            };
+            let dst = parent.join(&new_name);
+            match fs::rename(&src, &dst) {
+                Ok(_) => {
+                    invalidate_scan_cache(
+                        &mut state.scan_cache.lock().expect("scan_cache lock"),
+                        &parent.to_string_lossy(),
+                    );
+                    respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
+                }
+                Err(error) => {
+                    let mut body = String::from("{\"error\":");
+                    push_json_string(&mut body, &error.to_string());
+                    body.push('}');
+                    respond_json(&mut stream, 400, "Bad request", &body)
+                }
+            }
+        }
+        "/api/move-items" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let dest = extract_json_str(&body_str, "destination").unwrap_or_default();
+            let paths = extract_json_str_array(&body_str, "paths");
+            if dest.is_empty() || paths.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing destination or paths");
+            }
+            let dest_buf = PathBuf::from(&dest);
+            if !dest_buf.is_dir() {
+                return respond_text(&mut stream, 400, "Bad request", "Destination is not a directory");
+            }
+            let mut errors: Vec<String> = Vec::new();
+            let mut touched_parents: Vec<PathBuf> = Vec::new();
+            for p in &paths {
+                let src = PathBuf::from(p);
+                let Some(name) = src.file_name() else {
+                    errors.push(format!("{p}: invalid path"));
+                    continue;
+                };
+                let target = dest_buf.join(name);
+                if let Err(e) = fs::rename(&src, &target) {
+                    errors.push(format!("{p}: {e}"));
+                    continue;
+                }
+                if let Some(parent) = src.parent() {
+                    touched_parents.push(parent.to_path_buf());
+                }
+            }
+            touched_parents.push(dest_buf.clone());
+            let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+            for p in &touched_parents {
+                invalidate_scan_cache(&mut cache, &p.to_string_lossy());
+            }
+            drop(cache);
+            if errors.is_empty() {
+                respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
+            } else {
+                let mut body = String::from("{\"error\":");
+                push_json_string(&mut body, &errors.join("; "));
+                body.push('}');
+                respond_json(&mut stream, 400, "Bad request", &body)
+            }
+        }
         "/api/bookmarks" => {
             if request.method == "POST" {
                 // Save bookmarks: body is a JSON array of path strings.
@@ -792,14 +901,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             };
             let x: i32 = query.get("x").and_then(|v| v.parse().ok()).unwrap_or(0);
             let y: i32 = query.get("y").and_then(|v| v.parse().ok()).unwrap_or(0);
-            eprintln!("[ctx-server] path={path:?} x={x} y={y}");
-            #[cfg(windows)]
-            {
-                let hwnd = crate::desktop::main_hwnd();
-                eprintln!("[ctx-server] MAIN_HWND={hwnd} posting WM_SHELL_CONTEXT_MENU");
-                crate::desktop::post_shell_context_menu(path.clone(), x, y);
-            }
-            #[cfg(not(windows))]
+            // Shell context menu is handled by the Electron main process via IPC.
             let _ = (path, x, y);
             respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
         }
@@ -1395,37 +1497,27 @@ fn serve_thumbnail(stream: &mut TcpStream, path: &str) -> sio::Result<()> {
         return respond_text(stream, 404, "Not Found", "Unsupported type");
     }
 
-    if is_video {
-        // Use the Windows Shell thumbnail cache to render a frame server-side.
-        // This works for all codecs the OS has installed (HEVC, AV1, etc.) and
-        // avoids streaming raw video bytes to Chromium, which can't decode HEVC.
-        eprintln!("[thumb-route] requesting shell thumbnail for video");
-        #[cfg(windows)]
-        if let Some(jpeg) = shell_thumbnail_jpeg(path, 480) {
-            return respond_bytes(stream, 200, "OK", "image/jpeg", &jpeg,
-                &[("Cache-Control", "private, max-age=300")]);
-        }
-        return respond_text(stream, 404, "Not Found", "Thumbnail unavailable");
+    if is_video || is_image {
+        // Use the Windows Shell thumbnail cache.
+        // IShellItemImageFactory::GetImage requires a COM STA with a message pump.
+        // Server connection threads are plain OS threads with no pump, so we
+        // spawn a dedicated thread, join it, and return the PNG bytes (or 404).
+        let path_owned = path.to_string();
+        let png = std::thread::spawn(move || {
+            #[cfg(windows)]
+            { shell_thumbnail_jpeg(&path_owned, 480) }
+            #[cfg(not(windows))]
+            { None::<Vec<u8>> }
+        }).join().ok().flatten();
+
+        return match png {
+            Some(data) => respond_bytes(stream, 200, "OK", "image/png", &data,
+                &[("Cache-Control", "private, max-age=300")]),
+            None => respond_text(stream, 404, "Not Found", "Thumbnail unavailable"),
+        };
     }
 
-    // Images: serve the raw file directly.
-    let content_type = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png"          => "image/png",
-        "gif"          => "image/gif",
-        "webp"         => "image/webp",
-        "bmp"          => "image/bmp",
-        "svg"          => "image/svg+xml",
-        "tif" | "tiff" => "image/tiff",
-        "avif"         => "image/avif",
-        "heic"         => "image/heic",
-        _              => "application/octet-stream",
-    };
-    let data = match fs::read(p) {
-        Ok(d) => d,
-        Err(_) => return respond_text(stream, 404, "Not Found", "File not readable"),
-    };
-    respond_bytes(stream, 200, "OK", content_type, &data, &[("Cache-Control", "private, max-age=60")])
+    respond_text(stream, 404, "Not Found", "Unsupported type")
 }
 
 /// Extract a thumbnail for any file using the Windows Shell thumbnail cache.
@@ -1442,10 +1534,13 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
     //   Data2 0x1A8E     → LE bytes: 8E 1A
     //   Data3 0x11D2     → LE bytes: D2 11
     //   Data4 (BE)       → 87 96 00 00 7F 75 A2 D0
+    // IShellItem: {43826D1E-E718-42EE-BC55-A1E261C37BFE}
     #[allow(non_upper_case_globals)]
     const IID_IShellItem: [u8; 16] = [
-        0x7F, 0x6D, 0x82, 0x43, 0x8E, 0x1A, 0xD2, 0x11,
-        0x87, 0x96, 0x00, 0x00, 0x7F, 0x75, 0xA2, 0xD0,
+        0x1E, 0x6D, 0x82, 0x43,  // Data1 LE
+        0x18, 0xE7,               // Data2 LE
+        0xEE, 0x42,               // Data3 LE
+        0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE, // Data4 BE
     ];
     // IShellItemImageFactory: {BCC18B79-BA16-442F-80C4-8A59C30C463B}
     //   Data1 0xBCC18B79 → LE bytes: 79 8B C1 BC
@@ -1478,8 +1573,16 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
             ppv: *mut *mut c_void,
         ) -> i32;
     }
+    #[repr(C)]
+    struct GdiBitmap {
+        bmType: i32, bmWidth: i32, bmHeight: i32, bmWidthBytes: i32,
+        bmPlanes: u16, bmBitsPixel: u16, bmBits: *mut c_void,
+    }
+
     #[link(name = "Gdi32")] unsafe extern "system" {
         fn CreateCompatibleDC(hdc: isize) -> isize;
+        #[link_name = "GetObjectW"]
+        fn GetGdiObject(h: isize, c: i32, pv: *mut c_void) -> i32;
         fn GetDIBits(hdc: isize, hbm: isize, start: u32, lines: u32,
                      bits: *mut c_void, bmi: *mut BitmapInfo, usage: u32) -> i32;
         fn DeleteDC(hdc: isize) -> i32;
@@ -1574,20 +1677,22 @@ fn shell_thumbnail_jpeg(path: &str, size: i32) -> Option<Vec<u8>> {
             return None;
         }
 
-        // First call GetDIBits with null bits to query width/height
+        // Use GetObject to query bitmap dimensions (GetDIBits with lines=0 doesn't populate them).
+        let mut gdi_bm: GdiBitmap = unsafe { std::mem::zeroed() };
+        GetGdiObject(hbm, std::mem::size_of::<GdiBitmap>() as i32, &mut gdi_bm as *mut _ as *mut c_void);
+        let w = gdi_bm.bmWidth.abs();
+        let h = gdi_bm.bmHeight.abs();
+        eprintln!("[thumb] bitmap dims: {w}x{h}");
+
         let mut bmi = BitmapInfo {
             bmiHeader: BitmapInfoHeader {
                 biSize: std::mem::size_of::<BitmapInfoHeader>() as u32,
-                biWidth: 0, biHeight: 0, biPlanes: 1, biBitCount: 32,
+                biWidth: w, biHeight: h, biPlanes: 1, biBitCount: 32,
                 biCompression: 0, biSizeImage: 0,
                 biXPelsPerMeter: 0, biYPelsPerMeter: 0, biClrUsed: 0, biClrImportant: 0,
             },
             bmiColors: [0],
         };
-        GetDIBits(hdc, hbm, 0, 0, std::ptr::null_mut(), &mut bmi, DIB_RGB_COLORS);
-        let w = bmi.bmiHeader.biWidth.abs();
-        let h = bmi.bmiHeader.biHeight.abs();
-        eprintln!("[thumb] bitmap dims: {w}x{h}");
         if w == 0 || h == 0 {
             eprintln!("[thumb] FAIL: zero-size bitmap");
             DeleteDC(hdc);

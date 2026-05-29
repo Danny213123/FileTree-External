@@ -1,5 +1,3 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod analytics;
 mod cli;
 mod diff;
@@ -15,6 +13,3 @@ mod settings;
 fn main() {
     cli::run();
 }
-
-#[cfg(windows)]
-mod desktop;

@@ -203,12 +203,57 @@ export default function App() {
     });
   }, []);
 
-  const handleOpenInNewTab = useCallback((path: string) => {
+  const handleOpenInNewTab = useCallback((path: string, beforeId?: string) => {
     const id = newTabId();
     const ref = createRef<WorkspaceTabHandle>();
-    setTabs((prev) => [...prev, { id, initialPath: path, ref }]);
+    setTabs((prev) => {
+      if (beforeId) {
+        const idx = prev.findIndex((t) => t.id === beforeId);
+        if (idx >= 0) {
+          const next = [...prev];
+          next.splice(idx, 0, { id, initialPath: path, ref });
+          return next;
+        }
+      }
+      return [...prev, { id, initialPath: path, ref }];
+    });
     setActiveTabId(id);
   }, []);
+
+  // External file/folder drop into FileTree:
+  // In Electron, files dropped onto the window are handled by the main process
+  // which sends the absolute paths back via ipcRenderer → preload → electronAPI.
+  // Additionally accept HTML5 dragover/drop for when running in dev (Vite server).
+  useEffect(() => {
+    // Register Electron IPC drop handler (production path).
+    const eAPI = (window as unknown as { electronAPI?: { onExternalDrop: (cb: (paths: string[]) => void) => void } }).electronAPI;
+    if (eAPI?.onExternalDrop) {
+      eAPI.onExternalDrop((paths) => paths.forEach((p) => handleOpenInNewTab(p)));
+    }
+
+    // HTML5 drop fallback for dev mode / non-Electron environments.
+    const onDragOver = (e: DragEvent) => {
+      if (!e.dataTransfer) return;
+      if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+    };
+    const onDrop = (e: DragEvent) => {
+      if (!e.dataTransfer?.files?.length) return;
+      e.preventDefault();
+      // In Electron, (file as any).path gives the absolute path.
+      for (const f of Array.from(e.dataTransfer.files)) {
+        const p = (f as unknown as { path?: string }).path;
+        if (p) handleOpenInNewTab(p);
+      }
+    };
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, [handleOpenInNewTab]);
 
   const handleScanPath = useCallback((path: string) => {
     getActiveRef()?.doScanPath(path);
@@ -217,6 +262,18 @@ export default function App() {
       scheduleSaveSettings();
     }
   }, [getActiveRef, scheduleSaveSettings]);
+
+  const handleReorderTab = useCallback((fromId: string, toId: string) => {
+    setTabs((prev) => {
+      const fromIdx = prev.findIndex((t) => t.id === fromId);
+      const toIdx = prev.findIndex((t) => t.id === toId);
+      if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(fromIdx, 1);
+      next.splice(toIdx, 0, moved);
+      return next;
+    });
+  }, []);
 
   const handleCloseTab = useCallback((id: string) => {
     setTabs((prev) => {
@@ -304,6 +361,7 @@ export default function App() {
         onOpenFilter={() => activeRef?.doOpenFilter()}
         onExport={(format) => activeRef?.doExport(format)}
         onOpenLocation={() => activeRef?.doReveal()}
+        onCopyFiles={() => activeRef?.doCopyFiles()}
         filterActive={ribbonFilterActive}
         bookmarks={bookmarkList}
         darkMode={darkMode}
@@ -346,6 +404,8 @@ export default function App() {
         onActivate={setActiveTabId}
         onClose={handleCloseTab}
         onNew={() => handleOpenInNewTab("")}
+        onReorder={handleReorderTab}
+        onFolderDrop={(path, beforeId) => handleOpenInNewTab(path, beforeId)}
       />
 
       <div className="workspace-area">

@@ -121,12 +121,10 @@ impl SettingsStore {
     /// needed. Returns an error only if the directory cannot be created or the
     /// AppData path cannot be resolved.
     pub(crate) fn default() -> io::Result<Self> {
-        #[cfg(windows)]
-        let appdata = crate::desktop::ffi::known_folder_roaming_appdata()?;
-        #[cfg(not(windows))]
-        let appdata = std::env::var_os("HOME")
+        let appdata = std::env::var_os("APPDATA")
+            .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
-            .ok_or_else(|| io::Error::other("HOME not set"))?;
+            .ok_or_else(|| io::Error::other("APPDATA/HOME not set"))?;
 
         let dir = appdata.join("FileTree");
         fs::create_dir_all(&dir)?;
@@ -776,10 +774,7 @@ fn atomic_write_settings(final_path: &Path, body: &[u8]) -> io::Result<()> {
         file.sync_all()?;
     } // handle dropped (closed) before MoveFileExW rename
 
-    let src = crate::io::wide(&tmp_path.to_string_lossy());
-    let dst = crate::io::wide(&final_path.to_string_lossy());
-    if let Err(error) = crate::desktop::ffi::atomic_rename(src.as_ptr(), dst.as_ptr()) {
-        // Clean up the orphaned temp file before returning the error.
+    if let Err(error) = fs::rename(&tmp_path, &final_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(error);
     }
