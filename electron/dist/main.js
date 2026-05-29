@@ -148,8 +148,13 @@ electron_1.ipcMain.on("ondragstart", (event, arg) => {
     const iconPath = path.join(repoRoot, "assets", "drag-icon.png");
     console.log("[electron] ondragstart file=", filePath, "icon=", iconPath);
     event.sender.startDrag({ file: filePath, icon: iconPath });
-    console.log("[electron] drag initiated");
-    event.returnValue = null; // unblock renderer — move detection handled via dragend IPC
+    // Wait for the OS to complete the drop, then check if the file was moved by the OS.
+    // Explorer native-move removes the source; copy leaves it intact.
+    setTimeout(() => {
+        const moved = !fs.existsSync(filePath);
+        console.log("[electron] drag completed, filePath=", filePath, "moved=", moved);
+        event.returnValue = moved ? "moved" : "copy";
+    }, 200);
 });
 // Called by renderer after dragend — deletes source file for always-move behavior.
 electron_1.ipcMain.handle("deleteAfterDrag", async (_event, filePath) => {
