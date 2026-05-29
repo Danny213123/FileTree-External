@@ -89,7 +89,7 @@ export function TreeTable({
 }: TreeTableProps) {
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
   const dragPathRef = useRef<string | null>(null);
-  type ElectronAPI = { startDrag: (filePath: string) => void; deleteAfterDrag: (filePath: string) => Promise<{ ok: boolean }> };
+  type ElectronAPI = { startDrag: (filePath: string) => string | null; deleteAfterDrag: (filePath: string) => Promise<{ ok: boolean }> };
   const electronAPI = () => (window as unknown as { electronAPI?: ElectronAPI }).electronAPI;
   const cols = useMemo(
     () => ALL_COLUMNS.filter((c) => visibleColumns.has(c.key)),
@@ -213,21 +213,26 @@ export function TreeTable({
                 onDragStart={(e) => {
                   if (!isDraggable) return;
                   onSelect(node.id);
+                  // Set internal drag MIME so drop targets inside FileTree can detect this.
+                  e.dataTransfer.setData("application/x-filetree-path", node.path);
+                  e.dataTransfer.effectAllowed = "move";
                   dragPathRef.current = node.path;
-                  e.preventDefault();
-                  electronAPI()?.startDrag(node.path);
-                }}
-                onDragEnd={async () => {
-                  const src = dragPathRef.current;
-                  dragPathRef.current = null;
-                  setDropTargetId(null);
-                  if (!src) return;
-                  // Delete source after drop (always-move behavior).
-                  // deleteAfterDrag handles the actual fs deletion in main process.
                   const api = electronAPI();
-                  if (api?.deleteAfterDrag) {
-                    await api.deleteAfterDrag(src);
-                    onExternalMove?.([]);  // trigger rescan only
+                  if (api) {
+                    // External drag-out via Electron native drag (blocks until drop/cancel).
+                    e.preventDefault(); // suppress Chromium's HTML5 drag to avoid double-drag crash
+                    const effect = api.startDrag(node.path) as string | null | undefined;
+                    console.log("[TreeTable] dragstart effect=", effect, "src=", node.path);
+                    if (effect === "moved") {
+                      // OS already moved the file (Explorer native move). Just rescan.
+                      dragPathRef.current = null;
+                      onExternalMove?.([]);
+                    } else if (effect === "copy") {
+                      // File still exists — always-move: delete source then rescan.
+                      dragPathRef.current = null;
+                      onExternalMove?.([node.path]);
+                    }
+                    // "none" or unexpected: drag was cancelled, do nothing.
                   }
                 }}
                 onDragOver={(e) => {
