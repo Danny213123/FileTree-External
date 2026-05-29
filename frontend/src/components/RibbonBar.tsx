@@ -35,6 +35,7 @@ export interface RibbonBarProps {
   onOpenFilter: () => void;
   onExport: (format: "csv" | "json") => void;
   onOpenLocation: () => void;
+  onCopyFiles: () => void;
   bookmarks: string[];
   filterActive: boolean;
   darkMode: boolean;
@@ -158,6 +159,16 @@ function IcoExpand() {
       <rect x="12" y="2" width="8" height="8" rx="1" stroke="#4A90D9" strokeWidth="1.5" fill="none"/>
       <rect x="2" y="12" width="8" height="8" rx="1" stroke="#4A90D9" strokeWidth="1.5" fill="none"/>
       <rect x="12" y="12" width="8" height="8" rx="1" stroke="#4A90D9" strokeWidth="1.5" fill="none"/>
+    </svg>
+  );
+}
+
+function IcoCopyFiles() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+      <rect x="5" y="4" width="12" height="15" rx="1.5" fill="#DBEAFE" stroke="#4A90D9" strokeWidth="1.2"/>
+      <rect x="3" y="2" width="12" height="15" rx="1.5" fill="#EFF6FF" stroke="#4A90D9" strokeWidth="1.2"/>
+      <path d="M7 7h6M7 10h6M7 13h4" stroke="#4A90D9" strokeWidth="1" strokeLinecap="round"/>
     </svg>
   );
 }
@@ -728,13 +739,14 @@ function ScanRibbon({
   onOpenFilter,
   onExport,
   onOpenLocation,
+  onCopyFiles,
   hasScan,
 }: Pick<RibbonBarProps,
   | "drives" | "specialFolders" | "scanning" | "hasScan" | "filter" | "exclude"
   | "includeHidden" | "followLinks" | "threads" | "bookmarks" | "filterActive"
   | "onScan" | "onCancel" | "onScanPath" | "onFilterChange" | "onExcludeChange"
   | "onHiddenChange" | "onFollowLinksChange" | "onThreadsChange" | "onNavigateParent"
-  | "onExpand" | "onOpenFilter" | "onExport" | "onOpenLocation"
+  | "onExpand" | "onOpenFilter" | "onExport" | "onOpenLocation" | "onCopyFiles"
 >) {
   return (
     <>
@@ -797,6 +809,7 @@ function ScanRibbon({
         <RbBtn icon={<IcoParent />} label="Parent Folder"  onClick={onNavigateParent} />
         <ExportDropdown onExport={onExport} disabled={!hasScan} />
         <RbBtn icon={<IcoFolderOpen />} label="Open Location" onClick={onOpenLocation} disabled={!hasScan} />
+        <RbBtn icon={<IcoCopyFiles />} label="Copy Files" onClick={onCopyFiles} disabled={!hasScan} title="Copy selected item to clipboard (paste in Explorer)" />
       </RbGroup>
 
       <RbGroup label="Threads">
@@ -1497,6 +1510,7 @@ export function RibbonBar(props: RibbonBarProps) {
             onOpenFilter={props.onOpenFilter}
             onExport={props.onExport}
             onOpenLocation={props.onOpenLocation}
+            onCopyFiles={props.onCopyFiles}
             hasScan={props.hasScan}
           />
         )}

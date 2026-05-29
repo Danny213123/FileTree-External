@@ -157,11 +157,13 @@ export function useScan(): UseScanReturn {
     // Serve from cache when available — avoids redundant network requests
     const cached = getCached(opts.path);
     if (cached) {
+      console.log("[useScan] startScan CACHE HIT path=", opts.path, "nodes=", cached.nodes?.length);
       setData(cached);
       setStatus("done");
       setProgress(null);
       return;
     }
+    console.log("[useScan] startScan CACHE MISS path=", opts.path, "— fetching from server");
 
     const controller = new AbortController();
     controllerRef.current = controller;
@@ -179,6 +181,7 @@ export function useScan(): UseScanReturn {
         const result = await readNdjsonStream(reader, (nodeCount, elapsed) => {
           setProgress({ nodes: nodeCount, elapsed });
         });
+        console.log("[useScan] startScan DONE path=", opts.path, "nodes=", result.nodes?.length, "sample=", result.nodes?.slice(0,3).map(n=>`${n.name}:${n.size}B`));
         setCached(opts.path, result);
         setData(result);
         setStatus("done");
@@ -221,6 +224,8 @@ export function useScan(): UseScanReturn {
         // Publish the final result so useEffect([data]) in WorkspaceTab can
         // drive the tree update through the same code path as startScan.
         // We do NOT clear data first (no setData(null)), so the tree never blanks.
+        const folders = result.nodes?.filter(n=>n.dir).slice(0,5).map(n=>`${n.name}:size=${n.size},files=${n.files},folders=${n.folders}`) ?? [];
+        console.log("[useScan] startRefresh DONE path=", opts.path, "nodes=", result.nodes?.length, "folders=", folders);
         setData(result);
         setStatus("done");
         setProgress(null);

@@ -10,6 +10,10 @@
 # Frontend build artifacts
 /frontend/node_modules/
 
+# Electron deps
+/electron/node_modules/
+/frontend/frontend/
+
 # Local dev helper
 run.bat
 

@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef, forwardRef, useImperativeHandle } from "react";
 import { useScan, reconstructChildren } from "../hooks/useScan";
 import { useTreeState } from "../hooks/useTreeState";
-import { invalidate as invalidateScanCache } from "../lib/scanCache";
+import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import {
   revealPath, openPath, shellContextMenu, createFolder, fetchScan,
+  copyPath, renameItem, moveItems, deletePath, copyFiles,
 } from "../api/client";
 import type { ScanOptions } from "../api/client";
 import type { DriveEntry, SpecialFolder, SortKey } from "../api/types";
@@ -43,6 +44,11 @@ export interface WorkspaceTabHandle {
   doOpenFilter: () => void;
   doReveal: () => void;
   doExport: (format: "csv" | "json") => void;
+  doRename: () => void;
+  doDelete: () => void;
+  doMoveTo: () => void;
+  doCopyPath: () => void;
+  doCopyFiles: () => void;
   // State readers for ribbon props
   getRibbonState: () => RibbonState;
   // State setters called from ribbon
@@ -135,6 +141,8 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   const watchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Paths whose directories changed since the last debounce flush.
   const pendingChangesRef = useRef<Set<string>>(new Set());
+  // When true, suppress watcher patch updates — a full rescan is already in flight.
+  const suppressWatchRef = useRef(false);
 
 
   const doScan = useCallback((path?: string, t?: number) => {
@@ -147,10 +155,9 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
       followLinks,
       excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
     };
-    if (p.trim() === lastCompletedPathRef.current) {
-      // Same path: use startRefresh so the tree never blanks mid-stream.
-      // startRefresh now calls setData(finalResult), which triggers useEffect([data])
-      // → tree.mergeNodes, preserving expansion state.
+    const isRefresh = p.trim() === lastCompletedPathRef.current;
+    console.log("[doScan] path=", p, "isRefresh=", isRefresh, "lastCompletedPath=", lastCompletedPathRef.current);
+    if (isRefresh) {
       lastScanWasRefreshRef.current = true;
       startRefresh(opts);
     } else {
@@ -175,18 +182,26 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   // Sync tree nodes whenever data changes (fires for both startScan and startRefresh).
   // For refresh scans we call setNodes directly (same proven path as initial scan).
   useEffect(() => {
-    console.log("[data effect] fired, data:", data?.rootPath, "nodes:", data?.nodes?.length, "wasRefresh:", lastScanWasRefreshRef.current);
+    const nodeCount = data?.nodes?.length ?? 0;
+    console.log("[data-effect] fired rootPath=", data?.rootPath, "nodes=", nodeCount, "wasRefresh=", lastScanWasRefreshRef.current, "isFirstChunk=", isFirstChunkRef.current, "lastCompleted=", lastCompletedPathRef.current);
     if (data === null) {
+      console.log("[data-effect] data=null → setNodes([])");
       tree.setNodes([]);
       isFirstChunkRef.current = true;
     } else if (lastScanWasRefreshRef.current) {
-      // Refresh: replace nodes. Expansion state uses stable IDs so mostly survives.
-      console.log("[data effect] calling setNodes for refresh with", data.nodes?.length, "nodes");
+      const folders = (data.nodes ?? []).filter(n => n.dir).slice(0, 5).map(n => `${n.name}:size=${n.size},files=${n.files},folders=${n.folders}`);
+      const files = (data.nodes ?? []).filter(n => !n.dir).slice(0, 3).map(n => `${n.name}:${n.size}B`);
+      console.log("[data-effect] REFRESH setNodes count=", nodeCount, "folders=", folders, "files=", files);
       tree.setNodes(data.nodes ?? []);
+      suppressWatchRef.current = false;
     } else {
+      const folders = (data.nodes ?? []).filter(n => n.dir).slice(0, 5).map(n => `${n.name}:size=${n.size},files=${n.files},folders=${n.folders}`);
+      const files = (data.nodes ?? []).filter(n => !n.dir).slice(0, 3).map(n => `${n.name}:${n.size}B`);
+      console.log("[data-effect] SCAN setNodes count=", nodeCount, "folders=", folders, "files=", files);
       tree.setNodes(data.nodes ?? []);
       if (isFirstChunkRef.current) {
         const isSamePath = data.rootPath === lastCompletedPathRef.current;
+        console.log("[data-effect] firstChunk isSamePath=", isSamePath);
         if (!isSamePath) {
           tree.resetForNewScan();
         }
@@ -246,6 +261,10 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
         // Shallow-rescan each changed directory (maxDepth=1 → only immediate children).
         // ~50ms vs ~1500ms for a full rescan — gives TreeSize-like update latency.
         for (const dir of toScan) {
+          if (suppressWatchRef.current) {
+            console.log("[watch] suppressed patch for dir=", dir, "(rescan in flight)");
+            continue;
+          }
           invalidateScanCache(dir);
           try {
             const raw = await fetchScan({
@@ -325,6 +344,9 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     tree.setSelectedId(id);
     const node = tree.nodeById.get(id);
     if (!node || node.id < 0 || !node.path) return;
+    // Pass screen coordinates (not client/CSS coords) so Win32 TrackPopupMenu places correctly.
+    // The backend uses GetCursorPos() which gives real screen coords, so x/y here are
+    // informational only — the backend ignores them and reads the cursor directly.
     shellContextMenu(node.path, x, y).catch(() => {});
   }, [tree]);
 
@@ -402,7 +424,66 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   const selectedNode = tree.nodeById.get(tree.selectedId);
   const runReveal   = useCallback(() => { if (selectedNode) revealPath(selectedNode.path); }, [selectedNode]);
   const runOpen     = useCallback(() => { if (selectedNode) openPath(selectedNode.path); }, [selectedNode]);
-  const runCopyPath = useCallback(() => { if (selectedNode) navigator.clipboard.writeText(selectedNode.path).catch(() => {}); }, [selectedNode]);
+  const runCopyPath = useCallback(() => { if (selectedNode) copyPath(selectedNode.path).catch(() => {}); }, [selectedNode]);
+
+  const runRename = useCallback(async () => {
+    if (!selectedNode || !selectedNode.path) return;
+    const currentName = selectedNode.name;
+    const newName = window.prompt("Rename to:", currentName);
+    if (!newName?.trim() || newName.trim() === currentName) return;
+    const result = await renameItem(selectedNode.path, newName.trim());
+    if (!result.ok) { alert(`Rename failed: ${result.error ?? "unknown error"}`); return; }
+    doScan();
+  }, [selectedNode, doScan]);
+
+  const runDelete = useCallback(async () => {
+    if (!selectedNode || !selectedNode.path) return;
+    const confirmed = window.confirm(`Move "${selectedNode.name}" to Recycle Bin?`);
+    if (!confirmed) return;
+    await deletePath(selectedNode.path);
+    // Tree will refresh via fs-events watch or next manual scan
+  }, [selectedNode]);
+
+  const runMoveTo = useCallback(async () => {
+    if (!selectedNode || !selectedNode.path) return;
+    const dest = window.prompt("Move to folder:");
+    if (!dest?.trim()) return;
+    const result = await moveItems([selectedNode.path], dest.trim());
+    if (!result.ok) { alert(`Move failed: ${result.error ?? "unknown error"}`); return; }
+    doScan();
+  }, [selectedNode, doScan]);
+
+  const runCopyFiles = useCallback(() => {
+    if (selectedNode?.path) copyFiles([selectedNode.path]).catch(() => {});
+  }, [selectedNode]);
+
+  const handleInternalMove = useCallback(async (sources: string[], destination: string) => {
+    console.log("[move] handleInternalMove sources=", sources, "destination=", destination);
+    if (sources.length === 0 || !destination) return;
+    if (sources.some(s => destination === s || destination.startsWith(s + "\\") || destination.startsWith(s + "/"))) {
+      alert("Cannot move a folder into itself or one of its descendants.");
+      return;
+    }
+    const result = await moveItems(sources, destination);
+    console.log("[move] moveItems result=", result);
+    if (!result.ok) { alert(`Move failed: ${result.error ?? "unknown error"}`); return; }
+    console.log("[move] invalidating ALL client cache, then doScan. scanPath=", scanPath, "lastCompletedPath=", lastCompletedPathRef.current);
+    // Suppress the fs-events watcher patch — it fires with maxDepth=1 (size=0 for folders)
+    // and would overwrite the correct aggregate sizes from the full rescan we're about to do.
+    suppressWatchRef.current = true;
+    invalidateAllScanCache();
+    doScan();
+  }, [doScan, scanPath]);
+
+  const handleExternalMove = useCallback(async (paths: string[]) => {
+    // paths is empty when OS already moved the file; non-empty means we must delete.
+    for (const p of paths) {
+      await deletePath(p).catch(() => {});
+    }
+    suppressWatchRef.current = true;
+    invalidateAllScanCache();
+    doScan();
+  }, [doScan]);
 
   // Expose API to parent via ref
   useImperativeHandle(ref, () => ({
@@ -421,6 +502,11 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     doNewFolder: handleNewFolder,
     doOpenFilter: () => setFilterDialogOpen(true),
     doReveal: () => { if (selectedNode) revealPath(selectedNode.path); },
+    doRename: runRename,
+    doDelete: runDelete,
+    doMoveTo: runMoveTo,
+    doCopyPath: runCopyPath,
+    doCopyFiles: runCopyFiles,
     doExport: (format) => {
       if (!data) return;
       const path = encodeURIComponent(data.rootPath);
@@ -459,7 +545,8 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     showDetailsPane: () => setActiveTab("details"),
     showTreemapPane: () => setActiveTab("chart"),
   }), [status, data, progress, errorMessage, scanPath, activeTab, tree, cancelScan,
-       doScan, handleNavigateParent, handleExpand, handleNewFolder, selectedNode]);
+       doScan, handleNavigateParent, handleExpand, handleNewFolder, selectedNode,
+       runRename, runDelete, runMoveTo, runCopyPath, runCopyFiles]);
 
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -518,6 +605,9 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
           onDoubleClick={handleDblClick}
           onCtrlClick={handleCtrlClick}
           onContextMenu={handleContextMenu}
+          onCopySelected={runCopyFiles}
+          onMoveItems={handleInternalMove}
+          onExternalMove={handleExternalMove}
           onSortChange={(k: SortKey) => tree.setSortKey(k)}
           bookmarks={bookmarkSet}
           onToggleBookmark={onToggleBookmark}

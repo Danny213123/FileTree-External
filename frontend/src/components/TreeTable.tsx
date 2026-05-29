@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback, useMemo } from "react";
+import { useRef, useState, useCallback, useMemo, useEffect } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { NodeRecord, SortKey, Metric, Unit } from "../api/types";
 import { formatBytes, formatCount } from "../utils/formatBytes";
@@ -48,6 +48,11 @@ interface TreeTableProps {
   onContextMenu: (id: number, x: number, y: number) => void;
   onSortChange: (key: SortKey) => void;
   onToggleBookmark: (path: string) => void;
+  onCopySelected?: () => void;
+  /** Called when the user drags rows from inside FileTree onto a folder row. */
+  onMoveItems?: (sourcePaths: string[], destinationFolder: string) => void;
+  /** Called after a successful external drag-out with dropEffect="move" to delete source. */
+  onExternalMove?: (paths: string[]) => void;
 }
 
 function metricValue(node: NodeRecord, metric: Metric): number {
@@ -78,7 +83,14 @@ export function TreeTable({
   onContextMenu,
   onSortChange,
   onToggleBookmark,
+  onCopySelected,
+  onMoveItems,
+  onExternalMove,
 }: TreeTableProps) {
+  const [dropTargetId, setDropTargetId] = useState<number | null>(null);
+  const dragPathRef = useRef<string | null>(null);
+  type ElectronAPI = { startDrag: (filePath: string) => void; deleteAfterDrag: (filePath: string) => Promise<{ ok: boolean }> };
+  const electronAPI = () => (window as unknown as { electronAPI?: ElectronAPI }).electronAPI;
   const cols = useMemo(
     () => ALL_COLUMNS.filter((c) => visibleColumns.has(c.key)),
     [visibleColumns],
@@ -87,6 +99,20 @@ export function TreeTable({
     () => `minmax(200px,1fr)${cols.filter(c => c.key !== "name").map(() => " minmax(70px,100px)").join("")}`,
     [cols],
   );
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+
+  // Native wheel listener attached via ref callback so it fires even during
+  // an active HTML5 drag (React's synthetic onWheel is suppressed during drag).
+  useEffect(() => {
+    if (!scrollEl) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      scrollEl.scrollTop += e.deltaY;
+    };
+    scrollEl.addEventListener("wheel", onWheel, { passive: false });
+    return () => scrollEl.removeEventListener("wheel", onWheel);
+  }, [scrollEl]);
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [tooltip, setTooltip] = useState<{ node: NodeRecord; x: number; y: number } | null>(null);
@@ -114,7 +140,18 @@ export function TreeTable({
   const rootNode = nodeById.get(0);
 
   return (
-    <div className="table-pane">
+    <div
+      className="table-pane"
+      tabIndex={0}
+      style={{ outline: "none" }}
+      onMouseDown={(e) => { (e.currentTarget as HTMLElement).focus(); }}
+      onKeyDown={(e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === "c" && onCopySelected) {
+          e.preventDefault();
+          onCopySelected();
+        }
+      }}
+    >
       {/* Column header */}
       <div className="table-head" style={{ gridTemplateColumns: gridTemplate }}>
         {cols.map((col) => (
@@ -130,7 +167,18 @@ export function TreeTable({
       </div>
 
       {/* Virtual scroll container */}
-      <div className="rows" ref={scrollRef}>
+      <div className="rows"
+        ref={(el) => { (scrollRef as React.MutableRefObject<HTMLDivElement | null>).current = el; setScrollEl(el); }}
+        onDragOver={(e) => {
+          const el = scrollRef.current;
+          if (!el) return;
+          const { top, bottom, height } = el.getBoundingClientRect();
+          const ZONE = Math.min(50, height * 0.15);
+          const y = e.clientY;
+          if (y < top + ZONE) el.scrollTop -= 6 * ((top + ZONE - y) / ZONE);
+          else if (y > bottom - ZONE) el.scrollTop += 6 * ((y - (bottom - ZONE)) / ZONE);
+        }}
+      >
         <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
           {virtualizer.getVirtualItems().map((vItem) => {
             const node = rows[vItem.index];
@@ -143,27 +191,62 @@ export function TreeTable({
             const pct       = parentSize > 0 ? (node.size / parentSize) * 100 : 100;
             const hasKids   = node.children.length > 0;
             const isOpen    = expanded.has(node.id);
+            const isDraggable = !isBundle && !!node.path;
+            const isDropTarget = dropTargetId === node.id;
             return (
               <div
                 key={node.id}
                 data-index={vItem.index}
-                className={`row${selectedId === node.id ? " selected" : ""}${node.hidden ? " hidden-entry" : ""}`}
+                className={`row${selectedId === node.id ? " selected" : ""}${node.hidden ? " hidden-entry" : ""}${isDropTarget ? " drop-target" : ""}`}
                 style={{ position: "absolute", top: vItem.start, left: 0, right: 0, height: ROW_HEIGHT, gridTemplateColumns: gridTemplate }}
+                draggable={isDraggable}
                 onClick={(e) => {
-                  if (isBundle) {
-                    onToggleExpand(node.id);
-                    onSelect(node.id);
-                    return;
-                  }
+                  if (isBundle) { onToggleExpand(node.id); onSelect(node.id); return; }
                   if (e.ctrlKey) { onCtrlClick(node.id); return; }
                   onSelect(node.id);
                 }}
-                onDoubleClick={() => {
-                  if (!isBundle) onDoubleClick(node.id);
-                }}
+                onDoubleClick={() => { if (!isBundle) onDoubleClick(node.id); }}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   if (!isBundle) onContextMenu(node.id, e.clientX, e.clientY);
+                }}
+                onDragStart={(e) => {
+                  if (!isDraggable) return;
+                  onSelect(node.id);
+                  dragPathRef.current = node.path;
+                  e.preventDefault();
+                  electronAPI()?.startDrag(node.path);
+                }}
+                onDragEnd={async () => {
+                  const src = dragPathRef.current;
+                  dragPathRef.current = null;
+                  setDropTargetId(null);
+                  if (!src) return;
+                  // Delete source after drop (always-move behavior).
+                  // deleteAfterDrag handles the actual fs deletion in main process.
+                  const api = electronAPI();
+                  if (api?.deleteAfterDrag) {
+                    await api.deleteAfterDrag(src);
+                    onExternalMove?.([]);  // trigger rescan only
+                  }
+                }}
+                onDragOver={(e) => {
+                  if (!node.dir || !node.path || isBundle) return;
+                  if (!e.dataTransfer.types.includes("application/x-filetree-path")) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = e.ctrlKey ? "copy" : "move";
+                  if (dropTargetId !== node.id) setDropTargetId(node.id);
+                }}
+                onDragLeave={() => {
+                  if (dropTargetId === node.id) setDropTargetId(null);
+                }}
+                onDrop={(e) => {
+                  if (!node.dir || !node.path || isBundle) return;
+                  const src = e.dataTransfer.getData("application/x-filetree-path");
+                  setDropTargetId(null);
+                  if (!src || src === node.path) return;
+                  e.preventDefault();
+                  onMoveItems?.([src], node.path);
                 }}
               >
                 <div
