@@ -25,6 +25,25 @@ A standalone Windows disk-usage explorer — point at a folder, see what's takin
 
 Prerequisites: Rust stable (1.85+), Node.js 18+.
 
+To build the portable Electron app, run this from the repo root:
+
+```powershell
+.\build-portable.bat
+```
+
+This runs the frontend build, compiles the Rust server with the fresh embedded
+assets, compiles Electron, and assembles the portable app at:
+
+```powershell
+.\dist-portable\FileTree\FileTree.exe
+```
+
+Keep the generated `FileTree` folder together when moving it to another
+machine; `FileTree.exe` expects its bundled runtime files and server binary
+beside it.
+
+Manual server-only build:
+
 ```powershell
 # Build the frontend first (output goes to frontend/dist/, embedded at compile time)
 cd frontend
