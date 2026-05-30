@@ -129,8 +129,8 @@ function createWindow(port: number): void {
 // The renderer sends this when document.drag fires with clientX/Y = 0 (cursor left window).
 // Official Electron pattern: https://www.electronjs.org/docs/latest/tutorial/native-file-drag-drop
 ipcMain.on("ondragstart", (event, arg: string | string[]) => {
-  const filePath = Array.isArray(arg) ? arg[0] : arg;
-  if (!filePath || !fs.existsSync(filePath)) {
+  const filePaths = (Array.isArray(arg) ? arg : [arg]).filter((filePath) => filePath && fs.existsSync(filePath));
+  if (filePaths.length === 0) {
     event.returnValue = { ok: false, status: "missing" };
     return;
   }
@@ -138,8 +138,8 @@ ipcMain.on("ondragstart", (event, arg: string | string[]) => {
   try {
     const repoRoot = path.join(app.getAppPath(), "..");
     const iconPath = path.join(repoRoot, "assets", "drag-icon.png");
-    console.log("[electron] ondragstart file=", filePath, "icon=", iconPath);
-    event.sender.startDrag({ file: filePath, icon: iconPath });
+    console.log("[electron] ondragstart files=", filePaths, "icon=", iconPath);
+    event.sender.startDrag({ file: filePaths[0], files: filePaths, icon: iconPath });
     event.returnValue = { ok: true, status: "started" };
   } catch (e) {
     console.log("[electron] startDrag failed:", e);

@@ -4,7 +4,7 @@ const electron_1 = require("electron");
 // Expose a safe API to the renderer that replaces window.chrome.webview.
 electron_1.contextBridge.exposeInMainWorld("electronAPI", {
     // sendSync keeps startDrag inside the dragstart event context (required by Electron).
-    startDrag: (filePath) => electron_1.ipcRenderer.sendSync("ondragstart", filePath),
+    startDrag: (filePaths) => electron_1.ipcRenderer.sendSync("ondragstart", filePaths),
     // Call after dragend to move the dragged source to the OS trash.
     deleteAfterDrag: (filePath) => electron_1.ipcRenderer.invoke("deleteAfterDrag", filePath),
     // Clipboard: copy file path as text.

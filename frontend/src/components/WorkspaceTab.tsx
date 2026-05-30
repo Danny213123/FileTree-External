@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, forwardRef, useImperativeHandle } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
 import { useScan, reconstructChildren } from "../hooks/useScan";
 import { useTreeState } from "../hooks/useTreeState";
 import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
@@ -7,7 +7,7 @@ import {
   copyPath, renameItem, moveItems, deletePath, copyFiles,
 } from "../api/client";
 import type { ScanOptions } from "../api/client";
-import type { DriveEntry, SpecialFolder, SortKey } from "../api/types";
+import type { DriveEntry, NodeRecord, SpecialFolder, SortKey } from "../api/types";
 import { TreeTable } from "./TreeTable";
 import { TabStrip } from "./TabStrip";
 import type { TabId } from "./TabStrip";
@@ -75,6 +75,24 @@ export interface RibbonState {
   sortDir: 1 | -1;
 }
 
+function pathWithin(path: string, parent: string): boolean {
+  const normalizedPath = path.toLowerCase();
+  const normalizedParent = parent.replace(/[\\/]+$/, "").toLowerCase();
+  return normalizedPath === normalizedParent ||
+    normalizedPath.startsWith(`${normalizedParent}\\`) ||
+    normalizedPath.startsWith(`${normalizedParent}/`);
+}
+
+function dedupeNestedPaths(paths: string[], nodeByPath: Map<string, NodeRecord>): string[] {
+  const sorted = [...paths].sort((a, b) => a.length - b.length);
+  const result: string[] = [];
+  for (const path of sorted) {
+    if (result.some((kept) => nodeByPath.get(kept)?.dir && pathWithin(path, kept))) continue;
+    result.push(path);
+  }
+  return result;
+}
+
 interface WorkspaceTabProps {
   tabId: string;
   initialPath: string;
@@ -100,7 +118,6 @@ interface WorkspaceTabProps {
   onClose3D: () => void;
   onToggleBookmark: (path: string) => void;
   onScanPath: (path: string) => void; // open in current tab
-  onOpenInNewTab: (path: string) => void;
   onStateChange: () => void; // notify App that something changed (for status bar refresh)
 }
 
@@ -113,7 +130,7 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     treemapPosition, treemapDetail,
     tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
     decimals, visibleColumns,
-    onClose3D, onToggleBookmark, onScanPath, onOpenInNewTab, onStateChange,
+    onClose3D, onToggleBookmark, onScanPath, onStateChange,
   }: WorkspaceTabProps,
   ref,
 ) {
@@ -125,6 +142,8 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
 
   const { data, status, errorMessage, progress, startScan, startRefresh, cancelScan } = useScan();
   const tree = useTreeState();
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set([0]));
+  const selectionAnchorIdRef = useRef<number>(0);
   const isFirstChunkRef = useRef(true);
   // Root path of the last completed scan. When doScan is called with the same
   // path, we skip resetForNewScan and preserve expansion via mergeNodes instead.
@@ -335,20 +354,63 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [threads, includeHidden, followLinks, exclude]);
 
-  const handleCtrlClick = useCallback((id: number) => {
+  const handleSelectRow = useCallback((id: number, mode: "single" | "toggle" | "range") => {
     const node = tree.nodeById.get(id);
-    if (node?.dir) onOpenInNewTab(node.path);
-  }, [tree, onOpenInNewTab]);
+    if (!node || node.id < 0 || !node.path) return;
+
+    if (mode === "range") {
+      const anchorId = selectionAnchorIdRef.current;
+      const anchorIndex = tree.visibleRows.findIndex((row) => row.id === anchorId);
+      const targetIndex = tree.visibleRows.findIndex((row) => row.id === id);
+      if (anchorIndex >= 0 && targetIndex >= 0) {
+        const [start, end] = anchorIndex < targetIndex
+          ? [anchorIndex, targetIndex]
+          : [targetIndex, anchorIndex];
+        const rangeIds = tree.visibleRows
+          .slice(start, end + 1)
+          .filter((row) => row.id >= 0 && !!row.path)
+          .map((row) => row.id);
+        setSelectedIds(new Set(rangeIds));
+        tree.setSelectedId(id);
+        return;
+      }
+    }
+
+    if (mode === "toggle") {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(id) && next.size > 1) {
+          next.delete(id);
+          if (tree.selectedId === id) {
+            const nextPrimary = next.values().next().value as number | undefined;
+            tree.setSelectedId(nextPrimary ?? id);
+          }
+        } else {
+          next.add(id);
+          tree.setSelectedId(id);
+          selectionAnchorIdRef.current = id;
+        }
+        return next;
+      });
+      return;
+    }
+
+    selectionAnchorIdRef.current = id;
+    setSelectedIds(new Set([id]));
+    tree.setSelectedId(id);
+  }, [tree]);
 
   const handleContextMenu = useCallback((id: number, x: number, y: number) => {
-    tree.setSelectedId(id);
+    if (!selectedIds.has(id)) {
+      handleSelectRow(id, "single");
+    }
     const node = tree.nodeById.get(id);
     if (!node || node.id < 0 || !node.path) return;
     // Pass screen coordinates (not client/CSS coords) so Win32 TrackPopupMenu places correctly.
     // The backend uses GetCursorPos() which gives real screen coords, so x/y here are
     // informational only — the backend ignores them and reads the cursor directly.
     shellContextMenu(node.path, x, y).catch(() => {});
-  }, [tree]);
+  }, [handleSelectRow, selectedIds, tree]);
 
   const handleDblClick = useCallback((id: number) => {
     const node = tree.nodeById.get(id);
@@ -422,6 +484,35 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   }, [tree]);
 
   const selectedNode = tree.nodeById.get(tree.selectedId);
+  const selectedNodes = useMemo(() => {
+    const nodes = Array.from(selectedIds)
+      .map((id) => tree.nodeById.get(id))
+      .filter((node): node is NodeRecord => !!node && node.id >= 0 && !!node.path);
+    return nodes.length > 0 && selectedNode?.path ? nodes : selectedNode?.path ? [selectedNode] : [];
+  }, [selectedIds, selectedNode, tree.nodeById]);
+  const nodeByPath = useMemo(() => {
+    const map = new Map<string, NodeRecord>();
+    for (const node of tree.nodeById.values()) {
+      if (node.path) map.set(node.path, node);
+    }
+    return map;
+  }, [tree.nodeById]);
+  const selectedPaths = useMemo(
+    () => dedupeNestedPaths(selectedNodes.map((node) => node.path), nodeByPath),
+    [nodeByPath, selectedNodes],
+  );
+
+  useEffect(() => {
+    const node = tree.nodeById.get(tree.selectedId);
+    if (!node || node.id < 0 || !node.path) return;
+    setSelectedIds((prev) => {
+      const valid = new Set(Array.from(prev).filter((id) => tree.nodeById.has(id)));
+      if (valid.has(tree.selectedId) && valid.size === prev.size) return prev;
+      selectionAnchorIdRef.current = tree.selectedId;
+      return new Set([tree.selectedId]);
+    });
+  }, [tree.selectedId, tree.nodeById]);
+
   const runReveal   = useCallback(() => { if (selectedNode) revealPath(selectedNode.path); }, [selectedNode]);
   const runOpen     = useCallback(() => { if (selectedNode) openPath(selectedNode.path); }, [selectedNode]);
   const runCopyPath = useCallback(() => { if (selectedNode) copyPath(selectedNode.path).catch(() => {}); }, [selectedNode]);
@@ -437,42 +528,50 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   }, [selectedNode, doScan]);
 
   const runDelete = useCallback(async () => {
-    if (!selectedNode || !selectedNode.path) return;
-    const confirmed = window.confirm(`Move "${selectedNode.name}" to Recycle Bin?`);
+    if (selectedPaths.length === 0) return;
+    const confirmed = selectedPaths.length === 1
+      ? window.confirm(`Move "${selectedNodes[0]?.name ?? selectedPaths[0]}" to Recycle Bin?`)
+      : window.confirm(`Move ${selectedPaths.length} selected items to Recycle Bin?`);
     if (!confirmed) return;
-    await deletePath(selectedNode.path);
+    for (const path of selectedPaths) {
+      await deletePath(path).catch(() => {});
+    }
     // Tree will refresh via fs-events watch or next manual scan
-  }, [selectedNode]);
+  }, [selectedNodes, selectedPaths]);
 
   const runMoveTo = useCallback(async () => {
-    if (!selectedNode || !selectedNode.path) return;
+    if (selectedPaths.length === 0) return;
     const dest = window.prompt("Move to folder:");
     if (!dest?.trim()) return;
-    const result = await moveItems([selectedNode.path], dest.trim());
+    const result = await moveItems(selectedPaths, dest.trim());
     if (!result.ok) { alert(`Move failed: ${result.error ?? "unknown error"}`); return; }
     doScan();
-  }, [selectedNode, doScan]);
+  }, [selectedPaths, doScan]);
 
   const runCopyFiles = useCallback(() => {
-    if (selectedNode?.path) copyFiles([selectedNode.path]).catch(() => {});
-  }, [selectedNode]);
+    if (selectedPaths.length > 0) copyFiles(selectedPaths).catch(() => {});
+  }, [selectedPaths]);
 
-  const handleInternalMove = useCallback(async (sources: string[], destination: string) => {
+  const handleInternalMove = useCallback(async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string }> => {
     console.log("[move] handleInternalMove sources=", sources, "destination=", destination);
-    if (sources.length === 0 || !destination) return;
+    if (sources.length === 0 || !destination) return { ok: true };
     if (sources.some(s => destination === s || destination.startsWith(s + "\\") || destination.startsWith(s + "/"))) {
-      alert("Cannot move a folder into itself or one of its descendants.");
-      return;
+      return { ok: false, error: "Cannot move a folder into itself or one of its descendants." };
     }
-    const result = await moveItems(sources, destination);
-    console.log("[move] moveItems result=", result);
-    if (!result.ok) { alert(`Move failed: ${result.error ?? "unknown error"}`); return; }
-    console.log("[move] invalidating ALL client cache, then doScan. scanPath=", scanPath, "lastCompletedPath=", lastCompletedPathRef.current);
-    // Suppress the fs-events watcher patch — it fires with maxDepth=1 (size=0 for folders)
-    // and would overwrite the correct aggregate sizes from the full rescan we're about to do.
-    suppressWatchRef.current = true;
-    invalidateAllScanCache();
-    doScan();
+    try {
+      const result = await moveItems(sources, destination);
+      console.log("[move] moveItems result=", result);
+      if (!result.ok) return result;
+      console.log("[move] invalidating ALL client cache, then doScan. scanPath=", scanPath, "lastCompletedPath=", lastCompletedPathRef.current);
+      // Suppress the fs-events watcher patch - it fires with maxDepth=1 (size=0 for folders)
+      // and would overwrite the correct aggregate sizes from the full rescan we're about to do.
+      suppressWatchRef.current = true;
+      invalidateAllScanCache();
+      doScan();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
   }, [doScan, scanPath]);
 
   const handleExternalMove = useCallback(async (paths: string[]) => {
@@ -594,6 +693,7 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
           nodeById={tree.nodeById}
           expanded={tree.expanded}
           selectedId={tree.selectedId}
+          selectedIds={selectedIds}
           sortKey={tree.sortKey}
           sortDir={tree.sortDir}
           metric={tree.metric}
@@ -601,9 +701,8 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
           decimals={decimals}
           visibleColumns={visibleColumns}
           onToggleExpand={tree.toggleExpand}
-          onSelect={tree.setSelectedId}
+          onSelect={handleSelectRow}
           onDoubleClick={handleDblClick}
-          onCtrlClick={handleCtrlClick}
           onContextMenu={handleContextMenu}
           onCopySelected={runCopyFiles}
           onMoveItems={handleInternalMove}
