@@ -116,8 +116,21 @@ export function TreeTable({
   type ElectronAPI = {
     startDrag: (filePaths: string | string[]) => DragStartResult;
     deleteAfterDrag: (filePath: string) => Promise<DeleteAfterDragResult>;
+    getPathForFile?: (file: File) => string;
   };
   const electronAPI = () => (window as unknown as { electronAPI?: ElectronAPI }).electronAPI;
+  const getDroppedFilePaths = useCallback((files: FileList) => {
+    const api = electronAPI();
+    return Array.from(files)
+      .map((file) => {
+        try {
+          return api?.getPathForFile?.(file) || (file as unknown as { path?: string }).path || "";
+        } catch {
+          return (file as unknown as { path?: string }).path || "";
+        }
+      })
+      .filter((filePath) => filePath.length > 0);
+  }, []);
   const clearDragUi = useCallback(() => {
     dragPathsRef.current = [];
     setDropTargetId(null);
@@ -340,7 +353,7 @@ export function TreeTable({
                   if (draggedNodes.length === 1 && draggedNodes[0].dir) {
                     e.dataTransfer.setData("application/x-filetree-folder-path", draggedPaths[0]);
                   }
-                  e.dataTransfer.effectAllowed = "move";
+                  e.dataTransfer.effectAllowed = draggedNodes.some((draggedNode) => draggedNode.dir) ? "copyMove" : "move";
                   dragPathsRef.current = draggedPaths;
                   pendingExternalDragRef.current = null;
                   const api = electronAPI();
@@ -380,8 +393,11 @@ export function TreeTable({
                 }}
                 onDragOver={(e) => {
                   if (!node.dir || !node.path || isBundle) return;
-                  if (!e.dataTransfer.types.includes("application/x-filetree-path")) return;
+                  const acceptsFileTreeDrag = e.dataTransfer.types.includes("application/x-filetree-path");
+                  const acceptsExplorerFiles = e.dataTransfer.types.includes("Files");
+                  if (!acceptsFileTreeDrag && !acceptsExplorerFiles) return;
                   e.preventDefault();
+                  e.stopPropagation();
                   e.dataTransfer.dropEffect = "move";
                   if (dropTargetId !== node.id) setDropTargetId(node.id);
                 }}
@@ -390,23 +406,36 @@ export function TreeTable({
                 }}
                 onDrop={(e) => {
                   if (!node.dir || !node.path || isBundle) return;
-                  const pathsPayload = e.dataTransfer.getData("application/x-filetree-paths");
-                  let sources: string[];
-                  try {
-                    sources = pathsPayload
-                      ? JSON.parse(pathsPayload) as string[]
-                      : [e.dataTransfer.getData("application/x-filetree-path")];
-                  } catch {
-                    sources = [e.dataTransfer.getData("application/x-filetree-path")];
+                  const isFileTreeDrag = e.dataTransfer.types.includes("application/x-filetree-path");
+                  const isExplorerFileDrag = e.dataTransfer.types.includes("Files");
+                  if (!isFileTreeDrag && !isExplorerFileDrag) return;
+
+                  e.preventDefault();
+                  e.stopPropagation();
+
+                  let sources: string[] = [];
+                  if (isFileTreeDrag) {
+                    const pathsPayload = e.dataTransfer.getData("application/x-filetree-paths");
+                    try {
+                      sources = pathsPayload
+                        ? JSON.parse(pathsPayload) as string[]
+                        : [e.dataTransfer.getData("application/x-filetree-path")];
+                    } catch {
+                      sources = [e.dataTransfer.getData("application/x-filetree-path")];
+                    }
+                  } else {
+                    sources = getDroppedFilePaths(e.dataTransfer.files);
                   }
+
                   setDropTargetId(null);
                   const movableSources = sources.filter((src) => src && src !== node.path);
                   if (movableSources.length === 0) {
                     resetDragState();
+                    if (isExplorerFileDrag && sources.length === 0) {
+                      reportInternalMoveError("Could not read the dropped file paths.");
+                    }
                     return;
                   }
-                  e.preventDefault();
-                  e.stopPropagation();
                   resetDragState();
                   window.setTimeout(() => {
                     void runInternalMove(movableSources, node.path);

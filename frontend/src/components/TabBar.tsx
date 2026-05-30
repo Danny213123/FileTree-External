@@ -104,6 +104,7 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
       onDragOver={(e) => {
         if (!isFolderDrag(e) || isTabDrag(e)) return;
         e.preventDefault();
+        e.stopPropagation();
         e.dataTransfer.dropEffect = "copy";
         const insertIdx = insertIdxForBar(e.clientX);
         if (folderInsertIdx !== insertIdx) setFolderInsertIdx(insertIdx);
@@ -114,6 +115,7 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
       onDrop={(e) => {
         if (!isFolderDrag(e) || isTabDrag(e)) return;
         e.preventDefault();
+        e.stopPropagation();
         const path = folderPathFromDrag(e);
         const beforeTab = tabs[insertIdxForBar(e.clientX)];
         clearAll();
@@ -221,10 +223,10 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
         onClick={onNew}
         title="New tab"
         onDragOver={(e) => {
-          if (isFolderDrag(e)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; if (folderInsertIdx !== tabs.length) setFolderInsertIdx(tabs.length); }
+          if (isFolderDrag(e)) { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy"; if (folderInsertIdx !== tabs.length) setFolderInsertIdx(tabs.length); }
         }}
         onDrop={(e) => {
-          if (isFolderDrag(e)) { e.preventDefault(); const path = folderPathFromDrag(e); clearAll(); if (path) onFolderDrop(path); }
+          if (isFolderDrag(e)) { e.preventDefault(); e.stopPropagation(); const path = folderPathFromDrag(e); clearAll(); if (path) onFolderDrop(path); }
         }}
       >+</button>
     </div>

@@ -11,6 +11,8 @@ electron_1.contextBridge.exposeInMainWorld("electronAPI", {
     copyText: (text) => electron_1.ipcRenderer.invoke("copyText", text),
     // Clipboard: copy files as CF_HDROP (paste in Explorer).
     copyFiles: (paths) => electron_1.ipcRenderer.invoke("copyFiles", paths),
+    // Electron 32+ no longer exposes file.path directly in the renderer.
+    getPathForFile: (file) => electron_1.webUtils.getPathForFile(file),
     // Register a callback for folders dropped onto the window from Explorer.
     onExternalDrop: (cb) => {
         electron_1.ipcRenderer.on("externalDrop", (_evt, paths) => cb(paths));
@@ -25,7 +27,9 @@ electron_1.contextBridge.exposeInMainWorld("electronAPI", {
     },
     // Context menu actions dispatched from Electron main (rename, delete, etc.)
     onContextMenuAction: (cb) => {
-        electron_1.ipcRenderer.on("contextMenuAction", (_evt, action, path) => cb(action, path));
+        const listener = (_evt, action, path) => cb(action, path);
+        electron_1.ipcRenderer.on("contextMenuAction", listener);
+        return () => electron_1.ipcRenderer.removeListener("contextMenuAction", listener);
     },
     // Shell context menu for the given path at screen position.
     shellContextMenu: (path, x, y) => electron_1.ipcRenderer.invoke("shellContextMenu", path, x, y),

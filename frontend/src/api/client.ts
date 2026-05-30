@@ -12,6 +12,17 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function responseErrorText(res: Response): Promise<string> {
+  const text = await res.text();
+  if (!text) return `HTTP ${res.status}`;
+  try {
+    const parsed = JSON.parse(text) as { error?: string };
+    return parsed.error ?? text;
+  } catch {
+    return text;
+  }
+}
+
 export interface ScanOptions {
   path: string;
   threads?: number;
@@ -304,8 +315,7 @@ export async function renameItem(path: string, newName: string): Promise<{ ok: b
     body: JSON.stringify({ path, newName }),
   });
   if (res.ok) return { ok: true };
-  const text = await res.text();
-  return { ok: false, error: text };
+  return { ok: false, error: await responseErrorText(res) };
 }
 
 export async function moveItems(paths: string[], destination: string): Promise<{ ok: boolean; error?: string }> {
@@ -315,8 +325,7 @@ export async function moveItems(paths: string[], destination: string): Promise<{
     body: JSON.stringify({ paths, destination }),
   });
   if (res.ok) return { ok: true };
-  const text = await res.text();
-  return { ok: false, error: text };
+  return { ok: false, error: await responseErrorText(res) };
 }
 
 export async function copyFiles(paths: string[]): Promise<void> {
