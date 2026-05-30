@@ -3,7 +3,7 @@ import type { DupeGroupV2, DupeFileV2, DupeScanMode, ReprioritizeCriterion } fro
 import type { DriveEntry, SpecialFolder } from "../api/types";
 import {
   fetchDupesV2, fetchDupesProgress, dupeAction, dupeMakeRef,
-  dupeIgnorePair, dupeClearIgnoreList,
+  dupeIgnorePair, dupeClearIgnoreList, cancelDupesScan,
 } from "../api/client";
 import type { DupesProgress } from "../api/client";
 import { formatBytes } from "../utils/formatBytes";
@@ -272,7 +272,11 @@ export function DuplicateFinder({ scanPath, hasScan, drives, specialFolders, onN
     }
   }, [selectedPaths, hasScan, scanPath, buildOpts, onRescan]);
 
-  const stopScan = () => { abortRef.current?.abort(); setScanState("idle"); };
+  const stopScan = () => {
+    void cancelDupesScan();
+    abortRef.current?.abort();
+    setScanState("idle");
+  };
 
   const handleReprioritize = useCallback(async () => {
     if (!groups.length) return;
@@ -378,6 +382,9 @@ export function DuplicateFinder({ scanPath, hasScan, drives, specialFolders, onN
   const selectedCount = selected.size;
   const canScan = selectedPaths.length > 0 || hasScan;
   const modeLabel = scanMode === "exact" ? "byte-identical" : scanMode === "filename" ? "similar filename" : "matching audio tags";
+  const hashDone = progress?.filesHashed ?? 0;
+  const hashTotal = progress?.filesHashing ?? 0;
+  const hashPct = hashTotal > 0 ? Math.min(100, Math.max(0, (hashDone / hashTotal) * 100)) : 0;
 
   return (
     <div className="df-root">
@@ -538,17 +545,24 @@ export function DuplicateFinder({ scanPath, hasScan, drives, specialFolders, onN
                 {progress?.phase === "scan" && progress.filesScanned > 0
                   ? `${progress.filesScanned.toLocaleString()} files found…`
                   : progress?.phase === "hash"
-                    ? `${progress.filesScanned.toLocaleString()} files scanned`
+                    ? `${progress.filesScanned.toLocaleString()} candidate files after filters`
                     : selectedPaths.length > 0
                       ? `Scanning ${selectedPaths.join(", ")}…`
                       : "Searching for duplicates…"}
               </div>
               <div className="df-progress-track">
-                <div className={`df-progress-bar${progress?.phase === "hash" ? " df-progress-bar-pulse" : " df-progress-bar-sweep"}`} />
+                <div
+                  className={`df-progress-bar${progress?.phase === "hash" ? " df-progress-bar-determinate" : " df-progress-bar-sweep"}`}
+                  style={progress?.phase === "hash" ? { width: `${hashPct}%` } : undefined}
+                />
               </div>
               {progress && (
                 <div className="df-progress-label">
-                  {progress.phase === "scan" ? "Scanning filesystem…" : `Hashing ${progress.filesScanned.toLocaleString()} files`}
+                  {progress.phase === "scan"
+                    ? "Scanning filesystem…"
+                    : hashTotal > 0
+                      ? `Hashing ${hashDone.toLocaleString()} / ${hashTotal.toLocaleString()} file reads`
+                      : "Preparing hash candidates…"}
                 </div>
               )}
             </div>

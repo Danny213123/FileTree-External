@@ -2624,6 +2624,11 @@ input:focus, select:focus {
   0%, 100% { opacity: 0.35; }
   50%       { opacity: 1; }
 }
+.df-progress-bar-determinate {
+  left: 0;
+  width: 0;
+  transition: width 180ms ease-out;
+}
 .df-progress-label {
   font-size: 11px;
   color: var(--muted);

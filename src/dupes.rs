@@ -2,9 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::export::push_json_string;
-use crate::model::{NodeRecord, ScanResult};
+use crate::model::{DupesProgress, NodeRecord, ScanResult};
 
 // ── Core types ─────────────────────────────────────────────────────────────
 
@@ -33,6 +35,25 @@ pub(crate) struct DupeGroupV2 {
 
 // ── FNV-1a file hash ────────────────────────────────────────────────────────
 
+const SAMPLE_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct FileFingerprint {
+    hash: u64,
+    complete: bool,
+}
+
+fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+}
+
+fn fnv1a_update_u64(hash: &mut u64, value: u64) {
+    fnv1a_update(hash, &value.to_le_bytes());
+}
+
 pub(crate) fn fnv1a_file(path: &Path) -> io::Result<u64> {
     let mut file = File::open(path)?;
     let mut buffer = [0u8; 1024 * 1024];
@@ -42,12 +63,36 @@ pub(crate) fn fnv1a_file(path: &Path) -> io::Result<u64> {
         if read == 0 {
             break;
         }
-        for byte in &buffer[..read] {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
+        fnv1a_update(&mut hash, &buffer[..read]);
     }
     Ok(hash)
+}
+
+fn fnv1a_file_sample(path: &Path, size: u64) -> io::Result<FileFingerprint> {
+    let mut file = File::open(path)?;
+    let mut buffer = [0u8; SAMPLE_BYTES];
+    let mut hash = 0xcbf29ce484222325u64;
+    fnv1a_update_u64(&mut hash, size);
+
+    if size <= (SAMPLE_BYTES as u64).saturating_mul(2) {
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            fnv1a_update(&mut hash, &buffer[..read]);
+        }
+        return Ok(FileFingerprint { hash, complete: true });
+    }
+
+    let read = file.read(&mut buffer)?;
+    fnv1a_update(&mut hash, &buffer[..read]);
+
+    file.seek(SeekFrom::End(-(SAMPLE_BYTES as i64)))?;
+    let read = file.read(&mut buffer)?;
+    fnv1a_update(&mut hash, &buffer[..read]);
+
+    Ok(FileFingerprint { hash, complete: false })
 }
 
 // ── Build candidate file list from scan result ──────────────────────────────
@@ -101,6 +146,7 @@ pub(crate) fn build_candidates_from_nodes(nodes: &[NodeRecord], filter: &DupeFil
 
 // ── Algorithm 1: Exact (byte-identical via FNV-1a) ─────────────────────────
 
+#[allow(dead_code)]
 pub(crate) fn scan_exact(files: &[DupeFileV2]) -> Vec<(usize, usize, u8)> {
     // Group by size first — only files with identical sizes can be identical
     let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -136,6 +182,106 @@ pub(crate) fn scan_exact(files: &[DupeFileV2]) -> Vec<(usize, usize, u8)> {
 }
 
 // ── Algorithm 2: Filename fuzzy (Sørensen-Dice) ────────────────────────────
+
+fn is_canceled(cancel: Option<&Arc<AtomicBool>>) -> bool {
+    cancel
+        .map(|flag| flag.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+fn progress_add_hashed(progress: Option<&Arc<DupesProgress>>, count: u64) {
+    if let Some(progress) = progress {
+        progress.files_hashed.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+fn progress_add_hashing(progress: Option<&Arc<DupesProgress>>, count: u64) {
+    if let Some(progress) = progress {
+        progress.files_hashing.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+fn emit_all_pairs(indices: &[usize], matches: &mut Vec<(usize, usize, u8)>) {
+    for i in 0..indices.len() {
+        for j in (i + 1)..indices.len() {
+            matches.push((indices[i], indices[j], 100u8));
+        }
+    }
+}
+
+pub(crate) fn scan_exact_with_progress(
+    files: &[DupeFileV2],
+    progress: Option<&Arc<DupesProgress>>,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Vec<(usize, usize, u8)> {
+    // Group by size first. Only files with identical byte lengths can be exact duplicates.
+    let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (idx, file) in files.iter().enumerate() {
+        by_size.entry(file.size).or_default().push(idx);
+    }
+
+    let buckets: Vec<Vec<usize>> = by_size
+        .into_values()
+        .filter(|indices| indices.len() > 1)
+        .collect();
+
+    if let Some(progress) = progress {
+        let hash_candidates = buckets.iter().map(|indices| indices.len() as u64).sum::<u64>();
+        progress.files_hashing.store(hash_candidates, Ordering::Relaxed);
+        progress.files_hashed.store(0, Ordering::Relaxed);
+    }
+
+    let mut matches = Vec::new();
+    for indices in buckets {
+        if is_canceled(cancel) {
+            return Vec::new();
+        }
+
+        let mut by_sample_hash: HashMap<u64, Vec<(usize, bool)>> = HashMap::new();
+        for idx in indices {
+            if is_canceled(cancel) {
+                return Vec::new();
+            }
+            if let Ok(fingerprint) = fnv1a_file_sample(&files[idx].path, files[idx].size) {
+                by_sample_hash
+                    .entry(fingerprint.hash)
+                    .or_default()
+                    .push((idx, fingerprint.complete));
+            }
+            progress_add_hashed(progress, 1);
+        }
+
+        for sample_group in by_sample_hash.values().filter(|group| group.len() > 1) {
+            if is_canceled(cancel) {
+                return Vec::new();
+            }
+
+            if sample_group.iter().all(|(_, complete)| *complete) {
+                let exact_indices: Vec<usize> = sample_group.iter().map(|(idx, _)| *idx).collect();
+                emit_all_pairs(&exact_indices, &mut matches);
+                continue;
+            }
+
+            progress_add_hashing(progress, sample_group.len() as u64);
+            let mut by_full_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+            for &(idx, _) in sample_group {
+                if is_canceled(cancel) {
+                    return Vec::new();
+                }
+                if let Ok(hash) = fnv1a_file(&files[idx].path) {
+                    by_full_hash.entry(hash).or_default().push(idx);
+                }
+                progress_add_hashed(progress, 1);
+            }
+
+            for hash_group in by_full_hash.values().filter(|group| group.len() > 1) {
+                emit_all_pairs(hash_group, &mut matches);
+            }
+        }
+    }
+
+    matches
+}
 
 fn get_words(name: &str) -> Vec<String> {
     // Strip file extension

@@ -14,7 +14,7 @@ use crate::cli::APP_NAME;
 use crate::dupes::{
     DupeFilter2, DupeGroupV2, ReprioritizeCriterion, ScanMode, IgnoreList,
     build_candidates_from_nodes, matches_to_groups, groups_to_json,
-    scan_exact, scan_filename, scan_audio, reprioritize,
+    scan_exact_with_progress, scan_filename, scan_audio, reprioritize,
     action_delete, action_move, action_copy,
 };
 use crate::export::{
@@ -47,6 +47,7 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
         scan_cache: Mutex::new(std::collections::HashMap::new()),
         icon_cache: Mutex::new(std::collections::HashMap::new()),
         dupes_progress: Arc::new(DupesProgress::default()),
+        dupes_cancel: Arc::new(AtomicBool::new(false)),
         ignore_list: Mutex::new(ignore_list),
         ignore_list_path,
     });
@@ -232,9 +233,7 @@ fn build_dupe_filter(query: &std::collections::HashMap<String, String>) -> DupeF
     DupeFilter {
         min_size: query.get("minSize").and_then(|v| v.parse().ok()).unwrap_or(1),
         max_size: query.get("maxSize").and_then(|v| v.parse().ok()),
-        extensions: query.get("extensions")
-            .map(|v| v.split(',').filter(|s| !s.is_empty()).map(|s| s.to_lowercase()).collect())
-            .unwrap_or_default(),
+        extensions: parse_extension_filter(query.get("extensions")),
         name_pattern: query.get("namePattern").cloned().unwrap_or_default().to_lowercase(),
         name_exact: query.get("nameExact").map(|v| v == "1").unwrap_or(false),
         date_from: query.get("dateFrom").and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -242,6 +241,17 @@ fn build_dupe_filter(query: &std::collections::HashMap<String, String>) -> DupeF
         keep_prefix: query.get("keepPrefix").cloned().unwrap_or_default(),
         search_prefix: query.get("searchPrefix").cloned().unwrap_or_default(),
     }
+}
+
+fn parse_extension_filter(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|raw| {
+            raw.split(',')
+                .map(|ext| ext.trim().trim_start_matches('.').to_lowercase())
+                .filter(|ext| !ext.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 const SCAN_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
@@ -470,6 +480,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
 
             // Reset progress counters and enter scan phase.
             let prog = Arc::clone(&state.dupes_progress);
+            state.dupes_cancel.store(false, Ordering::Relaxed);
             prog.phase.store(1, Ordering::Relaxed);
             prog.files_scanned.store(0, Ordering::Relaxed);
             prog.files_hashing.store(0, Ordering::Relaxed);
@@ -488,7 +499,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     exclude_patterns: vec![],
                     max_depth: None,
                 };
-                let cancel = Arc::new(AtomicBool::new(false));
+                let cancel = Arc::clone(&state.dupes_cancel);
                 let prog2 = Arc::clone(&prog);
                 match scan_path_with_progress(options, cancel, move |node_count, _elapsed_ms| {
                     prog2.files_scanned.store(node_count as u64, Ordering::Relaxed);
@@ -510,6 +521,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                             message: e.to_string(),
                         });
                     }
+                }
+                if state.dupes_cancel.load(Ordering::Relaxed) {
+                    prog.phase.store(0, Ordering::Relaxed);
+                    return respond_json(&mut stream, 499, "Client Closed Request", "{\"groups\":[],\"errors\":[\"Scan canceled\"]}");
                 }
             }
 
@@ -554,6 +569,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             body.push('}');
             respond_json(&mut stream, 200, "OK", &body)
         }
+        "/api/dupes-cancel" => {
+            state.dupes_cancel.store(true, Ordering::Relaxed);
+            let prog = &state.dupes_progress;
+            prog.phase.store(0, Ordering::Relaxed);
+            prog.files_hashing.store(0, Ordering::Relaxed);
+            prog.files_hashed.store(0, Ordering::Relaxed);
+            respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
+        }
         // ── dupeguru-style duplicate detection (V2) ────────────────
         "/api/dupes-v2" => {
             let paths_raw = query.get("paths").cloned().unwrap_or_default();
@@ -578,13 +601,12 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let filter = DupeFilter2 {
                 min_size: query.get("minSize").and_then(|v| v.parse().ok()).unwrap_or(1),
                 max_size: query.get("maxSize").and_then(|v| v.parse().ok()),
-                extensions: query.get("extensions")
-                    .map(|v| v.split(',').filter(|s| !s.is_empty()).map(|s| s.to_lowercase()).collect())
-                    .unwrap_or_default(),
+                extensions: parse_extension_filter(query.get("extensions")),
             };
 
             // Scan each path and merge
             let prog = Arc::clone(&state.dupes_progress);
+            state.dupes_cancel.store(false, Ordering::Relaxed);
             prog.phase.store(1, Ordering::Relaxed);
             prog.files_scanned.store(0, Ordering::Relaxed);
             prog.files_hashing.store(0, Ordering::Relaxed);
@@ -602,7 +624,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     exclude_patterns: vec![],
                     max_depth: None,
                 };
-                let cancel = Arc::new(AtomicBool::new(false));
+                let cancel = Arc::clone(&state.dupes_cancel);
                 let prog2 = Arc::clone(&prog);
                 match scan_path_with_progress(options, cancel, move |node_count, _elapsed_ms| {
                     prog2.files_scanned.store(node_count as u64, Ordering::Relaxed);
@@ -621,21 +643,36 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     }
                     Err(e) => scan_errors.push(format!("{raw_path}: {e}")),
                 }
+                if state.dupes_cancel.load(Ordering::Relaxed) {
+                    prog.phase.store(0, Ordering::Relaxed);
+                    return respond_json(&mut stream, 499, "Client Closed Request", "{\"groups\":[],\"errors\":[\"Scan canceled\"],\"ignoredCount\":0}");
+                }
             }
 
             prog.phase.store(2, Ordering::Relaxed);
 
             let candidates = build_candidates_from_nodes(&all_nodes, &filter);
+            prog.files_scanned.store(candidates.len() as u64, Ordering::Relaxed);
+            prog.files_hashing.store(0, Ordering::Relaxed);
+            prog.files_hashed.store(0, Ordering::Relaxed);
 
             let ignore = state.ignore_list.lock().expect("ignore lock poisoned");
             let raw_matches = match mode {
-                ScanMode::Exact    => scan_exact(&candidates),
+                ScanMode::Exact    => scan_exact_with_progress(
+                    &candidates,
+                    Some(&prog),
+                    Some(&state.dupes_cancel),
+                ),
                 ScanMode::Filename => scan_filename(&candidates, min_score, weighted, mix_kinds),
                 ScanMode::Audio    => {
                     let tag_refs: Vec<&str> = active_tags.iter().map(|s| s.as_str()).collect();
                     scan_audio(&candidates, &tag_refs, min_score)
                 }
             };
+            if state.dupes_cancel.load(Ordering::Relaxed) {
+                prog.phase.store(0, Ordering::Relaxed);
+                return respond_json(&mut stream, 499, "Client Closed Request", "{\"groups\":[],\"errors\":[\"Scan canceled\"],\"ignoredCount\":0}");
+            }
             let ignored_count = ignore.pair_count();
             let mut groups = matches_to_groups(raw_matches, &candidates, mode, &ignore);
             drop(ignore);

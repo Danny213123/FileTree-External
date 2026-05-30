@@ -102,6 +102,10 @@ export async function fetchDupesProgress(): Promise<DupesProgress> {
   try { return await res.json() as DupesProgress; } catch { return { phase: "idle", filesScanned: 0, filesHashing: 0, filesHashed: 0 }; }
 }
 
+export async function cancelDupesScan(): Promise<void> {
+  await fetch("/api/dupes-cancel", { method: "POST" }).catch(() => {});
+}
+
 export async function fetchDupesScan(
   paths: string[],
   filter: import("./types").DupeFilter,
