@@ -3,8 +3,8 @@ import { contextBridge, ipcRenderer } from "electron";
 // Expose a safe API to the renderer that replaces window.chrome.webview.
 contextBridge.exposeInMainWorld("electronAPI", {
   // sendSync keeps startDrag inside the dragstart event context (required by Electron).
-  startDrag: (filePath: string): { ok: boolean; status: string; error?: string } =>
-    ipcRenderer.sendSync("ondragstart", filePath),
+  startDrag: (filePaths: string | string[]): { ok: boolean; status: string; error?: string } =>
+    ipcRenderer.sendSync("ondragstart", filePaths),
 
   // Call after dragend to move the dragged source to the OS trash.
   deleteAfterDrag: (filePath: string): Promise<{ ok: boolean; status?: string; error?: string }> =>

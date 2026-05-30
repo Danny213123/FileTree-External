@@ -29,11 +29,14 @@ export const ALL_COLUMNS: { key: SortKey; label: string }[] = [
 
 export const DEFAULT_VISIBLE_COLUMNS = new Set<SortKey>(["name", "size", "allocated", "files", "folders", "percent", "modified"]);
 
+type MoveItemsResult = { ok: boolean; error?: string };
+
 interface TreeTableProps {
   rows: NodeRecord[];
   nodeById: Map<number, NodeRecord>;
   expanded: Set<number>;
   selectedId: number;
+  selectedIds: Set<number>;
   sortKey: SortKey;
   sortDir: 1 | -1;
   metric: Metric;
@@ -42,15 +45,14 @@ interface TreeTableProps {
   visibleColumns: Set<SortKey>;
   bookmarks: Set<string>;
   onToggleExpand: (id: number) => void;
-  onSelect: (id: number) => void;
+  onSelect: (id: number, mode: "single" | "toggle" | "range") => void;
   onDoubleClick: (id: number) => void;
-  onCtrlClick: (id: number) => void;
   onContextMenu: (id: number, x: number, y: number) => void;
   onSortChange: (key: SortKey) => void;
   onToggleBookmark: (path: string) => void;
   onCopySelected?: () => void;
   /** Called when the user drags rows from inside FileTree onto a folder row. */
-  onMoveItems?: (sourcePaths: string[], destinationFolder: string) => void;
+  onMoveItems?: (sourcePaths: string[], destinationFolder: string) => Promise<MoveItemsResult | void> | MoveItemsResult | void;
   /** Called after a successful external drag-out with dropEffect="move" to delete source. */
   onExternalMove?: (paths: string[]) => void;
 }
@@ -64,11 +66,31 @@ function metricValue(node: NodeRecord, metric: Metric): number {
   }
 }
 
+function isPathInside(path: string, parent: string): boolean {
+  const normalizedPath = path.toLowerCase();
+  const normalizedParent = parent.replace(/[\\/]+$/, "").toLowerCase();
+  return normalizedPath === normalizedParent ||
+    normalizedPath.startsWith(`${normalizedParent}\\`) ||
+    normalizedPath.startsWith(`${normalizedParent}/`);
+}
+
+function dedupeNestedNodes(nodes: NodeRecord[]): NodeRecord[] {
+  const sorted = [...nodes].sort((a, b) => a.path.length - b.path.length);
+  const result: NodeRecord[] = [];
+  for (const node of sorted) {
+    if (!node.path) continue;
+    if (result.some((kept) => kept.dir && isPathInside(node.path, kept.path))) continue;
+    result.push(node);
+  }
+  return result;
+}
+
 export function TreeTable({
   rows,
   nodeById,
   expanded,
   selectedId,
+  selectedIds,
   sortKey,
   sortDir,
   unit,
@@ -79,7 +101,6 @@ export function TreeTable({
   onToggleExpand,
   onSelect,
   onDoubleClick,
-  onCtrlClick,
   onContextMenu,
   onSortChange,
   onToggleBookmark,
@@ -88,15 +109,23 @@ export function TreeTable({
   onExternalMove,
 }: TreeTableProps) {
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
-  const dragPathRef = useRef<string | null>(null);
-  const pendingExternalDragRef = useRef<{ path: string; completed: boolean; cancelled: boolean } | null>(null);
+  const dragPathsRef = useRef<string[]>([]);
+  const pendingExternalDragRef = useRef<{ paths: string[]; completed: boolean; cancelled: boolean } | null>(null);
   type DragStartResult = { ok: boolean; status: string; error?: string };
   type DeleteAfterDragResult = { ok: boolean; status?: string; error?: string };
   type ElectronAPI = {
-    startDrag: (filePath: string) => DragStartResult;
+    startDrag: (filePaths: string | string[]) => DragStartResult;
     deleteAfterDrag: (filePath: string) => Promise<DeleteAfterDragResult>;
   };
   const electronAPI = () => (window as unknown as { electronAPI?: ElectronAPI }).electronAPI;
+  const clearDragUi = useCallback(() => {
+    dragPathsRef.current = [];
+    setDropTargetId(null);
+  }, []);
+  const resetDragState = useCallback(() => {
+    clearDragUi();
+    pendingExternalDragRef.current = null;
+  }, [clearDragUi]);
   const cols = useMemo(
     () => ALL_COLUMNS.filter((c) => visibleColumns.has(c.key)),
     [visibleColumns],
@@ -118,6 +147,22 @@ export function TreeTable({
     scrollEl.addEventListener("wheel", onWheel, { passive: false });
     return () => scrollEl.removeEventListener("wheel", onWheel);
   }, [scrollEl]);
+
+  useEffect(() => {
+    const resetNonNativeDrag = () => {
+      if (pendingExternalDragRef.current) {
+        setDropTargetId(null);
+      } else {
+        resetDragState();
+      }
+    };
+    window.addEventListener("dragend", resetNonNativeDrag);
+    window.addEventListener("drop", resetNonNativeDrag);
+    return () => {
+      window.removeEventListener("dragend", resetNonNativeDrag);
+      window.removeEventListener("drop", resetNonNativeDrag);
+    };
+  }, [resetDragState]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -144,14 +189,22 @@ export function TreeTable({
   });
 
   const rootNode = nodeById.get(0);
+  const selectedDragNodes = useMemo(
+    () => dedupeNestedNodes(
+      Array.from(selectedIds)
+        .map((id) => nodeById.get(id))
+        .filter((node): node is NodeRecord => !!node && node.id >= 0 && !!node.path),
+    ),
+    [nodeById, selectedIds],
+  );
 
-  const finishExternalDrag = useCallback(async (src: string, reason: string) => {
+  const finishExternalDrag = useCallback(async (paths: string[], reason: string) => {
     const pending = pendingExternalDragRef.current;
-    if (!pending || pending.path !== src || pending.completed || pending.cancelled) return;
+    if (!pending || pending.completed || pending.cancelled) return;
+    if (pending.paths.join("\n") !== paths.join("\n")) return;
 
     pending.completed = true;
-    dragPathRef.current = null;
-    setDropTargetId(null);
+    clearDragUi();
 
     const api = electronAPI();
     if (!api?.deleteAfterDrag) {
@@ -160,24 +213,47 @@ export function TreeTable({
     }
 
     try {
-      const result = await api.deleteAfterDrag(src);
-      if (!result.ok) {
-        const message = result.error ?? "unknown error";
-        console.error("[TreeTable] deleteAfterDrag failed", { src, reason, message });
-        window.alert(`Could not remove the original after drag-out: ${message}`);
-        return;
+      for (const path of paths) {
+        const result = await api.deleteAfterDrag(path);
+        if (!result.ok) {
+          const message = result.error ?? "unknown error";
+          console.error("[TreeTable] deleteAfterDrag failed", { path, reason, message });
+          window.alert(`Could not remove "${path}" after drag-out: ${message}`);
+          return;
+        }
       }
 
-      console.log("[TreeTable] external drag cleanup complete", { src, reason, status: result.status });
+      console.log("[TreeTable] external drag cleanup complete", { paths, reason });
       onExternalMove?.([]);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error("[TreeTable] deleteAfterDrag threw", { src, reason, error });
+      console.error("[TreeTable] deleteAfterDrag threw", { paths, reason, error });
       window.alert(`Could not remove the original after drag-out: ${message}`);
     } finally {
       pendingExternalDragRef.current = null;
     }
-  }, [onExternalMove]);
+  }, [clearDragUi, onExternalMove]);
+
+  const reportInternalMoveError = useCallback((message: string) => {
+    console.error("[TreeTable] internal move failed", message);
+    window.setTimeout(() => {
+      window.alert(`Move failed: ${message}`);
+    }, 0);
+  }, []);
+
+  const runInternalMove = useCallback(async (sourcePaths: string[], destinationFolder: string) => {
+    try {
+      const result = await onMoveItems?.(sourcePaths, destinationFolder);
+      if (result && !result.ok) {
+        reportInternalMoveError(result.error ?? "unknown error");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      reportInternalMoveError(message);
+    } finally {
+      resetDragState();
+    }
+  }, [onMoveItems, reportInternalMoveError, resetDragState]);
 
   return (
     <div
@@ -232,18 +308,18 @@ export function TreeTable({
             const hasKids   = node.children.length > 0;
             const isOpen    = expanded.has(node.id);
             const isDraggable = !isBundle && !!node.path;
+            const isSelected = !isBundle && selectedIds.has(node.id);
             const isDropTarget = dropTargetId === node.id;
             return (
               <div
                 key={node.id}
                 data-index={vItem.index}
-                className={`row${selectedId === node.id ? " selected" : ""}${node.hidden ? " hidden-entry" : ""}${isDropTarget ? " drop-target" : ""}`}
+                className={`row${isSelected ? " selected" : ""}${selectedId === node.id ? " primary-selected" : ""}${node.hidden ? " hidden-entry" : ""}${isDropTarget ? " drop-target" : ""}`}
                 style={{ position: "absolute", top: vItem.start, left: 0, right: 0, height: ROW_HEIGHT, gridTemplateColumns: gridTemplate }}
                 draggable={isDraggable}
                 onClick={(e) => {
-                  if (isBundle) { onToggleExpand(node.id); onSelect(node.id); return; }
-                  if (e.ctrlKey) { onCtrlClick(node.id); return; }
-                  onSelect(node.id);
+                  if (isBundle) { onToggleExpand(node.id); return; }
+                  onSelect(node.id, e.shiftKey ? "range" : (e.ctrlKey || e.metaKey ? "toggle" : "single"));
                 }}
                 onDoubleClick={() => { if (!isBundle) onDoubleClick(node.id); }}
                 onContextMenu={(e) => {
@@ -252,48 +328,61 @@ export function TreeTable({
                 }}
                 onDragStart={(e) => {
                   if (!isDraggable) return;
-                  onSelect(node.id);
-                  // Set internal drag MIME so drop targets inside FileTree can detect this.
-                  e.dataTransfer.setData("application/x-filetree-path", node.path);
+                  const draggedNodes = selectedIds.has(node.id)
+                    ? selectedDragNodes
+                    : dedupeNestedNodes([node]);
+                  const draggedPaths = draggedNodes.map((draggedNode) => draggedNode.path);
+                  if (draggedPaths.length === 0) return;
+
+                  if (!selectedIds.has(node.id)) onSelect(node.id, "single");
+                  e.dataTransfer.setData("application/x-filetree-path", draggedPaths[0]);
+                  e.dataTransfer.setData("application/x-filetree-paths", JSON.stringify(draggedPaths));
+                  if (draggedNodes.length === 1 && draggedNodes[0].dir) {
+                    e.dataTransfer.setData("application/x-filetree-folder-path", draggedPaths[0]);
+                  }
                   e.dataTransfer.effectAllowed = "move";
-                  dragPathRef.current = node.path;
-                  pendingExternalDragRef.current = { path: node.path, completed: false, cancelled: false };
+                  dragPathsRef.current = draggedPaths;
+                  pendingExternalDragRef.current = null;
                   const api = electronAPI();
-                  if (api) {
+                  const canUseNativeDrag = !!api && draggedNodes.every((draggedNode) => !draggedNode.dir);
+                  if (canUseNativeDrag) {
                     // External drag-out via Electron native drag (blocks until drop/cancel).
                     e.preventDefault(); // suppress Chromium's HTML5 drag to avoid double-drag crash
-                    const result = api.startDrag(node.path);
-                    console.log("[TreeTable] dragstart result=", result, "src=", node.path);
+                    pendingExternalDragRef.current = { paths: draggedPaths, completed: false, cancelled: false };
+                    const result = api.startDrag(draggedPaths);
+                    console.log("[TreeTable] dragstart result=", result, "paths=", draggedPaths);
                     if (!result?.ok) {
-                      console.error("[TreeTable] startDrag failed", { src: node.path, result });
-                      dragPathRef.current = null;
-                      pendingExternalDragRef.current = null;
+                      console.error("[TreeTable] startDrag failed", { paths: draggedPaths, result });
+                      resetDragState();
                       return;
                     }
-                    window.setTimeout(() => { void finishExternalDrag(node.path, "native-return"); }, 0);
+                    window.setTimeout(() => { void finishExternalDrag(draggedPaths, "native-return"); }, 0);
                   }
                 }}
                 onDragEnd={(e) => {
-                  const src = dragPathRef.current;
+                  const paths = dragPathsRef.current;
                   setDropTargetId(null);
-                  if (!src) return;
-
-                  if (e.dataTransfer.dropEffect === "none") {
-                    const pending = pendingExternalDragRef.current;
-                    if (pending?.path === src) pending.cancelled = true;
-                    pendingExternalDragRef.current = null;
-                    dragPathRef.current = null;
-                    console.log("[TreeTable] external drag cancelled", { src });
+                  if (paths.length === 0) return;
+                  if (!pendingExternalDragRef.current) {
+                    resetDragState();
                     return;
                   }
 
-                  void finishExternalDrag(src, `dragend:${e.dataTransfer.dropEffect}`);
+                  if (e.dataTransfer.dropEffect === "none") {
+                    const pending = pendingExternalDragRef.current;
+                    if (pending) pending.cancelled = true;
+                    resetDragState();
+                    console.log("[TreeTable] external drag cancelled", { paths });
+                    return;
+                  }
+
+                  void finishExternalDrag(paths, `dragend:${e.dataTransfer.dropEffect}`);
                 }}
                 onDragOver={(e) => {
                   if (!node.dir || !node.path || isBundle) return;
                   if (!e.dataTransfer.types.includes("application/x-filetree-path")) return;
                   e.preventDefault();
-                  e.dataTransfer.dropEffect = e.ctrlKey ? "copy" : "move";
+                  e.dataTransfer.dropEffect = "move";
                   if (dropTargetId !== node.id) setDropTargetId(node.id);
                 }}
                 onDragLeave={() => {
@@ -301,11 +390,27 @@ export function TreeTable({
                 }}
                 onDrop={(e) => {
                   if (!node.dir || !node.path || isBundle) return;
-                  const src = e.dataTransfer.getData("application/x-filetree-path");
+                  const pathsPayload = e.dataTransfer.getData("application/x-filetree-paths");
+                  let sources: string[];
+                  try {
+                    sources = pathsPayload
+                      ? JSON.parse(pathsPayload) as string[]
+                      : [e.dataTransfer.getData("application/x-filetree-path")];
+                  } catch {
+                    sources = [e.dataTransfer.getData("application/x-filetree-path")];
+                  }
                   setDropTargetId(null);
-                  if (!src || src === node.path) return;
+                  const movableSources = sources.filter((src) => src && src !== node.path);
+                  if (movableSources.length === 0) {
+                    resetDragState();
+                    return;
+                  }
                   e.preventDefault();
-                  onMoveItems?.([src], node.path);
+                  e.stopPropagation();
+                  resetDragState();
+                  window.setTimeout(() => {
+                    void runInternalMove(movableSources, node.path);
+                  }, 0);
                 }}
               >
                 <div

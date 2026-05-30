@@ -70,7 +70,7 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
   }, [tabs, onFolderDrop]);
 
   const isTabDrag  = (e: React.DragEvent) => e.dataTransfer.types.includes("application/x-tab-id");
-  const isFolderDrag = (e: React.DragEvent) => e.dataTransfer.types.includes("application/x-filetree-path");
+  const isFolderDrag = (e: React.DragEvent) => e.dataTransfer.types.includes("application/x-filetree-folder-path");
 
   const clearAll = () => { setReorderInsertIdx(null); setFolderInsertIdx(null); };
 
@@ -82,12 +82,42 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
     return e.clientX < mid ? tabIdx : tabIdx + 1;
   };
 
+  const insertIdxForBar = (clientX: number) => {
+    const bar = barRef.current;
+    if (!bar) return tabs.length;
+    const tabEls = Array.from(bar.querySelectorAll<HTMLElement>(".wtab:not(.wtab-ghost)"));
+    let insertIdx = tabs.length;
+    for (let i = 0; i < tabEls.length; i++) {
+      const rect = tabEls[i].getBoundingClientRect();
+      if (clientX < rect.left + rect.width / 2) { insertIdx = i; break; }
+    }
+    return insertIdx;
+  };
+
+  const folderPathFromDrag = (e: React.DragEvent) =>
+    e.dataTransfer.getData("application/x-filetree-folder-path");
+
   return (
     <div
       ref={barRef}
       className="workspace-tabbar"
+      onDragOver={(e) => {
+        if (!isFolderDrag(e) || isTabDrag(e)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+        const insertIdx = insertIdxForBar(e.clientX);
+        if (folderInsertIdx !== insertIdx) setFolderInsertIdx(insertIdx);
+      }}
       onDragLeave={(e) => {
         if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) clearAll();
+      }}
+      onDrop={(e) => {
+        if (!isFolderDrag(e) || isTabDrag(e)) return;
+        e.preventDefault();
+        const path = folderPathFromDrag(e);
+        const beforeTab = tabs[insertIdxForBar(e.clientX)];
+        clearAll();
+        if (path) onFolderDrop(path, beforeTab?.id);
       }}
     >
       {tabs.map((tab, idx) => {
@@ -155,7 +185,7 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
                   }
                 } else if (isFolderDrag(e)) {
                   e.preventDefault();
-                  const path = e.dataTransfer.getData("application/x-filetree-path");
+                  const path = folderPathFromDrag(e);
                   const insertIdx = insertIdxFor(e, idx);
                   clearAll();
                   const beforeTab = tabs[insertIdx];
@@ -194,7 +224,7 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
           if (isFolderDrag(e)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; if (folderInsertIdx !== tabs.length) setFolderInsertIdx(tabs.length); }
         }}
         onDrop={(e) => {
-          if (isFolderDrag(e)) { e.preventDefault(); const path = e.dataTransfer.getData("application/x-filetree-path"); clearAll(); if (path) onFolderDrop(path); }
+          if (isFolderDrag(e)) { e.preventDefault(); const path = folderPathFromDrag(e); clearAll(); if (path) onFolderDrop(path); }
         }}
       >+</button>
     </div>

@@ -437,7 +437,6 @@ export default function App() {
             onClose3D={() => setTmShow3D(false)}
             onToggleBookmark={handleToggleBookmark}
             onScanPath={handleScanPath}
-            onOpenInNewTab={handleOpenInNewTab}
             onStateChange={notifyRibbon}
           />
         ))}
