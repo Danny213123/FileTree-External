@@ -45,7 +45,9 @@ export interface WorkspaceTabHandle {
   doReveal: () => void;
   doExport: (format: "csv" | "json") => void;
   doRename: () => void;
+  doRenamePath: (path: string) => void;
   doDelete: () => void;
+  doDeletePaths: (paths: string[]) => void;
   doMoveTo: () => void;
   doCopyPath: () => void;
   doCopyFiles: () => void;
@@ -91,6 +93,11 @@ function dedupeNestedPaths(paths: string[], nodeByPath: Map<string, NodeRecord>)
     result.push(path);
   }
   return result;
+}
+
+function basenameFromPath(path: string): string {
+  const parts = path.replace(/[\\/]+$/, "").split(/[\\/]/);
+  return parts[parts.length - 1] || path;
 }
 
 interface WorkspaceTabProps {
@@ -232,6 +239,7 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   }, [data]);
 
   useEffect(() => { onStateChange(); }, [status, progress, onStateChange]);
+  useEffect(() => { onStateChange(); }, [activeTab, onStateChange]);
 
   // Real-time filesystem watch via SSE (ReadDirectoryChangesW on backend).
   // Opens an EventSource to /api/fs-events?path=<root>. On each notification
@@ -517,27 +525,33 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   const runOpen     = useCallback(() => { if (selectedNode) openPath(selectedNode.path); }, [selectedNode]);
   const runCopyPath = useCallback(() => { if (selectedNode) copyPath(selectedNode.path).catch(() => {}); }, [selectedNode]);
 
-  const runRename = useCallback(async () => {
-    if (!selectedNode || !selectedNode.path) return;
-    const currentName = selectedNode.name;
+  const runRenamePath = useCallback(async (targetPath?: string) => {
+    const pathToRename = targetPath ?? selectedNode?.path;
+    if (!pathToRename) return;
+    const currentName = nodeByPath.get(pathToRename)?.name ?? selectedNode?.name ?? basenameFromPath(pathToRename);
     const newName = window.prompt("Rename to:", currentName);
     if (!newName?.trim() || newName.trim() === currentName) return;
-    const result = await renameItem(selectedNode.path, newName.trim());
+    const result = await renameItem(pathToRename, newName.trim());
     if (!result.ok) { alert(`Rename failed: ${result.error ?? "unknown error"}`); return; }
     doScan();
-  }, [selectedNode, doScan]);
+  }, [selectedNode, nodeByPath, doScan]);
 
-  const runDelete = useCallback(async () => {
-    if (selectedPaths.length === 0) return;
-    const confirmed = selectedPaths.length === 1
-      ? window.confirm(`Move "${selectedNodes[0]?.name ?? selectedPaths[0]}" to Recycle Bin?`)
-      : window.confirm(`Move ${selectedPaths.length} selected items to Recycle Bin?`);
+  const runRename = useCallback(() => { void runRenamePath(); }, [runRenamePath]);
+
+  const runDeletePaths = useCallback(async (paths?: string[]) => {
+    const targetPaths = paths && paths.length > 0 ? dedupeNestedPaths(paths, nodeByPath) : selectedPaths;
+    if (targetPaths.length === 0) return;
+    const confirmed = targetPaths.length === 1
+      ? window.confirm(`Move "${nodeByPath.get(targetPaths[0])?.name ?? basenameFromPath(targetPaths[0])}" to Recycle Bin?`)
+      : window.confirm(`Move ${targetPaths.length} selected items to Recycle Bin?`);
     if (!confirmed) return;
-    for (const path of selectedPaths) {
+    for (const path of targetPaths) {
       await deletePath(path).catch(() => {});
     }
-    // Tree will refresh via fs-events watch or next manual scan
-  }, [selectedNodes, selectedPaths]);
+    doScan();
+  }, [nodeByPath, selectedPaths, doScan]);
+
+  const runDelete = useCallback(() => { void runDeletePaths(); }, [runDeletePaths]);
 
   const runMoveTo = useCallback(async () => {
     if (selectedPaths.length === 0) return;
@@ -602,7 +616,9 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     doOpenFilter: () => setFilterDialogOpen(true),
     doReveal: () => { if (selectedNode) revealPath(selectedNode.path); },
     doRename: runRename,
+    doRenamePath: (path) => { void runRenamePath(path); },
     doDelete: runDelete,
+    doDeletePaths: (paths) => { void runDeletePaths(paths); },
     doMoveTo: runMoveTo,
     doCopyPath: runCopyPath,
     doCopyFiles: runCopyFiles,
@@ -642,10 +658,10 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
       if (tree.sortDir !== dir) tree.setSortKey(key as SortKey);
     },
     showDetailsPane: () => setActiveTab("details"),
-    showTreemapPane: () => setActiveTab("chart"),
+    showTreemapPane: () => setActiveTab((current) => current === "chart" ? "details" : "chart"),
   }), [status, data, progress, errorMessage, scanPath, activeTab, tree, cancelScan,
        doScan, handleNavigateParent, handleExpand, handleNewFolder, selectedNode,
-       runRename, runDelete, runMoveTo, runCopyPath, runCopyFiles]);
+       runRename, runRenamePath, runDelete, runDeletePaths, runMoveTo, runCopyPath, runCopyFiles]);
 
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -713,7 +729,7 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
         />
 
         <div className="side-pane">
-          {treemapPosition === "right" ? (
+          {treemapPosition === "right" && activeTab === "chart" ? (
             <Treemap
               nodeById={tree.nodeById}
               selectedId={tree.selectedId}

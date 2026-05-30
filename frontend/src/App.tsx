@@ -226,10 +226,22 @@ export default function App() {
   // Additionally accept HTML5 dragover/drop for when running in dev (Vite server).
   useEffect(() => {
     // Register Electron IPC drop handler (production path).
-    const eAPI = (window as unknown as { electronAPI?: { onExternalDrop: (cb: (paths: string[]) => void) => void } }).electronAPI;
+    type ElectronAPI = {
+      onExternalDrop?: (cb: (paths: string[]) => void) => void;
+      getPathForFile?: (file: File) => string;
+    };
+    const eAPI = (window as unknown as { electronAPI?: ElectronAPI }).electronAPI;
     if (eAPI?.onExternalDrop) {
       eAPI.onExternalDrop((paths) => paths.forEach((p) => handleOpenInNewTab(p)));
     }
+
+    const pathForFile = (file: File) => {
+      try {
+        return eAPI?.getPathForFile?.(file) || (file as unknown as { path?: string }).path || "";
+      } catch {
+        return (file as unknown as { path?: string }).path || "";
+      }
+    };
 
     // HTML5 drop fallback for dev mode / non-Electron environments.
     const onDragOver = (e: DragEvent) => {
@@ -241,9 +253,8 @@ export default function App() {
     const onDrop = (e: DragEvent) => {
       if (!e.dataTransfer?.files?.length) return;
       e.preventDefault();
-      // In Electron, (file as any).path gives the absolute path.
       for (const f of Array.from(e.dataTransfer.files)) {
-        const p = (f as unknown as { path?: string }).path;
+        const p = pathForFile(f);
         if (p) handleOpenInNewTab(p);
       }
     };
@@ -254,6 +265,25 @@ export default function App() {
       window.removeEventListener("drop", onDrop);
     };
   }, [handleOpenInNewTab]);
+
+  useEffect(() => {
+    type ElectronAPI = {
+      onContextMenuAction?: (cb: (action: string, path: string) => void) => void | (() => void);
+    };
+    const eAPI = (window as unknown as { electronAPI?: ElectronAPI }).electronAPI;
+    const cleanup = eAPI?.onContextMenuAction?.((action, message) => {
+      if (action === "rename") {
+        getActiveRef()?.doRenamePath(message);
+      } else if (action === "delete") {
+        getActiveRef()?.doDeletePaths([message]);
+      } else if (action === "refresh") {
+        getActiveRef()?.doScan();
+      } else if (action === "error") {
+        window.alert(message);
+      }
+    });
+    return typeof cleanup === "function" ? cleanup : undefined;
+  }, [getActiveRef]);
 
   const handleScanPath = useCallback((path: string) => {
     getActiveRef()?.doScanPath(path);

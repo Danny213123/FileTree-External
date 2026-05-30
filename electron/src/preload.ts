@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 
 // Expose a safe API to the renderer that replaces window.chrome.webview.
 contextBridge.exposeInMainWorld("electronAPI", {
@@ -18,6 +18,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
   copyFiles: (paths: string[]): Promise<void> =>
     ipcRenderer.invoke("copyFiles", paths),
 
+  // Electron 32+ no longer exposes file.path directly in the renderer.
+  getPathForFile: (file: File): string =>
+    webUtils.getPathForFile(file),
+
   // Register a callback for folders dropped onto the window from Explorer.
   onExternalDrop: (cb: (paths: string[]) => void) => {
     ipcRenderer.on("externalDrop", (_evt, paths: string[]) => cb(paths));
@@ -34,7 +38,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // Context menu actions dispatched from Electron main (rename, delete, etc.)
   onContextMenuAction: (cb: (action: string, path: string) => void) => {
-    ipcRenderer.on("contextMenuAction", (_evt, action: string, path: string) => cb(action, path));
+    const listener = (_evt: Electron.IpcRendererEvent, action: string, path: string) => cb(action, path);
+    ipcRenderer.on("contextMenuAction", listener);
+    return () => ipcRenderer.removeListener("contextMenuAction", listener);
   },
 
   // Shell context menu for the given path at screen position.

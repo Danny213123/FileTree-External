@@ -71,6 +71,93 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
     Ok(())
 }
 
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn remove_after_copy(path: &Path) -> sio::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> sio::Result<()> {
+    fs::create_dir(dst)?;
+    for entry_result in fs::read_dir(src)? {
+        let entry = entry_result?;
+        let child_src = entry.path();
+        let child_dst = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&child_src, &child_dst)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            if file_type.is_symlink() && child_src.is_dir() {
+                copy_dir_recursive(&child_src, &child_dst)?;
+            } else {
+                fs::copy(&child_src, &child_dst)?;
+            }
+        } else {
+            return Err(sio::Error::new(
+                sio::ErrorKind::Unsupported,
+                format!("unsupported file type: {}", child_src.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn copy_path_recursive(src: &Path, dst: &Path) -> sio::Result<()> {
+    let metadata = fs::symlink_metadata(src)?;
+    if metadata.is_dir() {
+        copy_dir_recursive(src, dst)
+    } else {
+        fs::copy(src, dst).map(|_| ())
+    }
+}
+
+fn move_path_or_copy_remove(src: &Path, dst: &Path) -> sio::Result<()> {
+    if paths_refer_to_same_file(src, dst) {
+        return Ok(());
+    }
+    if dst.exists() {
+        return Err(sio::Error::new(
+            sio::ErrorKind::AlreadyExists,
+            format!("destination already exists: {}", dst.display()),
+        ));
+    }
+
+    match fs::rename(src, dst) {
+        Ok(_) => Ok(()),
+        Err(rename_error) => {
+            copy_path_recursive(src, dst).map_err(|copy_error| {
+                sio::Error::new(
+                    copy_error.kind(),
+                    format!(
+                        "rename failed: {rename_error}; copy fallback failed: {copy_error}"
+                    ),
+                )
+            })?;
+            if let Err(remove_error) = remove_after_copy(src) {
+                let _ = remove_after_copy(dst);
+                return Err(sio::Error::new(
+                    remove_error.kind(),
+                    format!(
+                        "copied to {}, but could not remove original: {remove_error}",
+                        dst.display(),
+                    ),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Extract a single string value from naive JSON: `"key":"value"` or `"key": "value"`.
 fn extract_json_str(json: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
@@ -852,8 +939,20 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     errors.push(format!("{p}: invalid path"));
                     continue;
                 };
+                let Ok(src_metadata) = fs::symlink_metadata(&src) else {
+                    errors.push(format!("{p}: source does not exist"));
+                    continue;
+                };
+                if src_metadata.is_dir() {
+                    let src_canon = fs::canonicalize(&src).unwrap_or_else(|_| src.clone());
+                    let dest_canon = fs::canonicalize(&dest_buf).unwrap_or_else(|_| dest_buf.clone());
+                    if dest_canon.starts_with(&src_canon) {
+                        errors.push(format!("{p}: cannot move a folder into itself or one of its descendants"));
+                        continue;
+                    }
+                }
                 let target = dest_buf.join(name);
-                if let Err(e) = fs::rename(&src, &target) {
+                if let Err(e) = move_path_or_copy_remove(&src, &target) {
                     errors.push(format!("{p}: {e}"));
                     continue;
                 }
