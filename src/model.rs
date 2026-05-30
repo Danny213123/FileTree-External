@@ -92,6 +92,7 @@ pub(crate) struct AppState {
     /// Cached shell icon BMPs, keyed by lowercase extension (no dot).
     pub(crate) icon_cache: Mutex<HashMap<String, Vec<u8>>>,
     pub(crate) dupes_progress: Arc<DupesProgress>,
+    pub(crate) dupes_cancel: Arc<AtomicBool>,
     pub(crate) ignore_list: Mutex<IgnoreList>,
     pub(crate) ignore_list_path: PathBuf,
 }
