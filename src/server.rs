@@ -371,13 +371,26 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             // Return cached result if still fresh (skip when nocache=1)
             let skip_cache = query.get("nocache").map(|v| v == "1").unwrap_or(false);
             if !skip_cache {
-                let mut cache = state.scan_cache.lock().expect("scan_cache lock");
-                if let Some((result, ts)) = cache.get(&cache_key) {
-                    if ts.elapsed() < SCAN_CACHE_TTL {
-                        let body = scan_result_to_json(result);
-                        return respond_json(&mut stream, 200, "OK", &body);
-                    }
-                    cache.remove(&cache_key);
+                // Clone the Arc out and release the cache lock before responding so
+                // we never hold the lock during a multi-hundred-MB stream and never
+                // materialise the whole JSON body as a String — stream it instead.
+                let cached = {
+                    let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                    let fresh = match cache.get(&cache_key) {
+                        Some((result, ts)) if ts.elapsed() < SCAN_CACHE_TTL => Some(Arc::clone(result)),
+                        _ => None,
+                    };
+                    if fresh.is_none() { cache.remove(&cache_key); }
+                    fresh
+                };
+                if let Some(result) = cached {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                    )?;
+                    let mut cw = ChunkedWriter::new(&mut stream);
+                    write_scan_result_json(&mut cw, &result)?;
+                    return cw.finish();
                 }
             }
 
@@ -584,6 +597,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 thread_count,
                 nodes: merged_nodes,
                 errors: merged_errors,
+                summary: crate::model::ScanSummary::default(),
             };
             let filter = build_dupe_filter(&query);
             let limit = query.get("limit").and_then(|v| v.parse().ok()).unwrap_or(1000);

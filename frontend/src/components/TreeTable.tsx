@@ -1,10 +1,11 @@
-import { useRef, useState, useCallback, useMemo, useEffect } from "react";
+import { useRef, useState, useCallback, useMemo, useEffect, memo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { NodeRecord, SortKey, Metric, Unit } from "../api/types";
 import { formatBytes, formatCount } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
 import { NodeTooltip } from "./NodeTooltip";
 import { FileIcon } from "./FileIcon";
+import { Icon } from "./Icon";
 
 const ROW_HEIGHT = 20;
 
@@ -149,7 +150,7 @@ function RenameInput({
   );
 }
 
-export function TreeTable({
+function TreeTableInner({
   rows,
   nodeById,
   expanded,
@@ -224,6 +225,13 @@ export function TreeTable({
   );
   const gridTemplate = useMemo(
     () => `minmax(200px,1fr)${cols.filter(c => c.key !== "name").map(() => " minmax(70px,100px)").join("")}`,
+    [cols],
+  );
+  // Floor width that keeps every column at its minimum (200px name + 70px each
+  // for the rest). Applied to both the header and the rows so they overflow —
+  // and therefore horizontally scroll — together inside the single scroller.
+  const minTableWidth = useMemo(
+    () => 200 + Math.max(0, cols.length - 1) * 70,
     [cols],
   );
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
@@ -318,6 +326,17 @@ export function TreeTable({
       // (display:none) TreeTable and would otherwise all handle this same IPC.
       if (!origin) return;
 
+      // If the drop landed outside the tree (e.g. on the AI chat panel), let that
+      // surface claim the paths — don't perform a tree move into the last
+      // highlighted folder.
+      const overTree = !!(document.elementFromPoint(clientX, clientY) as HTMLElement | null)?.closest(".table-pane");
+      if (!overTree) {
+        nativeDragOriginRef.current = false;
+        lastFolderTargetRef.current = null;
+        resetDragState();
+        return;
+      }
+
       // Primary target: the folder the user last highlighted during the drag
       // (exactly what was shown highlighted). Fall back to hit-testing the drop
       // point only if no folder was tracked.
@@ -359,21 +378,9 @@ export function TreeTable({
         }
       }}
     >
-      {/* Column header */}
-      <div className="table-head" style={{ gridTemplateColumns: gridTemplate }}>
-        {cols.map((col) => (
-          <button
-            key={col.key}
-            data-sort={col.key}
-            onClick={() => onSortChange(col.key)}
-          >
-            {col.label}
-            {sortKey === col.key ? (sortDir === 1 ? " ↑" : " ↓") : ""}
-          </button>
-        ))}
-      </div>
-
-      {/* Virtual scroll container */}
+      {/* Single scroll container: the header is a sticky child so the vertical
+          scrollbar gutter and any horizontal overflow stay aligned with the body
+          rows at every window size (no separate, drifting header bar). */}
       <div className="rows"
         ref={(el) => { (scrollRef as React.MutableRefObject<HTMLDivElement | null>).current = el; setScrollEl(el); }}
         onDragOver={(e) => {
@@ -386,7 +393,23 @@ export function TreeTable({
           else if (y > bottom - ZONE) el.scrollTop += 6 * ((y - (bottom - ZONE)) / ZONE);
         }}
       >
-        <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
+        {/* Column header (sticky inside the scroller) */}
+        <div className="table-head" style={{ gridTemplateColumns: gridTemplate, minWidth: minTableWidth }}>
+          {cols.map((col) => (
+            <button
+              key={col.key}
+              data-sort={col.key}
+              onClick={() => onSortChange(col.key)}
+            >
+              {col.label}
+              {sortKey === col.key && (
+                <Icon name={sortDir === 1 ? "caret-up" : "caret-down"} size={10} className="sort-caret" />
+              )}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ height: virtualizer.getTotalSize(), position: "relative", minWidth: minTableWidth }}>
           {virtualizer.getVirtualItems().map((vItem) => {
             const node = rows[vItem.index];
             const isBundle  = node.id < 0;
@@ -522,7 +545,7 @@ export function TreeTable({
                       className="twisty"
                       onClick={(e) => { e.stopPropagation(); onToggleExpand(node.id); }}
                     >
-                      {isOpen ? "▾" : "▸"}
+                      <Icon name={isOpen ? "chevron-down" : "chevron-right"} size={10} />
                     </button>
                   ) : (
                     <span className="twisty" />
@@ -549,7 +572,7 @@ export function TreeTable({
                       title={bookmarks.has(node.path) ? "Remove bookmark" : "Add bookmark"}
                       onClick={(e) => { e.stopPropagation(); onToggleBookmark(node.path); }}
                     >
-                      {bookmarks.has(node.path) ? "★" : "☆"}
+                      <Icon name={bookmarks.has(node.path) ? "star-fill" : "star"} size={12} />
                     </button>
                   )}
                 </div>
@@ -588,3 +611,9 @@ export function TreeTable({
     </div>
   );
 }
+
+// Memoized so background re-renders of WorkspaceTab (toasts, dialogs, treemap
+// hover state, etc.) don't reconcile the whole virtualized table. All callback
+// props from WorkspaceTab are useCallback-stable and bookmarks is memoized, so
+// a shallow prop compare correctly skips no-op renders.
+export const TreeTable = memo(TreeTableInner);

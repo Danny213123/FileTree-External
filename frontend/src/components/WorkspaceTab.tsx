@@ -1,34 +1,28 @@
-import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle, memo } from "react";
 import { useScan, reconstructChildren } from "../hooks/useScan";
 import { useTreeState } from "../hooks/useTreeState";
 import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import {
   revealPath, openPath, shellContextMenu, createFolder, fetchScan,
   copyPath, renameItem, moveItems, deletePath, copyFiles,
-  hasNativeMove, moveItemsNative,
+  hasNativeMove, moveItemsNative, fetchDupesV2,
 } from "../api/client";
 import type { ScanOptions } from "../api/client";
 import type { DriveEntry, NodeRecord, SpecialFolder, SortKey } from "../api/types";
+import type { AgentApi } from "../lib/agent";
 import { TreeTable } from "./TreeTable";
-import { TabStrip } from "./TabStrip";
-import type { TabId } from "./TabStrip";
 import { Treemap } from "./Treemap";
-import { DetailsTab } from "./DetailsTab";
-import { ExtensionsTab } from "./ExtensionsTab";
-import { AgeTab } from "./AgeTab";
-import { TopFilesTab } from "./TopFilesTab";
-import { DuplicatesTab } from "./DuplicatesTab";
-import { ErrorsTab } from "./ErrorsTab";
+import { SideBar } from "./SideBar";
+import { ActivityBar, type ViewId } from "./ActivityBar";
+import { TabBar } from "./TabBar";
+import type { WorkspaceTab as WorkspaceTabMeta } from "./TabBar";
 import { ConflictDialog, type ConflictChoice } from "./ConflictDialog";
-import { BookmarksTab } from "./BookmarksTab";
-import { AiChatTab } from "./AiChatTab";
-import { DuplicateFinder } from "./DuplicateFinder";
 import { FilterDialog } from "./FilterDialog";
+import { Icon } from "./Icon";
 import type { ScanStatus } from "../hooks/useScan";
-import type { ScanResult } from "../api/types";
+import type { ScanResult, Metric, Unit } from "../api/types";
 
 export interface WorkspaceTabHandle {
-  // Called by App to propagate active tab's status/data upward for the status bar
   getStatus: () => ScanStatus;
   getData: () => ScanResult | null;
   getProgress: () => { nodes: number; elapsed: number } | null;
@@ -36,7 +30,8 @@ export interface WorkspaceTabHandle {
   getVisibleCount: () => number;
   getScanPath: () => string;
   getScanning: () => boolean;
-  // Called to trigger actions from the ribbon (which lives in App)
+  getNodeById: () => Map<number, NodeRecord>;
+  getAgentApi: () => AgentApi;
   doScan: () => void;
   doCancel: () => void;
   doScanPath: (path: string) => void;
@@ -53,17 +48,13 @@ export interface WorkspaceTabHandle {
   doMoveTo: () => void;
   doCopyPath: () => void;
   doCopyFiles: () => void;
-  // State readers for ribbon props
   getRibbonState: () => RibbonState;
-  // State setters called from ribbon
   setMetric: (m: string) => void;
   setUnit: (u: string) => void;
   setFilter: (f: string) => void;
   setShowFiles: (v: boolean) => void;
   setScanPath: (p: string) => void;
   setSortKeyDir: (key: string, dir: 1 | -1) => void;
-  showDetailsPane: () => void;
-  showTreemapPane: () => void;
 }
 
 export interface RibbonState {
@@ -74,25 +65,30 @@ export interface RibbonState {
   filter: string;
   showFiles: boolean;
   filterActive: boolean;
-  activeTab: string;
   sortKey: string;
   sortDir: 1 | -1;
 }
 
-function pathWithin(path: string, parent: string): boolean {
-  const normalizedPath = path.toLowerCase();
-  const normalizedParent = parent.replace(/[\\/]+$/, "").toLowerCase();
-  return normalizedPath === normalizedParent ||
-    normalizedPath.startsWith(`${normalizedParent}\\`) ||
-    normalizedPath.startsWith(`${normalizedParent}/`);
-}
-
 function dedupeNestedPaths(paths: string[], nodeByPath: Map<string, NodeRecord>): string[] {
+  // Sort shortest-first so an ancestor is always kept before its descendants.
   const sorted = [...paths].sort((a, b) => a.length - b.length);
   const result: string[] = [];
+  // A candidate is dropped iff it (or an ancestor) is already a kept directory.
+  // Walking ancestors against a Set is O(path depth) instead of O(kept) per item.
+  const keptDirs = new Set<string>();
+  const norm = (p: string) => p.replace(/[\\/]+$/, "").toLowerCase();
   for (const path of sorted) {
-    if (result.some((kept) => nodeByPath.get(kept)?.dir && pathWithin(path, kept))) continue;
+    let cur = norm(path);
+    let covered = false;
+    for (;;) {
+      if (keptDirs.has(cur)) { covered = true; break; }
+      const i = Math.max(cur.lastIndexOf("\\"), cur.lastIndexOf("/"));
+      if (i <= 0) break;
+      cur = cur.slice(0, i);
+    }
+    if (covered) continue;
     result.push(path);
+    if (nodeByPath.get(path)?.dir) keptDirs.add(norm(path));
   }
   return result;
 }
@@ -102,11 +98,38 @@ function basenameFromPath(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+// Filesystem-watch tuning. Patching is O(n) over the whole node array, so on big
+// scans we throttle hard and only patch folders the user actually has open.
+const WATCH_DEBOUNCE_MS = 700;
+const WATCH_MAX_BATCH = 6;
+const WATCH_LARGE_TREE = 50_000;
+
 interface WorkspaceTabProps {
   tabId: string;
   initialPath: string;
   active: boolean;
-  showDuplicateFinder: boolean;
+  activeView: ViewId;
+  onSelectView: (v: ViewId) => void;
+  chatOpen: boolean;
+  onToggleChat: () => void;
+  darkMode: boolean;
+  onToggleTheme: () => void;
+  sidebarOpen: boolean;
+  sidebarWidth: number;
+  onSidebarWidthChange: (n: number) => void;
+  panelOpen: boolean;
+  onPanelOpenChange: (v: boolean) => void;
+  panelHeight: number;
+  onPanelHeightChange: (n: number) => void;
+  // editor tabs (open scans)
+  tabBarMeta: WorkspaceTabMeta[];
+  activeTabId: string;
+  onActivateTab: (id: string) => void;
+  onCloseTab: (id: string) => void;
+  onNewTab: () => void;
+  onReorderTab: (fromId: string, toId: string) => void;
+  onFolderDrop: (path: string, beforeId?: string) => void;
+  // data + options
   drives: DriveEntry[];
   specialFolders: SpecialFolder[];
   bookmarkList: string[];
@@ -114,7 +137,6 @@ interface WorkspaceTabProps {
   includeHidden: boolean;
   followLinks: boolean;
   exclude: string;
-  treemapPosition: "bottom" | "right";
   treemapDetail: number;
   tmShowSingleFiles: boolean;
   tmShow3D: boolean;
@@ -126,52 +148,67 @@ interface WorkspaceTabProps {
   visibleColumns: Set<SortKey>;
   onClose3D: () => void;
   onToggleBookmark: (path: string) => void;
-  onScanPath: (path: string) => void; // open in current tab
-  onStateChange: () => void; // notify App that something changed (for status bar refresh)
+  onScanPath: (path: string) => void;
+  onStateChange: () => void;
+  onOpenTerminal?: (cwd: string) => void;
 }
 
-export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(function WorkspaceTab(
+const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(function WorkspaceTab(
   {
-    tabId, initialPath, active,
-    showDuplicateFinder,
+    tabId, initialPath, active, activeView,
+    onSelectView, chatOpen, onToggleChat, darkMode, onToggleTheme,
+    sidebarOpen, sidebarWidth, onSidebarWidthChange,
+    panelOpen, onPanelOpenChange, panelHeight, onPanelHeightChange,
+    tabBarMeta, activeTabId, onActivateTab, onCloseTab, onNewTab, onReorderTab, onFolderDrop,
     drives, specialFolders,
     bookmarkList, threads, includeHidden, followLinks, exclude,
-    treemapPosition, treemapDetail,
+    treemapDetail,
     tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
     decimals, visibleColumns,
-    onClose3D, onToggleBookmark, onScanPath, onStateChange,
+    onClose3D, onToggleBookmark, onScanPath, onStateChange, onOpenTerminal,
   }: WorkspaceTabProps,
   ref,
 ) {
   const [scanPath, setScanPathState] = useState(initialPath);
   const [filterDialogOpen, setFilterDialogOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<TabId>("chart");
-  const [chartHeight, setChartHeight] = useState(420);
   const dragStartRef = useRef<{ y: number; h: number } | null>(null);
+  const sidebarDragRef = useRef<{ x: number; w: number } | null>(null);
 
   const { data, status, errorMessage, progress, startScan, startRefresh, cancelScan } = useScan();
   const tree = useTreeState();
+  // Latest tree snapshot for stable callbacks / async watch handlers (avoids
+  // recreating callbacks every render and reading stale expansion state).
+  const treeRef = useRef(tree);
+  treeRef.current = tree;
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set([0]));
+  const selectedIdsRef = useRef(selectedIds);
+  selectedIdsRef.current = selectedIds;
   const selectionAnchorIdRef = useRef<number>(0);
   const isFirstChunkRef = useRef(true);
-  // Root path of the last completed scan. When doScan is called with the same
-  // path, we skip resetForNewScan and preserve expansion via mergeNodes instead.
   const lastCompletedPathRef = useRef<string>("");
-  // True when the current in-flight scan is a startRefresh call (not startScan).
-  // Used in useEffect([status]) to skip the mergeNodes call — refresh callers
-  // handle merging directly, and data is stale for refresh paths.
   const lastScanWasRefreshRef = useRef(false);
-  const bookmarkSet = new Set(bookmarkList);
+  const bookmarkSet = useMemo(() => new Set(bookmarkList), [bookmarkList]);
 
-  // EventSource for real-time filesystem change notifications (/api/fs-events).
+  // Debounced filter box: typing commits to tree state ~180ms after the last
+  // keystroke so collectVisibleRows (O(n) over the whole tree) doesn't re-run on
+  // every character. The local input stays responsive; external changes (reset,
+  // agent) sync back into the box.
+  const [filterInput, setFilterInput] = useState(tree.filter);
+  useEffect(() => {
+    if (filterInput === treeRef.current.filter) return;
+    const id = setTimeout(() => treeRef.current.setFilter(filterInput), 180);
+    return () => clearTimeout(id);
+  }, [filterInput]);
+  useEffect(() => { setFilterInput(tree.filter); }, [tree.filter]);
+
   const fsEventsRef = useRef<EventSource | null>(null);
-  // Debounce: coalesce rapid changes before triggering a rescan.
   const watchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Paths whose directories changed since the last debounce flush.
   const pendingChangesRef = useRef<Set<string>>(new Set());
-  // When true, suppress watcher patch updates — a full rescan is already in flight.
   const suppressWatchRef = useRef(false);
-
+  // Skip stacking watch patches: a new batch is dropped/retried while one runs.
+  const patchInFlightRef = useRef(false);
+  // Latest path→node map, read inside the async watch flush for gating.
+  const nodeByPathRef = useRef<Map<string, NodeRecord>>(new Map());
 
   const doScan = useCallback((path?: string, t?: number, forceFresh?: boolean) => {
     const p = path ?? scanPath;
@@ -182,13 +219,9 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
       includeHidden,
       followLinks,
       excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
-      // Bypass the server's 5-min scan cache. Required after a native move,
-      // which mutates the disk without going through the server (so the cache
-      // is stale and would re-show the moved file in its old location).
       nocache: forceFresh || undefined,
     };
     const isRefresh = p.trim() === lastCompletedPathRef.current;
-    console.log("[doScan] path=", p, "isRefresh=", isRefresh, "lastCompletedPath=", lastCompletedPathRef.current);
     if (isRefresh) {
       lastScanWasRefreshRef.current = true;
       startRefresh(opts);
@@ -199,9 +232,6 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scanPath, threads, includeHidden, followLinks, exclude, startScan, startRefresh, tree]);
 
-  // Eager background start: begin scanning immediately on mount so the tab
-  // is ready by the time the user clicks it. `active` is intentionally NOT
-  // required here — all tabs scan in parallel from the moment they are created.
   const hasStartedRef = useRef(false);
   useEffect(() => {
     if (initialPath && !hasStartedRef.current) {
@@ -211,32 +241,18 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPath]);
 
-  // Sync tree nodes whenever data changes (fires for both startScan and startRefresh).
-  // For refresh scans we call setNodes directly (same proven path as initial scan).
   useEffect(() => {
-    const nodeCount = data?.nodes?.length ?? 0;
-    console.log("[data-effect] fired rootPath=", data?.rootPath, "nodes=", nodeCount, "wasRefresh=", lastScanWasRefreshRef.current, "isFirstChunk=", isFirstChunkRef.current, "lastCompleted=", lastCompletedPathRef.current);
     if (data === null) {
-      console.log("[data-effect] data=null → setNodes([])");
       tree.setNodes([]);
       isFirstChunkRef.current = true;
     } else if (lastScanWasRefreshRef.current) {
-      const folders = (data.nodes ?? []).filter(n => n.dir).slice(0, 5).map(n => `${n.name}:size=${n.size},files=${n.files},folders=${n.folders}`);
-      const files = (data.nodes ?? []).filter(n => !n.dir).slice(0, 3).map(n => `${n.name}:${n.size}B`);
-      console.log("[data-effect] REFRESH setNodes count=", nodeCount, "folders=", folders, "files=", files);
       tree.setNodes(data.nodes ?? []);
       suppressWatchRef.current = false;
     } else {
-      const folders = (data.nodes ?? []).filter(n => n.dir).slice(0, 5).map(n => `${n.name}:size=${n.size},files=${n.files},folders=${n.folders}`);
-      const files = (data.nodes ?? []).filter(n => !n.dir).slice(0, 3).map(n => `${n.name}:${n.size}B`);
-      console.log("[data-effect] SCAN setNodes count=", nodeCount, "folders=", folders, "files=", files);
       tree.setNodes(data.nodes ?? []);
       if (isFirstChunkRef.current) {
         const isSamePath = data.rootPath === lastCompletedPathRef.current;
-        console.log("[data-effect] firstChunk isSamePath=", isSamePath);
-        if (!isSamePath) {
-          tree.resetForNewScan();
-        }
+        if (!isSamePath) tree.resetForNewScan();
         isFirstChunkRef.current = false;
       }
     }
@@ -245,59 +261,60 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   }, [data]);
 
   useEffect(() => { onStateChange(); }, [status, progress, onStateChange]);
-  useEffect(() => { onStateChange(); }, [activeTab, onStateChange]);
 
-  // Real-time filesystem watch via SSE (ReadDirectoryChangesW on backend).
-  // Opens an EventSource to /api/fs-events?path=<root>. On each notification
-  // the backend sends the changed directory path. We debounce 200ms and rescan
-  // only the shallowest affected directories.
   const startWatch = useCallback((rootPath: string) => {
-    // Close any existing EventSource before opening a new one
-    if (fsEventsRef.current) {
-      fsEventsRef.current.close();
-      fsEventsRef.current = null;
-    }
-    if (watchDebounceRef.current) {
-      clearTimeout(watchDebounceRef.current);
-      watchDebounceRef.current = null;
-    }
+    if (fsEventsRef.current) { fsEventsRef.current.close(); fsEventsRef.current = null; }
+    if (watchDebounceRef.current) { clearTimeout(watchDebounceRef.current); watchDebounceRef.current = null; }
     pendingChangesRef.current.clear();
 
     const url = `/api/fs-events?path=${encodeURIComponent(rootPath)}`;
-    console.log("[watch] opening EventSource", url);
     const es = new EventSource(url);
     fsEventsRef.current = es;
 
-    es.onopen = () => console.log("[watch] SSE connected");
-    es.onerror = (e) => console.warn("[watch] SSE error", e, "readyState:", es.readyState);
+    // Coalesced + gated flush. A big drive (e.g. C:\) churns logs/registry/temp
+    // nonstop; patching every change would rebuild the whole node array each
+    // time. So we (1) debounce on a leading timer that is NOT reset per event
+    // (it fires ~700ms after the first pending change), (2) only patch dirs the
+    // user actually has open/visible, and (3) never stack patches.
+    async function flushWatch() {
+      watchDebounceRef.current = null;
+      if (patchInFlightRef.current) {
+        // A patch is still running — retry shortly without losing pending dirs.
+        watchDebounceRef.current = setTimeout(flushWatch, WATCH_DEBOUNCE_MS);
+        return;
+      }
+      if (suppressWatchRef.current) { pendingChangesRef.current.clear(); return; }
 
-    es.onmessage = (evt) => {
-      let changedDir: string;
-      try { changedDir = JSON.parse(evt.data) as string; }
-      catch { return; }
-      pendingChangesRef.current.add(changedDir);
+      const t = treeRef.current;
+      const byPath = nodeByPathRef.current;
+      const bigTree = t.nodeById.size > WATCH_LARGE_TREE;
 
-      if (watchDebounceRef.current) clearTimeout(watchDebounceRef.current);
-      // Short debounce: coalesce burst events (e.g. copying many files at once)
-      watchDebounceRef.current = setTimeout(async () => {
-        const dirs = [...pendingChangesRef.current];
-        pendingChangesRef.current.clear();
+      // Gate: keep only changed dirs that are loaded AND currently expanded, so
+      // background churn in unopened folders is ignored (reflected on next scan).
+      const dirs: string[] = [];
+      for (const d of pendingChangesRef.current) {
+        const node = byPath.get(d);
+        if (!node) continue; // dir isn't in our tree → nothing visible to update
+        const isOpen = node.id === 0
+          || (t.expandedAll ? !bigTree : t.expanded.has(node.id));
+        if (isOpen) dirs.push(d);
+      }
+      pendingChangesRef.current.clear();
+      if (dirs.length === 0) return;
 
-        // Deduplicate: drop child paths if parent is already included
-        dirs.sort((a, b) => a.length - b.length);
-        const toScan: string[] = [];
-        for (const d of dirs) {
-          if (!toScan.some(q => d === q || d.startsWith(q + "\\") || d.startsWith(q + "/")))
-            toScan.push(d);
-        }
+      // Coalesce nested dirs and cap the batch so one flush can't stall the UI.
+      dirs.sort((a, b) => a.length - b.length);
+      const toScan: string[] = [];
+      for (const d of dirs) {
+        if (!toScan.some(q => d === q || d.startsWith(q + "\\") || d.startsWith(q + "/")))
+          toScan.push(d);
+        if (toScan.length >= WATCH_MAX_BATCH) break;
+      }
 
-        // Shallow-rescan each changed directory (maxDepth=1 → only immediate children).
-        // ~50ms vs ~1500ms for a full rescan — gives TreeSize-like update latency.
+      patchInFlightRef.current = true;
+      try {
         for (const dir of toScan) {
-          if (suppressWatchRef.current) {
-            console.log("[watch] suppressed patch for dir=", dir, "(rescan in flight)");
-            continue;
-          }
+          if (suppressWatchRef.current) break;
           invalidateScanCache(dir);
           try {
             const raw = await fetchScan({
@@ -309,83 +326,82 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
               maxDepth: 1,
               nocache: true,
             });
-            // fetchScan returns raw JSON — nodes lack children[] and path strings.
-            // reconstructChildren rebuilds both before we graft into the tree.
             const result = reconstructChildren(raw);
-            if (result?.nodes?.length) tree.patchDirectory(dir, result.nodes);
+            if (result?.nodes?.length) treeRef.current.patchDirectory(dir, result.nodes);
           } catch { /* ignore network errors */ }
         }
-      }, 100);
+      } finally {
+        patchInFlightRef.current = false;
+      }
+    }
+
+    es.onmessage = (evt) => {
+      let changedDir: string;
+      try { changedDir = JSON.parse(evt.data) as string; }
+      catch { return; }
+      pendingChangesRef.current.add(changedDir);
+      // Leading-edge: schedule once, don't reset on every event during a storm.
+      if (!watchDebounceRef.current) {
+        watchDebounceRef.current = setTimeout(flushWatch, WATCH_DEBOUNCE_MS);
+      }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [threads, includeHidden, followLinks, exclude, startRefresh, tree]);
+  }, [threads, includeHidden, followLinks, exclude]);
 
   useEffect(() => {
     if (status === "done" && data) {
       lastCompletedPathRef.current = data.rootPath;
-      // (Re)open the SSE watch after every completed scan — both initial and refresh.
-      // The EventSource was closed when status changed to "scanning".
-      if (active) {
-        console.log("[watch] scan done, starting watch on", data.rootPath);
-        startWatch(data.rootPath);
-      }
+      if (active) startWatch(data.rootPath);
     }
     if (status === "scanning") {
-      // Close the EventSource while a scan is in progress to avoid duplicate events.
-      // It will be reopened when status becomes "done".
       fsEventsRef.current?.close();
       fsEventsRef.current = null;
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
 
-  // Close EventSource when tab is hidden; reopen when shown again.
   useEffect(() => {
     if (!active) {
       fsEventsRef.current?.close();
       fsEventsRef.current = null;
-      if (watchDebounceRef.current) {
-        clearTimeout(watchDebounceRef.current);
-        watchDebounceRef.current = null;
-      }
+      if (watchDebounceRef.current) { clearTimeout(watchDebounceRef.current); watchDebounceRef.current = null; }
     } else if (status === "done" && data) {
       startWatch(data.rootPath);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
-  const handleScanPath = useCallback((path: string) => {
+  // Scan a path inside THIS tab (no upward propagation/double-scan).
+  const openLocation = useCallback((path: string) => {
+    if (!path.trim()) return;
     setScanPathState(path);
-    onScanPath(path);
-    cancelScan();
-    startScan({
-      path,
-      threads,
-      includeHidden,
-      followLinks,
-      excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [threads, includeHidden, followLinks, exclude]);
+    onScanPath(path); // record recent only
+    doScan(path);
+  }, [doScan, onScanPath]);
 
+  const handleScanPath = useCallback((path: string) => { openLocation(path); }, [openLocation]);
+
+  // Stable identity (reads tree via ref) so TreeTable's React.memo holds across
+  // unrelated parent re-renders.
   const handleSelectRow = useCallback((id: number, mode: "single" | "toggle" | "range") => {
-    const node = tree.nodeById.get(id);
+    const t = treeRef.current;
+    const node = t.nodeById.get(id);
     if (!node || node.id < 0 || !node.path) return;
 
     if (mode === "range") {
       const anchorId = selectionAnchorIdRef.current;
-      const anchorIndex = tree.visibleRows.findIndex((row) => row.id === anchorId);
-      const targetIndex = tree.visibleRows.findIndex((row) => row.id === id);
+      const anchorIndex = t.visibleRows.findIndex((row) => row.id === anchorId);
+      const targetIndex = t.visibleRows.findIndex((row) => row.id === id);
       if (anchorIndex >= 0 && targetIndex >= 0) {
         const [start, end] = anchorIndex < targetIndex
           ? [anchorIndex, targetIndex]
           : [targetIndex, anchorIndex];
-        const rangeIds = tree.visibleRows
+        const rangeIds = t.visibleRows
           .slice(start, end + 1)
           .filter((row) => row.id >= 0 && !!row.path)
           .map((row) => row.id);
         setSelectedIds(new Set(rangeIds));
-        tree.setSelectedId(id);
+        t.setSelectedId(id);
         return;
       }
     }
@@ -395,13 +411,13 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
         const next = new Set(prev);
         if (next.has(id) && next.size > 1) {
           next.delete(id);
-          if (tree.selectedId === id) {
+          if (t.selectedId === id) {
             const nextPrimary = next.values().next().value as number | undefined;
-            tree.setSelectedId(nextPrimary ?? id);
+            t.setSelectedId(nextPrimary ?? id);
           }
         } else {
           next.add(id);
-          tree.setSelectedId(id);
+          t.setSelectedId(id);
           selectionAnchorIdRef.current = id;
         }
         return next;
@@ -411,36 +427,26 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
 
     selectionAnchorIdRef.current = id;
     setSelectedIds(new Set([id]));
-    tree.setSelectedId(id);
-  }, [tree]);
+    t.setSelectedId(id);
+  }, []);
 
   const handleContextMenu = useCallback((id: number, x: number, y: number) => {
-    const alreadySelected = selectedIds.has(id);
-    if (!alreadySelected) {
-      handleSelectRow(id, "single");
-    }
-    const node = tree.nodeById.get(id);
+    const t = treeRef.current;
+    const selIds = selectedIdsRef.current;
+    const alreadySelected = selIds.has(id);
+    if (!alreadySelected) handleSelectRow(id, "single");
+    const node = t.nodeById.get(id);
     if (!node || node.id < 0 || !node.path) return;
-    // Right-clicking inside an existing multi-selection acts on the whole
-    // selection (like Explorer); otherwise just the row under the cursor.
-    const targets = alreadySelected && selectedIds.size > 1
-      ? [...selectedIds]
-          .map((sid) => tree.nodeById.get(sid)?.path)
-          .filter((p): p is string => !!p)
+    const targets = alreadySelected && selIds.size > 1
+      ? [...selIds].map((sid) => t.nodeById.get(sid)?.path).filter((p): p is string => !!p)
       : [node.path];
-    // The native menu reads the live cursor position (real screen coords), so
-    // x/y are informational only here.
     shellContextMenu(targets, x, y).catch(() => {});
-  }, [handleSelectRow, selectedIds, tree]);
+  }, [handleSelectRow]);
 
   const handleDblClick = useCallback((id: number) => {
-    const node = tree.nodeById.get(id);
+    const node = treeRef.current.nodeById.get(id);
     if (!node) return;
     if (node.dir) {
-      // Navigate into this folder within the current tab only.
-      // Do NOT call handleScanPath here — that propagates via onScanPath up to
-      // App.handleScanPath → getActiveRef()?.doScanPath(), which may target the
-      // wrong tab if the active-ref closure is stale.
       setScanPathState(node.path);
       cancelScan();
       startScan({
@@ -453,18 +459,21 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     } else {
       openPath(node.path);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tree, threads, includeHidden, followLinks, exclude, cancelScan, startScan]);
+  }, [threads, includeHidden, followLinks, exclude, cancelScan, startScan]);
 
+  const handleSortChange = useCallback((k: SortKey) => { treeRef.current.setSortKey(k); }, []);
+
+  // Stable identity (reads tree via ref) so the memoized Treemap/SideBar don't
+  // re-render every time the tree object is recreated.
   const handleNavigate = useCallback((id: number) => {
-    let node = tree.nodeById.get(id);
-    // Ensure all ancestors are open so the node is visible in the table
+    const t = treeRef.current;
+    let node = t.nodeById.get(id);
     while (node && node.parent != null) {
-      tree.ensureExpanded(node.parent);
-      node = tree.nodeById.get(node.parent);
+      t.ensureExpanded(node.parent);
+      node = t.nodeById.get(node.parent);
     }
-    tree.setSelectedId(id);
-  }, [tree]);
+    t.setSelectedId(id);
+  }, []);
 
   const handleNavigateParent = useCallback(() => {
     const selected = tree.nodeById.get(tree.selectedId);
@@ -500,9 +509,9 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   }, [tree, scanPath, doScan]);
 
   const handleTreemapOpen = useCallback((id: number) => {
-    const node = tree.nodeById.get(id);
+    const node = treeRef.current.nodeById.get(id);
     if (node && !node.dir && node.path) openPath(node.path);
-  }, [tree]);
+  }, []);
 
   const selectedNode = tree.nodeById.get(tree.selectedId);
   const selectedNodes = useMemo(() => {
@@ -518,6 +527,7 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     }
     return map;
   }, [tree.nodeById]);
+  nodeByPathRef.current = nodeByPath;
   const selectedPaths = useMemo(
     () => dedupeNestedPaths(selectedNodes.map((node) => node.path), nodeByPath),
     [nodeByPath, selectedNodes],
@@ -538,8 +548,19 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   const runOpen     = useCallback(() => { if (selectedNode) openPath(selectedNode.path); }, [selectedNode]);
   const runCopyPath = useCallback(() => { if (selectedNode) copyPath(selectedNode.path).catch(() => {}); }, [selectedNode]);
 
-  // id of the row whose name is being edited inline (TreeSize-style F2 rename).
-  // window.prompt is unsupported in Electron's renderer, so we edit in-place.
+  // Open the integrated terminal at the selected folder (a file → its folder),
+  // falling back to the scanned root.
+  const handleOpenTerminal = useCallback(() => {
+    let cwd = data?.rootPath || scanPath;
+    if (selectedNode?.path) {
+      const parentId = selectedNode.parent;
+      cwd = selectedNode.dir
+        ? selectedNode.path
+        : (parentId != null ? tree.nodeById.get(parentId)?.path ?? cwd : cwd);
+    }
+    onOpenTerminal?.(cwd);
+  }, [selectedNode, tree, data, scanPath, onOpenTerminal]);
+
   const [renamingId, setRenamingId] = useState<number | null>(null);
 
   const runRenamePath = useCallback((targetPath?: string) => {
@@ -548,12 +569,11 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     const id = nodeByPath.get(pathToRename)?.id
       ?? (pathToRename === selectedNode?.path ? selectedNode?.id : undefined);
     if (id == null) return;
-    tree.setSelectedId(id); // ensure the row is the active/visible one
+    tree.setSelectedId(id);
     setRenamingId(id);
   }, [selectedNode, nodeByPath, tree]);
 
   const runRename = useCallback(() => { runRenamePath(); }, [runRenamePath]);
-
   const cancelRename = useCallback(() => setRenamingId(null), []);
 
   const commitRename = useCallback(async (id: number, rawName: string) => {
@@ -564,8 +584,6 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     if (!newName || newName === node.name) return;
     const result = await renameItem(node.path, newName);
     if (!result.ok) { alert(`Rename failed: ${result.error ?? "unknown error"}`); return; }
-    // The rename mutated the folder listing; bypass the (now stale) scan cache
-    // so the tree shows the new name instead of a ghost of the old one.
     invalidateAllScanCache();
     doScan(undefined, undefined, true);
   }, [tree.nodeById, doScan]);
@@ -585,8 +603,6 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
 
   const runDelete = useCallback(() => { void runDeletePaths(); }, [runDeletePaths]);
 
-  // Conflict dialog + transient notice state, shared by drag-drop moves and the
-  // "Move to" command.
   const [conflictPrompt, setConflictPrompt] = useState<{
     names: string[];
     resolve: (choice: ConflictChoice) => void;
@@ -600,16 +616,13 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   }, [moveNotice]);
 
   const askConflict = useCallback(
-    (names: string[]) =>
-      new Promise<ConflictChoice>((resolve) => setConflictPrompt({ names, resolve })),
+    (names: string[]) => new Promise<ConflictChoice>((resolve) => setConflictPrompt({ names, resolve })),
     [],
   );
   const handleConflictChoice = useCallback((choice: ConflictChoice) => {
     setConflictPrompt((prev) => { prev?.resolve(choice); return null; });
   }, []);
 
-  // Move the clean items, then, if any names collide, ask the user
-  // (Replace / Keep both / Skip) and resolve. Returns combined errors.
   const runMoveWithConflicts = useCallback(
     async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string }> => {
       const detected = await moveItems(sources, destination);
@@ -617,14 +630,9 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
       if (detected.conflicts.length > 0) {
         const choice = await askConflict(detected.conflicts.map((c) => c.name));
         if (choice === "replace" || choice === "keep-both") {
-          const resolved = await moveItems(
-            detected.conflicts.map((c) => c.src),
-            destination,
-            choice,
-          );
+          const resolved = await moveItems(detected.conflicts.map((c) => c.src), destination, choice);
           allErrors.push(...resolved.errors);
         }
-        // "skip" / "cancel": leave the conflicting items untouched.
       } else if (detected.alreadyThere.length > 0 && detected.moved.length === 0) {
         const n = detected.alreadyThere.length;
         setMoveNotice(n === 1 ? "Already in this folder." : `${n} items are already in this folder.`);
@@ -653,25 +661,15 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
       return { ok: false, error: "Cannot move a folder into itself or one of its descendants." };
     }
     try {
-      // Suppress the fs-events watcher patch during the move + rescan — it fires
-      // with maxDepth=1 (folders momentarily 0 B) and would race the full rescan.
       suppressWatchRef.current = true;
       let outcome: { ok: boolean; error?: string };
       if (hasNativeMove()) {
-        // Hand the move to the Windows shell (IFileOperation): the user gets the
-        // real native dialogs — progress, Replace / Skip / Keep both, "the source
-        // and destination file names are the same", elevation — exactly like
-        // Explorer/TreeSize. We then rescan to reflect whatever happened on disk.
         await moveItemsNative(sources, destination);
         outcome = { ok: true };
       } else {
-        // Browser / non-Electron fallback: backend move + in-app conflict dialog.
         outcome = await runMoveWithConflicts(sources, destination);
       }
       invalidateAllScanCache();
-      // Force-fresh: the native move bypassed the server, so its cached tree is
-      // stale. Without nocache the rescan would re-show the moved file in its old
-      // spot ("ghost" row pointing at a vanished path — can't drag or rename it).
       doScan(undefined, undefined, true);
       return outcome;
     } catch (error) {
@@ -680,7 +678,40 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     }
   }, [doScan, runMoveWithConflicts]);
 
-  // Expose API to parent via ref
+  // ── Agent API facade (used by the right-side ChatPanel) ──────────────────
+  const agentApi = useMemo<AgentApi>(() => ({
+    getScanPath: () => scanPath,
+    getScanResult: () => data,
+    getNodes: () => Array.from(tree.nodeById.values()),
+    scanFolder: async (path: string) => { openLocation(path); },
+    refresh: async () => { invalidateAllScanCache(); doScan(undefined, undefined, true); },
+    findDuplicates: async (minSizeBytes: number) => {
+      const root = data?.rootPath || scanPath;
+      const res = await fetchDupesV2({ paths: [root], mode: "exact", minSize: minSizeBytes });
+      return { groups: res.groups.map((g) => ({ waste: g.waste, files: g.files.map((f) => ({ path: f.path, size: f.size })) })) };
+    },
+    moveItems: async (paths: string[], destination: string) => handleInternalMove(paths, destination),
+    deleteItems: async (paths: string[]) => {
+      const errors: string[] = [];
+      for (const p of paths) {
+        try { await deletePath(p); } catch (e) { errors.push(`${p}: ${(e as Error).message}`); }
+      }
+      invalidateAllScanCache();
+      doScan(undefined, undefined, true);
+      return errors.length ? { ok: false, error: errors.join("; ") } : { ok: true };
+    },
+    renameItem: async (path: string, newName: string) => {
+      const r = await renameItem(path, newName);
+      if (r.ok) { invalidateAllScanCache(); doScan(undefined, undefined, true); }
+      return r;
+    },
+    createFolder: async (path: string) => {
+      try { await createFolder(path); doScan(); return { ok: true }; }
+      catch (e) { return { ok: false, error: (e as Error).message }; }
+    },
+    reveal: async (path: string) => { revealPath(path); },
+  }), [scanPath, data, tree.nodeById, openLocation, doScan, handleInternalMove]);
+
   useImperativeHandle(ref, () => ({
     getStatus: () => status,
     getData: () => data,
@@ -689,6 +720,8 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     getVisibleCount: () => tree.visibleRows.length,
     getScanPath: () => scanPath,
     getScanning: () => status === "scanning",
+    getNodeById: () => tree.nodeById,
+    getAgentApi: () => agentApi,
     doScan: () => doScan(),
     doCancel: cancelScan,
     doScanPath: (path) => { setScanPathState(path); doScan(path); },
@@ -707,9 +740,7 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     doExport: (format) => {
       if (!data) return;
       const path = encodeURIComponent(data.rootPath);
-      const url = format === "csv"
-        ? `/api/export.csv?path=${path}`
-        : `/api/export.json?path=${path}`;
+      const url = format === "csv" ? `/api/export.csv?path=${path}` : `/api/export.json?path=${path}`;
       const a = document.createElement("a");
       a.href = url;
       a.download = "";
@@ -725,7 +756,6 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
       filter: tree.filter,
       showFiles: tree.showFiles,
       filterActive: tree.filterRules.some((r) => r.value.trim() !== ""),
-      activeTab,
       sortKey: tree.sortKey,
       sortDir: tree.sortDir,
     }),
@@ -736,23 +766,20 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     setScanPath: (p) => setScanPathState(p),
     setSortKeyDir: (key, dir) => {
       tree.setSortKey(key as SortKey);
-      // setSortKey toggles direction if same key; force it by setting again when mismatched
       if (tree.sortDir !== dir) tree.setSortKey(key as SortKey);
     },
-    showDetailsPane: () => setActiveTab("details"),
-    showTreemapPane: () => setActiveTab((current) => current === "chart" ? "details" : "chart"),
-  }), [status, data, progress, errorMessage, scanPath, activeTab, tree, cancelScan,
+  }), [status, data, progress, errorMessage, scanPath, tree, cancelScan, agentApi,
        doScan, handleNavigateParent, handleExpand, handleNewFolder, selectedNode,
        runRename, runRenamePath, runDelete, runDeletePaths, runMoveTo, runCopyPath, runCopyFiles]);
 
-  const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
+  // Bottom-panel (treemap) vertical resize.
+  const handlePanelResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
-    dragStartRef.current = { y: e.clientY, h: chartHeight };
+    dragStartRef.current = { y: e.clientY, h: panelHeight };
     const onMove = (ev: MouseEvent) => {
       if (!dragStartRef.current) return;
-      const delta = dragStartRef.current.y - ev.clientY; // drag up = bigger chart
-      const newH = Math.max(120, Math.min(900, dragStartRef.current.h + delta));
-      setChartHeight(newH);
+      const delta = dragStartRef.current.y - ev.clientY;
+      onPanelHeightChange(Math.max(120, Math.min(900, dragStartRef.current.h + delta)));
     };
     const onUp = () => {
       dragStartRef.current = null;
@@ -765,157 +792,256 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     document.body.style.userSelect = "none";
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
-  }, [chartHeight]);
+  }, [panelHeight, onPanelHeightChange]);
+
+  // Side-bar horizontal resize.
+  const handleSidebarResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    sidebarDragRef.current = { x: e.clientX, w: sidebarWidth };
+    const onMove = (ev: MouseEvent) => {
+      if (!sidebarDragRef.current) return;
+      const delta = ev.clientX - sidebarDragRef.current.x;
+      onSidebarWidthChange(Math.max(170, Math.min(640, sidebarDragRef.current.w + delta)));
+    };
+    const onUp = () => {
+      sidebarDragRef.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "ew-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [sidebarWidth, onSidebarWidthChange]);
+
+  const showTreemapView = activeView === "treemap";
 
   return (
-    <div
-      className="workspace"
-      data-tab-id={tabId}
-      style={active ? undefined : { display: "none" }}
-    >
-      {showDuplicateFinder && (
-        <DuplicateFinder
-          scanPath={scanPath}
-          hasScan={data !== null}
-          drives={drives}
-          specialFolders={specialFolders}
-          onNavigate={(id) => { handleNavigate(id); }}
-          onRescan={doScan}
-        />
-      )}
-
-      {/* Top row: tree table + side pane */}
-      <div className="workspace-top" style={showDuplicateFinder ? { display: "none" } : undefined}>
-        <TreeTable
-          rows={tree.visibleRows}
-          nodeById={tree.nodeById}
-          expanded={tree.expanded}
-          selectedId={tree.selectedId}
-          selectedIds={selectedIds}
-          sortKey={tree.sortKey}
-          sortDir={tree.sortDir}
-          metric={tree.metric}
-          unit={tree.unit}
-          decimals={decimals}
-          visibleColumns={visibleColumns}
-          onToggleExpand={tree.toggleExpand}
-          onSelect={handleSelectRow}
-          onDoubleClick={handleDblClick}
-          onContextMenu={handleContextMenu}
-          onCopySelected={runCopyFiles}
-          onMoveItems={handleInternalMove}
-          onSortChange={(k: SortKey) => tree.setSortKey(k)}
-          bookmarks={bookmarkSet}
-          onToggleBookmark={onToggleBookmark}
-          renamingId={renamingId}
-          onRenameCommit={commitRename}
-          onRenameCancel={cancelRename}
-        />
-
-        <div className="side-pane">
-          {treemapPosition === "right" && activeTab === "chart" ? (
-            <Treemap
-              nodeById={tree.nodeById}
-              selectedId={tree.selectedId}
-              metric={tree.metric}
-              unit={tree.unit}
-              detail={treemapDetail}
-              showSingleFiles={tmShowSingleFiles}
-              show3D={tmShow3D}
-              showHierarchy={tmShowHierarchy}
-              showLegend={tmShowLegend}
-              showLabels={tmShowLabels}
-              dragDrop={tmDragDrop}
-              onSelect={tree.setSelectedId}
-              onNavigate={handleNavigate}
-              onOpen={handleTreemapOpen}
-              onClose3D={onClose3D}
+    <div className="wb-tab" data-tab-id={tabId} style={active ? undefined : { display: "none" }}>
+      {sidebarOpen && (
+        <>
+          <div className="sidebar" style={{ width: sidebarWidth, flex: `0 0 ${sidebarWidth}px` }}>
+            <ActivityBar
+              activeView={activeView}
+              sidebarOpen={sidebarOpen}
+              onSelect={onSelectView}
+              bookmarkCount={bookmarkList.length}
+              errorCount={data?.errorCount ?? 0}
+              chatOpen={chatOpen}
+              onToggleChat={onToggleChat}
+              darkMode={darkMode}
+              onToggleTheme={onToggleTheme}
             />
-          ) : (
-            <>
-              <TabStrip
-                active={activeTab}
-                onChange={setActiveTab}
-                errorCount={data?.errorCount ?? 0}
-                bookmarkCount={bookmarkList.length}
-              />
-              <div className="tab-body">
-                <div className={`tab-panel${activeTab === "details" ? " active" : ""}`}>
-                  <DetailsTab data={data} selectedNode={selectedNode} onOpen={runOpen} onReveal={runReveal} onCopyPath={runCopyPath} />
-                </div>
-                <div className={`tab-panel${activeTab === "extensions" ? " active" : ""}`}>
-                  <ExtensionsTab extensionStats={data?.extensionStats ?? []} />
-                </div>
-                <div className={`tab-panel${activeTab === "age" ? " active" : ""}`}>
-                  <AgeTab ageStats={data?.ageStats ?? []} />
-                </div>
-                <div className={`tab-panel${activeTab === "top" ? " active" : ""}`}>
-                  <TopFilesTab topFileIds={data?.topFiles ?? []} nodeById={tree.nodeById} onNavigate={handleNavigate} />
-                </div>
-                <div className={`tab-panel${activeTab === "duplicates" ? " active" : ""}`}>
-                  <DuplicatesTab
-                    candidates={data?.duplicateCandidates ?? []}
-                    exactGroups={null}
-                    scanPath={data?.rootPath ?? ""}
-                    nodeById={tree.nodeById}
-                    onNavigate={handleNavigate}
-                  />
-                </div>
-                <div className={`tab-panel${activeTab === "errors" ? " active" : ""}`}>
-                  <ErrorsTab errors={data?.scanErrors ?? []} />
-                </div>
-                <div className={`tab-panel${activeTab === "bookmarks" ? " active" : ""}`}>
-                  <BookmarksTab
-                    bookmarks={bookmarkList}
-                    nodeById={tree.nodeById}
-                    unit={tree.unit}
-                    onNavigate={handleNavigate}
-                    onScanPath={handleScanPath}
-                    onRemove={onToggleBookmark}
-                  />
-                </div>
-                <div className={`tab-panel${activeTab === "ai" ? " active" : ""}`}>
-                  <AiChatTab scanPath={scanPath} nodeById={tree.nodeById} />
-                </div>
-              </div>
-            </>
-          )}
-        </div>
-      </div>
-
-      {/* Resize handle — only visible when chart panel is open (bottom mode only) */}
-      {!showDuplicateFinder && treemapPosition === "bottom" && (
-        <div
-          className={`chart-resize-handle${activeTab === "chart" ? " chart-resize-handle-open" : ""}`}
-          onMouseDown={activeTab === "chart" ? handleResizeMouseDown : undefined}
-        />
+            <SideBar
+              view={activeView}
+              data={data}
+              nodeById={tree.nodeById}
+              unit={tree.unit as Unit}
+              onNavigate={handleNavigate}
+              scanPath={scanPath}
+              scanning={status === "scanning"}
+              onScanPathInput={setScanPathState}
+              onScan={() => { onScanPath(scanPath); doScan(); }}
+              onCancel={cancelScan}
+              onRefresh={() => doScan(undefined, undefined, true)}
+              onUp={handleNavigateParent}
+              onNewFolder={handleNewFolder}
+              onCollapseAll={() => tree.expandToLevel(0)}
+              drives={drives}
+              specialFolders={specialFolders}
+              bookmarkList={bookmarkList}
+              onOpenLocation={openLocation}
+              treeRows={tree.visibleRows}
+              expanded={tree.expanded}
+              selectedId={tree.selectedId}
+              onToggleExpand={tree.toggleExpand}
+              onSelectFolder={handleNavigate}
+              selectedNode={selectedNode}
+              onOpen={runOpen}
+              onReveal={runReveal}
+              onCopyPath={runCopyPath}
+              onScanPath={handleScanPath}
+              onRemoveBookmark={onToggleBookmark}
+            />
+          </div>
+          <div className="resizer-x" onMouseDown={handleSidebarResize} />
+        </>
       )}
 
-      {/* Chart panel — full width below table + side pane (bottom mode only) */}
-      {!showDuplicateFinder && treemapPosition === "bottom" && (
-        <div
-          className={`chart-panel${activeTab === "chart" ? " chart-panel-open" : ""}`}
-          style={activeTab === "chart" ? { flex: `0 0 ${chartHeight}px`, height: chartHeight } : undefined}
-        >
-          <Treemap
-            nodeById={tree.nodeById}
-            selectedId={tree.selectedId}
-            metric={tree.metric}
-            unit={tree.unit}
-            detail={treemapDetail}
-            showSingleFiles={tmShowSingleFiles}
-            show3D={tmShow3D}
-            showHierarchy={tmShowHierarchy}
-            showLegend={tmShowLegend}
-            showLabels={tmShowLabels}
-            dragDrop={tmDragDrop}
-            onSelect={tree.setSelectedId}
-            onNavigate={handleNavigate}
-            onOpen={handleTreemapOpen}
-            onClose3D={onClose3D}
+      <div className="editor-region">
+        {active && (
+          <TabBar
+            tabs={tabBarMeta}
+            activeId={activeTabId}
+            onActivate={onActivateTab}
+            onClose={onCloseTab}
+            onNew={onNewTab}
+            onReorder={onReorderTab}
+            onFolderDrop={onFolderDrop}
           />
-        </div>
-      )}
+        )}
+
+        {showTreemapView ? (
+          <>
+            <div className="editor-toolbar">
+              <label>
+                Size
+                <select value={tree.metric} onChange={(e) => tree.setMetric(e.target.value as Metric)}>
+                  <option value="size">Size</option>
+                  <option value="allocated">Allocated</option>
+                  <option value="files">Files</option>
+                  <option value="folders">Folders</option>
+                </select>
+              </label>
+              <label>
+                Unit
+                <select value={tree.unit} onChange={(e) => tree.setUnit(e.target.value as Unit)}>
+                  <option value="auto">Auto</option>
+                  <option value="tb">TB</option>
+                  <option value="gb">GB</option>
+                  <option value="mb">MB</option>
+                  <option value="kb">KB</option>
+                  <option value="bytes">Bytes</option>
+                </select>
+              </label>
+            </div>
+            <div className="editor-stack">
+              <div className="editor-main">
+                <Treemap
+                  nodeById={tree.nodeById}
+                  selectedId={tree.selectedId}
+                  metric={tree.metric}
+                  unit={tree.unit}
+                  detail={treemapDetail}
+                  darkMode={darkMode}
+                  showSingleFiles={tmShowSingleFiles}
+                  show3D={tmShow3D}
+                  showHierarchy={tmShowHierarchy}
+                  showLegend={tmShowLegend}
+                  showLabels={tmShowLabels}
+                  dragDrop={tmDragDrop}
+                  onSelect={tree.setSelectedId}
+                  onNavigate={handleNavigate}
+                  onOpen={handleTreemapOpen}
+                  onClose3D={onClose3D}
+                />
+              </div>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="editor-toolbar">
+              <label>
+                Size
+                <select value={tree.metric} onChange={(e) => tree.setMetric(e.target.value as Metric)}>
+                  <option value="size">Size</option>
+                  <option value="allocated">Allocated</option>
+                  <option value="files">Files</option>
+                  <option value="folders">Folders</option>
+                </select>
+              </label>
+              <label>
+                Unit
+                <select value={tree.unit} onChange={(e) => tree.setUnit(e.target.value as Unit)}>
+                  <option value="auto">Auto</option>
+                  <option value="tb">TB</option>
+                  <option value="gb">GB</option>
+                  <option value="mb">MB</option>
+                  <option value="kb">KB</option>
+                  <option value="bytes">Bytes</option>
+                </select>
+              </label>
+              <span className="sep" />
+              <label>
+                <input type="checkbox" checked={tree.showFiles} onChange={(e) => tree.setShowFiles(e.target.checked)} />
+                Files
+              </label>
+              <button onClick={() => tree.expandToLevel(Infinity)}>Expand all</button>
+              <button onClick={() => tree.expandToLevel(0)}>Collapse all</button>
+              <span className="sep" />
+              <input
+                placeholder="Filter…"
+                value={filterInput}
+                onChange={(e) => setFilterInput(e.target.value)}
+                style={{ height: 24, width: 150, background: "var(--vsc-input-bg)", border: "1px solid var(--vsc-border)", color: "var(--text)" }}
+              />
+              <button onClick={() => setFilterDialogOpen(true)} title="Advanced filter">Rules</button>
+              <span className="spacer" />
+              <button onClick={handleOpenTerminal} title="Open terminal here (Ctrl+`)">Terminal</button>
+              <button
+                className={panelOpen ? "active" : ""}
+                onClick={() => onPanelOpenChange(!panelOpen)}
+                title="Toggle treemap panel"
+              >Treemap</button>
+            </div>
+
+            <div className="editor-stack">
+              <div className="editor-main">
+                <TreeTable
+                  rows={tree.visibleRows}
+                  nodeById={tree.nodeById}
+                  expanded={tree.expanded}
+                  selectedId={tree.selectedId}
+                  selectedIds={selectedIds}
+                  sortKey={tree.sortKey}
+                  sortDir={tree.sortDir}
+                  metric={tree.metric}
+                  unit={tree.unit}
+                  decimals={decimals}
+                  visibleColumns={visibleColumns}
+                  onToggleExpand={tree.toggleExpand}
+                  onSelect={handleSelectRow}
+                  onDoubleClick={handleDblClick}
+                  onContextMenu={handleContextMenu}
+                  onCopySelected={runCopyFiles}
+                  onMoveItems={handleInternalMove}
+                  onSortChange={handleSortChange}
+                  bookmarks={bookmarkSet}
+                  onToggleBookmark={onToggleBookmark}
+                  renamingId={renamingId}
+                  onRenameCommit={commitRename}
+                  onRenameCancel={cancelRename}
+                />
+              </div>
+
+              {panelOpen && (
+                <>
+                  <div className="resizer-y" onMouseDown={handlePanelResize} />
+                  <div className="bottom-panel" style={{ height: panelHeight, flex: `0 0 ${panelHeight}px` }}>
+                    <div className="bottom-panel-header">
+                      <span className="bottom-panel-tab active">Treemap</span>
+                      <span className="spacer" />
+                      <button className="icon" title="Close panel" onClick={() => onPanelOpenChange(false)}><Icon name="x" size={13} /></button>
+                    </div>
+                    <div className="bottom-panel-body">
+                      <Treemap
+                        nodeById={tree.nodeById}
+                        selectedId={tree.selectedId}
+                        metric={tree.metric}
+                        unit={tree.unit}
+                        detail={treemapDetail}
+                        darkMode={darkMode}
+                        showSingleFiles={tmShowSingleFiles}
+                        show3D={tmShow3D}
+                        showHierarchy={tmShowHierarchy}
+                        showLegend={tmShowLegend}
+                        showLabels={tmShowLabels}
+                        dragDrop={tmDragDrop}
+                        onSelect={tree.setSelectedId}
+                        onNavigate={handleNavigate}
+                        onOpen={handleTreemapOpen}
+                        onClose3D={onClose3D}
+                      />
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          </>
+        )}
+      </div>
 
       {filterDialogOpen && (
         <FilterDialog
@@ -933,3 +1059,22 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
     </div>
   );
 });
+
+// Stops the App-level render cascade: when App re-renders (e.g. another tab's
+// scan progress or a tab switch), inactive tabs are skipped unless a prop that
+// affects their rendered output actually changed. `tabBarMeta` (a fresh array
+// every render) and `activeTabId` are only consumed by the active tab's TabBar,
+// so they are ignored for inactive tabs. The active tab always re-renders, and
+// any tab re-renders when its own internal state changes (memo only blocks
+// parent-driven renders).
+function arePropsEqual(prev: WorkspaceTabProps, next: WorkspaceTabProps): boolean {
+  if (prev.active !== next.active) return false;
+  if (next.active) return false;
+  for (const k of Object.keys(next) as (keyof WorkspaceTabProps)[]) {
+    if (k === "tabBarMeta" || k === "activeTabId") continue;
+    if (prev[k] !== next[k]) return false;
+  }
+  return true;
+}
+
+export const WorkspaceTab = memo(WorkspaceTabInner, arePropsEqual);

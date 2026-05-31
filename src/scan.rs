@@ -174,13 +174,18 @@ pub(crate) fn snapshot_scan_result(
 ) -> ScanResult {
     // Clone nodes and errors while holding their locks, then drop locks
     // immediately so worker threads are not blocked during aggregation.
-    let mut nodes = shared.nodes.lock().expect("nodes lock poisoned").clone();
-    let errors = shared.errors.lock().expect("errors lock poisoned").clone();
+    // Workers have already joined (handles are joined before this is called), so
+    // move the buffers out instead of cloning them (~250-400 MB at 750k nodes).
+    // mem::take leaves empty Vecs behind, which is fine — the scan is finished.
+    let mut nodes = std::mem::take(&mut *shared.nodes.lock().expect("nodes lock poisoned"));
+    let errors = std::mem::take(&mut *shared.errors.lock().expect("errors lock poisoned"));
 
     // Aggregation is O(n) and must not hold any shared lock.
     aggregate_nodes(&mut nodes);
 
     let root_path = nodes.first().map(|node| node.path.clone()).unwrap_or_default();
+    // Compute capped analytics once here so responses/cache hits never recompute.
+    let summary = crate::analytics::scan_summary(&nodes, scanned_at_ms);
 
     ScanResult {
         root_path,
@@ -189,6 +194,7 @@ pub(crate) fn snapshot_scan_result(
         thread_count,
         nodes,
         errors,
+        summary,
     }
 }
 
@@ -762,8 +768,17 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
     // Process deepest nodes first (bottom-up) so each parent sees
     // fully-aggregated children when it runs.
     // Build depth-sorted order without allocating a names/sizes clone.
-    let mut order: Vec<usize> = (0..nodes.len()).collect();
-    order.sort_unstable_by_key(|&i| std::cmp::Reverse(nodes[i].depth));
+    // Order indices deepest-first via a counting sort on depth (O(n + maxDepth))
+    // instead of sorting all n indices (O(n log n)).
+    let max_depth = nodes.iter().map(|n| n.depth).max().unwrap_or(0);
+    let mut by_depth: Vec<Vec<usize>> = vec![Vec::new(); max_depth + 1];
+    for (i, node) in nodes.iter().enumerate() {
+        by_depth[node.depth].push(i);
+    }
+    let mut order: Vec<usize> = Vec::with_capacity(nodes.len());
+    for bucket in by_depth.iter().rev() {
+        order.extend_from_slice(bucket);
+    }
 
     for id in order {
         if !nodes[id].is_dir {
@@ -783,8 +798,8 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
         let mut errors = nodes[id].errors;
         let mut modified_ms = nodes[id].modified_ms;
 
-        // Read children ids first (clone just the id vec, not the nodes)
-        let children: Vec<usize> = nodes[id].children.clone();
+        // Take the child id vec out (O(1)) instead of cloning it; restored below.
+        let children = std::mem::take(&mut nodes[id].children);
         for child_id in &children {
             let child = &nodes[*child_id];
             size = size.saturating_add(child.size);
@@ -805,6 +820,7 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
         nodes[id].folders = folders;
         nodes[id].errors = errors;
         nodes[id].modified_ms = modified_ms;
+        nodes[id].children = children; // restore (taken above to avoid a clone)
     }
 
     // Sort each dir's children by size desc, then name asc.
@@ -821,17 +837,12 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
         .collect();
 
     for dir_id in dir_ids {
-        let mut children = nodes[dir_id].children.clone();
-        children.sort_unstable_by(|&a, &b| {
-            let sa = nodes.get(a).map(|n| n.size).unwrap_or(0);
-            let sb = nodes.get(b).map(|n| n.size).unwrap_or(0);
-            sb.cmp(&sa)
-                .then_with(|| {
-                    let na = nodes.get(a).map(|n| n.name.as_str()).unwrap_or("");
-                    let nb = nodes.get(b).map(|n| n.name.as_str()).unwrap_or("");
-                    // Case-insensitive compare without allocating lowercase strings
-                    na.to_lowercase().cmp(&nb.to_lowercase())
-                })
+        let mut children = std::mem::take(&mut nodes[dir_id].children);
+        // Sort by size desc, then case-insensitive name asc. A cached key
+        // lowercases each name once instead of twice on every comparison.
+        children.sort_by_cached_key(|&cid| {
+            let n = &nodes[cid];
+            (std::cmp::Reverse(n.size), n.name.to_lowercase())
         });
         nodes[dir_id].children = children;
     }

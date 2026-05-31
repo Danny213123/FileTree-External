@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::export::{push_id_array, push_json_string};
 use crate::model::{
-    AgeBucket, DuplicateCandidate, ExtensionStat, NodeRecord, ScanError, ScanResult,
+    AgeBucket, DuplicateCandidate, ExtensionStat, NodeRecord, ScanError, ScanResult, ScanSummary,
 };
 
 /// Filter parameters for duplicate search.
@@ -235,14 +235,32 @@ fn fnv1a_file(path: &Path) -> io::Result<u64> {
     Ok(hash)
 }
 
+/// Compute all capped analytics once. Called when a scan finalises (see
+/// `snapshot_scan_result`) and stored on `ScanResult`, so JSON/NDJSON responses,
+/// cache hits, and exports reuse it instead of re-scanning every node per request.
+pub(crate) fn scan_summary(nodes: &[NodeRecord], scanned_at_ms: u64) -> ScanSummary {
+    ScanSummary {
+        top_files: top_file_ids(nodes, 100),
+        largest_dirs: largest_dir_ids(nodes, 100),
+        extension_stats: extension_stats(nodes, 80),
+        age_stats: age_stats(nodes, scanned_at_ms),
+        duplicate_candidates: duplicate_candidates(nodes, 100),
+    }
+}
+
 pub(crate) fn top_file_ids(nodes: &[NodeRecord], limit: usize) -> Vec<usize> {
     let mut ids: Vec<usize> = nodes
         .iter()
         .filter(|node| !node.is_dir)
         .map(|node| node.id)
         .collect();
+    // Partition the `limit` largest to the front in O(n), then sort only those
+    // (O(limit log limit)) instead of fully sorting every file id (O(n log n)).
+    if ids.len() > limit {
+        ids.select_nth_unstable_by(limit, |left, right| nodes[*right].size.cmp(&nodes[*left].size));
+        ids.truncate(limit);
+    }
     ids.sort_by(|left, right| nodes[*right].size.cmp(&nodes[*left].size));
-    ids.truncate(limit);
     ids
 }
 
@@ -252,8 +270,11 @@ pub(crate) fn largest_dir_ids(nodes: &[NodeRecord], limit: usize) -> Vec<usize> 
         .filter(|node| node.is_dir)
         .map(|node| node.id)
         .collect();
+    if ids.len() > limit {
+        ids.select_nth_unstable_by(limit, |left, right| nodes[*right].size.cmp(&nodes[*left].size));
+        ids.truncate(limit);
+    }
     ids.sort_by(|left, right| nodes[*right].size.cmp(&nodes[*left].size));
-    ids.truncate(limit);
     ids
 }
 

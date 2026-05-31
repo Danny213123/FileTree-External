@@ -170,6 +170,193 @@ pub fn show_context_menu_native(
     }
 }
 
+// ── Integrated terminal (PTY) ─────────────────────────────────────────────────
+// A real pseudo-terminal per session via portable-pty (ConPTY on Windows). The
+// Electron main process spawns a shell here, polls `pty_read` on a short timer to
+// drain output to the renderer's xterm.js, and forwards keystrokes via
+// `pty_write`. Keeping this in the existing Rust addon reuses the cargo build
+// pipeline instead of pulling in node-pty's node-gyp / Electron-ABI build.
+use napi::bindgen_prelude::Buffer;
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+struct PtySession {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    buf: Vec<u8>,
+    exit: Option<i32>,
+    done: bool,
+}
+
+fn pty_sessions() -> &'static Mutex<HashMap<u32, PtySession>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<u32, PtySession>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static NEXT_PTY_ID: AtomicU32 = AtomicU32::new(1);
+
+/// A drained chunk of terminal output, plus the exit code delivered exactly once
+/// after the shell has exited and all buffered output has been read.
+#[napi(object)]
+pub struct PtyChunk {
+    pub data: Buffer,
+    pub exit: Option<i32>,
+}
+
+/// Spawn `program args…` in a new pseudo-terminal sized `cols`×`rows`, starting in
+/// `cwd`. Returns an id used by the read/write/resize/kill calls below.
+#[napi]
+pub fn pty_spawn(
+    program: String,
+    args: Vec<String>,
+    cwd: String,
+    cols: u16,
+    rows: u16,
+) -> napi::Result<u32> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| napi::Error::from_reason(format!("openpty failed: {e}")))?;
+
+    let mut cmd = CommandBuilder::new(&program);
+    for a in &args {
+        cmd.arg(a);
+    }
+    if !cwd.is_empty() {
+        cmd.cwd(&cwd);
+    }
+    // Inherit the parent environment so PATH, USERPROFILE, … are present.
+    for (k, v) in std::env::vars() {
+        cmd.env(k, v);
+    }
+    cmd.env("TERM", "xterm-256color");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| napi::Error::from_reason(format!("spawn failed: {e}")))?;
+    drop(pair.slave);
+
+    let killer = child.clone_killer();
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| napi::Error::from_reason(format!("clone reader failed: {e}")))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| napi::Error::from_reason(format!("take writer failed: {e}")))?;
+
+    let id = NEXT_PTY_ID.fetch_add(1, Ordering::Relaxed);
+    pty_sessions().lock().unwrap().insert(
+        id,
+        PtySession {
+            master: pair.master,
+            writer,
+            killer,
+            buf: Vec::new(),
+            exit: None,
+            done: false,
+        },
+    );
+
+    // Drain the pty off-thread into the session buffer so the shell never blocks
+    // on a full pipe; the main process collects it via `pty_read`. On Windows the
+    // ConPTY read side stays open until the master is dropped, so a read EOF here
+    // means the session was removed (after the exit code was delivered).
+    std::thread::spawn(move || {
+        let mut tmp = [0u8; 16384];
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut map = pty_sessions().lock().unwrap();
+                    match map.get_mut(&id) {
+                        Some(s) => s.buf.extend_from_slice(&tmp[..n]),
+                        None => break,
+                    }
+                }
+            }
+        }
+    });
+
+    // Wait for the shell to exit on its own thread — ConPTY won't EOF the reader
+    // while we hold the master. A short grace period lets the reader drain any
+    // trailing output before the exit code is surfaced through `pty_read`.
+    std::thread::spawn(move || {
+        let code = child.wait().map(|st| st.exit_code() as i32).unwrap_or(-1);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let mut map = pty_sessions().lock().unwrap();
+        if let Some(s) = map.get_mut(&id) {
+            s.exit = Some(code);
+            s.done = true;
+        }
+    });
+
+    Ok(id)
+}
+
+/// Drain buffered output for `id`. Returns the bytes produced since the previous
+/// call; once the shell has exited and its output is fully drained, returns the
+/// exit code and removes the session.
+#[napi]
+pub fn pty_read(id: u32) -> napi::Result<PtyChunk> {
+    let mut map = pty_sessions().lock().unwrap();
+    let s = match map.get_mut(&id) {
+        Some(s) => s,
+        None => return Ok(PtyChunk { data: Buffer::from(Vec::new()), exit: None }),
+    };
+    let data = std::mem::take(&mut s.buf);
+    if s.done && data.is_empty() {
+        let code = s.exit.unwrap_or(-1);
+        map.remove(&id);
+        return Ok(PtyChunk { data: Buffer::from(Vec::new()), exit: Some(code) });
+    }
+    Ok(PtyChunk { data: Buffer::from(data), exit: None })
+}
+
+/// Send keystrokes / pasted text to the shell.
+#[napi]
+pub fn pty_write(id: u32, data: Buffer) -> napi::Result<()> {
+    let mut map = pty_sessions().lock().unwrap();
+    if let Some(s) = map.get_mut(&id) {
+        s.writer
+            .write_all(data.as_ref())
+            .map_err(|e| napi::Error::from_reason(format!("write failed: {e}")))?;
+        s.writer
+            .flush()
+            .map_err(|e| napi::Error::from_reason(format!("flush failed: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Resize the pseudo-terminal to `cols`×`rows` character cells.
+#[napi]
+pub fn pty_resize(id: u32, cols: u16, rows: u16) -> napi::Result<()> {
+    let map = pty_sessions().lock().unwrap();
+    if let Some(s) = map.get(&id) {
+        s.master
+            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .map_err(|e| napi::Error::from_reason(format!("resize failed: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Terminate the shell. The reader thread observes EOF, records the exit code,
+/// and the session is removed on the next `pty_read`.
+#[napi]
+pub fn pty_kill(id: u32) -> napi::Result<()> {
+    let mut map = pty_sessions().lock().unwrap();
+    if let Some(s) = map.get_mut(&id) {
+        let _ = s.killer.kill();
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use super::DragResult;

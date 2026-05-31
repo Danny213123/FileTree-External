@@ -33,6 +33,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getPathForFile: (file: File): string =>
     webUtils.getPathForFile(file),
 
+  // Read an image file off disk → base64 data URL (for attaching tree files as
+  // vision inputs). Returns { dataUrl, mediaType } or { error }.
+  readFileBase64: (filePath: string): Promise<{ dataUrl?: string; mediaType?: string; error?: string }> =>
+    ipcRenderer.invoke("readFileBase64", filePath),
+
   // Register a callback for folders dropped onto the window from Explorer.
   onExternalDrop: (cb: (paths: string[]) => void) => {
     ipcRenderer.on("externalDrop", (_evt, paths: string[]) => cb(paths));
@@ -64,6 +69,24 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener("nativeDropEnd", listener);
   },
 
+  // ── Cloud LLM gateway ──────────────────────────────────────────────────────
+  // Ollama is reached directly from the renderer (same-origin /api/ai-chat on the
+  // Rust server). OpenAI/Anthropic need TLS + SSE, so main makes the request and
+  // streams unified events back over "llmEvent" keyed by a per-request id.
+  llm: {
+    models: (provider: string, apiKey?: string): Promise<string[]> =>
+      ipcRenderer.invoke("llmModels", provider, apiKey),
+    start: (reqId: string, payload: unknown): void =>
+      ipcRenderer.send("llmStart", reqId, payload),
+    cancel: (reqId: string): void =>
+      ipcRenderer.send("llmCancel", reqId),
+    onEvent: (cb: (reqId: string, ev: unknown) => void) => {
+      const listener = (_evt: Electron.IpcRendererEvent, reqId: string, ev: unknown) => cb(reqId, ev);
+      ipcRenderer.on("llmEvent", listener);
+      return () => ipcRenderer.removeListener("llmEvent", listener);
+    },
+  },
+
   // Context menu actions dispatched from Electron main (rename, delete, etc.)
   onContextMenuAction: (cb: (action: string, path: string) => void) => {
     const listener = (_evt: Electron.IpcRendererEvent, action: string, path: string) => cb(action, path);
@@ -74,4 +97,29 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Real Windows shell context menu for the given path(s) at the cursor.
   shellContextMenu: (paths: string | string[], x: number, y: number): Promise<void> =>
     ipcRenderer.invoke("shellContextMenu", paths, x, y),
+
+  // Integrated terminal: spawn a real shell (PTY) and stream its output to
+  // xterm.js in the renderer. `onData`/`onExit` return unsubscribe functions.
+  terminal: {
+    profiles: (): Promise<{ id: string; label: string }[]> =>
+      ipcRenderer.invoke("terminalProfiles"),
+    spawn: (profileId: string, cwd: string, cols: number, rows: number): Promise<{ id: number; title: string }> =>
+      ipcRenderer.invoke("terminalSpawn", profileId, cwd, cols, rows),
+    write: (id: number, data: string): void =>
+      ipcRenderer.send("terminalWrite", id, data),
+    resize: (id: number, cols: number, rows: number): void =>
+      ipcRenderer.send("terminalResize", id, cols, rows),
+    kill: (id: number): void =>
+      ipcRenderer.send("terminalKill", id),
+    onData: (cb: (id: number, data: Uint8Array) => void) => {
+      const listener = (_evt: Electron.IpcRendererEvent, id: number, data: Uint8Array) => cb(id, data);
+      ipcRenderer.on("terminalData", listener);
+      return () => ipcRenderer.removeListener("terminalData", listener);
+    },
+    onExit: (cb: (id: number, code: number) => void) => {
+      const listener = (_evt: Electron.IpcRendererEvent, id: number, code: number) => cb(id, code);
+      ipcRenderer.on("terminalExit", listener);
+      return () => ipcRenderer.removeListener("terminalExit", listener);
+    },
+  },
 });
