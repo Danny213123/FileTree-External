@@ -41,6 +41,7 @@ export function scanStreamUrl(opts: ScanOptions): string {
   if (opts.excludePatterns?.length)
     params.set("exclude", opts.excludePatterns.join(","));
   if (opts.maxDepth != null) params.set("maxdepth", String(opts.maxDepth));
+  if (opts.nocache) params.set("nocache", "1");
   return `/api/scan-stream?${params}`;
 }
 
@@ -295,10 +296,30 @@ export async function* streamAiChat(
 type ElectronAPI = {
   copyText?: (text: string) => Promise<void>;
   copyFiles?: (paths: string[]) => Promise<void>;
-  shellContextMenu?: (path: string, x: number, y: number) => Promise<void>;
+  shellContextMenu?: (paths: string | string[], x: number, y: number) => Promise<void>;
+  moveItemsNative?: (paths: string[], destination: string) => Promise<{ aborted: boolean }>;
 };
 const eAPI = (): ElectronAPI =>
   (window as unknown as { electronAPI?: ElectronAPI }).electronAPI ?? {};
+
+/** True when running in Electron with the native shell move-operation available. */
+export function hasNativeMove(): boolean {
+  return typeof eAPI().moveItemsNative === "function";
+}
+
+/**
+ * Move items into a folder using the Windows shell (IFileOperation), which shows
+ * the real native dialogs (progress, Replace/Skip/Keep both, "source and
+ * destination file names are the same", elevation). Throws if unavailable.
+ */
+export async function moveItemsNative(
+  paths: string[],
+  destination: string,
+): Promise<{ aborted: boolean }> {
+  const api = eAPI();
+  if (!api.moveItemsNative) throw new Error("native move unavailable");
+  return api.moveItemsNative(paths, destination);
+}
 
 export async function copyPath(path: string): Promise<void> {
   if (eAPI().copyText) {
@@ -322,14 +343,69 @@ export async function renameItem(path: string, newName: string): Promise<{ ok: b
   return { ok: false, error: await responseErrorText(res) };
 }
 
-export async function moveItems(paths: string[], destination: string): Promise<{ ok: boolean; error?: string }> {
+export type MoveConflictChoice = "replace" | "keep-both" | "skip";
+
+export interface MoveConflict {
+  /** Absolute source path that collides with an existing item. */
+  src: string;
+  /** Base name that already exists in the destination. */
+  name: string;
+}
+
+export interface MoveItemsResult {
+  ok: boolean;
+  /** Joined per-item error messages, if any. */
+  error?: string;
+  /** Sources that were moved on this call. */
+  moved: string[];
+  /** Sources that were already the same file in the destination (no-op). */
+  alreadyThere: string[];
+  /** Collisions reported in detect mode (no `conflict` arg) so the UI can ask. */
+  conflicts: MoveConflict[];
+  /** Sources skipped when called with conflict="skip". */
+  skipped: string[];
+  /** Per-item error strings. */
+  errors: string[];
+}
+
+/**
+ * Move items into a folder.
+ *
+ * Called once without `conflict` to "detect": clean items are moved and any
+ * name collisions are returned in `conflicts` (nothing overwritten). Call again
+ * with the colliding sources and a `conflict` choice to resolve them.
+ */
+export async function moveItems(
+  paths: string[],
+  destination: string,
+  conflict?: MoveConflictChoice,
+): Promise<MoveItemsResult> {
+  const empty: MoveItemsResult = {
+    ok: false, moved: [], alreadyThere: [], conflicts: [], skipped: [], errors: [],
+  };
   const res = await fetch("/api/move-items", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ paths, destination }),
+    body: JSON.stringify(conflict ? { paths, destination, conflict } : { paths, destination }),
   });
-  if (res.ok) return { ok: true };
-  return { ok: false, error: await responseErrorText(res) };
+  if (!res.ok) {
+    return { ...empty, error: await responseErrorText(res) };
+  }
+  try {
+    const j = (await res.json()) as Partial<MoveItemsResult>;
+    const errors = j.errors ?? [];
+    return {
+      ok: j.ok ?? errors.length === 0,
+      moved: j.moved ?? [],
+      alreadyThere: j.alreadyThere ?? [],
+      conflicts: j.conflicts ?? [],
+      skipped: j.skipped ?? [],
+      errors,
+      error: errors.length > 0 ? errors.join("; ") : undefined,
+    };
+  } catch {
+    return { ...empty, ok: true };
+  }
 }
 
 export async function copyFiles(paths: string[]): Promise<void> {
@@ -352,11 +428,13 @@ export async function dragOut(paths: string[]): Promise<void> {
   });
 }
 
-export async function shellContextMenu(path: string, x: number, y: number): Promise<void> {
+export async function shellContextMenu(paths: string | string[], x: number, y: number): Promise<void> {
   if (eAPI().shellContextMenu) {
-    await eAPI().shellContextMenu!(path, x, y);
+    await eAPI().shellContextMenu!(paths, x, y);
   } else {
-    const params = new URLSearchParams({ path, x: String(Math.round(x)), y: String(Math.round(y)) });
+    const first = Array.isArray(paths) ? paths[0] : paths;
+    if (!first) return;
+    const params = new URLSearchParams({ path: first, x: String(Math.round(x)), y: String(Math.round(y)) });
     await fetch(`/api/shell-context-menu?${params}`);
   }
 }

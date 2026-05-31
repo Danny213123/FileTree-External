@@ -446,81 +446,91 @@ export function useTreeState(): UseTreeStateReturn {
   // recalculate ancestor sizes/counts up to the root.
   const patchDirectory = useCallback((changedPath: string, newNodes: NodeRecord[]) => {
     setNodesState((prevNodes) => {
-      // Find the existing node for changedPath in the current full tree
+      // The patch is a maxDepth=1 (shallow) re-scan of changedPath: it lists the
+      // directory's immediate children, but every SUBFOLDER comes back as a
+      // depth-limited stub (size 0, no children, a spurious "depth limit reached"
+      // error). We must NOT let those stubs clobber the real subtrees we already
+      // hold — only the file children and the *set* of immediate entries are
+      // authoritative. So we keep existing subfolders' subtrees untouched and
+      // re-aggregate changedPath from its real children.
       const oldByPath = new Map<string, NodeRecord>();
       for (const n of prevNodes) if (n.path) oldByPath.set(n.path, n);
       const targetNode = oldByPath.get(changedPath);
       if (!targetNode) return prevNodes; // not in tree, ignore
 
-      // Build old tree map
-      const oldById = new Map<number, NodeRecord>();
-      for (const n of prevNodes) oldById.set(n.id, n);
+      const miniById = new Map<number, NodeRecord>();
+      for (const n of newNodes) miniById.set(n.id, n);
+      const miniRoot = miniById.get(0);
+      if (!miniRoot) return prevNodes;
 
-      // newNodes is a mini-tree rooted at changedPath (id=0 there).
-      // We need to remap their IDs to avoid collisions with the full tree.
-      // Strategy: assign new IDs starting after the current max ID.
       let maxId = 0;
       for (const n of prevNodes) if (n.id > maxId) maxId = n.id;
 
-      // Build a map: mini-tree id → full-tree id
-      // Mini root (id=0) maps to the existing targetNode id
-      const miniToFull = new Map<number, number>();
-      miniToFull.set(0, targetNode.id);
+      // Immediate subfolders we preserve from the old tree (keep descendants +
+      // aggregate sizes); files and brand-new folders spliced in with fresh ids.
+      const preservedDirPaths: string[] = [];
+      const addedNodes: NodeRecord[] = [];
+      const rootChildIds: number[] = [];
 
-      // Assign new full-tree IDs to all non-root mini nodes
-      const remappedNew: NodeRecord[] = [];
-      for (const n of newNodes) {
-        if (n.id === 0) {
-          // Root of mini-tree: update in-place with new stats but keep same id/parent/path
-          remappedNew.push({
-            ...n,
-            id: targetNode.id,
-            parent: targetNode.parent,
-            path: targetNode.path,
-            depth: targetNode.depth,
-          });
+      for (const childId of miniRoot.children) {
+        const child = miniById.get(childId);
+        if (!child) continue;
+        const old = child.path ? oldByPath.get(child.path) : undefined;
+        if (child.dir && old && old.dir) {
+          // Existing subfolder: keep its old subtree (id, size, descendants).
+          preservedDirPaths.push(old.path.toLowerCase());
+          rootChildIds.push(old.id);
         } else {
+          // New/changed file, or a brand-new folder: take the fresh node. A new
+          // folder's real contents stay unknown (0) until the next full scan, so
+          // drop the shallow depth-limit error it would otherwise carry.
           const newId = ++maxId;
-          miniToFull.set(n.id, newId);
-          remappedNew.push({ ...n, id: newId });
+          addedNodes.push({
+            ...child,
+            id: newId,
+            parent: targetNode.id,
+            depth: targetNode.depth + 1,
+            children: [],
+            errors: child.dir ? 0 : child.errors,
+          });
+          rootChildIds.push(newId);
         }
       }
 
-      // Fix parent and children references in remapped nodes
-      for (const n of remappedNew) {
-        if (n.id === targetNode.id) {
-          // Children of root stay remapped; parent stays as original
-        } else {
-          const parentFullId = miniToFull.get(n.parent ?? 0);
-          (n as NodeRecord).parent = parentFullId ?? targetNode.id;
-        }
-        (n as NodeRecord).children = n.children.map(c => miniToFull.get(c) ?? c);
-      }
+      // Rebuild changedPath from the fresh scan (fresh mtime/name) but keep its
+      // identity and point it at the resolved child set.
+      const newRoot: NodeRecord = {
+        ...miniRoot,
+        id: targetNode.id,
+        parent: targetNode.parent,
+        path: targetNode.path,
+        depth: targetNode.depth,
+        children: rootChildIds,
+      };
 
-      // Fix children of root separately
-      const newRoot = remappedNew.find(n => n.id === targetNode.id)!;
-      if (newRoot) {
-        (newRoot as NodeRecord).children = newNodes.find(n => n.id === 0)!
-          .children.map(c => miniToFull.get(c) ?? c);
-      }
-
-      // Build the new full node list: keep all existing nodes that are NOT
-      // descendants of changedPath, then append the remapped new nodes.
+      // Keep every old node except changedPath itself and the old descendants
+      // that are NOT under a preserved subfolder (old file children + entries
+      // that disappeared). Preserved subfolders + descendants are retained as-is.
       const changedPathNorm = changedPath.toLowerCase();
-      const kept = prevNodes.filter(n => {
-        if (n.id === targetNode.id) return false; // replaced by new root
+      const underPreserved = (p: string) =>
+        preservedDirPaths.some((pp) => p === pp || p.startsWith(pp + "\\") || p.startsWith(pp + "/"));
+      const kept = prevNodes.filter((n) => {
+        if (n.id === targetNode.id) return false; // replaced by newRoot
         const p = n.path.toLowerCase();
-        // drop old descendants
-        return !(p.startsWith(changedPathNorm + "\\") || p.startsWith(changedPathNorm + "/"));
+        const underChanged = p.startsWith(changedPathNorm + "\\") || p.startsWith(changedPathNorm + "/");
+        if (!underChanged) return true;
+        return underPreserved(p);
       });
 
-      // Recalculate ancestor sizes/counts from targetNode up to root
-      const merged = [...kept, ...remappedNew];
+      const merged = [...kept, newRoot, ...addedNodes];
       const byId = new Map<number, NodeRecord>();
       for (const n of merged) byId.set(n.id, n);
 
-      // Walk up from targetNode's parent, recalculating from children
-      let cur = targetNode.parent != null ? byId.get(targetNode.parent) : null;
+      // Re-aggregate size/counts from changedPath up to the root. We start AT
+      // changedPath (not its parent): the shallow scan undercounts it because the
+      // subfolder stubs reported 0. A file node carries files=1; a dir carries
+      // its subtree totals — so summing children is correct and convention-safe.
+      let cur: NodeRecord | null | undefined = byId.get(targetNode.id);
       while (cur) {
         let size = 0, allocated = 0, files = 0, folders = 0, errors = 0;
         for (const cid of cur.children) {

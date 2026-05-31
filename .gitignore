@@ -20,3 +20,13 @@ run.bat
 
 # Local media / screenshots
 /images/
+
+# --- Build outputs / stray files (not needed to build or run) ---
+# Packaged Electron app (regenerate via build-portable.bat)
+/dist-electron/
+# Logs anywhere (e.g. .cursor/debug-*.log)
+*.log
+# Stray downloads / data exports accidentally dropped in the tree
+*.zip
+*.csv
+/electron/taglinter.yml

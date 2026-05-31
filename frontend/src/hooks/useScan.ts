@@ -154,8 +154,9 @@ export function useScan(): UseScanReturn {
   const startScan = useCallback((opts: ScanOptions) => {
     if (controllerRef.current) return;
 
-    // Serve from cache when available — avoids redundant network requests
-    const cached = getCached(opts.path);
+    // Serve from cache when available — avoids redundant network requests.
+    // nocache forces a fresh fetch (e.g. the rescan right after a native move).
+    const cached = opts.nocache ? null : getCached(opts.path);
     if (cached) {
       console.log("[useScan] startScan CACHE HIT path=", opts.path, "nodes=", cached.nodes?.length);
       setData(cached);

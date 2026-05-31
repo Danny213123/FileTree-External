@@ -53,8 +53,12 @@ interface TreeTableProps {
   onCopySelected?: () => void;
   /** Called when the user drags rows from inside FileTree onto a folder row. */
   onMoveItems?: (sourcePaths: string[], destinationFolder: string) => Promise<MoveItemsResult | void> | MoveItemsResult | void;
-  /** Called after a successful external drag-out with dropEffect="move" to delete source. */
-  onExternalMove?: (paths: string[]) => void;
+  /** id of the row whose name is being edited inline (null/undefined = none). */
+  renamingId?: number | null;
+  /** Commit an inline rename for the given row id with the typed name. */
+  onRenameCommit?: (id: number, newName: string) => void;
+  /** Abandon the in-progress inline rename without changing anything. */
+  onRenameCancel?: () => void;
 }
 
 function metricValue(node: NodeRecord, metric: Metric): number {
@@ -85,6 +89,66 @@ function dedupeNestedNodes(nodes: NodeRecord[]): NodeRecord[] {
   return result;
 }
 
+/**
+ * Inline name editor shown in the Name cell of the row being renamed.
+ * Mirrors Explorer/TreeSize: autofocuses, pre-selects the filename stem,
+ * commits on Enter or blur, cancels on Escape. All pointer/key events are
+ * stopped so they don't reach the row's selection / keyboard-nav handlers.
+ */
+function RenameInput({
+  initialName,
+  onCommit,
+  onCancel,
+}: {
+  initialName: string;
+  onCommit: (newName: string) => void;
+  onCancel: () => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  // Guards against firing twice (e.g. Enter commits, which then blurs).
+  const doneRef = useRef(false);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.focus();
+    const dot = initialName.lastIndexOf(".");
+    if (dot > 0) el.setSelectionRange(0, dot); // select stem, keep extension
+    else el.select();
+  }, [initialName]);
+
+  const commit = useCallback(() => {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    onCommit(ref.current?.value ?? initialName);
+  }, [initialName, onCommit]);
+
+  const cancel = useCallback(() => {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    onCancel();
+  }, [onCancel]);
+
+  return (
+    <input
+      ref={ref}
+      className="name-edit"
+      defaultValue={initialName}
+      spellCheck={false}
+      autoComplete="off"
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") { e.preventDefault(); commit(); }
+        else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+      }}
+      onBlur={commit}
+    />
+  );
+}
+
 export function TreeTable({
   rows,
   nodeById,
@@ -106,17 +170,33 @@ export function TreeTable({
   onToggleBookmark,
   onCopySelected,
   onMoveItems,
-  onExternalMove,
+  renamingId,
+  onRenameCommit,
+  onRenameCancel,
 }: TreeTableProps) {
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
   const dragPathsRef = useRef<string[]>([]);
-  const pendingExternalDragRef = useRef<{ paths: string[]; completed: boolean; cancelled: boolean } | null>(null);
-  type DragStartResult = { ok: boolean; status: string; error?: string };
-  type DeleteAfterDragResult = { ok: boolean; status?: string; error?: string };
+  // True only on the TreeTable instance that started the current native drag.
+  // Gates the nativeDropInternal IPC so hidden/other-tab instances ignore it.
+  const nativeDragOriginRef = useRef<boolean>(false);
+  // Path of the folder the cursor last highlighted during the drag — this is
+  // the real drop target (the same folder shown highlighted), so we move into
+  // it directly instead of re-deriving it from drop coordinates.
+  const lastFolderTargetRef = useRef<string | null>(null);
   type ElectronAPI = {
-    startDrag: (filePaths: string | string[]) => DragStartResult;
-    deleteAfterDrag: (filePath: string) => Promise<DeleteAfterDragResult>;
+    // Fire-and-forget: main runs the native shell drag while the renderer stays
+    // responsive (auto-scroll + folder highlight keep working during the drag).
+    startDrag: (filePaths: string | string[]) => void;
     getPathForFile?: (file: File) => string;
+    // The native drag ended over a FileTree window: hit-test the drop point and
+    // move the dragged files into that folder ourselves.
+    onNativeDropInternal?: (
+      cb: (clientX: number, clientY: number, paths: string[]) => void,
+    ) => () => void;
+    // The native drag ended externally or was cancelled: clear drag UI.
+    onNativeDropEnd?: (cb: () => void) => () => void;
+    // TEMP diagnostic: forward a renderer log line to the main-process terminal.
+    diag?: (message: string) => void;
   };
   const electronAPI = () => (window as unknown as { electronAPI?: ElectronAPI }).electronAPI;
   const getDroppedFilePaths = useCallback((files: FileList) => {
@@ -131,14 +211,13 @@ export function TreeTable({
       })
       .filter((filePath) => filePath.length > 0);
   }, []);
-  const clearDragUi = useCallback(() => {
+  const resetDragState = useCallback(() => {
+    // NOTE: deliberately does NOT clear nativeDragOriginRef / lastFolderTargetRef.
+    // Those must survive any dragend/drop/dragleave that fire during the native
+    // drag so the nativeDropInternal IPC (which arrives afterwards) can use them.
     dragPathsRef.current = [];
     setDropTargetId(null);
   }, []);
-  const resetDragState = useCallback(() => {
-    clearDragUi();
-    pendingExternalDragRef.current = null;
-  }, [clearDragUi]);
   const cols = useMemo(
     () => ALL_COLUMNS.filter((c) => visibleColumns.has(c.key)),
     [visibleColumns],
@@ -162,18 +241,11 @@ export function TreeTable({
   }, [scrollEl]);
 
   useEffect(() => {
-    const resetNonNativeDrag = () => {
-      if (pendingExternalDragRef.current) {
-        setDropTargetId(null);
-      } else {
-        resetDragState();
-      }
-    };
-    window.addEventListener("dragend", resetNonNativeDrag);
-    window.addEventListener("drop", resetNonNativeDrag);
+    window.addEventListener("dragend", resetDragState);
+    window.addEventListener("drop", resetDragState);
     return () => {
-      window.removeEventListener("dragend", resetNonNativeDrag);
-      window.removeEventListener("drop", resetNonNativeDrag);
+      window.removeEventListener("dragend", resetDragState);
+      window.removeEventListener("drop", resetDragState);
     };
   }, [resetDragState]);
 
@@ -211,42 +283,6 @@ export function TreeTable({
     [nodeById, selectedIds],
   );
 
-  const finishExternalDrag = useCallback(async (paths: string[], reason: string) => {
-    const pending = pendingExternalDragRef.current;
-    if (!pending || pending.completed || pending.cancelled) return;
-    if (pending.paths.join("\n") !== paths.join("\n")) return;
-
-    pending.completed = true;
-    clearDragUi();
-
-    const api = electronAPI();
-    if (!api?.deleteAfterDrag) {
-      pendingExternalDragRef.current = null;
-      return;
-    }
-
-    try {
-      for (const path of paths) {
-        const result = await api.deleteAfterDrag(path);
-        if (!result.ok) {
-          const message = result.error ?? "unknown error";
-          console.error("[TreeTable] deleteAfterDrag failed", { path, reason, message });
-          window.alert(`Could not remove "${path}" after drag-out: ${message}`);
-          return;
-        }
-      }
-
-      console.log("[TreeTable] external drag cleanup complete", { paths, reason });
-      onExternalMove?.([]);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error("[TreeTable] deleteAfterDrag threw", { paths, reason, error });
-      window.alert(`Could not remove the original after drag-out: ${message}`);
-    } finally {
-      pendingExternalDragRef.current = null;
-    }
-  }, [clearDragUi, onExternalMove]);
-
   const reportInternalMoveError = useCallback((message: string) => {
     console.error("[TreeTable] internal move failed", message);
     window.setTimeout(() => {
@@ -267,6 +303,48 @@ export function TreeTable({
       resetDragState();
     }
   }, [onMoveItems, reportInternalMoveError, resetDragState]);
+
+  // When a native (file) drag-out ends back over FileTree, main sends the drop
+  // point so we hit-test the destination folder and perform the move ourselves
+  // (Chromium can't complete its own drop while the modal drag loop runs).
+  useEffect(() => {
+    const api = electronAPI();
+    if (!api?.onNativeDropInternal) return;
+    const offInternal = api.onNativeDropInternal((clientX, clientY, paths) => {
+      const origin = nativeDragOriginRef.current;
+      const tracked = lastFolderTargetRef.current;
+      api?.diag?.(`[diag] internal-drop ENTER origin=${origin} tracked=${tracked ?? "(none)"} paths=${paths.length} xy=${clientX},${clientY}`);
+      // Only the instance that started the drag acts. Other tabs keep a mounted
+      // (display:none) TreeTable and would otherwise all handle this same IPC.
+      if (!origin) return;
+
+      // Primary target: the folder the user last highlighted during the drag
+      // (exactly what was shown highlighted). Fall back to hit-testing the drop
+      // point only if no folder was tracked.
+      let destPath = tracked ?? undefined;
+      if (!destPath) {
+        const el = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+        const row = el?.closest<HTMLElement>(".row");
+        if (row?.dataset.nodeDir === "1") destPath = row.dataset.nodePath;
+      }
+      const movable = destPath ? paths.filter((src) => src && src !== destPath) : [];
+      api?.diag?.(`[diag] internal-drop dest=${destPath ?? "(none)"} willMove=${movable.length}`);
+      nativeDragOriginRef.current = false;
+      lastFolderTargetRef.current = null;
+      if (destPath && movable.length > 0) {
+        const target = destPath;
+        window.setTimeout(() => { void runInternalMove(movable, target); }, 0);
+        return;
+      }
+      resetDragState();
+    });
+    const offEnd = api.onNativeDropEnd?.(() => {
+      nativeDragOriginRef.current = false;
+      lastFolderTargetRef.current = null;
+      resetDragState();
+    });
+    return () => { offInternal?.(); offEnd?.(); };
+  }, [runInternalMove, resetDragState]);
 
   return (
     <div
@@ -327,6 +405,8 @@ export function TreeTable({
               <div
                 key={node.id}
                 data-index={vItem.index}
+                data-node-path={node.path ?? ""}
+                data-node-dir={node.dir && !isBundle ? "1" : "0"}
                 className={`row${isSelected ? " selected" : ""}${selectedId === node.id ? " primary-selected" : ""}${node.hidden ? " hidden-entry" : ""}${isDropTarget ? " drop-target" : ""}`}
                 style={{ position: "absolute", top: vItem.start, left: 0, right: 0, height: ROW_HEIGHT, gridTemplateColumns: gridTemplate }}
                 draggable={isDraggable}
@@ -355,41 +435,29 @@ export function TreeTable({
                   }
                   e.dataTransfer.effectAllowed = draggedNodes.some((draggedNode) => draggedNode.dir) ? "copyMove" : "move";
                   dragPathsRef.current = draggedPaths;
-                  pendingExternalDragRef.current = null;
                   const api = electronAPI();
-                  const canUseNativeDrag = !!api && draggedNodes.every((draggedNode) => !draggedNode.dir);
-                  if (canUseNativeDrag) {
-                    // External drag-out via Electron native drag (blocks until drop/cancel).
-                    e.preventDefault(); // suppress Chromium's HTML5 drag to avoid double-drag crash
-                    pendingExternalDragRef.current = { paths: draggedPaths, completed: false, cancelled: false };
-                    const result = api.startDrag(draggedPaths);
-                    console.log("[TreeTable] dragstart result=", result, "paths=", draggedPaths);
-                    if (!result?.ok) {
-                      console.error("[TreeTable] startDrag failed", { paths: draggedPaths, result });
-                      resetDragState();
-                      return;
-                    }
-                    window.setTimeout(() => { void finishExternalDrag(draggedPaths, "native-return"); }, 0);
+                  const useNativeDrag = !!api && draggedNodes.every((draggedNode) => !draggedNode.dir);
+                  if (useNativeDrag) {
+                    // Files: hand the drag to the native shell drag (fire-and-forget
+                    // so the renderer stays responsive). Chromium still fires
+                    // dragover on the page during the drag (folder highlight +
+                    // auto-scroll work). The drop is completed by main via
+                    // onNativeDropInternal (internal move) or onNativeDropEnd
+                    // (external move/copy/cancel). Folders fall through to a pure
+                    // HTML5 drag (internal move only).
+                    e.preventDefault(); // suppress Chromium's HTML5 drag; native drag takes over
+                    // Mark this instance as the drag origin and reset the tracked
+                    // target; the nativeDropInternal IPC will only act here.
+                    nativeDragOriginRef.current = true;
+                    lastFolderTargetRef.current = null;
+                    api.diag?.(`[diag] native dragstart paths=${draggedPaths.length}`);
+                    api.startDrag(draggedPaths);
                   }
                 }}
-                onDragEnd={(e) => {
-                  const paths = dragPathsRef.current;
-                  setDropTargetId(null);
-                  if (paths.length === 0) return;
-                  if (!pendingExternalDragRef.current) {
-                    resetDragState();
-                    return;
-                  }
-
-                  if (e.dataTransfer.dropEffect === "none") {
-                    const pending = pendingExternalDragRef.current;
-                    if (pending) pending.cancelled = true;
-                    resetDragState();
-                    console.log("[TreeTable] external drag cancelled", { paths });
-                    return;
-                  }
-
-                  void finishExternalDrag(paths, `dragend:${e.dataTransfer.dropEffect}`);
+                onDragEnd={() => {
+                  // Native drag-out is fully handled in onDragStart; this only needs to clear
+                  // UI state for internal (HTML5) drags that ended without a valid drop.
+                  resetDragState();
                 }}
                 onDragOver={(e) => {
                   if (!node.dir || !node.path || isBundle) return;
@@ -399,6 +467,9 @@ export function TreeTable({
                   e.preventDefault();
                   e.stopPropagation();
                   e.dataTransfer.dropEffect = "move";
+                  // Remember the highlighted folder as the live drop target so a
+                  // native drag-out that returns here can move into it directly.
+                  lastFolderTargetRef.current = node.path;
                   if (dropTargetId !== node.id) setDropTargetId(node.id);
                 }}
                 onDragLeave={() => {
@@ -463,7 +534,15 @@ export function TreeTable({
                     onMouseEnter={(e) => handleKindEnter(node, e)}
                     onMouseLeave={handleKindLeave}
                   />
-                  <span className={`name-text${isBundle ? " bundle-label" : ""}`}>{node.name}</span>
+                  {node.id === renamingId ? (
+                    <RenameInput
+                      initialName={node.name}
+                      onCommit={(newName) => onRenameCommit?.(node.id, newName)}
+                      onCancel={() => onRenameCancel?.()}
+                    />
+                  ) : (
+                    <span className={`name-text${isBundle ? " bundle-label" : ""}`}>{node.name}</span>
+                  )}
                   {!isBundle && node.path && (
                     <button
                       className={`bookmark-btn${bookmarks.has(node.path) ? " bookmarked" : ""}`}
