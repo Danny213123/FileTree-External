@@ -41,23 +41,36 @@ const child_process_1 = require("child_process");
 let nativeDragFiles = null;
 let nativeMoveItems = null;
 let nativeContextMenu = null;
+let ptySpawn = null;
+let ptyRead = null;
+let ptyWrite = null;
+let ptyResize = null;
+let ptyKill = null;
 try {
     const addon = require(path.join(__dirname, "filetree_drag.node"));
     nativeDragFiles = typeof addon.dragFiles === "function" ? addon.dragFiles : null;
     nativeMoveItems = typeof addon.moveItemsNative === "function" ? addon.moveItemsNative : null;
     nativeContextMenu = typeof addon.showContextMenuNative === "function" ? addon.showContextMenuNative : null;
+    ptySpawn = typeof addon.ptySpawn === "function" ? addon.ptySpawn : null;
+    ptyRead = typeof addon.ptyRead === "function" ? addon.ptyRead : null;
+    ptyWrite = typeof addon.ptyWrite === "function" ? addon.ptyWrite : null;
+    ptyResize = typeof addon.ptyResize === "function" ? addon.ptyResize : null;
+    ptyKill = typeof addon.ptyKill === "function" ? addon.ptyKill : null;
     if (!nativeDragFiles)
         console.warn("[electron] native drag addon missing dragFiles export");
     if (!nativeMoveItems)
         console.warn("[electron] native drag addon missing moveItemsNative export");
     if (!nativeContextMenu)
         console.warn("[electron] native drag addon missing showContextMenuNative export");
+    if (!ptySpawn)
+        console.warn("[electron] native addon missing pty exports; terminal disabled");
 }
 catch (e) {
     console.warn("[electron] native drag addon unavailable; drag-out will copy:", e);
     nativeDragFiles = null;
     nativeMoveItems = null;
     nativeContextMenu = null;
+    ptySpawn = ptyRead = ptyWrite = ptyResize = ptyKill = null;
 }
 let serverProcess = null;
 let mainWindow = null;
@@ -127,6 +140,16 @@ function createWindow(port) {
         minWidth: 640,
         minHeight: 400,
         title: "FileTree",
+        backgroundColor: "#1e1e1e",
+        // Frameless VS Code-style chrome: hide the OS title bar but keep the native
+        // Windows caption buttons (min/max/close) as an overlay on the right. The
+        // custom TitleBar fills the rest of the bar (menus) and is the drag region.
+        titleBarStyle: "hidden",
+        titleBarOverlay: {
+            color: "#181818",
+            symbolColor: "#cccccc",
+            height: 35,
+        },
         webPreferences: {
             preload: path.join(__dirname, "preload.js"),
             contextIsolation: true,
@@ -452,6 +475,295 @@ if ($action) { [Console]::Out.WriteLine("FILETREE_ACTION:" + $action) }
 electron_1.ipcMain.on("diag", (_event, message) => {
     console.log("[renderer]", message);
 });
+const llmAbort = new Map();
+electron_1.ipcMain.on("llmCancel", (_event, reqId) => {
+    llmAbort.get(reqId)?.abort();
+    llmAbort.delete(reqId);
+});
+electron_1.ipcMain.on("llmStart", (event, reqId, payload) => {
+    const controller = new AbortController();
+    llmAbort.set(reqId, controller);
+    const emit = (ev) => { try {
+        event.sender.send("llmEvent", reqId, ev);
+    }
+    catch { /* window gone */ } };
+    runCloudStream(payload, controller.signal, emit)
+        .catch((e) => emit({ type: "error", value: e?.message || String(e) }))
+        .finally(() => llmAbort.delete(reqId));
+});
+electron_1.ipcMain.handle("llmModels", async (_event, provider) => {
+    if (provider === "openai")
+        return ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1", "o3-mini"];
+    if (provider === "anthropic")
+        return ["claude-3-5-haiku-latest", "claude-3-5-sonnet-latest", "claude-3-7-sonnet-latest"];
+    return [];
+});
+async function runCloudStream(payload, signal, emit) {
+    if (payload.provider === "openai")
+        return streamOpenAi(payload, signal, emit);
+    if (payload.provider === "anthropic")
+        return streamAnthropic(payload, signal, emit);
+    emit({ type: "error", value: `Unsupported provider ${payload.provider}` });
+}
+async function* sseLines(res) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done)
+            break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines)
+            yield line;
+    }
+    if (buf)
+        yield buf;
+}
+function parseArgs(s) {
+    try {
+        return s ? JSON.parse(s) : {};
+    }
+    catch {
+        return {};
+    }
+}
+function shorten(s) { return s.length > 200 ? s.slice(0, 200) + "…" : s; }
+function randId() { return `call_${Math.random().toString(36).slice(2, 10)}`; }
+async function streamOpenAi(payload, signal, emit) {
+    const body = {
+        model: payload.model,
+        messages: toOpenAiMessages(payload.messages),
+        stream: true,
+        ...(payload.tools?.length ? { tools: payload.tools, tool_choice: "auto" } : {}),
+    };
+    let res;
+    try {
+        res = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${payload.apiKey ?? ""}` },
+            body: JSON.stringify(body),
+            signal,
+        });
+    }
+    catch (e) {
+        if (e.name === "AbortError")
+            return;
+        emit({ type: "error", value: `OpenAI request failed: ${e.message}` });
+        return;
+    }
+    if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        emit({ type: "error", value: `OpenAI HTTP ${res.status}: ${shorten(t)}` });
+        return;
+    }
+    const toolAcc = {};
+    try {
+        for await (const line of sseLines(res)) {
+            const l = line.trim();
+            if (!l.startsWith("data:"))
+                continue;
+            const data = l.slice(5).trim();
+            if (data === "[DONE]")
+                break;
+            let json;
+            try {
+                json = JSON.parse(data);
+            }
+            catch {
+                continue;
+            }
+            const delta = json.choices?.[0]?.delta;
+            if (!delta)
+                continue;
+            if (delta.content)
+                emit({ type: "text", value: delta.content });
+            if (Array.isArray(delta.tool_calls)) {
+                for (const tc of delta.tool_calls) {
+                    const idx = tc.index ?? 0;
+                    const cur = toolAcc[idx] ?? (toolAcc[idx] = { id: "", name: "", args: "" });
+                    if (tc.id)
+                        cur.id = tc.id;
+                    if (tc.function?.name)
+                        cur.name = tc.function.name;
+                    if (tc.function?.arguments)
+                        cur.args += tc.function.arguments;
+                }
+            }
+        }
+    }
+    catch (e) {
+        if (e.name === "AbortError")
+            return;
+        emit({ type: "error", value: e.message });
+        return;
+    }
+    const calls = Object.values(toolAcc)
+        .filter((c) => c.name)
+        .map((c) => ({ id: c.id || randId(), name: c.name, args: parseArgs(c.args) }));
+    if (calls.length)
+        emit({ type: "tool_calls", value: calls });
+    emit({ type: "done" });
+}
+async function streamAnthropic(payload, signal, emit) {
+    const { system, messages } = toAnthropicMessages(payload.messages);
+    const body = {
+        model: payload.model,
+        max_tokens: 2048,
+        stream: true,
+        ...(system ? { system } : {}),
+        messages,
+        ...(payload.tools?.length
+            ? { tools: payload.tools.map((t) => ({ name: t.function.name, description: t.function.description, input_schema: t.function.parameters })) }
+            : {}),
+    };
+    let res;
+    try {
+        res = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-api-key": payload.apiKey ?? "", "anthropic-version": "2023-06-01" },
+            body: JSON.stringify(body),
+            signal,
+        });
+    }
+    catch (e) {
+        if (e.name === "AbortError")
+            return;
+        emit({ type: "error", value: `Anthropic request failed: ${e.message}` });
+        return;
+    }
+    if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        emit({ type: "error", value: `Anthropic HTTP ${res.status}: ${shorten(t)}` });
+        return;
+    }
+    const blocks = {};
+    const calls = [];
+    try {
+        for await (const line of sseLines(res)) {
+            const l = line.trim();
+            if (!l.startsWith("data:"))
+                continue;
+            const data = l.slice(5).trim();
+            if (!data)
+                continue;
+            let json;
+            try {
+                json = JSON.parse(data);
+            }
+            catch {
+                continue;
+            }
+            if (json.type === "content_block_start") {
+                const idx = json.index ?? 0;
+                const cb = json.content_block ?? {};
+                blocks[idx] = { type: cb.type, id: cb.id, name: cb.name, json: "" };
+            }
+            else if (json.type === "content_block_delta") {
+                const idx = json.index ?? 0;
+                const d = json.delta ?? {};
+                if (d.type === "text_delta" && d.text)
+                    emit({ type: "text", value: d.text });
+                else if (d.type === "thinking_delta" && d.thinking)
+                    emit({ type: "thinking", value: d.thinking });
+                else if (d.type === "input_json_delta" && d.partial_json != null) {
+                    const b = blocks[idx];
+                    if (b)
+                        b.json += d.partial_json;
+                }
+            }
+            else if (json.type === "content_block_stop") {
+                const idx = json.index ?? 0;
+                const b = blocks[idx];
+                if (b && b.type === "tool_use" && b.name)
+                    calls.push({ id: b.id || randId(), name: b.name, args: parseArgs(b.json || "{}") });
+            }
+            else if (json.type === "error") {
+                emit({ type: "error", value: json.error?.message || "Anthropic stream error" });
+                return;
+            }
+        }
+    }
+    catch (e) {
+        if (e.name === "AbortError")
+            return;
+        emit({ type: "error", value: e.message });
+        return;
+    }
+    if (calls.length)
+        emit({ type: "tool_calls", value: calls });
+    emit({ type: "done" });
+}
+function base64Of(dataUrl) {
+    const comma = dataUrl.indexOf(",");
+    return comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+}
+function toOpenAiMessages(messages) {
+    return messages.map((m) => {
+        if (m.role === "assistant" && m.toolCalls?.length) {
+            return {
+                role: "assistant",
+                content: m.content || null,
+                tool_calls: m.toolCalls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: JSON.stringify(c.args ?? {}) } })),
+            };
+        }
+        if (m.role === "tool")
+            return { role: "tool", tool_call_id: m.toolCallId, content: m.content };
+        if (m.role === "user" && m.images?.length) {
+            const parts = [];
+            if (m.content)
+                parts.push({ type: "text", text: m.content });
+            for (const im of m.images)
+                parts.push({ type: "image_url", image_url: { url: im.dataUrl } });
+            return { role: "user", content: parts };
+        }
+        return { role: m.role, content: m.content };
+    });
+}
+function toAnthropicMessages(messages) {
+    let system = "";
+    const out = [];
+    for (const m of messages) {
+        if (m.role === "system") {
+            system += (system ? "\n" : "") + m.content;
+            continue;
+        }
+        if (m.role === "tool") {
+            const block = { type: "tool_result", tool_use_id: m.toolCallId, content: m.content };
+            const last = out[out.length - 1];
+            if (last && last._toolGroup)
+                last.content.push(block);
+            else
+                out.push({ role: "user", content: [block], _toolGroup: true });
+            continue;
+        }
+        if (m.role === "assistant") {
+            const content = [];
+            if (m.content)
+                content.push({ type: "text", text: m.content });
+            if (m.toolCalls?.length)
+                for (const c of m.toolCalls)
+                    content.push({ type: "tool_use", id: c.id, name: c.name, input: c.args ?? {} });
+            out.push({ role: "assistant", content: content.length ? content : [{ type: "text", text: " " }] });
+            continue;
+        }
+        if (m.images?.length) {
+            const content = [];
+            for (const im of m.images)
+                content.push({ type: "image", source: { type: "base64", media_type: im.mediaType, data: base64Of(im.dataUrl) } });
+            if (m.content)
+                content.push({ type: "text", text: m.content });
+            out.push({ role: "user", content });
+            continue;
+        }
+        out.push({ role: "user", content: m.content });
+    }
+    for (const o of out)
+        delete o._toolGroup;
+    return { system, messages: out };
+}
 electron_1.ipcMain.on("ondragstart", (event, arg) => {
     const filePaths = (Array.isArray(arg) ? arg : [arg]).filter((filePath) => filePath && fs.existsSync(filePath));
     if (filePaths.length === 0)
@@ -497,6 +809,30 @@ electron_1.ipcMain.on("ondragstart", (event, arg) => {
 // Copy text to clipboard.
 electron_1.ipcMain.handle("copyText", (_event, text) => {
     electron_1.clipboard.writeText(text);
+});
+// Read a file off disk and return a base64 data URL so attached image *paths*
+// (dragged from the file tree) can be sent to vision-capable models. Capped so
+// we never blow up the IPC channel / model request with a giant payload.
+electron_1.ipcMain.handle("readFileBase64", async (_event, filePath) => {
+    try {
+        const MAX = 12 * 1024 * 1024; // 12 MB
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile())
+            return { error: "not a file" };
+        if (stat.size > MAX)
+            return { error: "file too large (max 12 MB)" };
+        const buf = await fs.promises.readFile(filePath);
+        const ext = path.extname(filePath).toLowerCase();
+        const mediaType = ext === ".png" ? "image/png" :
+            ext === ".gif" ? "image/gif" :
+                ext === ".webp" ? "image/webp" :
+                    ext === ".bmp" ? "image/bmp" :
+                        "image/jpeg";
+        return { dataUrl: `data:${mediaType};base64,${buf.toString("base64")}`, mediaType };
+    }
+    catch (e) {
+        return { error: e.message };
+    }
 });
 // Move files into a folder with the Windows shell file-operation engine
 // (IFileOperation), so the user sees the real native dialogs: progress,
@@ -585,6 +921,116 @@ electron_1.ipcMain.handle("shellContextMenu", async (event, paths, x, y) => {
     }
     showFallbackContextMenu(win, list[0], Math.round(x), Math.round(y));
 });
+function findOnPath(exe) {
+    for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+        if (!dir)
+            continue;
+        const candidate = path.join(dir, exe);
+        if (fs.existsSync(candidate))
+            return candidate;
+    }
+    return null;
+}
+function detectTerminalProfiles() {
+    const sysRoot = process.env.SystemRoot || "C:\\Windows";
+    const sys32 = path.join(sysRoot, "System32");
+    const profiles = [];
+    const ps = path.join(sys32, "WindowsPowerShell", "v1.0", "powershell.exe");
+    profiles.push({ id: "powershell", label: "PowerShell", program: fs.existsSync(ps) ? ps : "powershell.exe", args: ["-NoLogo"] });
+    const pwsh = findOnPath("pwsh.exe");
+    if (pwsh)
+        profiles.push({ id: "pwsh", label: "PowerShell 7", program: pwsh, args: ["-NoLogo"] });
+    const cmd = path.join(sys32, "cmd.exe");
+    profiles.push({ id: "cmd", label: "Command Prompt", program: fs.existsSync(cmd) ? cmd : "cmd.exe", args: [] });
+    const gitBash = [
+        path.join(process.env.ProgramFiles || "C:\\Program Files", "Git", "bin", "bash.exe"),
+        path.join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "Git", "bin", "bash.exe"),
+    ].find((p) => fs.existsSync(p));
+    if (gitBash)
+        profiles.push({ id: "git-bash", label: "Git Bash", program: gitBash, args: ["-i", "-l"] });
+    const wsl = path.join(sys32, "wsl.exe");
+    if (fs.existsSync(wsl))
+        profiles.push({ id: "wsl", label: "WSL", program: wsl, args: [] });
+    return profiles;
+}
+// Output pump: the addon buffers pty output; we drain every live session on a
+// short timer and forward it to the renderer's xterm.js. Runs only while at
+// least one terminal is open.
+const livePtys = new Set();
+let ptyPump = null;
+function startPtyPump() {
+    if (ptyPump || !ptyRead)
+        return;
+    ptyPump = setInterval(() => {
+        if (!ptyRead)
+            return;
+        const win = mainWindow;
+        for (const id of [...livePtys]) {
+            let chunk;
+            try {
+                chunk = ptyRead(id);
+            }
+            catch {
+                livePtys.delete(id);
+                continue;
+            }
+            if (chunk.data && chunk.data.length > 0) {
+                win?.webContents.send("terminalData", id, chunk.data);
+            }
+            if (chunk.exit !== null && chunk.exit !== undefined) {
+                livePtys.delete(id);
+                win?.webContents.send("terminalExit", id, chunk.exit);
+            }
+        }
+        if (livePtys.size === 0 && ptyPump) {
+            clearInterval(ptyPump);
+            ptyPump = null;
+        }
+    }, 16);
+}
+function killAllPtys() {
+    if (ptyKill)
+        for (const id of livePtys) {
+            try {
+                ptyKill(id);
+            }
+            catch { /* ignore */ }
+        }
+    livePtys.clear();
+    if (ptyPump) {
+        clearInterval(ptyPump);
+        ptyPump = null;
+    }
+}
+electron_1.ipcMain.handle("terminalProfiles", () => detectTerminalProfiles().map(({ id, label }) => ({ id, label })));
+electron_1.ipcMain.handle("terminalSpawn", (_event, profileId, cwd, cols, rows) => {
+    if (!ptySpawn)
+        throw new Error("terminal backend unavailable");
+    const profiles = detectTerminalProfiles();
+    const profile = profiles.find((p) => p.id === profileId) ?? profiles[0];
+    const id = ptySpawn(profile.program, profile.args, cwd || "", Math.max(1, Math.floor(cols) || 80), Math.max(1, Math.floor(rows) || 24));
+    livePtys.add(id);
+    startPtyPump();
+    return { id, title: profile.label };
+});
+electron_1.ipcMain.on("terminalWrite", (_event, id, data) => {
+    try {
+        ptyWrite?.(id, Buffer.from(data, "utf8"));
+    }
+    catch { /* session gone */ }
+});
+electron_1.ipcMain.on("terminalResize", (_event, id, cols, rows) => {
+    try {
+        ptyResize?.(id, Math.max(1, Math.floor(cols)), Math.max(1, Math.floor(rows)));
+    }
+    catch { /* session gone */ }
+});
+electron_1.ipcMain.on("terminalKill", (_event, id) => {
+    try {
+        ptyKill?.(id);
+    }
+    catch { /* session gone */ }
+});
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 electron_1.app.whenReady().then(async () => {
     try {
@@ -601,6 +1047,7 @@ electron_1.app.on("window-all-closed", () => {
     electron_1.app.quit();
 });
 electron_1.app.on("before-quit", () => {
+    killAllPtys();
     if (serverProcess) {
         serverProcess.kill();
         serverProcess = null;

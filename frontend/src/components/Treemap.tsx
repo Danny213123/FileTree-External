@@ -32,6 +32,44 @@ function lighten(hex: string, amt: number): string {
   return `rgb(${r},${g},${b})`;
 }
 
+// Scale a colour's brightness (factor < 1 darkens, > 1 lightens). Accepts the
+// "rgb(r,g,b)" strings produced by lighten() as well as #rrggbb hex.
+function shade(color: string, factor: number): string {
+  let r: number, g: number, b: number;
+  if (color[0] === "#") {
+    const n = parseInt(color.slice(1), 16);
+    r = (n >> 16) & 0xff; g = (n >> 8) & 0xff; b = n & 0xff;
+  } else {
+    const m = color.match(/\d+/g);
+    if (!m || m.length < 3) return color;
+    r = +m[0]; g = +m[1]; b = +m[2];
+  }
+  const f = (v: number) => Math.max(0, Math.min(255, Math.round(v * factor)));
+  return `rgb(${f(r)},${f(g)},${f(b)})`;
+}
+
+// Blend a #rrggbb colour toward white by ratio t (0 = unchanged, 1 = white).
+function tint(hex: string, t: number): string {
+  const n = parseInt(hex.slice(1), 16);
+  const r = (n >> 16) & 0xff, g = (n >> 8) & 0xff, b = n & 0xff;
+  const m = (v: number) => Math.round(v + (255 - v) * t);
+  return `rgb(${m(r)},${m(g)},${m(b)})`;
+}
+
+// Fill colour for a cell given its branch's base hue, nesting depth, and theme.
+// Dark theme: progressively lighter shades of the base colour (as before). Light
+// theme: light pastels (base tinted toward white) that get a little stronger with
+// depth, kept light enough for dark label text.
+function fillColor(branchHex: string, depth: number, darkMode: boolean): string {
+  if (darkMode) return lighten(branchHex, depth * 16);
+  return tint(branchHex, Math.max(0.3, 0.68 - depth * 0.09));
+}
+
+// Upper bound on rendered cells so the entire-treemap view stays interactive
+// even on a huge scan (the canvas is large, so without this the subdivision can
+// explode into many thousands of tiny rects).
+const MAX_RECTS = 4000;
+
 function getValue(n: NodeRecord, metric: Metric): number {
   switch (metric) {
     case "allocated": return n.allocated;
@@ -39,19 +77,6 @@ function getValue(n: NodeRecord, metric: Metric): number {
     case "folders":   return n.folders;
     default:          return n.size;
   }
-}
-
-function buildChildrenMap(nodeById: Map<number, NodeRecord>): Map<number, number[]> {
-  const map = new Map<number, number[]>();
-  for (const node of nodeById.values()) {
-    if (!map.has(node.id)) map.set(node.id, []);
-    if (node.parent != null) {
-      let arr = map.get(node.parent);
-      if (!arr) { arr = []; map.set(node.parent, arr); }
-      arr.push(node.id);
-    }
-  }
-  return map;
 }
 
 // Flat rect with absolute pixel coords for draw + hit testing
@@ -69,13 +94,14 @@ interface FlatRect {
 function flattenLayout(
   rects: { node: NodeRecord; x: number; y: number; w: number; h: number }[],
   nodeById: Map<number, NodeRecord>,
-  childrenMap: Map<number, number[]>,
   canvasW: number, canvasH: number,
   depth: number,
   maxDepth: number, maxChildren: number,
   metric: Metric,
   branchColor: string,
   offsetX: number, offsetY: number,
+  budget: { n: number },
+  darkMode: boolean,
 ): FlatRect[] {
   const result: FlatRect[] = [];
   for (const rect of rects) {
@@ -83,14 +109,16 @@ function flattenLayout(
     const py = offsetY + (rect.y / 100) * canvasH;
     const pw = (rect.w / 100) * canvasW;
     const ph = (rect.h / 100) * canvasH;
-    const color = lighten(branchColor, depth * 16);
+    const color = fillColor(branchColor, depth, darkMode);
     const labelH = (pw >= 20 && ph >= 10) ? 16 : 0;
     const showLabel = labelH > 0 && pw >= 30;
     const showCount = showLabel && pw >= 70;
 
     const children: FlatRect[] = [];
-    if (rect.node.dir && depth < maxDepth) {
-      const kids = (childrenMap.get(rect.node.id) ?? [])
+    // Use node.children directly (already maintained on every node) instead of
+    // rebuilding a parent→children map across the whole tree on each render.
+    if (rect.node.dir && depth < maxDepth && budget.n < MAX_RECTS) {
+      const kids = rect.node.children
         .map(id => nodeById.get(id))
         .filter((n): n is NodeRecord => n !== undefined && getValue(n, metric) > 0)
         .sort((a, b) => getValue(b, metric) - getValue(a, metric))
@@ -98,12 +126,12 @@ function flattenLayout(
       const innerH = ph - labelH;
       // Only skip subdivision for genuinely tiny cells — small enough to cut
       // crowding, but still showing the bordered/nested structure.
-      if (kids.length > 0 && innerH > 12 && pw > 16) {
+      if (kids.length > 0 && innerH > 14 && pw > 18) {
         const childRects = layoutTreemap(kids, pw, innerH, metric);
         children.push(...flattenLayout(
-          childRects, nodeById, childrenMap,
+          childRects, nodeById,
           pw, innerH, depth + 1, maxDepth, maxChildren, metric,
-          color, px, py + labelH,
+          branchColor, px, py + labelH, budget, darkMode,
         ));
       }
     }
@@ -114,6 +142,7 @@ function flattenLayout(
       showLabel, showCount, pxLabelH: labelH,
       children,
     });
+    budget.n++;
   }
   return result;
 }
@@ -135,13 +164,16 @@ function drawClippedText(
   ctx.restore();
 }
 
-function drawRects(
+// Base layer: fills, cell borders, header strips, and labels. Drawn only when
+// the layout (flatRects) changes — NOT on hover/selection — so moving the mouse
+// never repaints thousands of cells. `parentColor` is the fill of the containing
+// cell; each border is a darker shade of it.
+function drawBase(
   ctx: CanvasRenderingContext2D,
   rects: FlatRect[],
   nodeById: Map<number, NodeRecord>,
-  selectedId: number,
-  hoverId: number | null,
-  dragOverId: number | null,
+  darkMode: boolean,
+  parentColor?: string,
 ) {
   for (const r of rects) {
     const { px, py, pw, ph } = r;
@@ -150,8 +182,9 @@ function drawRects(
     ctx.fillStyle = r.color;
     ctx.fillRect(px, py, pw, ph);
 
-    // Border — crisp dark line so cells stay clearly separated even when large.
-    ctx.strokeStyle = "rgba(0,0,0,0.7)";
+    // Border: a darker shade of the parent cell's colour. At the top level there
+    // is no parent cell drawn, so shade the cell's own colour instead.
+    ctx.strokeStyle = shade(parentColor ?? r.color, 0.6);
     ctx.lineWidth = 1;
     ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
 
@@ -171,14 +204,14 @@ function drawRects(
         }
 
         const textX = isDir ? px + 16 : px + 3;
-        ctx.fillStyle = "#e8f0ff";
+        ctx.fillStyle = darkMode ? "#e8f0ff" : "#1f2430";
         ctx.font = "600 11px system-ui,sans-serif";
         ctx.textBaseline = "middle";
         const rightEdge = r.showCount ? pw - 54 : pw - 4;
         drawClippedText(ctx, node?.name ?? "", textX, py + r.pxLabelH / 2, rightEdge - (textX - px));
 
         if (r.showCount) {
-          ctx.fillStyle = "rgba(232,240,255,0.78)";
+          ctx.fillStyle = darkMode ? "rgba(232,240,255,0.78)" : "rgba(31,36,48,0.74)";
           ctx.font = "10px system-ui,sans-serif";
           const countText = isDir
             ? `(${formatCount(node?.files ?? 0)})`
@@ -188,35 +221,47 @@ function drawRects(
       }
     }
 
-    // Draw children before overlays so overlays appear on top
-    drawRects(ctx, r.children, nodeById, selectedId, hoverId, dragOverId);
+    drawBase(ctx, r.children, nodeById, darkMode, r.color);
+  }
+}
 
-    // Overlays
-    if (r.nodeId === selectedId) {
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 2;
-      ctx.strokeRect(px + 1, py + 1, pw - 2, ph - 2);
+// Overlay layer: just the selection / hover / drag-over highlights (at most a
+// few rects), painted on a transparent canvas stacked above the base.
+function drawOverlay(
+  ctx: CanvasRenderingContext2D,
+  canvasW: number, canvasH: number,
+  rectById: Map<number, FlatRect>,
+  selectedId: number,
+  hoverId: number | null,
+  dragOverId: number | null,
+) {
+  ctx.clearRect(0, 0, canvasW, canvasH);
+
+  const hov = hoverId != null ? rectById.get(hoverId) : undefined;
+  if (hov) {
+    if (hov.pxLabelH > 0) {
+      ctx.fillStyle = "rgba(255,255,255,0.14)";
+      ctx.fillRect(hov.px, hov.py, hov.pw, hov.pxLabelH);
     }
-    if (r.nodeId === hoverId && r.nodeId !== selectedId) {
+    if (hoverId !== selectedId) {
       ctx.strokeStyle = "rgba(255,255,255,0.7)";
       ctx.lineWidth = 2;
-      ctx.strokeRect(px + 1, py + 1, pw - 2, ph - 2);
-      if (r.pxLabelH > 0) {
-        ctx.fillStyle = "rgba(255,255,255,0.14)";
-        ctx.fillRect(px, py, pw, r.pxLabelH);
-      }
-    } else if (r.nodeId === hoverId) {
-      // selected+hovered: still show hover label brightening
-      if (r.pxLabelH > 0) {
-        ctx.fillStyle = "rgba(255,255,255,0.14)";
-        ctx.fillRect(px, py, pw, r.pxLabelH);
-      }
+      ctx.strokeRect(hov.px + 1, hov.py + 1, hov.pw - 2, hov.ph - 2);
     }
-    if (r.nodeId === dragOverId) {
-      ctx.strokeStyle = "#f0c040";
-      ctx.lineWidth = 2;
-      ctx.strokeRect(px + 1, py + 1, pw - 2, ph - 2);
-    }
+  }
+
+  const sel = rectById.get(selectedId);
+  if (sel) {
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(sel.px + 1, sel.py + 1, sel.pw - 2, sel.ph - 2);
+  }
+
+  const drag = dragOverId != null ? rectById.get(dragOverId) : undefined;
+  if (drag) {
+    ctx.strokeStyle = "#f0c040";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(drag.px + 1, drag.py + 1, drag.pw - 2, drag.ph - 2);
   }
 }
 
@@ -237,6 +282,7 @@ interface TreemapProps {
   metric: Metric;
   unit: Unit;
   detail: number;
+  darkMode: boolean;
   showSingleFiles: boolean;
   show3D: boolean;
   showHierarchy: boolean;
@@ -250,17 +296,21 @@ interface TreemapProps {
 }
 
 export const Treemap = memo(function Treemap({
-  nodeById, selectedId, metric, unit, detail,
+  nodeById, selectedId, metric, unit, detail, darkMode,
   showSingleFiles, show3D, showHierarchy, showLegend, showLabels, dragDrop,
   onSelect, onNavigate, onOpen, onClose3D,
 }: TreemapProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerSize, setContainerSize] = useState({ w: DEFAULT_W, h: DEFAULT_H });
-  const [hoverId, setHoverId] = useState<number | null>(null);
+  const hoverIdRef = useRef<number | null>(null);
   const [dragSourceId, setDragSourceId] = useState<number | null>(null);
-  const [dragOverId, setDragOverId] = useState<number | null>(null);
+  const dragOverIdRef = useRef<number | null>(null);
   const rafRef = useRef<number>(0);
+  const overlayRafRef = useRef<number>(0);
+  const moveRafRef = useRef<number>(0);
+  const pendingMoveRef = useRef<{ mx: number; my: number; cx: number; cy: number } | null>(null);
   const tooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [tooltip, setTooltip] = useState<{ node: NodeRecord; x: number; y: number } | null>(null);
   const isDraggingRef = useRef(false);
@@ -281,7 +331,6 @@ export const Treemap = memo(function Treemap({
   }, []);
 
   const { maxTop, maxChildren, maxDepth } = useMemo(() => detailLimits(detail), [detail]);
-  const childrenMap = useMemo(() => buildChildrenMap(nodeById), [nodeById]);
 
   // Bundle nodes have negative IDs: id = -(parentId + 1), so parentId = -id - 1.
   const isBundleSelected = selectedId < 0;
@@ -294,7 +343,7 @@ export const Treemap = memo(function Treemap({
   }, [selectedId, nodeById]);
 
   const topItems = useMemo(() => {
-    const allKids = (childrenMap.get(viewId) ?? [])
+    const allKids = (nodeById.get(viewId)?.children ?? [])
       .map(id => nodeById.get(id))
       .filter((n): n is NodeRecord => {
         if (n === undefined || getValue(n, metric) <= 0) return false;
@@ -305,11 +354,12 @@ export const Treemap = memo(function Treemap({
     return allKids
       .sort((a, b) => getValue(b, metric) - getValue(a, metric))
       .slice(0, maxTop);
-  }, [viewId, isBundleSelected, nodeById, childrenMap, metric, maxTop, showSingleFiles]);
+  }, [viewId, isBundleSelected, nodeById, metric, maxTop, showSingleFiles]);
 
   const flatRects = useMemo(() => {
     const topRects = layoutTreemap(topItems, containerSize.w, containerSize.h, metric);
     const result: FlatRect[] = [];
+    const budget = { n: 0 };
     for (let i = 0; i < topRects.length; i++) {
       const branchColor = BRANCH_COLORS[i % BRANCH_COLORS.length];
       if (!showHierarchy) {
@@ -323,7 +373,7 @@ export const Treemap = memo(function Treemap({
           px: (rect.x / 100) * containerSize.w,
           py: (rect.y / 100) * containerSize.h,
           pw, ph,
-          color: branchColor,
+          color: fillColor(branchColor, 0, darkMode),
           depth: 0,
           showLabel: showLabels && labelH > 0 && pw >= 30,
           showCount: showLabels && labelH > 0 && pw >= 70,
@@ -332,10 +382,10 @@ export const Treemap = memo(function Treemap({
         });
       } else {
         const flat = flattenLayout(
-          [topRects[i]], nodeById, childrenMap,
+          [topRects[i]], nodeById,
           containerSize.w, containerSize.h,
           0, maxDepth, maxChildren, metric,
-          branchColor, 0, 0,
+          branchColor, 0, 0, budget, darkMode,
         );
         // If labels disabled, strip showLabel/showCount
         if (!showLabels) {
@@ -348,18 +398,32 @@ export const Treemap = memo(function Treemap({
       }
     }
     return result;
-  }, [topItems, containerSize, nodeById, childrenMap, maxDepth, maxChildren, metric, showHierarchy, showLabels]);
+  }, [topItems, containerSize, nodeById, maxDepth, maxChildren, metric, showHierarchy, showLabels, darkMode]);
+
+  // Flat node→rect index for O(1) overlay highlight lookup (no tree walk per
+  // hover). Rebuilt only when the layout changes.
+  const rectById = useMemo(() => {
+    const m = new Map<number, FlatRect>();
+    const walk = (rs: FlatRect[]) => {
+      for (const r of rs) {
+        m.set(r.nodeId, r);
+        if (r.children.length) walk(r.children);
+      }
+    };
+    walk(flatRects);
+    return m;
+  }, [flatRects]);
 
   // Legend data (top-level items with their colors)
   const legendItems = useMemo(() =>
     topItems.slice(0, BRANCH_COLORS.length).map((n, i) => ({
       node: n,
-      color: BRANCH_COLORS[i % BRANCH_COLORS.length],
+      color: fillColor(BRANCH_COLORS[i % BRANCH_COLORS.length], 0, darkMode),
     })),
-    [topItems],
+    [topItems, darkMode],
   );
 
-  // Redraw on any visual state change
+  // Base layer redraw: only when the layout itself changes (NOT hover/select).
   useEffect(() => {
     cancelAnimationFrame(rafRef.current);
     rafRef.current = requestAnimationFrame(() => {
@@ -368,9 +432,25 @@ export const Treemap = memo(function Treemap({
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      drawRects(ctx, flatRects, nodeById, selectedId, hoverId, dragOverId);
+      drawBase(ctx, flatRects, nodeById, darkMode);
     });
-  }, [flatRects, nodeById, selectedId, hoverId, dragOverId]);
+  }, [flatRects, nodeById, darkMode]);
+
+  // Overlay layer: hover/drag highlights live in refs and are painted imperatively
+  // (no React re-render per hovered cell). The effect only fires when the layout
+  // (rectById) or the selection changes.
+  const redrawOverlay = useCallback(() => {
+    const canvas = overlayRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    drawOverlay(ctx, canvas.width, canvas.height, rectById, selectedId, hoverIdRef.current, dragOverIdRef.current);
+  }, [rectById, selectedId]);
+
+  useEffect(() => {
+    cancelAnimationFrame(overlayRafRef.current);
+    overlayRafRef.current = requestAnimationFrame(redrawOverlay);
+  }, [redrawOverlay]);
 
   const getHit = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -379,11 +459,13 @@ export const Treemap = memo(function Treemap({
     return hitTest(flatRects, e.clientX - rect.left, e.clientY - rect.top);
   }, [flatRects]);
 
-  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    const hit = getHit(e);
-    const newHoverId = hit ? hit.nodeId : null;
-    setHoverId(newHoverId);
-
+  // Hit-test + hover state are computed at most once per animation frame so a
+  // fast mouse drag across a dense treemap can't queue up redundant work.
+  const processMove = useCallback(() => {
+    moveRafRef.current = 0;
+    const pm = pendingMoveRef.current;
+    if (!pm) return;
+    const hit = hitTest(flatRects, pm.mx, pm.my);
     const hitNode = hit ? nodeById.get(hit.nodeId) : null;
     if (canvasRef.current) {
       canvasRef.current.style.cursor =
@@ -393,27 +475,51 @@ export const Treemap = memo(function Treemap({
         : "default";
     }
 
-    // Drag-over tracking
-    if (isDraggingRef.current) {
-      setDragOverId(hitNode?.dir ? (hit!.nodeId) : null);
+    let changed = false;
+    const newHoverId = hit ? hit.nodeId : null;
+    if (newHoverId !== hoverIdRef.current) {
+      hoverIdRef.current = newHoverId;
+      changed = true;
     }
+    if (isDraggingRef.current) {
+      const newDragOverId = hitNode?.dir ? hit!.nodeId : null;
+      if (newDragOverId !== dragOverIdRef.current) {
+        dragOverIdRef.current = newDragOverId;
+        changed = true;
+      }
+    }
+    if (changed) redrawOverlay();
 
-    // Tooltip timer
     if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
     setTooltip(null);
     if (hit && hitNode) {
-      const cx = e.clientX, cy = e.clientY;
+      const cx = pm.cx, cy = pm.cy;
       tooltipTimerRef.current = setTimeout(() => {
         setTooltip({ node: hitNode, x: cx, y: cy });
       }, 400);
     }
-  }, [getHit, nodeById]);
+  }, [flatRects, nodeById, redrawOverlay]);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    pendingMoveRef.current = {
+      mx: e.clientX - rect.left,
+      my: e.clientY - rect.top,
+      cx: e.clientX,
+      cy: e.clientY,
+    };
+    if (!moveRafRef.current) moveRafRef.current = requestAnimationFrame(processMove);
+  }, [processMove]);
 
   const handleMouseLeave = useCallback(() => {
-    setHoverId(null);
+    if (moveRafRef.current) { cancelAnimationFrame(moveRafRef.current); moveRafRef.current = 0; }
+    pendingMoveRef.current = null;
+    if (hoverIdRef.current !== null) { hoverIdRef.current = null; redrawOverlay(); }
     if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
     setTooltip(null);
-  }, []);
+  }, [redrawOverlay]);
 
   const handleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (isDraggingRef.current) return;
@@ -445,9 +551,10 @@ export const Treemap = memo(function Treemap({
     if (!isDraggingRef.current) return;
     isDraggingRef.current = false;
     const srcId = dragSourceId;
-    const dstId = dragOverId;
+    const dstId = dragOverIdRef.current;
     setDragSourceId(null);
-    setDragOverId(null);
+    dragOverIdRef.current = null;
+    redrawOverlay();
     if (canvasRef.current) canvasRef.current.style.cursor = "default";
 
     if (srcId == null || dstId == null || srcId === dstId) return;
@@ -459,7 +566,7 @@ export const Treemap = memo(function Treemap({
     const newPath = dst.path + sep + srcName;
     const result = await moveItem(src.path, newPath);
     if (!result.ok) alert(`Move failed: ${result.error}`);
-  }, [dragSourceId, dragOverId, nodeById]);
+  }, [dragSourceId, nodeById, redrawOverlay]);
 
   return (
     <>
@@ -486,6 +593,12 @@ export const Treemap = memo(function Treemap({
             onDoubleClick={handleDoubleClick}
             onMouseDown={handleMouseDown}
             onMouseUp={handleMouseUp}
+          />
+          <canvas
+            ref={overlayRef}
+            width={containerSize.w}
+            height={containerSize.h}
+            className="treemap-overlay"
           />
           {tooltip && (
             <NodeTooltip

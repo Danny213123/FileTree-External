@@ -20,6 +20,7 @@ run.bat
 
 # Local media / screenshots
 /images/
+/.verify_*.png
 
 # --- Build outputs / stray files (not needed to build or run) ---
 # Packaged Electron app (regenerate via build-portable.bat)

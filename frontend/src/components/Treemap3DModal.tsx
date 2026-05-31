@@ -67,8 +67,9 @@ export function Treemap3DModal({ nodeById, viewId, metric, onClose, onNavigate }
 
   const items = useMemo(() => {
     const kids: NodeRecord[] = [];
-    for (const n of nodeById.values()) {
-      if (n.parent === viewId) kids.push(n);
+    for (const cid of nodeById.get(viewId)?.children ?? []) {
+      const child = nodeById.get(cid);
+      if (child) kids.push(child);
     }
     return kids
       .filter(n => getValue(n, metric) > 0)

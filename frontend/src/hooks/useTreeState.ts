@@ -200,8 +200,13 @@ function collectVisibleRows(
   const root = nodeById.get(0);
   if (!root) return [];
 
-  const isOpen = (id: number) =>
-    expandedAll ? !collapsedOverrides.has(id) : expanded.has(id);
+  // File bundles (negative ids) are always opt-in via `expanded`, even under
+  // Expand All — auto-opening them would materialise every file in the folder as
+  // its own row (the ~700k-row freeze). Real folders honour Expand All.
+  const isOpen = (id: number) => {
+    if (id < 0) return expanded.has(id);
+    return expandedAll ? !collapsedOverrides.has(id) : expanded.has(id);
+  };
 
   // Determine which filtering mode is active.
   // Rules take precedence when any rule has a non-empty value.
@@ -283,10 +288,11 @@ export function useTreeState(): UseTreeStateReturn {
   const [unit, setUnit] = useState<Unit>("auto");
   const [showFiles, setShowFiles] = useState(true);
 
-  const nodeById = useMemo(
-    () => new Map(nodes.map((n) => [n.id, n])),
-    [nodes],
-  );
+  const nodeById = useMemo(() => {
+    const m = new Map<number, NodeRecord>();
+    for (const n of nodes) m.set(n.id, n);
+    return m;
+  }, [nodes]);
 
   // Rebuild sort+bundle cache only when data or sort changes — not on expand/filter
   const dirCache = useMemo(
@@ -303,7 +309,7 @@ export function useTreeState(): UseTreeStateReturn {
   );
 
   const toggleExpand = useCallback((id: number) => {
-    if (expandedAll) {
+    if (expandedAll && id >= 0) {
       setCollapsedOverrides((prev) => {
         const next = new Set(prev);
         if (next.has(id)) next.delete(id); // re-open a manually-collapsed node
@@ -512,8 +518,19 @@ export function useTreeState(): UseTreeStateReturn {
       // that are NOT under a preserved subfolder (old file children + entries
       // that disappeared). Preserved subfolders + descendants are retained as-is.
       const changedPathNorm = changedPath.toLowerCase();
-      const underPreserved = (p: string) =>
-        preservedDirPaths.some((pp) => p === pp || p.startsWith(pp + "\\") || p.startsWith(pp + "/"));
+      // O(1) membership instead of O(preservedDirPaths) per node: a path is
+      // "under preserved" iff itself or one of its ancestor dirs is preserved.
+      const preservedSet = new Set(preservedDirPaths);
+      const underPreserved = (p: string) => {
+        if (preservedSet.has(p)) return true;
+        let cur = p;
+        for (;;) {
+          const i = Math.max(cur.lastIndexOf("\\"), cur.lastIndexOf("/"));
+          if (i <= 0) return false;
+          cur = cur.slice(0, i);
+          if (preservedSet.has(cur)) return true;
+        }
+      };
       const kept = prevNodes.filter((n) => {
         if (n.id === targetNode.id) return false; // replaced by newRoot
         const p = n.path.toLowerCase();

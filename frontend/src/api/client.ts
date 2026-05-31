@@ -209,6 +209,14 @@ export interface AppSettings {
   sortDir?: number;
   openTabs?: string[];
   recentPaths?: string[];
+  // VS Code workbench layout
+  activeView?: string;
+  sidebarOpen?: boolean;
+  sidebarWidth?: number;
+  panelOpen?: boolean;
+  panelHeight?: number;
+  chatOpen?: boolean;
+  chatWidth?: number;
 }
 
 export async function fetchSettings(): Promise<AppSettings> {
@@ -284,11 +292,66 @@ export async function* streamAiChat(
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      try {
-        const parsed = JSON.parse(trimmed) as { message?: { content?: string }; done?: boolean; error?: string };
-        if (parsed.error) throw new Error(parsed.error);
-        if (parsed.message?.content) yield parsed.message.content;
-      } catch { /* skip malformed */ }
+      // Parse and error-handling are kept separate so a provider-reported
+      // error is surfaced (thrown) rather than swallowed by the parse catch.
+      let parsed: { message?: { content?: string }; done?: boolean; error?: string } | null = null;
+      try { parsed = JSON.parse(trimmed); } catch { parsed = null; }
+      if (!parsed) continue;
+      if (parsed.error) throw new Error(parsed.error);
+      if (parsed.message?.content) yield parsed.message.content;
+    }
+  }
+}
+
+// ── Agentic AI chat (tool-calling) ───────────────────────────
+
+export interface OllamaToolCall {
+  function: { name: string; arguments: Record<string, unknown> | string };
+}
+export type ChatRole = "system" | "user" | "assistant" | "tool";
+export interface OllamaMessage {
+  role: ChatRole;
+  content: string;
+  tool_calls?: OllamaToolCall[];
+}
+export type AgentChatEvent =
+  | { type: "text"; value: string }
+  | { type: "tool_calls"; value: OllamaToolCall[] };
+
+// Stream a chat turn that may include tool definitions. The Rust server forwards
+// the body verbatim to Ollama /api/chat, so `tools` and role:"tool" messages pass
+// straight through, and `message.tool_calls` is surfaced from the NDJSON stream.
+export async function* streamAgentChat(
+  model: string,
+  messages: OllamaMessage[],
+  tools: unknown[] | undefined,
+  signal?: AbortSignal,
+): AsyncGenerator<AgentChatEvent> {
+  const res = await fetch("/api/ai-chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, messages, tools, stream: true }),
+    signal,
+  });
+  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let parsed: { message?: OllamaMessage; done?: boolean; error?: string };
+      try { parsed = JSON.parse(trimmed); } catch { continue; }
+      if (parsed.error) throw new Error(parsed.error);
+      const msg = parsed.message;
+      if (msg?.tool_calls?.length) yield { type: "tool_calls", value: msg.tool_calls };
+      if (msg?.content) yield { type: "text", value: msg.content };
     }
   }
 }

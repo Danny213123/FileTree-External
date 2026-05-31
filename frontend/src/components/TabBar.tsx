@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { Icon } from "./Icon";
 
 interface WorkspaceTab {
   id: string;
@@ -202,7 +203,7 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
                   className="wtab-close"
                   title="Close tab"
                   onClick={(e2) => { e2.stopPropagation(); onClose(tab.id); }}
-                >×</button>
+                ><Icon name="x" size={12} /></button>
               )}
             </div>
           </div>
@@ -228,7 +229,7 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
         onDrop={(e) => {
           if (isFolderDrag(e)) { e.preventDefault(); e.stopPropagation(); const path = folderPathFromDrag(e); clearAll(); if (path) onFolderDrop(path); }
         }}
-      >+</button>
+      ><Icon name="plus" size={14} /></button>
     </div>
   );
 }

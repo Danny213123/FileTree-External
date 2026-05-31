@@ -12,6 +12,8 @@ crate-type = ["cdylib"]
 [dependencies]
 napi = { version = "2", default-features = false, features = ["napi4"] }
 napi-derive = "2"
+# Cross-platform pseudo-terminal (ConPTY on Windows) for the integrated terminal.
+portable-pty = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 # windows-core must be a direct dependency: the `#[implement]` macro expands to

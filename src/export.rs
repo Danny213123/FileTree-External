@@ -2,9 +2,6 @@ use std::env;
 use std::io::Write;
 use std::path::PathBuf;
 
-use crate::analytics::{
-    age_stats, duplicate_candidates, extension_stats, largest_dir_ids, top_file_ids,
-};
 use crate::cli::{APP_NAME, APP_VERSION};
 use crate::io::{default_thread_count, epoch_ms_to_utc, path_to_string};
 use crate::model::{AppState, ScanResult};
@@ -12,11 +9,13 @@ use crate::model::{AppState, ScanResult};
 /// Write scan result JSON directly to any `Write` impl (e.g. a TCP stream).
 /// Avoids materialising a 300-400 MB intermediate String for large scans.
 pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -> std::io::Result<()> {
-    let top_files = top_file_ids(&result.nodes, 100);
-    let largest_dirs = largest_dir_ids(&result.nodes, 100);
-    let extension_stats = extension_stats(&result.nodes, 80);
-    let age_stats = age_stats(&result.nodes, result.scanned_at_ms);
-    let duplicate_candidates = duplicate_candidates(&result.nodes, 100);
+    // Reuse analytics computed once at scan time (no per-response recompute).
+    // These are small, capped collections, so cloning them is negligible.
+    let top_files = result.summary.top_files.clone();
+    let largest_dirs = result.summary.largest_dirs.clone();
+    let extension_stats = result.summary.extension_stats.clone();
+    let age_stats = result.summary.age_stats.clone();
+    let duplicate_candidates = result.summary.duplicate_candidates.clone();
 
     // Use a 64 KB write buffer so we're not calling the underlying writer for every field.
     let mut buf = Vec::with_capacity(65536);
@@ -118,11 +117,11 @@ pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -
 ///   {"type":"node","id":N,"parent":N|null,...}   ← one per node
 ///   {"type":"done"}
 pub(crate) fn write_scan_result_ndjson<W: Write>(w: &mut W, result: &ScanResult) -> std::io::Result<()> {
-    let top_files        = top_file_ids(&result.nodes, 100);
-    let largest_dirs     = largest_dir_ids(&result.nodes, 100);
-    let ext_stats        = extension_stats(&result.nodes, 80);
-    let age_st           = age_stats(&result.nodes, result.scanned_at_ms);
-    let dup_cands        = duplicate_candidates(&result.nodes, 100);
+    let top_files        = result.summary.top_files.clone();
+    let largest_dirs     = result.summary.largest_dirs.clone();
+    let ext_stats        = result.summary.extension_stats.clone();
+    let age_st           = result.summary.age_stats.clone();
+    let dup_cands        = result.summary.duplicate_candidates.clone();
 
     let mut buf = Vec::with_capacity(65536);
 

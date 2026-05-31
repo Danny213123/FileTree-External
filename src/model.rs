@@ -53,6 +53,20 @@ pub(crate) struct ScanResult {
     pub(crate) thread_count: usize,
     pub(crate) nodes: Vec<NodeRecord>,
     pub(crate) errors: Vec<ScanError>,
+    /// Capped analytics computed once when the scan finalises, so JSON/NDJSON
+    /// responses, cache hits, and exports reuse them instead of recomputing.
+    pub(crate) summary: ScanSummary,
+}
+
+/// Precomputed, size-capped analytics for a scan. Built once in
+/// `snapshot_scan_result` and stored on `ScanResult`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ScanSummary {
+    pub(crate) top_files: Vec<usize>,
+    pub(crate) largest_dirs: Vec<usize>,
+    pub(crate) extension_stats: Vec<ExtensionStat>,
+    pub(crate) age_stats: Vec<AgeBucket>,
+    pub(crate) duplicate_candidates: Vec<DuplicateCandidate>,
 }
 
 #[derive(Debug)]
@@ -104,7 +118,7 @@ pub(crate) struct HttpRequest {
     pub(crate) body: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ExtensionStat {
     pub(crate) ext: String,
     pub(crate) bytes: u64,
@@ -112,14 +126,14 @@ pub(crate) struct ExtensionStat {
     pub(crate) files: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AgeBucket {
     pub(crate) label: &'static str,
     pub(crate) bytes: u64,
     pub(crate) files: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct DuplicateCandidate {
     pub(crate) name: String,
     pub(crate) size: u64,
