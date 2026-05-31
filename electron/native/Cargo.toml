@@ -1,0 +1,41 @@
+[package]
+name = "filetree-drag"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Native Windows shell drag-and-drop with real drop-effect reporting for FileTree"
+
+[lib]
+name = "filetree_drag"
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi4"] }
+napi-derive = "2"
+
+[target.'cfg(windows)'.dependencies]
+# windows-core must be a direct dependency: the `#[implement]` macro expands to
+# `windows_core::` paths that have to resolve at the crate root.
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+strip = true

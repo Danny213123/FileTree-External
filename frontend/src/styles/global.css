@@ -1023,6 +1023,23 @@ input:focus, select:focus {
 .name-text { overflow: hidden; text-overflow: ellipsis; font-weight: 400; }
 .name-text.bundle-label { color: var(--muted); font-style: italic; }
 
+/* Inline rename box (TreeSize/Explorer-style F2 editing). */
+.name-edit {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 16px;
+  margin: 0;
+  padding: 0 2px;
+  font: inherit;
+  line-height: 16px;
+  color: #000;
+  background: #fff;
+  border: 1px solid #0078d4;
+  border-radius: 1px;
+  outline: none;
+  box-sizing: border-box;
+}
+
 .row.hidden-entry { opacity: 0.55; }
 .row.hidden-entry.selected { opacity: 0.8; }
 
@@ -1865,6 +1882,87 @@ input:focus, select:focus {
 }
 
 .fd-clear:hover { background: rgba(196,43,28,0.15); color: #ff9090; transform: none; box-shadow: none; }
+
+/* ── Move conflict dialog ──────────────────────────────────── */
+
+.conflict-dialog {
+  background: #2b2b2b;
+  border: 1px solid #555;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  min-width: 420px;
+  max-width: 560px;
+  width: 90vw;
+  display: flex;
+  flex-direction: column;
+  color: #e8e8e8;
+  font-size: 12px;
+}
+
+.cd-body {
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cd-msg {
+  margin: 0;
+  color: #cfcfcf;
+}
+
+.cd-list {
+  margin: 0;
+  padding: 6px 8px;
+  list-style: none;
+  max-height: 200px;
+  overflow-y: auto;
+  background: #222;
+  border: 1px solid #3c3c3c;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cd-list li {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #e8e8e8;
+}
+
+.cd-list .cd-more {
+  color: #9a9a9a;
+  font-style: italic;
+}
+
+.cd-keep {
+  height: 28px;
+  padding: 0 16px;
+  background: #3a3a3a;
+  border: 1px solid #666;
+  color: #e8e8e8;
+  font-size: 12px;
+  border-radius: 0;
+  cursor: pointer;
+  min-height: 0;
+}
+
+.cd-keep:hover { background: #4a4a4a; color: #fff; transform: none; box-shadow: none; }
+
+.move-toast {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9500;
+  background: #2b2b2b;
+  border: 1px solid #555;
+  color: #e8e8e8;
+  font-size: 12px;
+  padding: 8px 16px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+}
 
 /* ── Dark mode ─────────────────────────────────────────────── */
 

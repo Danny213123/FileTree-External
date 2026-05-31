@@ -4,7 +4,8 @@
   "description": "FileTree disk-usage explorer",
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm run build:native",
+    "build:native": "node scripts/build-native.mjs",
     "start": "npm run build && electron .",
     "dev": "tsc && electron ."
   },

@@ -5,6 +5,7 @@ import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCa
 import {
   revealPath, openPath, shellContextMenu, createFolder, fetchScan,
   copyPath, renameItem, moveItems, deletePath, copyFiles,
+  hasNativeMove, moveItemsNative,
 } from "../api/client";
 import type { ScanOptions } from "../api/client";
 import type { DriveEntry, NodeRecord, SpecialFolder, SortKey } from "../api/types";
@@ -18,6 +19,7 @@ import { AgeTab } from "./AgeTab";
 import { TopFilesTab } from "./TopFilesTab";
 import { DuplicatesTab } from "./DuplicatesTab";
 import { ErrorsTab } from "./ErrorsTab";
+import { ConflictDialog, type ConflictChoice } from "./ConflictDialog";
 import { BookmarksTab } from "./BookmarksTab";
 import { AiChatTab } from "./AiChatTab";
 import { DuplicateFinder } from "./DuplicateFinder";
@@ -171,7 +173,7 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   const suppressWatchRef = useRef(false);
 
 
-  const doScan = useCallback((path?: string, t?: number) => {
+  const doScan = useCallback((path?: string, t?: number, forceFresh?: boolean) => {
     const p = path ?? scanPath;
     if (!p.trim()) return;
     const opts: ScanOptions = {
@@ -180,6 +182,10 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
       includeHidden,
       followLinks,
       excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
+      // Bypass the server's 5-min scan cache. Required after a native move,
+      // which mutates the disk without going through the server (so the cache
+      // is stale and would re-show the moved file in its old location).
+      nocache: forceFresh || undefined,
     };
     const isRefresh = p.trim() === lastCompletedPathRef.current;
     console.log("[doScan] path=", p, "isRefresh=", isRefresh, "lastCompletedPath=", lastCompletedPathRef.current);
@@ -409,15 +415,22 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   }, [tree]);
 
   const handleContextMenu = useCallback((id: number, x: number, y: number) => {
-    if (!selectedIds.has(id)) {
+    const alreadySelected = selectedIds.has(id);
+    if (!alreadySelected) {
       handleSelectRow(id, "single");
     }
     const node = tree.nodeById.get(id);
     if (!node || node.id < 0 || !node.path) return;
-    // Pass screen coordinates (not client/CSS coords) so Win32 TrackPopupMenu places correctly.
-    // The backend uses GetCursorPos() which gives real screen coords, so x/y here are
-    // informational only — the backend ignores them and reads the cursor directly.
-    shellContextMenu(node.path, x, y).catch(() => {});
+    // Right-clicking inside an existing multi-selection acts on the whole
+    // selection (like Explorer); otherwise just the row under the cursor.
+    const targets = alreadySelected && selectedIds.size > 1
+      ? [...selectedIds]
+          .map((sid) => tree.nodeById.get(sid)?.path)
+          .filter((p): p is string => !!p)
+      : [node.path];
+    // The native menu reads the live cursor position (real screen coords), so
+    // x/y are informational only here.
+    shellContextMenu(targets, x, y).catch(() => {});
   }, [handleSelectRow, selectedIds, tree]);
 
   const handleDblClick = useCallback((id: number) => {
@@ -525,18 +538,37 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
   const runOpen     = useCallback(() => { if (selectedNode) openPath(selectedNode.path); }, [selectedNode]);
   const runCopyPath = useCallback(() => { if (selectedNode) copyPath(selectedNode.path).catch(() => {}); }, [selectedNode]);
 
-  const runRenamePath = useCallback(async (targetPath?: string) => {
+  // id of the row whose name is being edited inline (TreeSize-style F2 rename).
+  // window.prompt is unsupported in Electron's renderer, so we edit in-place.
+  const [renamingId, setRenamingId] = useState<number | null>(null);
+
+  const runRenamePath = useCallback((targetPath?: string) => {
     const pathToRename = targetPath ?? selectedNode?.path;
     if (!pathToRename) return;
-    const currentName = nodeByPath.get(pathToRename)?.name ?? selectedNode?.name ?? basenameFromPath(pathToRename);
-    const newName = window.prompt("Rename to:", currentName);
-    if (!newName?.trim() || newName.trim() === currentName) return;
-    const result = await renameItem(pathToRename, newName.trim());
-    if (!result.ok) { alert(`Rename failed: ${result.error ?? "unknown error"}`); return; }
-    doScan();
-  }, [selectedNode, nodeByPath, doScan]);
+    const id = nodeByPath.get(pathToRename)?.id
+      ?? (pathToRename === selectedNode?.path ? selectedNode?.id : undefined);
+    if (id == null) return;
+    tree.setSelectedId(id); // ensure the row is the active/visible one
+    setRenamingId(id);
+  }, [selectedNode, nodeByPath, tree]);
 
-  const runRename = useCallback(() => { void runRenamePath(); }, [runRenamePath]);
+  const runRename = useCallback(() => { runRenamePath(); }, [runRenamePath]);
+
+  const cancelRename = useCallback(() => setRenamingId(null), []);
+
+  const commitRename = useCallback(async (id: number, rawName: string) => {
+    setRenamingId(null);
+    const node = tree.nodeById.get(id);
+    if (!node) return;
+    const newName = rawName.trim();
+    if (!newName || newName === node.name) return;
+    const result = await renameItem(node.path, newName);
+    if (!result.ok) { alert(`Rename failed: ${result.error ?? "unknown error"}`); return; }
+    // The rename mutated the folder listing; bypass the (now stale) scan cache
+    // so the tree shows the new name instead of a ghost of the old one.
+    invalidateAllScanCache();
+    doScan(undefined, undefined, true);
+  }, [tree.nodeById, doScan]);
 
   const runDeletePaths = useCallback(async (paths?: string[]) => {
     const targetPaths = paths && paths.length > 0 ? dedupeNestedPaths(paths, nodeByPath) : selectedPaths;
@@ -553,50 +585,100 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
 
   const runDelete = useCallback(() => { void runDeletePaths(); }, [runDeletePaths]);
 
+  // Conflict dialog + transient notice state, shared by drag-drop moves and the
+  // "Move to" command.
+  const [conflictPrompt, setConflictPrompt] = useState<{
+    names: string[];
+    resolve: (choice: ConflictChoice) => void;
+  } | null>(null);
+  const [moveNotice, setMoveNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!moveNotice) return;
+    const timer = window.setTimeout(() => setMoveNotice(null), 2600);
+    return () => window.clearTimeout(timer);
+  }, [moveNotice]);
+
+  const askConflict = useCallback(
+    (names: string[]) =>
+      new Promise<ConflictChoice>((resolve) => setConflictPrompt({ names, resolve })),
+    [],
+  );
+  const handleConflictChoice = useCallback((choice: ConflictChoice) => {
+    setConflictPrompt((prev) => { prev?.resolve(choice); return null; });
+  }, []);
+
+  // Move the clean items, then, if any names collide, ask the user
+  // (Replace / Keep both / Skip) and resolve. Returns combined errors.
+  const runMoveWithConflicts = useCallback(
+    async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string }> => {
+      const detected = await moveItems(sources, destination);
+      const allErrors = [...detected.errors];
+      if (detected.conflicts.length > 0) {
+        const choice = await askConflict(detected.conflicts.map((c) => c.name));
+        if (choice === "replace" || choice === "keep-both") {
+          const resolved = await moveItems(
+            detected.conflicts.map((c) => c.src),
+            destination,
+            choice,
+          );
+          allErrors.push(...resolved.errors);
+        }
+        // "skip" / "cancel": leave the conflicting items untouched.
+      } else if (detected.alreadyThere.length > 0 && detected.moved.length === 0) {
+        const n = detected.alreadyThere.length;
+        setMoveNotice(n === 1 ? "Already in this folder." : `${n} items are already in this folder.`);
+      }
+      return allErrors.length > 0 ? { ok: false, error: allErrors.join("; ") } : { ok: true };
+    },
+    [askConflict],
+  );
+
   const runMoveTo = useCallback(async () => {
     if (selectedPaths.length === 0) return;
     const dest = window.prompt("Move to folder:");
     if (!dest?.trim()) return;
-    const result = await moveItems(selectedPaths, dest.trim());
-    if (!result.ok) { alert(`Move failed: ${result.error ?? "unknown error"}`); return; }
+    const outcome = await runMoveWithConflicts(selectedPaths, dest.trim());
+    if (!outcome.ok) { alert(`Move failed: ${outcome.error ?? "unknown error"}`); return; }
     doScan();
-  }, [selectedPaths, doScan]);
+  }, [selectedPaths, doScan, runMoveWithConflicts]);
 
   const runCopyFiles = useCallback(() => {
     if (selectedPaths.length > 0) copyFiles(selectedPaths).catch(() => {});
   }, [selectedPaths]);
 
   const handleInternalMove = useCallback(async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string }> => {
-    console.log("[move] handleInternalMove sources=", sources, "destination=", destination);
     if (sources.length === 0 || !destination) return { ok: true };
     if (sources.some(s => destination === s || destination.startsWith(s + "\\") || destination.startsWith(s + "/"))) {
       return { ok: false, error: "Cannot move a folder into itself or one of its descendants." };
     }
     try {
-      const result = await moveItems(sources, destination);
-      console.log("[move] moveItems result=", result);
-      if (!result.ok) return result;
-      console.log("[move] invalidating ALL client cache, then doScan. scanPath=", scanPath, "lastCompletedPath=", lastCompletedPathRef.current);
-      // Suppress the fs-events watcher patch - it fires with maxDepth=1 (size=0 for folders)
-      // and would overwrite the correct aggregate sizes from the full rescan we're about to do.
+      // Suppress the fs-events watcher patch during the move + rescan — it fires
+      // with maxDepth=1 (folders momentarily 0 B) and would race the full rescan.
       suppressWatchRef.current = true;
+      let outcome: { ok: boolean; error?: string };
+      if (hasNativeMove()) {
+        // Hand the move to the Windows shell (IFileOperation): the user gets the
+        // real native dialogs — progress, Replace / Skip / Keep both, "the source
+        // and destination file names are the same", elevation — exactly like
+        // Explorer/TreeSize. We then rescan to reflect whatever happened on disk.
+        await moveItemsNative(sources, destination);
+        outcome = { ok: true };
+      } else {
+        // Browser / non-Electron fallback: backend move + in-app conflict dialog.
+        outcome = await runMoveWithConflicts(sources, destination);
+      }
       invalidateAllScanCache();
-      doScan();
-      return { ok: true };
+      // Force-fresh: the native move bypassed the server, so its cached tree is
+      // stale. Without nocache the rescan would re-show the moved file in its old
+      // spot ("ghost" row pointing at a vanished path — can't drag or rename it).
+      doScan(undefined, undefined, true);
+      return outcome;
     } catch (error) {
+      suppressWatchRef.current = false;
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
-  }, [doScan, scanPath]);
-
-  const handleExternalMove = useCallback(async (paths: string[]) => {
-    // paths is empty when OS already moved the file; non-empty means we must delete.
-    for (const p of paths) {
-      await deletePath(p).catch(() => {});
-    }
-    suppressWatchRef.current = true;
-    invalidateAllScanCache();
-    doScan();
-  }, [doScan]);
+  }, [doScan, runMoveWithConflicts]);
 
   // Expose API to parent via ref
   useImperativeHandle(ref, () => ({
@@ -722,10 +804,12 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
           onContextMenu={handleContextMenu}
           onCopySelected={runCopyFiles}
           onMoveItems={handleInternalMove}
-          onExternalMove={handleExternalMove}
           onSortChange={(k: SortKey) => tree.setSortKey(k)}
           bookmarks={bookmarkSet}
           onToggleBookmark={onToggleBookmark}
+          renamingId={renamingId}
+          onRenameCommit={commitRename}
+          onRenameCancel={cancelRename}
         />
 
         <div className="side-pane">
@@ -840,6 +924,12 @@ export const WorkspaceTab = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(fu
           onClose={() => setFilterDialogOpen(false)}
         />
       )}
+
+      {conflictPrompt && (
+        <ConflictDialog names={conflictPrompt.names} onChoice={handleConflictChoice} />
+      )}
+
+      {moveNotice && <div className="move-toast" role="status">{moveNotice}</div>}
     </div>
   );
 });

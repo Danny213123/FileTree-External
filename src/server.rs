@@ -122,17 +122,10 @@ fn copy_path_recursive(src: &Path, dst: &Path) -> sio::Result<()> {
     }
 }
 
-fn move_path_or_copy_remove(src: &Path, dst: &Path) -> sio::Result<()> {
-    if paths_refer_to_same_file(src, dst) {
-        return Ok(());
-    }
-    if dst.exists() {
-        return Err(sio::Error::new(
-            sio::ErrorKind::AlreadyExists,
-            format!("destination already exists: {}", dst.display()),
-        ));
-    }
-
+/// Move `src` onto `dst` assuming the caller has already ensured `dst` does not
+/// exist (or has removed/renamed around it). Tries an atomic rename first, then
+/// falls back to copy + remove for cross-device moves.
+fn rename_or_copy_remove(src: &Path, dst: &Path) -> sio::Result<()> {
     match fs::rename(src, dst) {
         Ok(_) => Ok(()),
         Err(rename_error) => {
@@ -157,6 +150,45 @@ fn move_path_or_copy_remove(src: &Path, dst: &Path) -> sio::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Pick a non-colliding path inside `dir` for an item named `name`, appending
+/// " (2)", " (3)", ... before the extension — the Explorer "Keep both" rule.
+fn unique_target(dir: &Path, name: &str) -> PathBuf {
+    let initial = dir.join(name);
+    if !initial.exists() {
+        return initial;
+    }
+    let name_path = Path::new(name);
+    let stem = name_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_string());
+    let ext = name_path.extension().map(|e| e.to_string_lossy().to_string());
+    let mut n: u32 = 2;
+    loop {
+        let candidate_name = match &ext {
+            Some(ext) => format!("{stem} ({n}).{ext}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = dir.join(candidate_name);
+        if !candidate.exists() || n >= 9999 {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Append a JSON array of strings (each escaped) to `out`.
+fn push_json_string_array(out: &mut String, items: &[String]) {
+    out.push('[');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(out, item);
+    }
+    out.push(']');
 }
 
 /// Extract a single string value from naive JSON: `"key":"value"` or `"key": "value"`.
@@ -370,13 +402,21 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     .unwrap_or_else(default_thread_count),
             };
 
+            // A depth-limited (maxdepth) or nocache scan is only a PARTIAL view of
+            // the directory — e.g. the watcher's maxDepth=1 patch returns immediate
+            // children with subfolders reported as "depth limit reached" / 0 B. It
+            // must never be written to the shared cache or last_scan, or a later
+            // full scan / refresh / export would serve that shallow result. The
+            // cache key is path-only, so an unguarded write here poisons full scans.
+            let is_partial = skip_cache || options.max_depth.is_some();
+
             match scan_path(options) {
                 Ok(result) => {
                     let node_count = result.nodes.len();
                     let result = Arc::new(result);
-                    *state.last_scan.lock().expect("scan lock poisoned") =
-                        Some(Arc::clone(&result));
-                    {
+                    if !is_partial {
+                        *state.last_scan.lock().expect("scan lock poisoned") =
+                            Some(Arc::clone(&result));
                         let mut cache = state.scan_cache.lock().expect("scan_cache lock");
                         // Keep only the most recent entry to cap peak memory.
                         if cache.len() >= 2 {
@@ -389,6 +429,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         }
                         cache.insert(cache_key.clone(), (Arc::clone(&result), Instant::now()));
                         eprintln!("[mem] scan done: path={cache_key:?} nodes={node_count} cache_entries={}", cache.len());
+                    } else {
+                        eprintln!("[mem] partial scan (not cached): path={cache_key:?} nodes={node_count}");
                     }
                     // Stream JSON directly to avoid building a 300-400 MB intermediate String.
                     write!(
@@ -961,6 +1003,11 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let body_str = String::from_utf8_lossy(&request.body);
             let dest = extract_json_str(&body_str, "destination").unwrap_or_default();
             let paths = extract_json_str_array(&body_str, "paths");
+            // How to resolve name collisions. Empty = "detect": never overwrite,
+            // just report each collision so the renderer can prompt the user.
+            // "replace" | "keep-both" | "skip" come back on the second call once
+            // the user has chosen in the conflict dialog.
+            let conflict = extract_json_str(&body_str, "conflict").unwrap_or_default();
             if dest.is_empty() || paths.is_empty() {
                 return respond_text(&mut stream, 400, "Bad request", "Missing destination or paths");
             }
@@ -968,14 +1015,19 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             if !dest_buf.is_dir() {
                 return respond_text(&mut stream, 400, "Bad request", "Destination is not a directory");
             }
+            let mut moved: Vec<String> = Vec::new();
+            let mut already_there: Vec<String> = Vec::new();
+            let mut conflicts: Vec<(String, String)> = Vec::new();
+            let mut skipped: Vec<String> = Vec::new();
             let mut errors: Vec<String> = Vec::new();
             let mut touched_parents: Vec<PathBuf> = Vec::new();
             for p in &paths {
                 let src = PathBuf::from(p);
-                let Some(name) = src.file_name() else {
+                let Some(name_os) = src.file_name() else {
                     errors.push(format!("{p}: invalid path"));
                     continue;
                 };
+                let name = name_os.to_string_lossy().to_string();
                 let Ok(src_metadata) = fs::symlink_metadata(&src) else {
                     errors.push(format!("{p}: source does not exist"));
                     continue;
@@ -988,29 +1040,83 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         continue;
                     }
                 }
-                let target = dest_buf.join(name);
-                if let Err(e) = move_path_or_copy_remove(&src, &target) {
-                    errors.push(format!("{p}: {e}"));
+                let target = dest_buf.join(&name);
+
+                // The very same file already lives here -> nothing to do.
+                if paths_refer_to_same_file(&src, &target) {
+                    already_there.push(p.clone());
                     continue;
                 }
-                if let Some(parent) = src.parent() {
-                    touched_parents.push(parent.to_path_buf());
+
+                let move_result = if target.exists() {
+                    match conflict.as_str() {
+                        "skip" => {
+                            skipped.push(p.clone());
+                            continue;
+                        }
+                        "replace" => {
+                            if let Err(e) = remove_after_copy(&target) {
+                                errors.push(format!("{p}: could not replace existing item: {e}"));
+                                continue;
+                            }
+                            rename_or_copy_remove(&src, &target)
+                        }
+                        "keep-both" => {
+                            let unique = unique_target(&dest_buf, &name);
+                            rename_or_copy_remove(&src, &unique)
+                        }
+                        _ => {
+                            // Detect mode: report the collision, touch nothing.
+                            conflicts.push((p.clone(), name.clone()));
+                            continue;
+                        }
+                    }
+                } else {
+                    rename_or_copy_remove(&src, &target)
+                };
+
+                match move_result {
+                    Ok(()) => {
+                        moved.push(p.clone());
+                        if let Some(parent) = src.parent() {
+                            touched_parents.push(parent.to_path_buf());
+                        }
+                    }
+                    Err(e) => errors.push(format!("{p}: {e}")),
                 }
             }
             touched_parents.push(dest_buf.clone());
-            let mut cache = state.scan_cache.lock().expect("scan_cache lock");
-            for p in &touched_parents {
-                invalidate_scan_cache(&mut cache, &p.to_string_lossy());
+            {
+                let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                for p in &touched_parents {
+                    invalidate_scan_cache(&mut cache, &p.to_string_lossy());
+                }
             }
-            drop(cache);
-            if errors.is_empty() {
-                respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
-            } else {
-                let mut body = String::from("{\"error\":");
-                push_json_string(&mut body, &errors.join("; "));
+
+            let mut body = String::new();
+            body.push_str("{\"ok\":");
+            body.push_str(if errors.is_empty() { "true" } else { "false" });
+            body.push_str(",\"moved\":");
+            push_json_string_array(&mut body, &moved);
+            body.push_str(",\"alreadyThere\":");
+            push_json_string_array(&mut body, &already_there);
+            body.push_str(",\"skipped\":");
+            push_json_string_array(&mut body, &skipped);
+            body.push_str(",\"errors\":");
+            push_json_string_array(&mut body, &errors);
+            body.push_str(",\"conflicts\":[");
+            for (i, (src, name)) in conflicts.iter().enumerate() {
+                if i > 0 {
+                    body.push(',');
+                }
+                body.push_str("{\"src\":");
+                push_json_string(&mut body, src);
+                body.push_str(",\"name\":");
+                push_json_string(&mut body, name);
                 body.push('}');
-                respond_json(&mut stream, 400, "Bad request", &body)
             }
+            body.push_str("]}");
+            respond_json(&mut stream, 200, "OK", &body)
         }
         "/api/bookmarks" => {
             if request.method == "POST" {
@@ -1068,9 +1174,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 .map(PathBuf::from)
                 .unwrap_or_else(|| state.initial_path.clone());
             let cache_key = path.to_string_lossy().replace('\\', "/").to_lowercase();
+            // nocache=1 forces a fresh scan and bypasses the server-side cache.
+            // The rescan right after a native (IFileOperation) move sets this: that
+            // move never touches the server, so the cached tree is stale and would
+            // otherwise come back showing the moved file in its old spot ("ghost").
+            let skip_cache = query.get("nocache").map(|v| v == "1").unwrap_or(false);
 
             // If result is cached and fresh, return it as a single NDJSON chunk
-            {
+            if !skip_cache {
                 let mut cache = state.scan_cache.lock().expect("scan_cache lock");
                 if let Some((result, ts)) = cache.get(&cache_key) {
                     if ts.elapsed() < SCAN_CACHE_TTL {
@@ -1116,6 +1227,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
             )?;
 
+            // Defensive: a depth-limited stream is partial; never cache it (the
+            // cache key is path-only and shared with /api/scan, so it would poison
+            // later full scans). The main scan always runs with no maxdepth.
+            let is_partial = options.max_depth.is_some();
             let cancel = Arc::new(AtomicBool::new(false));
             let s = &mut stream;
             let scan_result = scan_path_with_progress(options, cancel, |node_count, elapsed_ms| {
@@ -1127,9 +1242,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             match scan_result {
                 Ok(result) => {
                     let result = Arc::new(result);
-                    *state.last_scan.lock().expect("scan lock poisoned") =
-                        Some(Arc::clone(&result));
-                    {
+                    if !is_partial {
+                        *state.last_scan.lock().expect("scan lock poisoned") =
+                            Some(Arc::clone(&result));
                         let mut cache = state.scan_cache.lock().expect("scan_cache lock");
                         // Keep only the most recent entry to cap peak memory.
                         if cache.len() >= 2 {

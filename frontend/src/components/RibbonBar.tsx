@@ -1131,8 +1131,9 @@ function TreemapChartRibbon({
             min={1}
             max={5}
             step={1}
-            value={treemapDetail}
-            onChange={(e) => onTreemapDetailChange(Number(e.target.value))}
+            /* Invert: left end = "More" = highest detail (5), like TreeSize. */
+            value={6 - treemapDetail}
+            onChange={(e) => onTreemapDetailChange(6 - Number(e.target.value))}
           />
         </div>
       </RbGroup>

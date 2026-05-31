@@ -9,8 +9,8 @@ import { NodeTooltip } from "./NodeTooltip";
 // detail 1–5 → rendering limits
 function detailLimits(detail: number) {
   const d = Math.max(1, Math.min(5, detail));
-  const top      = [4,  8, 12, 18, 25][d - 1];
-  const children = [4,  8, 12, 18, 25][d - 1];
+  const top      = [4,  7, 10, 14, 18][d - 1];
+  const children = [4,  6,  9, 12, 16][d - 1];
   const depth    = [1,  2,  3,  4,  5][d - 1];
   return { maxTop: top, maxChildren: children, maxDepth: depth };
 }
@@ -96,7 +96,9 @@ function flattenLayout(
         .sort((a, b) => getValue(b, metric) - getValue(a, metric))
         .slice(0, maxChildren);
       const innerH = ph - labelH;
-      if (kids.length > 0 && innerH > 4 && pw > 4) {
+      // Only skip subdivision for genuinely tiny cells — small enough to cut
+      // crowding, but still showing the bordered/nested structure.
+      if (kids.length > 0 && innerH > 12 && pw > 16) {
         const childRects = layoutTreemap(kids, pw, innerH, metric);
         children.push(...flattenLayout(
           childRects, nodeById, childrenMap,
@@ -148,8 +150,8 @@ function drawRects(
     ctx.fillStyle = r.color;
     ctx.fillRect(px, py, pw, ph);
 
-    // Border
-    ctx.strokeStyle = "rgba(0,0,0,0.55)";
+    // Border — crisp dark line so cells stay clearly separated even when large.
+    ctx.strokeStyle = "rgba(0,0,0,0.7)";
     ctx.lineWidth = 1;
     ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
 

@@ -5,11 +5,53 @@ import {
   clipboard,
   shell,
   Menu,
+  screen,
 } from "electron";
 import * as path from "path";
 import * as net from "net";
 import * as fs from "fs";
 import { spawn, ChildProcess } from "child_process";
+
+// ── Native drag-out addon ─────────────────────────────────────────────────────
+// Runs the Windows shell drag itself (SHDoDragDrop, synchronously on this UI
+// thread) so we learn the real OS drop effect. It classifies the drop:
+//   * "external-move" — dropped on another app with MOVE; the source was
+//                       deleted in native code (true move).
+//   * "external-copy" — dropped on another app (copy/none); source preserved.
+//   * "internal"      — dropped back on a FileTree window; native returns the
+//                       drop point so the renderer can perform the move itself
+//                       (Chromium can't complete its own drop while the UI
+//                       thread is busy in the modal drag loop).
+//   * "cancel"        — Esc; nothing happens.
+// If the addon can't load we fall back to Electron's copy-only startDrag.
+type NativeDragResult = { outcome: string; dropX: number; dropY: number; deleted: string[] };
+type NativeMoveResult = { aborted: boolean };
+type NativeContextMenuResult = { verb: string };
+let nativeDragFiles: ((paths: string[]) => NativeDragResult) | null = null;
+let nativeMoveItems:
+  | ((sources: string[], dest: string, ownerHwnd: number) => Promise<NativeMoveResult>)
+  | null = null;
+let nativeContextMenu:
+  | ((paths: string[], ownerHwnd: number) => NativeContextMenuResult)
+  | null = null;
+try {
+  const addon = require(path.join(__dirname, "filetree_drag.node")) as {
+    dragFiles?: (paths: string[]) => NativeDragResult;
+    moveItemsNative?: (sources: string[], dest: string, ownerHwnd: number) => Promise<NativeMoveResult>;
+    showContextMenuNative?: (paths: string[], ownerHwnd: number) => NativeContextMenuResult;
+  };
+  nativeDragFiles = typeof addon.dragFiles === "function" ? addon.dragFiles : null;
+  nativeMoveItems = typeof addon.moveItemsNative === "function" ? addon.moveItemsNative : null;
+  nativeContextMenu = typeof addon.showContextMenuNative === "function" ? addon.showContextMenuNative : null;
+  if (!nativeDragFiles) console.warn("[electron] native drag addon missing dragFiles export");
+  if (!nativeMoveItems) console.warn("[electron] native drag addon missing moveItemsNative export");
+  if (!nativeContextMenu) console.warn("[electron] native drag addon missing showContextMenuNative export");
+} catch (e) {
+  console.warn("[electron] native drag addon unavailable; drag-out will copy:", e);
+  nativeDragFiles = null;
+  nativeMoveItems = null;
+  nativeContextMenu = null;
+}
 
 let serverProcess: ChildProcess | null = null;
 let mainWindow: BrowserWindow | null = null;
@@ -418,48 +460,83 @@ if ($action) { [Console]::Out.WriteLine("FILETREE_ACTION:" + $action) }
   });
 }
 
-// Drag file(s) out to Explorer / desktop.
-// The renderer sends this when document.drag fires with clientX/Y = 0 (cursor left window).
-// Official Electron pattern: https://www.electronjs.org/docs/latest/tutorial/native-file-drag-drop
+// Drag file(s) out. Fired from the renderer's dragstart. The native addon runs
+// the shell drag on this thread (blocking for the drag's duration) and tells us
+// where/how it ended. Chromium keeps firing dragover on the page during the
+// drag (so highlight + auto-scroll work); we just complete the drop here.
+// TEMP diagnostic: print renderer-forwarded log lines to the terminal.
+ipcMain.on("diag", (_event, message: string) => {
+  console.log("[renderer]", message);
+});
+
 ipcMain.on("ondragstart", (event, arg: string | string[]) => {
   const filePaths = (Array.isArray(arg) ? arg : [arg]).filter((filePath) => filePath && fs.existsSync(filePath));
-  if (filePaths.length === 0) {
-    event.returnValue = { ok: false, status: "missing" };
-    return;
+  if (filePaths.length === 0) return;
+  const win = BrowserWindow.fromWebContents(event.sender);
+
+  if (nativeDragFiles) {
+    try {
+      const result = nativeDragFiles(filePaths);
+      console.log("[electron] native drag outcome=", result.outcome, "drop=", result.dropX, result.dropY, "deleted=", result.deleted);
+      if (result.outcome === "internal" && win) {
+        // dropX/dropY are physical screen pixels — convert to the renderer's
+        // CSS pixel space (DIP relative to the web content origin) so it can
+        // hit-test which folder row received the drop.
+        const dip = screen.screenToDipPoint({ x: result.dropX, y: result.dropY });
+        const bounds = win.getContentBounds();
+        const clientX = dip.x - bounds.x;
+        const clientY = dip.y - bounds.y;
+        console.log("[electron] internal drop convert: phys=", result.dropX, result.dropY,
+          "dip=", dip.x, dip.y, "contentBounds=", bounds, "client=", clientX, clientY);
+        win.webContents.send("nativeDropInternal", clientX, clientY, filePaths);
+      } else {
+        win?.webContents.send("nativeDropEnd");
+      }
+      return;
+    } catch (e) {
+      console.error("[electron] native drag failed, falling back to copy:", e);
+      win?.webContents.send("nativeDropEnd");
+      // fall through to the copy-only path below
+    }
   }
 
+  // Fallback: Electron's startDrag — copy-only (it can't report a drop effect,
+  // so deleting the source afterward would risk losing data on a cancel).
   try {
     const repoRoot = path.join(app.getAppPath(), "..");
     const iconPath = path.join(repoRoot, "assets", "drag-icon.png");
-    console.log("[electron] ondragstart files=", filePaths, "icon=", iconPath);
     event.sender.startDrag({ file: filePaths[0], files: filePaths, icon: iconPath });
-    event.returnValue = { ok: true, status: "started" };
   } catch (e) {
     console.log("[electron] startDrag failed:", e);
-    event.returnValue = { ok: false, status: "error", error: String(e) };
-  }
-});
-
-// Called by renderer after dragend; move the source to the OS trash for move-like drag-out.
-ipcMain.handle("deleteAfterDrag", async (_event, filePath: string) => {
-  if (!filePath) return { ok: false };
-  try {
-    const resolvedPath = path.resolve(filePath);
-    if (!fs.existsSync(resolvedPath)) {
-      return { ok: true, status: "already-gone" };
-    }
-    await shell.trashItem(resolvedPath);
-    console.log("[electron] deleteAfterDrag trashed:", resolvedPath);
-    return { ok: true, status: "trashed" };
-  } catch (e) {
-    console.log("[electron] deleteAfterDrag failed:", e);
-    return { ok: false, error: String(e) };
   }
 });
 
 // Copy text to clipboard.
 ipcMain.handle("copyText", (_event, text: string) => {
   clipboard.writeText(text);
+});
+
+// Move files into a folder with the Windows shell file-operation engine
+// (IFileOperation), so the user sees the real native dialogs: progress,
+// "Replace / Skip / Keep both", "the source and destination file names are the
+// same", and elevation prompts. Runs synchronously on this UI thread — the
+// modal Windows dialog is the UI while it runs; the renderer rescans after.
+ipcMain.handle("moveItemsNative", (event, paths: string[], destination: string) => {
+  const sources = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
+  if (sources.length === 0 || !destination) return { aborted: false };
+  if (!nativeMoveItems) throw new Error("native move addon unavailable");
+  const win = BrowserWindow.fromWebContents(event.sender);
+  try { win?.focus(); } catch { /* ignore */ }
+  // Pass our top-level window handle so the shell parents its dialogs to
+  // FileTree. The addon runs the operation on a background thread, so this
+  // returns a Promise and the main thread / UI stays responsive throughout.
+  let ownerHwnd = 0;
+  try {
+    const buf = win?.getNativeWindowHandle();
+    if (buf && buf.length >= 8) ownerHwnd = Number(buf.readBigUInt64LE(0));
+    else if (buf && buf.length >= 4) ownerHwnd = buf.readUInt32LE(0);
+  } catch { /* 0 → addon falls back to the foreground window */ }
+  return nativeMoveItems(sources, destination, ownerHwnd);
 });
 
 // Copy files as a file drop (CF_HDROP equivalent — paste in Explorer).
@@ -470,11 +547,52 @@ ipcMain.handle("copyFiles", (_event, paths: string[]) => {
   clipboard.writeText(paths.join("\n"));
 });
 
-// Shell context menu shown from the renderer. Keep this path in-process so item
-// clicks reliably dispatch back to FileTree.
-ipcMain.handle("shellContextMenu", (event, _path: string, _x: number, _y: number) => {
+// Shell context menu shown from the renderer. Prefer the native addon, which
+// hosts the *real* Windows shell menu (`IContextMenu`) — identical to what
+// Explorer/TreeSize show, including third-party extensions (CrowdStrike, Git,
+// Visual Studio, "Send to", Properties, …). It runs on a background thread so
+// the UI never freezes while the menu is open or a verb is invoked. The shell
+// can't drive FileTree's own actions, so a few verbs come back for us to handle.
+ipcMain.handle("shellContextMenu", async (event, paths: string[] | string, x: number, y: number) => {
   const win = BrowserWindow.fromWebContents(event.sender);
-  showFallbackContextMenu(win, _path, Math.round(_x), Math.round(_y));
+  const list = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
+  if (list.length === 0) return;
+
+  if (nativeContextMenu) {
+    let ownerHwnd = 0;
+    try {
+      const buf = win?.getNativeWindowHandle();
+      if (buf && buf.length >= 8) ownerHwnd = Number(buf.readBigUInt64LE(0));
+      else if (buf && buf.length >= 4) ownerHwnd = buf.readUInt32LE(0);
+    } catch { /* 0 → addon falls back to the foreground window */ }
+    try {
+      // Synchronous + modal: blocks the main thread only while the menu is open,
+      // so a verb's dialog (Properties, Open with) lives on the app's STA.
+      const { verb } = nativeContextMenu(list, ownerHwnd);
+      switch (verb) {
+        // Shell "rename" is a no-op outside Explorer, so drive FileTree's inline rename.
+        case "rename":
+          win?.webContents.send("contextMenuAction", "rename", list[0]);
+          break;
+        case "new-folder":
+          handleFileTreeContextAction(win, list[0], "new-folder");
+          break;
+        case "open-new-tab":
+          handleFileTreeContextAction(win, list[0], "open-new-tab");
+          break;
+        // "" → the shell already performed the command (Open, Cut, Copy, Delete,
+        // Properties, Send to, third-party verbs); the fs watcher reflects any
+        // disk change, so there is nothing more to do here.
+        default:
+          break;
+      }
+      return;
+    } catch (e) {
+      console.warn("[electron] native shell context menu failed; using fallback:", e);
+    }
+  }
+
+  showFallbackContextMenu(win, list[0], Math.round(x), Math.round(y));
 });
 
 // ── App lifecycle ─────────────────────────────────────────────────────────────
