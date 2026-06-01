@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use crate::analytics::{exact_duplicates_json, duplicates_full_json, DupeFilter};
 use crate::cli::APP_NAME;
 use crate::dupes::{
-    DupeFilter2, DupeGroupV2, ReprioritizeCriterion, ScanMode, IgnoreList,
+    DupeFilter2, DupeGroupV2, HashInput, ReprioritizeCriterion, ScanMode, IgnoreList,
     build_candidates_from_nodes, matches_to_groups, groups_to_json,
+    hash_candidate_groups, load_hash_cache, save_hash_cache,
     scan_exact_with_progress, scan_filename, scan_audio, reprioritize,
     action_delete, action_move, action_copy,
 };
@@ -41,6 +42,15 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
     };
     let ignore_list = IgnoreList::load(&ignore_list_path).unwrap_or_default();
 
+    // Persistent content-hash cache lives next to the ignore list.
+    let hash_cache_path = {
+        let base = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        base.join("FileTree").join("hash_cache.json")
+    };
+    let hash_cache = load_hash_cache(&hash_cache_path);
+
     let state = Arc::new(AppState {
         initial_path,
         last_scan: Mutex::new(None),
@@ -50,6 +60,8 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
         dupes_cancel: Arc::new(AtomicBool::new(false)),
         ignore_list: Mutex::new(ignore_list),
         ignore_list_path,
+        hash_cache: Mutex::new(hash_cache),
+        hash_cache_path,
     });
 
     println!("{} is running at http://127.0.0.1:{port}", APP_NAME);
@@ -261,6 +273,64 @@ fn extract_json_str_array(json: &str, key: &str) -> Vec<String> {
     results
 }
 
+/// Extract an unsigned integer value from naive JSON: `"key":123` or `"key": 123`.
+fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\"");
+    let start = json.find(&needle)? + needle.len();
+    let rest = json[start..].trim_start().strip_prefix(':')?.trim_start();
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    if end == 0 { return None; }
+    rest[..end].parse().ok()
+}
+
+/// Parse the `files` array of `{ path, size, mtime }` objects from the
+/// /api/dupes-hash request body. Quote-aware so paths containing braces (e.g.
+/// `{guid}` folders) don't confuse object boundary detection.
+fn parse_hash_files(body: &str) -> Vec<HashInput> {
+    let mut out = Vec::new();
+    let Some(files_pos) = body.find("\"files\"") else { return out; };
+    let bytes = body.as_bytes();
+    let mut i = files_pos + "\"files\"".len();
+    while i < bytes.len() && bytes[i] != b'[' { i += 1; }
+    if i >= bytes.len() { return out; }
+    i += 1; // step past '['
+
+    let mut depth = 0usize;
+    let mut obj_start = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if esc { esc = false; }
+            else if c == b'\\' { esc = true; }
+            else if c == b'"' { in_str = false; }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' => { if depth == 0 { obj_start = i; } depth += 1; }
+                b'}' => {
+                    if depth > 0 {
+                        depth -= 1;
+                        if depth == 0 {
+                            let obj = &body[obj_start..=i];
+                            if let Some(path) = extract_json_str(obj, "path") {
+                                let size = extract_json_u64(obj, "size").unwrap_or(0);
+                                let mtime = extract_json_u64(obj, "mtime").unwrap_or(0);
+                                out.push(HashInput { path: PathBuf::from(path), size, mtime });
+                            }
+                        }
+                    }
+                }
+                b']' if depth == 0 => break,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn build_dupe_filter(query: &std::collections::HashMap<String, String>) -> DupeFilter {
     DupeFilter {
         min_size: query.get("minSize").and_then(|v| v.parse().ok()).unwrap_or(1),
@@ -287,6 +357,25 @@ fn parse_extension_filter(value: Option<&String>) -> Vec<String> {
 }
 
 const SCAN_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+/// Max distinct scan roots kept in the in-memory cache. Raised above 1 so a
+/// multi-root duplicate scan (several drives/folders) can reuse every root's
+/// already-walked tree instead of re-walking. Oldest entries evict first.
+const SCAN_CACHE_CAPACITY: usize = 8;
+
+/// Evict oldest entries (by insertion timestamp) until the cache holds at most
+/// `SCAN_CACHE_CAPACITY - 1`, leaving room for the entry about to be inserted.
+/// `keep` is never evicted (it is the entry being refreshed/inserted).
+fn evict_scan_cache(cache: &mut HashMap<String, (Arc<crate::model::ScanResult>, Instant)>, keep: &str) {
+    while cache.len() >= SCAN_CACHE_CAPACITY {
+        let Some(oldest) = cache
+            .iter()
+            .filter(|(k, _)| k.as_str() != keep)
+            .min_by_key(|(_, (_, ts))| *ts)
+            .map(|(k, _)| k.clone())
+        else { break; };
+        cache.remove(&oldest);
+    }
+}
 
 /// Evict cache entries that are descendants of `path` OR ancestors of `path`.
 /// A move/rename affects both the subtree and all parent aggregates up to the root.
@@ -309,17 +398,25 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
 
     let (route, query) = split_target(&request.target);
 
-    // Allow POST for bookmarks and settings routes; all others are GET-only.
+    // Allow POST for bookmarks, settings, and the mutating Duplicates routes; all
+    // others are GET-only. The Duplicates delete/move/copy/make-ref/ignore/hash
+    // endpoints are POST (ignore-list clear is DELETE) and were previously
+    // rejected with 405, so the actions never reached the engine.
     let post_routes = [
         "/api/bookmarks", "/api/settings", "/api/ai-chat", "/api/watch", "/api/delete",
         "/api/copy-path", "/api/rename", "/api/move-items", "/api/copy-files", "/api/drag-out",
+        "/api/dupes-hash", "/api/dupes-action", "/api/dupes-make-ref", "/api/dupes-cancel",
+        "/api/dupes-ignore",
     ];
-    if request.method != "GET" && !(request.method == "POST" && post_routes.contains(&route.as_str())) {
+    let method_allowed = request.method == "GET"
+        || (request.method == "POST" && post_routes.contains(&route.as_str()))
+        || (request.method == "DELETE" && route.as_str() == "/api/dupes-ignore");
+    if !method_allowed {
         respond_text(
             &mut stream,
             405,
             "Method not allowed",
-            "Only GET is supported",
+            "Method not supported for this route",
         )?;
         return Ok(());
     }
@@ -431,15 +528,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         *state.last_scan.lock().expect("scan lock poisoned") =
                             Some(Arc::clone(&result));
                         let mut cache = state.scan_cache.lock().expect("scan_cache lock");
-                        // Keep only the most recent entry to cap peak memory.
-                        if cache.len() >= 2 {
-                            // evict the oldest entry that isn't the current path
-                            let to_remove: Vec<String> = cache.keys()
-                                .filter(|k| k.as_str() != cache_key.as_str())
-                                .cloned()
-                                .collect();
-                            for k in to_remove { cache.remove(&k); }
-                        }
+                        // Cap peak memory but keep several roots so multi-root
+                        // duplicate scans can reuse each already-walked tree.
+                        evict_scan_cache(&mut cache, &cache_key);
                         cache.insert(cache_key.clone(), (Arc::clone(&result), Instant::now()));
                         eprintln!("[mem] scan done: path={cache_key:?} nodes={node_count} cache_entries={}", cache.len());
                     } else {
@@ -672,6 +763,29 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let mut scan_errors: Vec<String> = Vec::new();
 
             for raw_path in paths_raw.split(',').filter(|s| !s.is_empty()) {
+                // Reuse an already-walked tree when one is cached and still fresh
+                // for this exact root, so a fresh server-side scan is avoided.
+                let cache_key = PathBuf::from(raw_path).to_string_lossy().replace('\\', "/").to_lowercase();
+                let cached = {
+                    let cache = state.scan_cache.lock().expect("scan_cache lock");
+                    match cache.get(&cache_key) {
+                        Some((result, ts)) if ts.elapsed() < SCAN_CACHE_TTL => Some(Arc::clone(result)),
+                        _ => None,
+                    }
+                };
+                if let Some(result) = cached {
+                    prog.files_scanned.fetch_add(result.nodes.len() as u64, Ordering::Relaxed);
+                    let offset = all_nodes.len();
+                    for node in result.nodes.iter() {
+                        let mut node = node.clone();
+                        node.id += offset;
+                        if let Some(p) = node.parent { node.parent = Some(p + offset); }
+                        node.children = node.children.into_iter().map(|c| c + offset).collect();
+                        all_nodes.push(node);
+                    }
+                    continue;
+                }
+
                 let options = ScanOptions {
                     root: PathBuf::from(raw_path),
                     threads: thread_count,
@@ -744,6 +858,66 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             respond_json(&mut stream, 200, "OK", &body)
         }
 
+        // ── Content-hash duplicate detection (candidate-list driven, no walk) ──
+        "/api/dupes-hash" => {
+            // POST JSON: { "files": [{ "path", "size", "mtime" }, ...], "confirmBytes"?: bool }
+            // Returns content-identical groups: { "groups": [{ "paths": [...] }], "errors": [...] }
+            let body_str = String::from_utf8_lossy(&request.body);
+            let files = parse_hash_files(&body_str);
+            // Content-verified by default: only an explicit confirmBytes:false skips it.
+            let confirm_bytes = !body_str.contains("\"confirmBytes\":false");
+            let thread_count = query
+                .get("threads")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_else(default_thread_count);
+
+            let prog = Arc::clone(&state.dupes_progress);
+            state.dupes_cancel.store(false, Ordering::Relaxed);
+            prog.phase.store(2, Ordering::Relaxed);
+            prog.files_scanned.store(files.len() as u64, Ordering::Relaxed);
+            prog.files_hashing.store(0, Ordering::Relaxed);
+            prog.files_hashed.store(0, Ordering::Relaxed);
+
+            let (groups, errors, cache_dirty) = hash_candidate_groups(
+                &files,
+                confirm_bytes,
+                &state.hash_cache,
+                Some(&prog),
+                Some(&state.dupes_cancel),
+                thread_count,
+            );
+
+            if cache_dirty {
+                let cache = state.hash_cache.lock().expect("hash_cache lock");
+                let _ = save_hash_cache(&state.hash_cache_path, &cache);
+            }
+
+            prog.phase.store(3, Ordering::Relaxed);
+
+            if state.dupes_cancel.load(Ordering::Relaxed) {
+                prog.phase.store(0, Ordering::Relaxed);
+                return respond_json(&mut stream, 499, "Client Closed Request", "{\"groups\":[],\"errors\":[\"Hashing canceled\"]}");
+            }
+
+            let mut body = String::from("{\"groups\":[");
+            for (gi, group) in groups.iter().enumerate() {
+                if gi > 0 { body.push(','); }
+                body.push_str("{\"paths\":[");
+                for (pi, &idx) in group.iter().enumerate() {
+                    if pi > 0 { body.push(','); }
+                    push_json_string(&mut body, &files[idx].path.to_string_lossy());
+                }
+                body.push_str("]}");
+            }
+            body.push_str("],\"errors\":[");
+            for (i, e) in errors.iter().enumerate() {
+                if i > 0 { body.push(','); }
+                push_json_string(&mut body, e);
+            }
+            body.push_str("]}");
+            respond_json(&mut stream, 200, "OK", &body)
+        }
+
         "/api/dupes-action" => {
             // POST JSON: { "action": "delete"|"move"|"copy", "paths": [...], "permanent": bool, "dest": "..." }
             let body_str = String::from_utf8_lossy(&request.body);
@@ -773,6 +947,39 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 }
                 _ => vec!["Unknown action".to_string()],
             };
+
+            // A delete/move/copy changes the filesystem, so any cached scan that
+            // covered a source/destination is now stale, and any hash-cache entry
+            // for a moved/deleted source path is invalid. Drop both so the next
+            // scan re-aggregates the real tree (the routes previously did neither).
+            {
+                let mut scan_cache = state.scan_cache.lock().expect("scan_cache lock");
+                let mut affected: Vec<String> = Vec::new();
+                for p in &paths {
+                    if let Some(parent) = p.parent() {
+                        affected.push(parent.to_string_lossy().to_string());
+                    }
+                    affected.push(p.to_string_lossy().to_string());
+                }
+                if !dest_str.is_empty() {
+                    affected.push(dest_str.clone());
+                }
+                for a in &affected {
+                    invalidate_scan_cache(&mut scan_cache, a);
+                }
+            }
+            {
+                let mut hash_cache = state.hash_cache.lock().expect("hash_cache lock");
+                let mut changed = false;
+                for p in &paths {
+                    if hash_cache.remove(p).is_some() {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let _ = save_hash_cache(&state.hash_cache_path, &hash_cache);
+                }
+            }
 
             let ok = errors.is_empty();
             let mut resp = String::from("{\"ok\":");
@@ -1260,14 +1467,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         *state.last_scan.lock().expect("scan lock poisoned") =
                             Some(Arc::clone(&result));
                         let mut cache = state.scan_cache.lock().expect("scan_cache lock");
-                        // Keep only the most recent entry to cap peak memory.
-                        if cache.len() >= 2 {
-                            let to_remove: Vec<String> = cache.keys()
-                                .filter(|k| k.as_str() != cache_key.as_str())
-                                .cloned()
-                                .collect();
-                            for k in to_remove { cache.remove(&k); }
-                        }
+                        // Cap peak memory but keep several roots so multi-root
+                        // duplicate scans can reuse each already-walked tree.
+                        evict_scan_cache(&mut cache, &cache_key);
                         cache.insert(cache_key, (Arc::clone(&result), Instant::now()));
                     }
                     // Stream as per-node NDJSON so the browser never parses a giant string.
@@ -1472,7 +1674,10 @@ fn read_http_request(stream: &TcpStream) -> sio::Result<HttpRequest> {
         }
     }
 
-    let mut body = vec![0u8; content_length.min(4 * 1024 * 1024)];
+    // Cap the body allocation. Raised well above the old 4 MB so a large
+    // /api/dupes-hash candidate list (one {path,size,mtime} row per size-collision
+    // file) is never truncated, which would corrupt the JSON and drop candidates.
+    let mut body = vec![0u8; content_length.min(256 * 1024 * 1024)];
     if !body.is_empty() {
         reader.read_exact(&mut body)?;
     }

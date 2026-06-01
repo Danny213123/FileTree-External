@@ -141,14 +141,20 @@ function waitForServer(port, timeoutMs = 10000) {
 }
 // ── Server launch ─────────────────────────────────────────────────────────────
 async function startRustServer(port) {
-    // Find the server binary next to the Electron app, or in the repo root.
-    // app.getAppPath() = .../FileTree/electron  (where package.json lives)
+    // Find the server binary. When packaged by electron-builder it ships as an
+    // extraResource at <resources>/filetree.exe (process.resourcesPath). In dev it
+    // lives in the repo's target/release. app.getAppPath() = .../FileTree/electron
+    // (where package.json lives), so the repo root is one level up.
     const repoRoot = path.join(electron_1.app.getAppPath(), "..");
-    const candidates = [
-        path.join(repoRoot, "target", "release", "filetree.exe"), // dev build
-        path.join(repoRoot, "filetree-server.exe"), // packaged
-        path.join(electron_1.app.getAppPath(), "filetree-server.exe"), // bundled next to electron/
-    ];
+    const candidates = electron_1.app.isPackaged
+        ? [
+            path.join(process.resourcesPath, "filetree.exe"), // packaged (extraResources)
+        ]
+        : [
+            path.join(repoRoot, "target", "release", "filetree.exe"), // dev build
+            path.join(repoRoot, "filetree-server.exe"), // legacy fallback
+            path.join(electron_1.app.getAppPath(), "filetree-server.exe"), // legacy fallback
+        ];
     let serverBin = candidates.find((p) => fs.existsSync(p));
     if (!serverBin) {
         throw new Error(`Could not find filetree server binary. Tried:\n${candidates.join("\n")}`);
@@ -859,6 +865,8 @@ electron_1.ipcMain.on("ondragstart", (event, arg) => {
 electron_1.ipcMain.handle("copyText", (_event, text) => {
     electron_1.clipboard.writeText(text);
 });
+// Read text from the clipboard (terminal paste fallback).
+electron_1.ipcMain.handle("clipboardReadText", () => electron_1.clipboard.readText());
 // Read a file off disk and return a base64 data URL so attached image *paths*
 // (dragged from the file tree) can be sent to vision-capable models. Capped so
 // we never blow up the IPC channel / model request with a giant payload.

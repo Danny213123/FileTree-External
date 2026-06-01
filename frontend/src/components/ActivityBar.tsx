@@ -2,12 +2,13 @@
 // active view. Icons come from the shared Bootstrap-based Icon set.
 import { Icon, type IconName } from "./Icon";
 
-export type ViewId = "explorer" | "search" | "treemap" | "bookmarks" | "errors";
+export type ViewId = "explorer" | "search" | "treemap" | "duplicates" | "bookmarks" | "errors";
 
 const ITEMS: { id: ViewId; label: string; icon: IconName }[] = [
   { id: "explorer", label: "Explorer", icon: "explorer" },
   { id: "search", label: "Search", icon: "search" },
   { id: "treemap", label: "Treemap", icon: "treemap" },
+  { id: "duplicates", label: "Duplicates", icon: "duplicates" },
   { id: "bookmarks", label: "Bookmarks", icon: "bookmark" },
   { id: "errors", label: "Problems", icon: "warning" },
 ];

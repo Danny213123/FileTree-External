@@ -8,6 +8,8 @@ import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
 
 const ROW_HEIGHT = 20;
+// Smallest a column may be dragged to, so a header never collapses to nothing.
+const MIN_COLUMN_WIDTH = 56;
 
 // Column descriptor. `width` is the base px width used both for the dynamic
 // grid template (minmax floor) and the min-table-width that forces horizontal
@@ -68,6 +70,12 @@ interface TreeTableProps {
   unit: Unit;
   decimals: number;
   visibleColumns: Set<SortKey>;
+  /** Per-column pixel widths for THIS tab/pane (columnKey → px). Owned by the
+   *  per-tab useTreeState, so widths are independent across tabs and split panes.
+   *  Columns absent from the map fall back to their ALL_COLUMNS default width. */
+  columnWidths: Partial<Record<SortKey, number>>;
+  /** Live width update while dragging a header's resize handle. */
+  onColumnResize: (key: SortKey, width: number) => void;
   bookmarks: Set<string>;
   onToggleExpand: (id: number) => void;
   onSelect: (id: number, mode: "single" | "toggle" | "range") => void;
@@ -186,6 +194,8 @@ function TreeTableInner({
   metric,
   decimals,
   visibleColumns,
+  columnWidths,
+  onColumnResize,
   bookmarks,
   onToggleExpand,
   onSelect,
@@ -251,20 +261,63 @@ function TreeTableInner({
     [visibleColumns],
   );
   const nonNameCols = useMemo(() => cols.filter((c) => c.key !== "name"), [cols]);
+  const nameCol = useMemo(() => cols.find((c) => c.key === "name") ?? ALL_COLUMNS[0], [cols]);
+  // Effective width for a column: the per-tab resized width if the user has set
+  // one, otherwise the ALL_COLUMNS default. Keeps newly-shown columns sensible.
+  const widthOf = useCallback(
+    (c: ColumnDef) => Math.max(MIN_COLUMN_WIDTH, columnWidths[c.key] ?? c.width),
+    [columnWidths],
+  );
   // The inline grid template is the single source of truth for column layout
   // (the static CSS template was removed so header/rows can't desync at low
-  // widths or non-default column counts). Name flexes; each other column uses
-  // its descriptor width as a minmax floor and grows a little.
-  const gridTemplate = useMemo(
-    () => `minmax(200px,1.7fr)${nonNameCols.map((c) => ` minmax(${c.width}px,${Math.round(c.width * 1.35)}px)`).join("")}`,
-    [nonNameCols],
-  );
-  // Floor width that keeps every column at its minimum. Applied to both the
+  // widths or non-default column counts). EVERY visible column — Name included —
+  // is a FIXED, resizable px track, so dragging a divider changes that column's
+  // width immediately (Explorer/TreeSize behaviour; dragging Name narrower
+  // visibly shrinks it). A trailing minmax(0,1fr) "filler" track is NOT a real
+  // column (no header/resizer/cell content) — it just absorbs leftover width so
+  // the header/row background spans the full pane without a ragged right edge,
+  // and collapses to 0 when the columns overflow (then the scroller scrolls).
+  // Toggling a column off drops it from the template entirely.
+  const gridTemplate = useMemo(() => {
+    const nameTrack = `${widthOf(nameCol)}px`;
+    const rest = nonNameCols.map((c) => `${widthOf(c)}px`).join(" ");
+    return `${nameTrack}${rest ? ` ${rest}` : ""} minmax(0,1fr)`;
+  }, [nameCol, nonNameCols, widthOf]);
+  // Floor width that keeps every real column at its (possibly resized) width.
+  // The filler track's min is 0 so it never adds to this. Applied to both the
   // header and the rows so they overflow — and therefore horizontally scroll —
-  // together inside the single scroller.
+  // together inside the single scroller when the pane is too narrow.
   const minTableWidth = useMemo(
-    () => 200 + nonNameCols.reduce((sum, c) => sum + c.width, 0),
-    [nonNameCols],
+    () => widthOf(nameCol) + nonNameCols.reduce((sum, c) => sum + widthOf(c), 0),
+    [nameCol, nonNameCols, widthOf],
+  );
+
+  // Begin a header column resize. Wired to the column's resize handle only (a
+  // separate hit area from the sort button), and stops propagation so dragging
+  // the divider never triggers the header's sort click. Updates the per-tab
+  // width live on every mousemove for immediate visual feedback.
+  const startColumnResize = useCallback(
+    (e: React.MouseEvent, col: ColumnDef) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const startX = e.clientX;
+      const startWidth = columnWidths[col.key] ?? col.width;
+      const onMove = (ev: MouseEvent) => {
+        const next = Math.max(MIN_COLUMN_WIDTH, Math.round(startWidth + (ev.clientX - startX)));
+        onColumnResize(col.key, next);
+      };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      };
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    },
+    [columnWidths, onColumnResize],
   );
 
   // Renders a single non-name cell from its column descriptor. The Name cell is
@@ -466,20 +519,36 @@ function TreeTableInner({
           else if (y > bottom - ZONE) el.scrollTop += 6 * ((y - (bottom - ZONE)) / ZONE);
         }}
       >
-        {/* Column header (sticky inside the scroller) */}
+        {/* Column header (sticky inside the scroller). Each header is a `.th`
+            grid cell holding the sort button plus a `.col-resizer` divider at the
+            right edge. The divider is a SEPARATE element (not inside the button)
+            and stops propagation on mousedown, so dragging it resizes without
+            ever firing the button's sort click. */}
         <div className="table-head" style={{ gridTemplateColumns: gridTemplate, minWidth: minTableWidth }}>
           {cols.map((col) => (
-            <button
-              key={col.key}
-              data-sort={col.key}
-              onClick={() => onSortChange(col.key)}
-            >
-              {col.label}
-              {sortKey === col.key && (
-                <Icon name={sortDir === 1 ? "caret-up" : "caret-down"} size={10} className="sort-caret" />
-              )}
-            </button>
+            <div key={col.key} className="th" data-col={col.key}>
+              <button
+                data-sort={col.key}
+                onClick={() => onSortChange(col.key)}
+              >
+                {col.label}
+                {sortKey === col.key && (
+                  <Icon name={sortDir === 1 ? "caret-up" : "caret-down"} size={10} className="sort-caret" />
+                )}
+              </button>
+              <div
+                className="col-resizer"
+                role="separator"
+                aria-orientation="vertical"
+                title="Drag to resize column"
+                onMouseDown={(e) => startColumnResize(e, col)}
+                onClick={(e) => e.stopPropagation()}
+                onDoubleClick={(e) => e.stopPropagation()}
+              />
+            </div>
           ))}
+          {/* Filler header cell for the trailing minmax(0,1fr) track. */}
+          <div className="th-filler" aria-hidden="true" />
         </div>
 
         <div style={{ height: virtualizer.getTotalSize(), position: "relative", minWidth: minTableWidth }}>
@@ -649,6 +718,9 @@ function TreeTableInner({
                   )}
                 </div>
                 {nonNameCols.map((col) => renderCell(col, node, isBundle, parentSize))}
+                {/* Empty cell occupying the trailing filler track (keeps row
+                    cells aligned 1:1 with the header's grid tracks). */}
+                <div className="cell-filler" aria-hidden="true" />
               </div>
             );
           })}

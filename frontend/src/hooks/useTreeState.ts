@@ -13,9 +13,15 @@ export interface TreeState {
   metric: Metric;
   unit: Unit;
   showFiles: boolean;
+  // Per-column pixel widths (columnKey → px). Lives in this per-tab hook so each
+  // workspace tab AND each split-view pane keeps its OWN column widths — resizing
+  // in one tab/pane never affects another. Distinct from the global Configure
+  // Columns visibility/decimals. Columns with no entry fall back to ALL_COLUMNS.
+  columnWidths: Partial<Record<SortKey, number>>;
 }
 
 export interface UseTreeStateReturn extends TreeState {
+  setColumnWidth: (key: SortKey, width: number) => void;
   toggleExpand: (id: number) => void;
   ensureExpanded: (id: number) => void;
   expandToLevel: (level: number) => void;
@@ -291,6 +297,11 @@ export function useTreeState(): UseTreeStateReturn {
   const [metric, setMetric] = useState<Metric>("size");
   const [unit, setUnit] = useState<Unit>("auto");
   const [showFiles, setShowFiles] = useState(true);
+  const [columnWidths, setColumnWidths] = useState<Partial<Record<SortKey, number>>>({});
+
+  const setColumnWidth = useCallback((key: SortKey, width: number) => {
+    setColumnWidths((prev) => (prev[key] === width ? prev : { ...prev, [key]: width }));
+  }, []);
 
   const nodeById = useMemo(() => {
     const m = new Map<number, NodeRecord>();
@@ -586,6 +597,8 @@ export function useTreeState(): UseTreeStateReturn {
     metric,
     unit,
     showFiles,
+    columnWidths,
+    setColumnWidth,
     toggleExpand,
     ensureExpanded,
     expandToLevel,

@@ -1,19 +1,56 @@
 {
   "name": "filetree",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "FileTree disk-usage explorer",
+  "author": "Danny213123",
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc && npm run build:native",
     "build:native": "node scripts/build-native.mjs",
     "start": "npm run build && electron .",
-    "dev": "tsc && electron ."
+    "dev": "tsc && electron .",
+    "package": "tsc && electron-builder --win portable nsis"
   },
-  "dependencies": {
-    "electron": "^33.0.0"
+  "build": {
+    "appId": "com.danny213123.filetree",
+    "productName": "FileTree",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "**/*.node"
+    ],
+    "extraResources": [
+      {
+        "from": "../target/release/filetree.exe",
+        "to": "filetree.exe"
+      }
+    ],
+    "win": {
+      "icon": "../assets/icon.ico",
+      "target": [
+        "portable",
+        "nsis"
+      ]
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-portable.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-${version}-setup.${ext}"
+    }
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^26.8.1",
     "typescript": "^5.5.0"
   }
 }

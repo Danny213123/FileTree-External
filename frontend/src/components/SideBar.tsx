@@ -5,11 +5,14 @@ import { BookmarksTab } from "./BookmarksTab";
 import { ErrorsTab } from "./ErrorsTab";
 import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
+import { DuplicatesConfigPanel } from "./DuplicatesConfigPanel";
+import type { DuplicatesController } from "../hooks/useDuplicates";
 
 const VIEW_TITLES: Record<ViewId, string> = {
   explorer: "Explorer",
   search: "Search",
   treemap: "Treemap",
+  duplicates: "Duplicates",
   bookmarks: "Bookmarks",
   errors: "Problems",
 };
@@ -58,6 +61,8 @@ export interface SideBarProps {
   // bookmarks
   onScanPath: (p: string) => void;
   onRemoveBookmark: (p: string) => void;
+  // duplicates page controller (shared with the app-level results view)
+  dupes?: DuplicatesController;
 }
 
 function ExplorerView(props: SideBarProps) {
@@ -260,6 +265,10 @@ export function SideBar(props: SideBarProps) {
       {(view === "explorer" || view === "treemap") && <ExplorerView {...props} />}
 
       {view === "search" && <SearchView {...props} />}
+
+      {view === "duplicates" && props.dupes && (
+        <DuplicatesConfigPanel ctrl={props.dupes} drives={props.drives} specialFolders={props.specialFolders} />
+      )}
 
       {view === "bookmarks" && (
         <div className="sidebar-content">

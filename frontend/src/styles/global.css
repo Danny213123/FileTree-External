@@ -919,6 +919,46 @@ input:focus, select:focus {
 
 .table-head button:hover { background: rgba(0,0,0,0.04); transform: none; box-shadow: none; }
 
+/* Header cell wrapper: holds the sort button (fills the cell) plus the resize
+   divider, so the divider can sit on top of the right edge without being part
+   of the clickable sort button. */
+.th {
+  position: relative;
+  height: 100%;
+  min-width: 0;
+}
+
+/* Draggable column divider at the right edge of each header cell. A wide,
+   transparent hit area with a thin accent line on hover/active; sits above the
+   sort button (z-index) so a drag is captured before the button's sort click. */
+.col-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 7px;
+  cursor: col-resize;
+  z-index: 3;
+  user-select: none;
+  touch-action: none;
+}
+.col-resizer::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  right: 0;
+  width: 2px;
+  background: transparent;
+}
+.col-resizer:hover::after,
+.col-resizer:active::after { background: var(--accent); }
+
+/* Trailing filler-track cells: not real columns — pure visual slack so the
+   header/row background spans the full pane when the columns don't fill it.
+   Never interactive and never a layout floor (min-width:0). */
+.th-filler, .cell-filler { min-width: 0; pointer-events: none; }
+
 .rows { flex: 1; overflow: auto; min-height: 0; position: relative; }
 
 .row {
@@ -3000,6 +3040,120 @@ input:focus, select:focus {
 /* Small utility button */
 .df-btn-sm { padding: 2px 8px; font-size: 12px; height: 24px; }
 
+/* ── Duplicates page (client-first, app-level) ───────────────────── */
+
+/* App-level editor wrapper (replaces the workbench tabs while active). */
+.dupes-editor { flex: 1 1 0; min-width: 0; display: flex; overflow: hidden; }
+.df-results-root {
+  flex: 1; min-width: 0; display: flex; flex-direction: column;
+  height: 100%; background: var(--bg); color: var(--text); overflow: hidden;
+}
+
+/* Sidebar config panel: fills + scrolls, footer sticks to the bottom. */
+.df-config {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; padding: 0;
+}
+
+/* Quick-add chips */
+.df-quick-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.df-chip {
+  font-size: 11px; padding: 2px 8px; border: 1px solid var(--border);
+  border-radius: 10px; background: var(--bg); color: var(--text); cursor: pointer;
+}
+.df-chip:hover { background: var(--hover); }
+.df-chip-on { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* Match criteria grid */
+.df-crit-head { display: flex; align-items: center; margin-bottom: 2px; }
+.df-crit-head-spacer { flex: 1; }
+.df-crit-head-col { width: 30px; text-align: center; font-size: 10px; color: var(--muted); text-transform: uppercase; }
+.df-crit-row { display: flex; align-items: center; min-height: 26px; }
+.df-crit-name { flex: 1; display: flex; flex-direction: column; line-height: 1.15; min-width: 0; }
+.df-crit-hint { font-size: 10px; color: var(--muted); }
+.df-crit-box { width: 30px; display: flex; align-items: center; justify-content: center; }
+.df-crit-sub { margin: 4px 0 2px; display: flex; flex-direction: column; gap: 4px; padding-left: 8px; border-left: 2px solid var(--line); }
+
+/* Results toolbar additions */
+.df-toolbar-spacer { flex: 1; }
+.df-search {
+  display: flex; align-items: center; gap: 4px; padding: 2px 6px;
+  border: 1px solid var(--border); border-radius: 3px; background: var(--bg); color: var(--muted);
+}
+.df-search input { border: none; background: none; color: var(--text); font-size: 12px; width: 150px; outline: none; }
+.df-search-clear { background: none; border: none; cursor: pointer; color: var(--muted); display: flex; padding: 0; }
+.df-search-clear:hover { color: var(--text); }
+.df-toggle-on { background: var(--accent); color: #fff; border-color: var(--accent); }
+.df-toggle-on:hover:not(:disabled) { background: #106ebe; }
+
+/* Virtualized table */
+.df-table { flex: 1; overflow: auto; position: relative; }
+.df-thead {
+  display: grid; position: sticky; top: 0; z-index: 3; height: 26px; align-items: center;
+  background: var(--panel-2); border-bottom: 1px solid var(--line);
+  font-size: 11px; font-weight: 600; color: var(--muted);
+}
+.df-th { position: relative; display: flex; align-items: center; height: 100%; overflow: hidden; }
+.df-th > button {
+  background: none; border: none; color: inherit; font: inherit; font-weight: 600;
+  cursor: pointer; display: flex; align-items: center; gap: 3px; padding: 0 6px;
+  width: 100%; height: 100%; overflow: hidden; white-space: nowrap;
+}
+.df-th > button:hover { color: var(--text); }
+.df-th-right > button { justify-content: flex-end; }
+.df-th-center > button { justify-content: center; }
+.df-th-gutter { justify-content: center; }
+.df-th .sort-caret { flex-shrink: 0; }
+.df-th .col-resizer {
+  position: absolute; right: 0; top: 0; height: 100%; width: 6px;
+  cursor: col-resize; z-index: 2;
+}
+.df-th .col-resizer:hover { background: var(--accent); opacity: 0.5; }
+
+/* Cells */
+.df-cell { display: flex; align-items: center; height: 100%; padding: 0 6px; overflow: hidden; white-space: nowrap; font-size: 12px; }
+.df-cell-right { justify-content: flex-end; text-align: right; }
+.df-cell-center { justify-content: center; }
+.df-cell-gutter { justify-content: center; padding: 0; }
+.df-cell > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.df-file-folder { color: var(--muted); }
+.df-dim { color: var(--muted); opacity: 0.55; }
+.df-delta { color: var(--warn); font-variant-numeric: tabular-nums; }
+.df-content-yes { color: #107c10; display: inline-flex; align-items: center; }
+[data-theme="dark"] .df-content-yes { color: #4ec94e; }
+
+/* Row overrides (scoped to the new results table) */
+.df-results-root .df-file-row { padding: 0; border-left: none; }
+.df-file-row.df-is-ref { box-shadow: inset 2px 0 0 var(--accent); }
+
+/* Match % mini-bar */
+.df-pct {
+  position: relative; display: inline-flex; align-items: center; justify-content: center;
+  width: 100%; max-width: 64px; height: 14px; border-radius: 3px; background: var(--line); overflow: hidden;
+}
+.df-pct-bar { position: absolute; left: 0; top: 0; height: 100%; background: rgba(0,120,212,0.4); }
+.df-pct-num { position: relative; font-size: 10px; color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* Per-row hover actions (rendered in the trailing filler track) */
+.df-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; padding-right: 8px; opacity: 0; }
+.df-file-row:hover .df-row-actions { opacity: 1; }
+
+/* Group header row (full-width flex) */
+.df-grp-row {
+  display: flex; align-items: center; gap: 6px; height: 100%; padding: 0 8px;
+  background: var(--panel); border-bottom: 1px solid var(--line); cursor: default; font-size: 12px;
+}
+.df-grp-row:hover { background: var(--hover); }
+.df-grp-row.df-checked { background: var(--selected); }
+.df-grp-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; }
+.df-grp-count { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+.df-grp-waste { color: var(--danger); font-size: 11px; margin-left: auto; flex-shrink: 0; }
+.df-grp-ignore {
+  background: none; border: 1px solid transparent; border-radius: 3px; padding: 1px 6px;
+  font-size: 11px; cursor: pointer; color: var(--muted); display: inline-flex; align-items: center; gap: 3px; flex-shrink: 0;
+}
+.df-grp-ignore:hover { border-color: var(--border); color: var(--danger); background: var(--bg); }
+
 /* Dark mode overrides */
 [data-theme="dark"] .df-sidebar { background: var(--panel, #1e1e1e); }
 [data-theme="dark"] .df-group-header { background: var(--panel, #1e1e1e); }
@@ -3234,13 +3388,17 @@ input:focus, select:focus {
 .resizer-y { height: 6px; flex: 0 0 6px; cursor: ns-resize; background: transparent; margin: -3px 0; z-index: 15; position: relative; }
 .resizer-y:hover, .resizer-y.active { background: var(--vsc-focus); }
 
+/* ── Editor groups container (the split columns) ───────────────
+   Fills the space between the side bar and the chat panel and CLIPS its
+   children, so editor-group boxes can never spill out of the editor area and
+   paint over the reserved chat column. */
+.workbench-tabs { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; overflow: hidden; }
+
 /* ── Editor group (one split pane: tab bar on top, editor below) ── */
 .editor-group {
   display: flex; flex-direction: column; min-width: 0; min-height: 0;
   background: var(--vsc-editor-bg); overflow: hidden;
 }
-/* Subtle focused-pane accent (only present when there is more than one pane). */
-.editor-group.focused > .workspace-tabbar { box-shadow: inset 0 2px 0 var(--vsc-focus); }
 
 /* ── Per-tab workbench region (side bar + editor) ─────────── */
 .wb-tab { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; }
@@ -3355,6 +3513,9 @@ input:focus, select:focus {
 .terminal-panel-close.icon:hover { background: var(--vsc-list-hover); color: var(--text); }
 .terminal-body { position: relative; flex: 1 1 0; min-height: 0; overflow: hidden; }
 .terminal-surface { position: absolute; inset: 0; padding: 4px 2px 4px 8px; }
+/* Right-click Copy/Paste menu — reuses the themed .context-menu base. */
+.terminal-context-menu { min-width: 150px; }
+.terminal-context-menu button { height: 26px; font-size: 12px; }
 .terminal-surface .xterm { height: 100%; }
 .terminal-empty { padding: 12px; font-size: 12px; color: var(--muted); }
 

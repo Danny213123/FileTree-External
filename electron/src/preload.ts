@@ -19,6 +19,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   copyText: (text: string): Promise<void> =>
     ipcRenderer.invoke("copyText", text),
 
+  // Clipboard: read text (fallback for terminal paste when the renderer blocks
+  // the async web Clipboard API).
+  clipboardReadText: (): Promise<string> =>
+    ipcRenderer.invoke("clipboardReadText"),
+
   // Clipboard: copy files as CF_HDROP (paste in Explorer).
   copyFiles: (paths: string[]): Promise<void> =>
     ipcRenderer.invoke("copyFiles", paths),
