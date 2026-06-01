@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self as sio, BufRead, BufReader, Write};
+use std::io::{self as sio, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -2555,7 +2555,6 @@ fn stream_fs_events_poll(mut stream: TcpStream, root: &str) -> sio::Result<()> {
 // ── Ollama proxy ────────────────────────────────────────────
 
 fn ollama_list_models() -> String {
-    use std::io::{BufRead, Read, Write};
     use std::net::TcpStream;
     let Ok(mut conn) = TcpStream::connect("127.0.0.1:11434") else {
         return "{\"models\":[]}".to_string();
@@ -2565,24 +2564,143 @@ fn ollama_list_models() -> String {
     if conn.write_all(req).is_err() {
         return "{\"models\":[]}".to_string();
     }
-    let mut reader = BufReader::new(&conn);
-    // Skip HTTP headers
+    let mut reader = BufReader::new(conn);
+    let Ok(headers) = read_http_response_headers(&mut reader) else {
+        return "{\"models\":[]}".to_string();
+    };
+    let mut body = String::new();
+    if header_has_token(&headers, "transfer-encoding", "chunked") {
+        match read_chunked_body_to_string(&mut reader) {
+            Ok(decoded) => body = decoded,
+            Err(_) => return "{\"models\":[]}".to_string(),
+        }
+    } else {
+        let _ = reader.read_to_string(&mut body);
+    }
+    if body.is_empty() {
+        "{\"models\":[]}".to_string()
+    } else {
+        body
+    }
+}
+
+fn read_http_response_headers<R: BufRead>(reader: &mut R) -> sio::Result<HashMap<String, String>> {
     let mut line = String::new();
+    reader.read_line(&mut line)?; // status line
+
+    let mut headers = HashMap::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+        if reader.read_line(&mut line)? == 0 {
             break;
         }
         if line == "\r\n" || line == "\n" {
             break;
         }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
     }
-    let mut body = String::new();
-    let _ = reader.read_to_string(&mut body);
-    if body.is_empty() {
-        "{\"models\":[]}".to_string()
-    } else {
-        body
+    Ok(headers)
+}
+
+fn header_has_token(headers: &HashMap<String, String>, name: &str, token: &str) -> bool {
+    headers
+        .get(&name.to_ascii_lowercase())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+        .unwrap_or(false)
+}
+
+fn read_chunked_body_to_string<R: BufRead>(reader: &mut R) -> sio::Result<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let size_text = line.trim();
+        if size_text.is_empty() {
+            continue;
+        }
+        let size_hex = size_text.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| sio::Error::new(sio::ErrorKind::InvalidData, "invalid chunk size"))?;
+        if size == 0 {
+            loop {
+                line.clear();
+                if reader.read_line(&mut line)? == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            break;
+        }
+
+        let start = out.len();
+        out.resize(start + size, 0);
+        reader.read_exact(&mut out[start..])?;
+
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf)?;
+        if crlf != *b"\r\n" {
+            return Err(sio::Error::new(
+                sio::ErrorKind::InvalidData,
+                "invalid chunk terminator",
+            ));
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+#[cfg(test)]
+mod ollama_proxy_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn decodes_chunked_ollama_model_body() {
+        let raw = b"HTTP/1.1 200 OK\r\n\
+                    Content-Type: application/json\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    \r\n\
+                    d\r\n\
+                    {\"models\":[]}\r\n\
+                    0\r\n\
+                    \r\n";
+        let mut reader = BufReader::new(Cursor::new(&raw[..]));
+
+        let headers = read_http_response_headers(&mut reader).unwrap();
+        assert!(header_has_token(&headers, "transfer-encoding", "chunked"));
+        assert_eq!(
+            read_chunked_body_to_string(&mut reader).unwrap(),
+            "{\"models\":[]}"
+        );
+    }
+
+    #[test]
+    fn decodes_chunked_body_with_extensions_and_trailers() {
+        let raw = b"HTTP/1.1 200 OK\r\n\
+                    Transfer-Encoding: gzip, chunked\r\n\
+                    \r\n\
+                    5;foo=bar\r\n\
+                    {\"mod\r\n\
+                    8\r\n\
+                    els\":[]}\r\n\
+                    0\r\n\
+                    X-Test: trailer\r\n\
+                    \r\n";
+        let mut reader = BufReader::new(Cursor::new(&raw[..]));
+
+        let headers = read_http_response_headers(&mut reader).unwrap();
+        assert!(header_has_token(&headers, "Transfer-Encoding", "chunked"));
+        assert_eq!(
+            read_chunked_body_to_string(&mut reader).unwrap(),
+            "{\"models\":[]}"
+        );
     }
 }
 
