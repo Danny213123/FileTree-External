@@ -42,6 +42,12 @@ function needsRealData(task: string, finalText: string): boolean {
   return FILE_INTENT_RE.test(task) || SPECIFICS_RE.test(finalText);
 }
 
+// Does the user's request ask for an actual file change (not just a question)?
+// Used to nudge the orchestrator to follow through with delegate_to_action
+// after Search has located the files, instead of stopping at the listing.
+const ACTION_INTENT_RE =
+  /\b(delete|deleting|delete'?s|remove|removing|move|moving|clean|cleaning|cleanup|clean up|free up|freeing|rename|renaming|organi[sz]e|organi[sz]ing|trash|purge|get rid of|tidy|consolidate)\b/i;
+
 // Deterministically pick the most relevant read-only tool (and args) for a
 // natural-language task. Used when a weak model refuses to call a tool itself,
 // so the runtime can fetch real data without the model's cooperation. Always
@@ -91,7 +97,7 @@ function coerceTask(v: unknown): string {
 export function searchSpec(api: AgentApi): AgentSpec {
   return {
     agent: "search",
-    maxSteps: 6,
+    maxSteps: 8,
     tools: SEARCH_TOOLS,
     systemPrompt: [
       "You are the Search agent inside FileTree, a disk-usage explorer.",
@@ -124,7 +130,7 @@ export function searchSpec(api: AgentApi): AgentSpec {
 export function actionSpec(api: AgentApi): AgentSpec {
   return {
     agent: "action",
-    maxSteps: 6,
+    maxSteps: 8,
     tools: ACTION_TOOLS,
     systemPrompt: [
       "You are the Action agent inside FileTree, a disk-usage explorer.",
@@ -175,9 +181,14 @@ const DELEGATION_TOOLS: ToolDef[] = [
 ];
 
 export function orchestratorSpec(api: AgentApi, attachedContext: string): AgentSpec {
+  // Fires at most once per turn: after Search finds the files for an action
+  // request, nudge the orchestrator to actually propose the change instead of
+  // stopping at the listing. Kept here (not via the shared nudges counter) so
+  // it can never loop regardless of how many search nudges happened.
+  let continuationNudged = false;
   return {
     agent: "orchestrator",
-    maxSteps: 8,
+    maxSteps: 12,
     tools: DELEGATION_TOOLS,
     systemPrompt: [
       "You are the Orchestrator of FileTree's AI assistant. You coordinate two specialized sub-agents to help the user understand and clean up disk usage.",
@@ -217,7 +228,22 @@ export function orchestratorSpec(api: AgentApi, attachedContext: string): AgentS
     // force a real read-only investigation so the user gets actual data instead
     // of fabricated file names/sizes. (Read-only only — never forces an action.)
     guardFinal: ({ task, finalText, ranTools, nudges }) => {
-      if (ranTools.includes("delegate_to_search")) return { action: "accept" };
+      const searched = ranTools.includes("delegate_to_search");
+      const acted = ranTools.includes("delegate_to_action");
+      // Follow-through: the user asked for a change and Search located the
+      // files, but no action has been proposed yet. Nudge once to call
+      // delegate_to_action (the user still approves/skips on screen). Gated by
+      // the closure flag so it can fire only once and never loops.
+      if (searched && !acted && !continuationNudged && ACTION_INTENT_RE.test(task)) {
+        continuationNudged = true;
+        return {
+          action: "nudge",
+          message:
+            "You found the files but haven't made the change the user asked for. Call delegate_to_action now with the EXACT absolute path(s) copied from the Search findings — the user will see an on-screen approval card and Approve or Skip it. Do NOT ask the user to confirm in chat.",
+          notice: "Found the files but no change proposed yet — prompting the assistant to take the action.",
+        };
+      }
+      if (searched) return { action: "accept" };
       if (!needsRealData(task, finalText)) return { action: "accept" };
       if (nudges === 0) {
         return {
@@ -241,11 +267,13 @@ export function orchestratorSpec(api: AgentApi, attachedContext: string): AgentS
         notice: "The model wouldn't use its tools — running the Search agent automatically to get real data.",
       };
     },
-    // If a search was forced but the model still won't phrase an answer, fall
-    // back to the Search agent's real findings so the final reply shows actual
-    // data rather than nothing.
+    // If the model won't phrase an answer of its own, fall back to a sub-agent's
+    // real report (Search findings or the Action agent's result) so the final
+    // reply shows actual data/outcome rather than nothing.
     formatFindings: (name, result) =>
-      name === "delegate_to_search" ? String((result as { report?: string })?.report ?? "") : "",
+      name === "delegate_to_search" || name === "delegate_to_action"
+        ? String((result as { report?: string })?.report ?? "")
+        : "",
   };
 }
 

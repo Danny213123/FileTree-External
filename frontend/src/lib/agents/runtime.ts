@@ -34,9 +34,14 @@ export async function runAgent(
   let nudges = 0; // interventions made by guardFinal (nudge or force)
   const ranTools = new Set<string>();
   let finalText = "";
-  // Deterministic findings produced by a forced read-only tool, used as a
-  // fallback answer if the model never phrases one of its own.
-  let forcedFindings = "";
+  // Best real findings gathered this run — from ANY tool whose result
+  // formatFindings can render, not just a forced one. Used as a fallback answer
+  // if the model never phrases a final reply of its own, so the run never ends
+  // blank (a major cause of the assistant "quitting early").
+  let fallbackFindings = "";
+  // True once we leave the loop via a real, accepted final answer (vs. running
+  // out of the step budget mid-task). Drives the step-limit notice below.
+  let reachedFinal = false;
   let status: RunResult["status"] = "done";
 
   // Execute a single tool call: approval-gate mutating/plan calls, run it,
@@ -50,7 +55,9 @@ export async function runAgent(
     // unless global auto-approve is on. (The guard only ever forces read-only
     // tools, so a forced call never silently runs a mutating action.)
     const isPlanDelegation = call.name === "delegate_to_action";
-    const requiresApproval = (mutating || isPlanDelegation) && !ctx.autoApprove;
+    // Mutating/plan calls need a review card, unless the user globally
+    // auto-approves or has "always allowed" this specific tool.
+    const requiresApproval = (mutating || isPlanDelegation) && !ctx.autoApprove && !ctx.allowTool(call.name);
     ctx.emit({ kind: "tool_start", runId, callId: call.id, tool: call.name, args: call.args, mutating, requiresApproval });
 
     let approved = true;
@@ -62,10 +69,15 @@ export async function runAgent(
     let summary: string;
     let stepStatus: "done" | "error" | "rejected";
     if (!approved) {
-      // Feed a clear rejection back so the orchestrator stops cleanly instead
-      // of retrying or fabricating a result.
-      resultObj = { ok: false, error: isPlanDelegation ? "User rejected this plan." : "User rejected this action." };
-      summary = "Rejected";
+      // The user skipped this step. Feed a clear, non-retry signal back so the
+      // agent moves on (or finalizes) instead of re-proposing or fabricating it.
+      resultObj = {
+        ok: false,
+        error: isPlanDelegation
+          ? "User skipped this plan. Do not retry it; continue or give your final answer."
+          : "User skipped this action. Do not retry it; continue with the rest of the task or give your final answer.",
+      };
+      summary = "Skipped";
       stepStatus = "rejected";
     } else {
       ctx.emit({ kind: "tool_update", runId, callId: call.id, status: "running" });
@@ -137,7 +149,13 @@ export async function runAgent(
     if (toolCalls.length) {
       for (const call of toolCalls) {
         if (ctx.signal.aborted) break;
-        await runOneCall(call);
+        const ran = await runOneCall(call);
+        // Capture renderable findings from real (model-issued) calls too, so a
+        // model that gathers data but then stalls still yields a useful answer.
+        if (spec.formatFindings) {
+          const findings = spec.formatFindings(call.name, ran.result);
+          if (findings.trim()) fallbackFindings = findings;
+        }
       }
       continue;
     }
@@ -183,7 +201,7 @@ export async function runAgent(
         const ran = await runOneCall(forced);
         if (spec.formatFindings) {
           const findings = spec.formatFindings(forced.name, ran.result);
-          if (findings.trim()) forcedFindings = findings;
+          if (findings.trim()) fallbackFindings = findings;
         }
         continue;
       }
@@ -204,14 +222,22 @@ export async function runAgent(
     }
 
     finalText = text;
+    reachedFinal = true;
     break;
   }
 
   if (ctx.signal.aborted) status = "error";
-  // If the model never produced a final answer but we forced a read-only tool,
-  // return the real findings so the user always sees actual data, not nothing.
-  if (status !== "error" && !finalText.trim() && forcedFindings.trim()) {
-    finalText = forcedFindings;
+  // Budget exhausted mid-task (the loop ran out of steps without a clean final
+  // answer). Tell the user we're wrapping up rather than ending silently, and
+  // still return the best content gathered below.
+  if (status === "done" && !reachedFinal && !ctx.signal.aborted) {
+    ctx.emit({ kind: "notice", runId, level: "warn", text: "Reached the step limit — wrapping up with what's been gathered so far." });
+  }
+  // If the model never produced a final answer but we gathered real findings
+  // (forced or model-issued), return them so the user always sees actual data,
+  // not a blank turn.
+  if (status !== "error" && !finalText.trim() && fallbackFindings.trim()) {
+    finalText = fallbackFindings;
   }
   if (status === "done" && !finalText.trim()) {
     ctx.emit({ kind: "notice", runId, level: "warn", text: "The model returned an empty response. Try a tool-capable model (e.g. qwen2.5, llama3.1) or a cloud provider." });

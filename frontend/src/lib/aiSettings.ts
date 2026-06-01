@@ -8,6 +8,9 @@ export interface AiSettings {
   provider: LlmProvider;
   model: string;
   keys: { openai: string; anthropic: string };
+  // Tool names the user chose to "always allow" — these run without surfacing a
+  // per-action approval card (e.g. "delete_items", "delegate_to_action").
+  allow: string[];
 }
 
 const KEY = "filetree.ai.settings";
@@ -16,12 +19,13 @@ const DEFAULTS: AiSettings = {
   provider: "ollama",
   model: "",
   keys: { openai: "", anthropic: "" },
+  allow: [],
 };
 
 export function loadAiSettings(): AiSettings {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return { ...DEFAULTS, keys: { ...DEFAULTS.keys } };
+    if (!raw) return { ...DEFAULTS, keys: { ...DEFAULTS.keys }, allow: [] };
     const parsed = JSON.parse(raw) as Partial<AiSettings>;
     return {
       provider: parsed.provider ?? DEFAULTS.provider,
@@ -30,9 +34,10 @@ export function loadAiSettings(): AiSettings {
         openai: parsed.keys?.openai ?? "",
         anthropic: parsed.keys?.anthropic ?? "",
       },
+      allow: Array.isArray(parsed.allow) ? parsed.allow.filter((t): t is string => typeof t === "string") : [],
     };
   } catch {
-    return { ...DEFAULTS, keys: { ...DEFAULTS.keys } };
+    return { ...DEFAULTS, keys: { ...DEFAULTS.keys }, allow: [] };
   }
 }
 
@@ -48,4 +53,8 @@ export function keyFor(s: AiSettings, provider: LlmProvider): string {
   if (provider === "openai") return s.keys.openai;
   if (provider === "anthropic") return s.keys.anthropic;
   return "";
+}
+
+export function isAllowed(s: AiSettings, tool: string): boolean {
+  return s.allow.includes(tool);
 }

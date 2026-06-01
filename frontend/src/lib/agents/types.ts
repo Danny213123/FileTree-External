@@ -39,8 +39,11 @@ export interface RunContext {
   autoApprove: boolean;
   signal: AbortSignal;
   emit: (ev: AgentEvent) => void;
-  // Resolves true to run a mutating tool, false to reject it.
+  // Resolves true to run a mutating tool, false to skip it.
   requestApproval: (callId: string, view: ToolCallView) => Promise<boolean>;
+  // True when the user has "always allowed" this tool, so it runs without
+  // surfacing an approval card (read live so a mid-run "always allow" applies).
+  allowTool: (tool: string) => boolean;
   newId: (prefix?: string) => string;
 }
 

@@ -99,6 +99,10 @@ function compareNodes(
       left = a.depth;
       right = b.depth;
       break;
+    case "compressionRate":
+      left = a.size > 0 && a.allocated < a.size ? 1 - a.allocated / a.size : 0;
+      right = b.size > 0 && b.allocated < b.size ? 1 - b.allocated / b.size : 0;
+      break;
     case "attributes":
       left = [a.hidden ? "H" : "", a.readonly ? "R" : "", a.link ? "L" : ""].join("");
       right = [b.hidden ? "H" : "", b.readonly ? "R" : "", b.link ? "L" : ""].join("");

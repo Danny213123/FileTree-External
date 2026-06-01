@@ -18,15 +18,13 @@ interface ActivityBarProps {
   onSelect: (v: ViewId) => void;
   bookmarkCount: number;
   errorCount: number;
-  chatOpen: boolean;
-  onToggleChat: () => void;
   darkMode: boolean;
   onToggleTheme: () => void;
 }
 
 export function ActivityBar({
   activeView, sidebarOpen, onSelect, bookmarkCount, errorCount,
-  chatOpen, onToggleChat, darkMode, onToggleTheme,
+  darkMode, onToggleTheme,
 }: ActivityBarProps) {
   return (
     <div className="activitybar">
@@ -46,13 +44,6 @@ export function ActivityBar({
         );
       })}
       <div className="spacer" />
-      <button
-        className={`activity-btn${chatOpen ? " active" : ""}`}
-        title="Toggle AI Assistant"
-        onClick={onToggleChat}
-      >
-        <Icon name="chat" />
-      </button>
       <button className="activity-btn" title={darkMode ? "Light theme" : "Dark theme"} onClick={onToggleTheme}>
         <Icon name={darkMode ? "sun" : "moon"} />
       </button>

@@ -147,12 +147,13 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
   const convoSummaryRef = useRef("");
   const summarizedCountRef = useRef(0);
 
-  const updateAi = useCallback((patch: { provider?: LlmProvider; model?: string; keys?: Partial<AiSettings["keys"]> }) => {
+  const updateAi = useCallback((patch: { provider?: LlmProvider; model?: string; keys?: Partial<AiSettings["keys"]>; allow?: string[] }) => {
     setAi((prev) => {
       const next: AiSettings = {
         provider: patch.provider ?? prev.provider,
         model: patch.model ?? prev.model,
         keys: { ...prev.keys, ...(patch.keys ?? {}) },
+        allow: patch.allow ?? prev.allow,
       };
       saveAiSettings(next);
       return next;
@@ -293,7 +294,21 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
         });
         break;
       case "agent_end":
-        setRuns((prev) => { const r = prev[ev.runId]; return r ? { ...prev, [ev.runId]: { ...r, status: ev.status, text: r.text || ev.summary || "" } } : prev; });
+        // The run (orchestrator or a sub-agent) just finished. Keep its final
+        // answer + step timeline, but drop the transient process-chatter
+        // notices (retry/force/step-limit/empty-response, guard nudges, …) that
+        // were only useful as live activity and otherwise pile up forever. Keep
+        // level "error" so genuine failures stay visible after the turn ends.
+        setRuns((prev) => { const r = prev[ev.runId]; return r ? { ...prev, [ev.runId]: { ...r, status: ev.status, text: r.text || ev.summary || "", notices: r.notices.filter((n) => n.level === "error") } } : prev; });
+        // If a top-level run ended (one tracked directly in the chat list, i.e.
+        // the orchestrator) the whole turn is done — sweep any standalone
+        // info/warn notice lines from this turn too, keeping errors. Sub-agent
+        // ends leave `items` untouched (the filter returns the same reference).
+        setItems((prev) => {
+          if (!prev.some((it) => it.type === "run" && it.runId === ev.runId)) return prev;
+          const next = prev.filter((it) => it.type !== "notice" || it.level === "error");
+          return next.length === prev.length ? prev : next;
+        });
         break;
       case "notice":
         if (ev.runId) {
@@ -328,6 +343,32 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     runAutoApproveRef.current = true;
     resolveApproval(callId, true);
   }, [resolveApproval]);
+
+  // Persist a tool to the "always allow" list so future calls to it skip the
+  // approval card (machine-local, like the other AI settings).
+  const addAllow = useCallback((tool: string) => {
+    setAi((prev) => {
+      if (prev.allow.includes(tool)) return prev;
+      const next = { ...prev, allow: [...prev.allow, tool] };
+      saveAiSettings(next);
+      return next;
+    });
+  }, []);
+
+  const removeAllow = useCallback((tool: string) => {
+    setAi((prev) => {
+      if (!prev.allow.includes(tool)) return prev;
+      const next = { ...prev, allow: prev.allow.filter((t) => t !== tool) };
+      saveAiSettings(next);
+      return next;
+    });
+  }, []);
+
+  // "Always allow <tool>": persist it, then approve the call that prompted it.
+  const allowlist = useCallback((callId: string, tool: string) => {
+    addAllow(tool);
+    resolveApproval(callId, true);
+  }, [addAllow, resolveApproval]);
 
   // ── Attached context ───────────────────────────────────────
   const pushAttached = useCallback((item: AttachedItem) => {
@@ -531,6 +572,9 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
           provider, model: selectedModel, apiKey, api,
           autoApprove, signal: controller.signal,
           emit: applyEvent, requestApproval, newId: uid,
+          // Read the allowlist live so an "Always allow" chosen mid-run applies
+          // to the rest of this turn without a stale closure.
+          allowTool: (t) => loadAiSettings().allow.includes(t),
         },
         { userText: text, attachedContext: combinedContext, priorConvo, images: images.length ? images : undefined },
       );
@@ -675,7 +719,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
             );
           }
           if (m.type === "notice") return <NoticeLine key={m.id} level={m.level} text={m.text} />;
-          return <RunView key={m.id} runId={m.runId} runs={runs} onApprove={(c) => resolveApproval(c, true)} onReject={(c) => resolveApproval(c, false)} onApproveAll={approveAll} />;
+          return <RunView key={m.id} runId={m.runId} runs={runs} onApprove={(c) => resolveApproval(c, true)} onReject={(c) => resolveApproval(c, false)} onApproveAll={approveAll} onAllowlist={allowlist} />;
         })}
         <div ref={bottomRef} />
       </div>
@@ -687,6 +731,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
             autoApprove={autoApprove}
             onChange={(keys) => updateAi({ keys })}
             onToggleAuto={setAutoApprove}
+            onRemoveAllow={removeAllow}
             onClose={() => setShowKeys(false)}
           />
         )}
@@ -795,7 +840,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
 }
 
 // ── Run timeline ─────────────────────────────────────────────
-function RunView({ runId, runs, onApprove, onReject, onApproveAll }: { runId: string; runs: Record<string, RunState>; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void }) {
+function RunView({ runId, runs, onApprove, onReject, onApproveAll, onAllowlist }: { runId: string; runs: Record<string, RunState>; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
   const run = runs[runId];
   if (!run) return null;
   const isOrch = run.agent === "orchestrator";
@@ -804,7 +849,7 @@ function RunView({ runId, runs, onApprove, onReject, onApproveAll }: { runId: st
   const body = (
     <>
       {run.thinking.trim() && <ThinkingBlock text={run.thinking} open={streaming && !run.text} live={streaming && !run.text} />}
-      <StepList run={run} runs={runs} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} />
+      <StepList run={run} runs={runs} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />
       {run.text.trim() && (
         <div className="chat-msg-text">
           <Markdown text={run.text} />
@@ -829,20 +874,20 @@ function RunView({ runId, runs, onApprove, onReject, onApproveAll }: { runId: st
 
 // Renders a run's ordered timeline: child sub-agents, the Tier-1 plan card for
 // delegate_to_action, and per-tool steps (Tier-2 action cards / search steps).
-function StepList({ run, runs, onApprove, onReject, onApproveAll }: { run: RunState; runs: Record<string, RunState>; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void }) {
+function StepList({ run, runs, onApprove, onReject, onApproveAll, onAllowlist }: { run: RunState; runs: Record<string, RunState>; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
   return (
     <>
       {run.order.map((o) => {
-        if (o.kind === "child") return <SubAgentCard key={o.childId} runId={o.childId} runs={runs} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} />;
+        if (o.kind === "child") return <SubAgentCard key={o.childId} runId={o.childId} runs={runs} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />;
         const tool = run.tools[o.callId];
-        if (tool?.tool === "delegate_to_action") return <PlanCard key={o.callId} tool={tool} onApprove={onApprove} onReject={onReject} />;
-        return <ToolStep key={o.callId} tool={tool} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} />;
+        if (tool?.tool === "delegate_to_action") return <PlanCard key={o.callId} tool={tool} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />;
+        return <ToolStep key={o.callId} tool={tool} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />;
       })}
     </>
   );
 }
 
-function SubAgentCard({ runId, runs, onApprove, onReject, onApproveAll }: { runId: string; runs: Record<string, RunState>; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void }) {
+function SubAgentCard({ runId, runs, onApprove, onReject, onApproveAll, onAllowlist }: { runId: string; runs: Record<string, RunState>; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
   const run = runs[runId];
   const [collapsed, setCollapsed] = useState(false);
   if (!run) return null;
@@ -864,7 +909,7 @@ function SubAgentCard({ runId, runs, onApprove, onReject, onApproveAll }: { runI
         <div className="subagent-body">
           {run.task && <div className="subagent-task">{String(run.task)}</div>}
           {run.thinking.trim() && <ThinkingBlock text={run.thinking} open={streaming && !run.text} live={streaming && !run.text} />}
-          <StepList run={run} runs={runs} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} />
+          <StepList run={run} runs={runs} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />
           {run.text.trim() && <div className="subagent-summary"><Markdown text={run.text} />{streaming && <span className="chat-cursor">{"\u258B"}</span>}</div>}
           {run.notices.map((n, i) => <NoticeLine key={i} level={n.level} text={n.text} />)}
           {streaming && <LiveStatus label={currentActivity(run, runs)} />}
@@ -874,9 +919,48 @@ function SubAgentCard({ runId, runs, onApprove, onReject, onApproveAll }: { runI
   );
 }
 
+// Cursor-style "Allow" split menu: a secondary control offering "Always allow
+// <tool>" (persists to the allowlist, then approves) and "Approve all in this
+// run" (per-turn latch). Closes on outside click / Escape.
+function AllowMenu({ callId, tool, label, onAllowlist, onApproveAll }: {
+  callId: string;
+  tool: string;
+  label: string;
+  onAllowlist: (c: string, tool: string) => void;
+  onApproveAll: (c: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDoc); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+  return (
+    <div className="approval-allow" ref={ref}>
+      <button className="agent-btn-ghost approval-allow-trigger" onClick={() => setOpen((v) => !v)} title="More approval options">
+        Allow <Icon name="chevron-down" size={10} />
+      </button>
+      {open && (
+        <div className="approval-allow-menu" role="menu">
+          <button role="menuitem" onClick={() => { setOpen(false); onAllowlist(callId, tool); }}>
+            <Icon name="check" size={11} /> {label}
+          </button>
+          <button role="menuitem" onClick={() => { setOpen(false); onApproveAll(callId); }} title="Approve this and all remaining actions in this run">
+            <Icon name="check" size={11} /> Approve all in this run
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Tier-1 plan card: the whole proposed change (delegate_to_action) the user
 // approves before the Action agent starts.
-function PlanCard({ tool, onApprove, onReject }: { tool?: ToolState; onApprove: (c: string) => void; onReject: (c: string) => void }) {
+function PlanCard({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { tool?: ToolState; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
   if (!tool) return null;
   const task = taskText(tool.args.task);
   const paths = parsePlanPaths(task);
@@ -888,7 +972,7 @@ function PlanCard({ tool, onApprove, onReject }: { tool?: ToolState; onApprove: 
         <span className={`tool-dot ${dotClass}`} />
         <Icon name="folder-open" size={13} />
         <span className="approval-card-title">Proposed changes</span>
-        {tool.status === "rejected" && <span className="approval-status rej">Rejected</span>}
+        {tool.status === "rejected" && <span className="approval-status rej">Skipped</span>}
         {tool.status === "done" && <span className="approval-status ok">Approved</span>}
       </div>
       <div className="approval-card-body">
@@ -903,17 +987,19 @@ function PlanCard({ tool, onApprove, onReject }: { tool?: ToolState; onApprove: 
       {pending && (
         <div className="approval-card-actions">
           <button className="agent-btn-approve" onClick={() => onApprove(tool.callId)}>Approve plan</button>
-          <button className="agent-btn-reject" onClick={() => onReject(tool.callId)}>Reject</button>
+          <button className="agent-btn-reject" onClick={() => onReject(tool.callId)}>Skip</button>
+          <span className="approval-actions-spacer" />
+          <AllowMenu callId={tool.callId} tool="delegate_to_action" label="Always allow action plans" onAllowlist={onAllowlist} onApproveAll={onApproveAll} />
         </div>
       )}
     </div>
   );
 }
 
-function ToolStep({ tool, onApprove, onReject, onApproveAll }: { tool?: ToolState; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void }) {
+function ToolStep({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { tool?: ToolState; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
   if (!tool) return null;
   // Mutating action tools render as the richer Tier-2 command-approval card.
-  if (tool.mutating) return <ActionCard tool={tool} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} />;
+  if (tool.mutating) return <ActionCard tool={tool} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />;
   // Read-only search steps stay as a compact one-liner.
   const argLine = compactArgs(tool);
   const dotClass = tool.status === "error" ? "err" : tool.status === "rejected" ? "rej" : tool.status === "done" ? "ok" : tool.status === "pending" ? "wait" : "run";
@@ -931,18 +1017,21 @@ function ToolStep({ tool, onApprove, onReject, onApproveAll }: { tool?: ToolStat
 
 // Tier-2 command-approval card (Codex/Cursor style): a humanized command line,
 // the affected paths, and Approve / Reject (+ optional Approve-all-in-run).
-function ActionCard({ tool, onApprove, onReject, onApproveAll }: { tool: ToolState; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void }) {
+function ActionCard({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { tool: ToolState; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
   const paths = (tool.args.paths as string[]) ?? (tool.args.path ? [String(tool.args.path)] : []);
   const dest = tool.args.destination as string | undefined;
   const newName = tool.args.new_name as string | undefined;
   const pending = tool.status === "pending";
   const dotClass = tool.status === "error" ? "err" : tool.status === "rejected" ? "rej" : tool.status === "done" ? "ok" : pending ? "wait" : "run";
-  const statusLabel = tool.status === "rejected" ? "Rejected" : tool.status === "done" ? (tool.summary || "Done") : tool.status === "error" ? (tool.summary || "Failed") : "";
+  const statusLabel = tool.status === "rejected" ? "Skipped" : tool.status === "done" ? (tool.summary || "Done") : tool.status === "error" ? (tool.summary || "Failed") : "";
+  // Ran without surfacing a card (global auto-approve or an allowlisted tool).
+  const autoRan = !tool.requiresApproval && tool.status !== "pending";
   return (
     <div className={`approval-card action-card ${tool.status}`}>
       <div className="approval-card-head">
         <span className={`tool-dot ${dotClass}`} />
         <span className="approval-card-title">Action agent wants to run</span>
+        {autoRan && <span className="approval-status auto" title="Ran without a review card (auto-approved or on the allowlist)">Auto-approved</span>}
         {!pending && statusLabel && <span className={`approval-status ${tool.status === "error" ? "err" : tool.status === "done" ? "ok" : "rej"}`}>{statusLabel}</span>}
       </div>
       <div className="approval-card-body">
@@ -959,8 +1048,9 @@ function ActionCard({ tool, onApprove, onReject, onApproveAll }: { tool: ToolSta
       {pending && (
         <div className="approval-card-actions">
           <button className="agent-btn-approve" onClick={() => onApprove(tool.callId)}>Approve</button>
-          <button className="agent-btn-reject" onClick={() => onReject(tool.callId)}>Reject</button>
-          <button className="agent-btn-ghost" onClick={() => onApproveAll(tool.callId)} title="Approve this and all remaining actions in this run">Approve all</button>
+          <button className="agent-btn-reject" onClick={() => onReject(tool.callId)}>Skip</button>
+          <span className="approval-actions-spacer" />
+          <AllowMenu callId={tool.callId} tool={tool.tool} label={`Always allow ${tool.tool}`} onAllowlist={onAllowlist} onApproveAll={onApproveAll} />
         </div>
       )}
     </div>
@@ -1251,13 +1341,21 @@ function ModelPicker({ groups, provider, model, disabled, onPick }: {
   );
 }
 
-function SettingsMenu({ ai, autoApprove, onChange, onToggleAuto, onClose }: {
+function SettingsMenu({ ai, autoApprove, onChange, onToggleAuto, onRemoveAllow, onClose }: {
   ai: AiSettings;
   autoApprove: boolean;
   onChange: (keys: Partial<AiSettings["keys"]>) => void;
   onToggleAuto: (v: boolean) => void;
+  onRemoveAllow: (tool: string) => void;
   onClose: () => void;
 }) {
+  const ALLOW_LABELS: Record<string, string> = {
+    delete_items: "Delete to Recycle Bin",
+    move_items: "Move items",
+    rename_item: "Rename item",
+    create_folder: "Create folder",
+    delegate_to_action: "Action plans",
+  };
   return (
     <div className="chat-keys">
       <div className="chat-keys-head">
@@ -1268,6 +1366,23 @@ function SettingsMenu({ ai, autoApprove, onChange, onToggleAuto, onClose }: {
         <input type="checkbox" checked={autoApprove} onChange={(e) => onToggleAuto(e.target.checked)} />
         <span>Auto-approve file actions</span>
       </label>
+      <div className="chat-keys-allow">
+        <div className="chat-keys-allow-head">Always-allowed actions</div>
+        {ai.allow.length === 0 ? (
+          <p className="chat-keys-note">None yet. Choose "Always allow" on an action's review box to skip its card next time.</p>
+        ) : (
+          <ul className="allow-list">
+            {ai.allow.map((t) => (
+              <li key={t} className="allow-row">
+                <Icon name="check" size={11} />
+                <span className="allow-name">{ALLOW_LABELS[t] ?? t}</span>
+                <span className="spacer" />
+                <button className="icon" onClick={() => onRemoveAllow(t)} title={`Stop always allowing ${t}`}><Icon name="x" size={11} /></button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
       <div className="chat-keys-divider" />
       <label>OpenAI API key
         <input type="password" value={ai.keys.openai} placeholder="sk-…" onChange={(e) => onChange({ openai: e.target.value })} autoComplete="off" spellCheck={false} />

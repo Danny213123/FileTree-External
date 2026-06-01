@@ -9,26 +9,50 @@ import { Icon } from "./Icon";
 
 const ROW_HEIGHT = 20;
 
-export const ALL_COLUMNS: { key: SortKey; label: string }[] = [
-  { key: "name",        label: "Name" },
-  { key: "path",        label: "Full Path" },
-  { key: "folderPath",  label: "Folder Path" },
-  { key: "size",        label: "Size" },
-  { key: "allocated",   label: "Allocated" },
-  { key: "type",        label: "Type" },
-  { key: "files",       label: "Files" },
-  { key: "folders",     label: "Folders" },
-  { key: "attributes",  label: "Attributes" },
-  { key: "percent",     label: "% of Parent" },
-  { key: "created",     label: "Creation Date" },
-  { key: "accessed",    label: "Last Accessed" },
-  { key: "modified",    label: "Last Modified" },
-  { key: "avgFileSize", label: "Avg. File Size" },
-  { key: "pathLength",  label: "Path Length" },
-  { key: "dirLevel",    label: "Dir Level" },
+// Column descriptor. `width` is the base px width used both for the dynamic
+// grid template (minmax floor) and the min-table-width that forces horizontal
+// scroll; `align` controls cell text alignment; `group` buckets the column in
+// the Configure Columns menu. The Name column is special-cased (tree cell).
+export interface ColumnDef {
+  key: SortKey;
+  label: string;
+  width: number;
+  align: "left" | "right" | "center";
+  group: "common" | "date" | "extended";
+}
+
+export const ALL_COLUMNS: ColumnDef[] = [
+  { key: "name",            label: "Name",          width: 200, align: "left",   group: "common" },
+  { key: "path",            label: "Full Path",     width: 300, align: "left",   group: "common" },
+  { key: "folderPath",      label: "Folder Path",   width: 240, align: "left",   group: "common" },
+  { key: "size",            label: "Size",          width: 92,  align: "right",  group: "common" },
+  { key: "allocated",       label: "Allocated",     width: 92,  align: "right",  group: "common" },
+  { key: "type",            label: "Type",          width: 88,  align: "left",   group: "common" },
+  { key: "files",           label: "Files",         width: 74,  align: "right",  group: "common" },
+  { key: "folders",         label: "Folders",       width: 74,  align: "right",  group: "common" },
+  { key: "attributes",      label: "Attributes",    width: 86,  align: "center", group: "common" },
+  { key: "percent",         label: "% of Parent",   width: 112, align: "center", group: "common" },
+  { key: "created",         label: "Creation Date", width: 132, align: "right",  group: "date" },
+  { key: "accessed",        label: "Last Accessed", width: 132, align: "right",  group: "date" },
+  { key: "modified",        label: "Last Modified", width: 132, align: "right",  group: "date" },
+  { key: "avgFileSize",     label: "Avg. File Size",width: 104, align: "right",  group: "extended" },
+  { key: "pathLength",      label: "Path Length",   width: 90,  align: "right",  group: "extended" },
+  { key: "dirLevel",        label: "Dir Level",     width: 82,  align: "right",  group: "extended" },
+  { key: "compressionRate", label: "Compression",   width: 104, align: "right",  group: "extended" },
 ];
 
 export const DEFAULT_VISIBLE_COLUMNS = new Set<SortKey>(["name", "size", "allocated", "files", "folders", "percent", "modified"]);
+
+/** Folder portion of a full path (strip the trailing file/dir name). */
+function folderPathOf(path: string): string {
+  if (!path) return "";
+  return path.replace(/[^/\\]*$/, "") || path;
+}
+
+/** Compact H/R/L attribute string (Hidden / Read-only / Link). */
+function attributesOf(node: NodeRecord): string {
+  return [node.hidden ? "H" : "", node.readonly ? "R" : "", node.link ? "L" : ""].filter(Boolean).join("") || "—";
+}
 
 type MoveItemsResult = { ok: boolean; error?: string };
 
@@ -219,20 +243,69 @@ function TreeTableInner({
     dragPathsRef.current = [];
     setDropTargetId(null);
   }, []);
+  // Name is always shown (it is the special tree cell); other columns are opt-in
+  // via `visibleColumns`. Header and rows render from this single list in
+  // ALL_COLUMNS order so they always stay aligned.
   const cols = useMemo(
-    () => ALL_COLUMNS.filter((c) => visibleColumns.has(c.key)),
+    () => ALL_COLUMNS.filter((c) => c.key === "name" || visibleColumns.has(c.key)),
     [visibleColumns],
   );
+  const nonNameCols = useMemo(() => cols.filter((c) => c.key !== "name"), [cols]);
+  // The inline grid template is the single source of truth for column layout
+  // (the static CSS template was removed so header/rows can't desync at low
+  // widths or non-default column counts). Name flexes; each other column uses
+  // its descriptor width as a minmax floor and grows a little.
   const gridTemplate = useMemo(
-    () => `minmax(200px,1fr)${cols.filter(c => c.key !== "name").map(() => " minmax(70px,100px)").join("")}`,
-    [cols],
+    () => `minmax(200px,1.7fr)${nonNameCols.map((c) => ` minmax(${c.width}px,${Math.round(c.width * 1.35)}px)`).join("")}`,
+    [nonNameCols],
   );
-  // Floor width that keeps every column at its minimum (200px name + 70px each
-  // for the rest). Applied to both the header and the rows so they overflow —
-  // and therefore horizontally scroll — together inside the single scroller.
+  // Floor width that keeps every column at its minimum. Applied to both the
+  // header and the rows so they overflow — and therefore horizontally scroll —
+  // together inside the single scroller.
   const minTableWidth = useMemo(
-    () => 200 + Math.max(0, cols.length - 1) * 70,
-    [cols],
+    () => 200 + nonNameCols.reduce((sum, c) => sum + c.width, 0),
+    [nonNameCols],
+  );
+
+  // Renders a single non-name cell from its column descriptor. The Name cell is
+  // kept as the bespoke tree/rename/bookmark cell below.
+  const renderCell = useCallback(
+    (col: ColumnDef, node: NodeRecord, isBundle: boolean, parentSize: number) => {
+      if (col.key === "percent") {
+        const pct = parentSize > 0 ? (node.size / parentSize) * 100 : 100;
+        return (
+          <div key="percent" className="percent-cell" style={{ "--percent": pct } as React.CSSProperties}>
+            <span>{pct.toFixed(decimals > 0 ? decimals : 1)}%</span>
+          </div>
+        );
+      }
+      let content: React.ReactNode = "";
+      let title: string | undefined;
+      switch (col.key) {
+        case "path":            content = node.path; title = node.path; break;
+        case "folderPath":    { const f = folderPathOf(node.path); content = f; title = f; break; }
+        case "size":            content = formatBytes(node.size, unit, decimals); break;
+        case "allocated":       content = formatBytes(node.allocated, unit, decimals); break;
+        case "type":            content = node.dir ? "Folder" : (node.extension ? node.extension.toUpperCase() : "File"); break;
+        case "files":           content = formatCount(node.files); break;
+        case "folders":         content = isBundle ? "" : formatCount(node.folders); break;
+        case "attributes":      content = attributesOf(node); break;
+        case "created":         content = (node.created ?? 0) > 0 ? formatDate(node.created) : "—"; break;
+        case "accessed":        content = (node.accessed ?? 0) > 0 ? formatDate(node.accessed) : "—"; break;
+        case "modified":        content = node.modified ? formatDate(node.modified) : ""; break;
+        case "avgFileSize":     content = node.files > 0 ? formatBytes(Math.round(node.size / node.files), unit, decimals) : "—"; break;
+        case "pathLength":      content = node.path.length; break;
+        case "dirLevel":        content = node.depth; break;
+        case "compressionRate": content = (node.size > 0 && node.allocated < node.size)
+          ? `${((1 - node.allocated / node.size) * 100).toFixed(decimals > 0 ? decimals : 1)}%`
+          : "—"; break;
+        default:                content = ""; break;
+      }
+      const className = col.align === "right" ? "cell num" : "cell";
+      const style = col.align === "center" ? ({ textAlign: "center" } as React.CSSProperties) : undefined;
+      return <div key={col.key} className={className} style={style} title={title}>{content}</div>;
+    },
+    [unit, decimals],
   );
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
 
@@ -418,7 +491,6 @@ function TreeTableInner({
             const barWidth  = rootVal > 0 ? (val / rootVal) * 100 : 0;
             const parentNode = node.parent != null ? nodeById.get(node.parent) : null;
             const parentSize = parentNode ? parentNode.size : node.size;
-            const pct       = parentSize > 0 ? (node.size / parentSize) * 100 : 100;
             const hasKids   = node.children.length > 0;
             const isOpen    = expanded.has(node.id);
             const isDraggable = !isBundle && !!node.path;
@@ -576,25 +648,7 @@ function TreeTableInner({
                     </button>
                   )}
                 </div>
-                {visibleColumns.has("path")       && <div className="cell num" title={node.path}>{node.path}</div>}
-                {visibleColumns.has("folderPath") && <div className="cell num" title={node.path}>{node.path.replace(/[^/\\]*$/, "") || node.path}</div>}
-                {visibleColumns.has("size")       && <div className="cell num">{formatBytes(node.size, unit, decimals)}</div>}
-                {visibleColumns.has("allocated")  && <div className="cell num">{formatBytes(node.allocated, unit, decimals)}</div>}
-                {visibleColumns.has("type")       && <div className="cell num">{node.dir ? "Folder" : (node.extension ? node.extension.toUpperCase() : "File")}</div>}
-                {visibleColumns.has("files")      && <div className="cell num">{formatCount(node.files)}</div>}
-                {visibleColumns.has("folders")    && <div className="cell num">{isBundle ? "" : formatCount(node.folders)}</div>}
-                {visibleColumns.has("attributes") && <div className="cell num">{[node.hidden ? "H" : "", node.readonly ? "R" : "", node.link ? "L" : ""].filter(Boolean).join("") || "—"}</div>}
-                {visibleColumns.has("percent")    && (
-                  <div className="percent-cell" style={{ "--percent": pct } as React.CSSProperties}>
-                    <span>{pct.toFixed(decimals > 0 ? decimals : 1)}%</span>
-                  </div>
-                )}
-                {visibleColumns.has("created")    && <div className="cell num">{(node.created ?? 0) > 0 ? formatDate(node.created) : "—"}</div>}
-                {visibleColumns.has("accessed")   && <div className="cell num">{(node.accessed ?? 0) > 0 ? formatDate(node.accessed) : "—"}</div>}
-                {visibleColumns.has("modified")   && <div className="cell num">{node.modified ? formatDate(node.modified) : ""}</div>}
-                {visibleColumns.has("avgFileSize") && <div className="cell num">{node.files > 0 ? formatBytes(Math.round(node.size / node.files), unit, decimals) : "—"}</div>}
-                {visibleColumns.has("pathLength") && <div className="cell num">{node.path.length}</div>}
-                {visibleColumns.has("dirLevel")   && <div className="cell num">{node.depth}</div>}
+                {nonNameCols.map((col) => renderCell(col, node, isBundle, parentSize))}
               </div>
             );
           })}

@@ -9,16 +9,31 @@ interface WorkspaceTab {
 }
 
 interface TabBarProps {
+  /** Editor group this bar belongs to (used to route cross-group tab moves). */
+  groupId: string;
   tabs: WorkspaceTab[];
   activeId: string;
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
   onNew: () => void;
-  onReorder: (fromId: string, toId: string) => void;
+  /**
+   * Move `fromId` (from any group) into THIS bar's group, inserting it before
+   * `beforeId` (append when omitted). Handles both intra-group reorder and
+   * cross-group moves — App resolves the source group from the tab id.
+   */
+  onMoveTab: (fromId: string, toGroupId: string, beforeId?: string) => void;
   onFolderDrop: (path: string, beforeId?: string) => void;
+  /** Split this group's active tab into a new pane (omit to hide the button). */
+  onSplit?: () => void;
+  /** Whether this group's controls toolbar (under the tabs) is currently shown. */
+  toolbarVisible?: boolean;
+  /** Toggle this group's controls toolbar visibility (omit to hide the button). */
+  onToggleToolbar?: () => void;
+  /** Allow closing the very last tab in this group (closes the pane). */
+  canCloseLast?: boolean;
 }
 
-export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, onFolderDrop }: TabBarProps) {
+export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, onMoveTab, onFolderDrop, onSplit, toolbarVisible = true, onToggleToolbar, canCloseLast }: TabBarProps) {
   const draggingTabIdRef = useRef<string | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
   const nativeDragPathRef = useRef<string | null>(null);
@@ -103,7 +118,18 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
       ref={barRef}
       className="workspace-tabbar"
       onDragOver={(e) => {
-        if (!isFolderDrag(e) || isTabDrag(e)) return;
+        // Tab drags that reach the bar (empty area, or a tab from another group)
+        // show a reorder indicator; per-tab handlers stopPropagation for hovers
+        // directly over a tab.
+        if (isTabDrag(e)) {
+          e.preventDefault();
+          e.stopPropagation();
+          e.dataTransfer.dropEffect = "move";
+          const insertIdx = insertIdxForBar(e.clientX);
+          if (reorderInsertIdx !== insertIdx) setReorderInsertIdx(insertIdx);
+          return;
+        }
+        if (!isFolderDrag(e)) return;
         e.preventDefault();
         e.stopPropagation();
         e.dataTransfer.dropEffect = "copy";
@@ -114,7 +140,17 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
         if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) clearAll();
       }}
       onDrop={(e) => {
-        if (!isFolderDrag(e) || isTabDrag(e)) return;
+        if (isTabDrag(e)) {
+          e.preventDefault();
+          e.stopPropagation();
+          const fromId = e.dataTransfer.getData("application/x-tab-id");
+          const beforeTab = tabs[insertIdxForBar(e.clientX)];
+          clearAll();
+          draggingTabIdRef.current = null;
+          if (fromId) onMoveTab(fromId, groupId, beforeTab?.id);
+          return;
+        }
+        if (!isFolderDrag(e)) return;
         e.preventDefault();
         e.stopPropagation();
         const path = folderPathFromDrag(e);
@@ -180,12 +216,10 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
                   const insertIdx = insertIdxFor(e, idx);
                   clearAll();
                   draggingTabIdRef.current = null;
-                  if (fromId && fromId !== tab.id) {
-                    // Find the tab that will be at insertIdx after removal of fromId
-                    const filtered = tabs.filter(t => t.id !== fromId);
-                    const beforeTab = filtered[insertIdx > idx ? insertIdx - 1 : insertIdx];
-                    onReorder(fromId, beforeTab?.id ?? tab.id);
-                  }
+                  // beforeId is the tab currently at insertIdx in THIS group's
+                  // raw list; App removes fromId first, then inserts before it
+                  // (works for both reorder and cross-group moves).
+                  if (fromId) onMoveTab(fromId, groupId, tabs[insertIdx]?.id);
                 } else if (isFolderDrag(e)) {
                   e.preventDefault();
                   const path = folderPathFromDrag(e);
@@ -198,7 +232,7 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
             >
               {tab.scanning && <span className="wtab-spinner" />}
               <span className="wtab-label">{tab.label || "New tab"}</span>
-              {tabs.length > 1 && (
+              {(tabs.length > 1 || canCloseLast) && (
                 <button
                   className="wtab-close"
                   title="Close tab"
@@ -230,6 +264,27 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onNew, onReorder, 
           if (isFolderDrag(e)) { e.preventDefault(); e.stopPropagation(); const path = folderPathFromDrag(e); clearAll(); if (path) onFolderDrop(path); }
         }}
       ><Icon name="plus" size={14} /></button>
+
+      <span className="wtab-spacer" />
+      {(onToggleToolbar || onSplit) && (
+        <div className="wtab-actions">
+          {onToggleToolbar && (
+            <button
+              className={`wtab-new wtab-toolbar-toggle${toolbarVisible ? "" : " active"}`}
+              onClick={onToggleToolbar}
+              title={toolbarVisible ? "Hide toolbar" : "Show toolbar"}
+              aria-pressed={!toolbarVisible}
+            >
+              <Icon name="window" size={14} />
+            </button>
+          )}
+          {onSplit && (
+            <button className="wtab-new wtab-split" onClick={onSplit} title="Split editor right">
+              <Icon name="layout-split" size={14} />
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
