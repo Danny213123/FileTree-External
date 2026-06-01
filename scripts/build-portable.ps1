@@ -1,5 +1,6 @@
 param(
-  [switch]$SkipInstall
+  [switch]$SkipInstall,
+  [switch]$NoLaunch
 )
 
 Set-StrictMode -Version Latest
@@ -111,7 +112,10 @@ New-Item -ItemType Directory -Force -Path $appDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $electronDir "package.json") -Destination $appDir -Force
 Copy-Item -LiteralPath (Join-Path $electronDir "dist") -Destination $appDir -Recurse -Force
 
-Copy-Item -LiteralPath $serverExe -Destination (Join-Path $resourcesDir "filetree-server.exe") -Force
+$packagedServerExe = Join-Path $resourcesDir "filetree.exe"
+$legacyServerExe = Join-Path $resourcesDir "filetree-server.exe"
+Copy-Item -LiteralPath $serverExe -Destination $packagedServerExe -Force
+Copy-Item -LiteralPath $serverExe -Destination $legacyServerExe -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "assets") -Destination $resourcesDir -Recurse -Force
 
 foreach ($fileName in @("README.md", "NOTICE", "VERSION")) {
@@ -135,8 +139,16 @@ rebuild it after source changes by running:
 or:
 
   powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
+
+Use -NoLaunch to build without starting FileTree afterward.
 "@ | Set-Content -LiteralPath $readmePath -Encoding UTF8
 
 Write-Host ""
 Write-Host "Portable Electron app created:"
 Write-Host "  $portableExe"
+
+if (!$NoLaunch) {
+  Write-Host ""
+  Write-Host "Starting FileTree..."
+  Start-Process -FilePath $portableExe -WorkingDirectory $portableDir
+}

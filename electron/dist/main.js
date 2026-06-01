@@ -149,6 +149,7 @@ async function startRustServer(port) {
     const candidates = electron_1.app.isPackaged
         ? [
             path.join(process.resourcesPath, "filetree.exe"), // packaged (extraResources)
+            path.join(process.resourcesPath, "filetree-server.exe"), // legacy portable builds
         ]
         : [
             path.join(repoRoot, "target", "release", "filetree.exe"), // dev build
