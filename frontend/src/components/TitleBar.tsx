@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 import { Icon } from "./Icon";
 import type { ChatSessionMeta } from "../lib/chatSessions";
+import type { SortKey, Unit } from "../api/types";
+import { ColumnsMenuContent, FixedDropdown } from "./ConfigureColumnsMenu";
 
 export interface MenuItem {
   label?: string;
@@ -9,6 +11,8 @@ export interface MenuItem {
   separator?: boolean;
   checked?: boolean;
   disabled?: boolean;
+  /** Open the shared Configure Columns popup instead of running `onClick`. */
+  opensColumns?: boolean;
 }
 
 export interface Menu {
@@ -38,6 +42,14 @@ interface TitleBarProps {
   getSessions: () => ChatSessionMeta[];
   onRestoreSession: (id: string) => void;
   optionsMenu: MenuItem[];
+  // Configure Columns popup (View ▸ Configure Columns) — shares global details-
+  // list prefs with the editor-toolbar control. `unit` is the active tab's unit.
+  visibleColumns: Set<SortKey>;
+  onVisibleColumnsChange: (cols: Set<SortKey>) => void;
+  decimals: number;
+  onDecimalsChange: (d: number) => void;
+  unit: Unit;
+  onUnitChange: (u: Unit) => void;
 }
 
 type Pop = "options" | "history" | null;
@@ -58,11 +70,18 @@ export function TitleBar({
   terminalOpen, onToggleTerminal,
   chatOpen, onToggleChat, onOpenAgents, onNewSession, onCloseChat,
   getSessions, onRestoreSession, optionsMenu,
+  visibleColumns, onVisibleColumnsChange, decimals, onDecimalsChange, unit, onUnitChange,
 }: TitleBarProps) {
   const [openIdx, setOpenIdx] = useState<number | null>(null);
   const [pop, setPop] = useState<Pop>(null);
   const [sessions, setSessions] = useState<ChatSessionMeta[]>([]);
+  const [colCfgOpen, setColCfgOpen] = useState(false);
   const barRef = useRef<HTMLDivElement>(null);
+  // Anchor for the Configure Columns popup — the `.vsc-menu` container of the
+  // menu whose items include `opensColumns` (the View menu). Anchoring to the
+  // container (not the button) keeps the fixed popup a DOM descendant of the
+  // anchor, so clicks inside it don't count as "outside" and dismiss it.
+  const colAnchorRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (openIdx === null && pop === null) return;
@@ -91,11 +110,17 @@ export function TitleBar({
     <div className="vsc-titlebar" ref={barRef}>
       <Icon name="folder" size={16} className="vsc-titlebar-logo" />
       <div className="vsc-menubar">
-        {menus.map((menu, idx) => (
-          <div key={menu.label} className={`vsc-menu${openIdx === idx ? " open" : ""}`}>
+        {menus.map((menu, idx) => {
+          const hasColumns = menu.items.some((it) => it.opensColumns);
+          return (
+          <div
+            key={menu.label}
+            className={`vsc-menu${openIdx === idx ? " open" : ""}`}
+            ref={hasColumns ? (el) => { colAnchorRef.current = el; } : undefined}
+          >
             <button
               className="vsc-menu-btn"
-              onClick={() => { setPop(null); setOpenIdx(openIdx === idx ? null : idx); }}
+              onClick={() => { setPop(null); setColCfgOpen(false); setOpenIdx(openIdx === idx ? null : idx); }}
               onMouseEnter={() => { if (openIdx !== null) setOpenIdx(idx); }}
             >
               {menu.label}
@@ -112,6 +137,7 @@ export function TitleBar({
                       onClick={() => {
                         if (item.disabled) return;
                         setOpenIdx(null);
+                        if (item.opensColumns) { setColCfgOpen(true); return; }
                         item.onClick?.();
                       }}
                     >
@@ -122,8 +148,22 @@ export function TitleBar({
                 )}
               </div>
             )}
+            {hasColumns && (
+              <FixedDropdown anchorRef={colAnchorRef} open={colCfgOpen} onClose={() => setColCfgOpen(false)}>
+                <ColumnsMenuContent
+                  visibleColumns={visibleColumns}
+                  onVisibleColumnsChange={onVisibleColumnsChange}
+                  decimals={decimals}
+                  onDecimalsChange={onDecimalsChange}
+                  unit={unit}
+                  onUnitChange={onUnitChange}
+                  onRequestClose={() => setColCfgOpen(false)}
+                />
+              </FixedDropdown>
+            )}
           </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* Left controls: collapse side bar + move between tabs */}

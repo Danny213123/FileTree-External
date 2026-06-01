@@ -209,6 +209,11 @@ export interface AppSettings {
   sortDir?: number;
   openTabs?: string[];
   recentPaths?: string[];
+  // Details-list columns (global, shared by all tabs/panes)
+  visibleColumns?: string[];
+  decimals?: number;
+  // Split-pane layout: each group references tab indices into openTabs.
+  paneGroups?: { tabs: number[]; active: number; width?: number; toolbarHidden?: boolean }[];
   // VS Code workbench layout
   activeView?: string;
   sidebarOpen?: boolean;

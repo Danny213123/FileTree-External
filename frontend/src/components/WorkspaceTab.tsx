@@ -8,14 +8,12 @@ import {
   hasNativeMove, moveItemsNative, fetchDupesV2,
 } from "../api/client";
 import type { ScanOptions } from "../api/client";
-import type { DriveEntry, NodeRecord, SpecialFolder, SortKey } from "../api/types";
+import type { NodeRecord, SortKey } from "../api/types";
 import type { AgentApi } from "../lib/agent";
 import { TreeTable } from "./TreeTable";
+import { ConfigureColumnsMenu } from "./ConfigureColumnsMenu";
 import { Treemap } from "./Treemap";
-import { SideBar } from "./SideBar";
-import { ActivityBar, type ViewId } from "./ActivityBar";
-import { TabBar } from "./TabBar";
-import type { WorkspaceTab as WorkspaceTabMeta } from "./TabBar";
+import type { ViewId } from "./ActivityBar";
 import { ConflictDialog, type ConflictChoice } from "./ConflictDialog";
 import { FilterDialog } from "./FilterDialog";
 import { Icon } from "./Icon";
@@ -32,6 +30,10 @@ export interface WorkspaceTabHandle {
   getScanning: () => boolean;
   getNodeById: () => Map<number, NodeRecord>;
   getAgentApi: () => AgentApi;
+  /** Snapshot of everything the shared (hoisted) Explorer side bar needs, plus
+   *  the navigation/scan handlers bound to THIS tab. App reads it from the
+   *  focused group's active tab so the single left panel drives that pane. */
+  getSidebarModel: () => SidebarModel;
   doScan: () => void;
   doCancel: () => void;
   doScanPath: (path: string) => void;
@@ -67,6 +69,38 @@ export interface RibbonState {
   filterActive: boolean;
   sortKey: string;
   sortDir: 1 | -1;
+}
+
+// Data + handlers the shared Explorer side bar (rendered once in App, to the
+// left of the editor groups) needs from the focused pane. The handlers are the
+// same ones the in-pane tree/treemap already use, so clicking a location/folder
+// in the left panel acts on the focused group's active tab.
+export interface SidebarModel {
+  data: ScanResult | null;
+  nodeById: Map<number, NodeRecord>;
+  unit: Unit;
+  scanPath: string;
+  scanning: boolean;
+  treeRows: NodeRecord[];
+  expanded: Set<number>;
+  selectedId: number;
+  selectedNode: NodeRecord | undefined;
+  errorCount: number;
+  onNavigate: (id: number) => void;
+  onScanPathInput: (p: string) => void;
+  onScan: () => void;
+  onCancel: () => void;
+  onRefresh: () => void;
+  onUp: () => void;
+  onNewFolder: () => void;
+  onCollapseAll: () => void;
+  onOpenLocation: (path: string) => void;
+  onToggleExpand: (id: number) => void;
+  onSelectFolder: (id: number) => void;
+  onOpen: () => void;
+  onReveal: () => void;
+  onCopyPath: () => void;
+  onScanPath: (p: string) => void;
 }
 
 function dedupeNestedPaths(paths: string[], nodeByPath: Map<string, NodeRecord>): string[] {
@@ -108,30 +142,17 @@ interface WorkspaceTabProps {
   tabId: string;
   initialPath: string;
   active: boolean;
+  // Drives the in-pane treemap "view"; the shared side bar (App) tracks its own.
   activeView: ViewId;
-  onSelectView: (v: ViewId) => void;
-  chatOpen: boolean;
-  onToggleChat: () => void;
+  // Whether the per-pane controls toolbar row (under the tabs) is shown. Toggled
+  // from the tab bar's toolbar button; per-editor-group, defaults to visible.
+  toolbarVisible: boolean;
   darkMode: boolean;
-  onToggleTheme: () => void;
-  sidebarOpen: boolean;
-  sidebarWidth: number;
-  onSidebarWidthChange: (n: number) => void;
   panelOpen: boolean;
   onPanelOpenChange: (v: boolean) => void;
   panelHeight: number;
   onPanelHeightChange: (n: number) => void;
-  // editor tabs (open scans)
-  tabBarMeta: WorkspaceTabMeta[];
-  activeTabId: string;
-  onActivateTab: (id: string) => void;
-  onCloseTab: (id: string) => void;
-  onNewTab: () => void;
-  onReorderTab: (fromId: string, toId: string) => void;
-  onFolderDrop: (path: string, beforeId?: string) => void;
   // data + options
-  drives: DriveEntry[];
-  specialFolders: SpecialFolder[];
   bookmarkList: string[];
   threads: number;
   includeHidden: boolean;
@@ -146,6 +167,8 @@ interface WorkspaceTabProps {
   tmDragDrop: boolean;
   decimals: number;
   visibleColumns: Set<SortKey>;
+  onVisibleColumnsChange: (cols: Set<SortKey>) => void;
+  onDecimalsChange: (d: number) => void;
   onClose3D: () => void;
   onToggleBookmark: (path: string) => void;
   onScanPath: (path: string) => void;
@@ -155,16 +178,12 @@ interface WorkspaceTabProps {
 
 const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(function WorkspaceTab(
   {
-    tabId, initialPath, active, activeView,
-    onSelectView, chatOpen, onToggleChat, darkMode, onToggleTheme,
-    sidebarOpen, sidebarWidth, onSidebarWidthChange,
+    tabId, initialPath, active, activeView, toolbarVisible, darkMode,
     panelOpen, onPanelOpenChange, panelHeight, onPanelHeightChange,
-    tabBarMeta, activeTabId, onActivateTab, onCloseTab, onNewTab, onReorderTab, onFolderDrop,
-    drives, specialFolders,
     bookmarkList, threads, includeHidden, followLinks, exclude,
     treemapDetail,
     tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
-    decimals, visibleColumns,
+    decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
     onClose3D, onToggleBookmark, onScanPath, onStateChange, onOpenTerminal,
   }: WorkspaceTabProps,
   ref,
@@ -172,7 +191,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const [scanPath, setScanPathState] = useState(initialPath);
   const [filterDialogOpen, setFilterDialogOpen] = useState(false);
   const dragStartRef = useRef<{ y: number; h: number } | null>(null);
-  const sidebarDragRef = useRef<{ x: number; w: number } | null>(null);
 
   const { data, status, errorMessage, progress, startScan, startRefresh, cancelScan } = useScan();
   const tree = useTreeState();
@@ -261,6 +279,16 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   }, [data]);
 
   useEffect(() => { onStateChange(); }, [status, progress, onStateChange]);
+
+  // The Explorer side bar lives once in App (shared, left of the editor groups)
+  // and pulls its data from the focused pane's getSidebarModel(). When THIS is
+  // the visible tab, notify App on tree/selection/path changes so the shared
+  // panel re-renders. notifyState is throttled, so scan-time row storms stay
+  // cheap; single user actions fire on its leading edge (instant). data/status/
+  // progress already notify above.
+  useEffect(() => {
+    if (active) onStateChange();
+  }, [active, tree.visibleRows, tree.expanded, tree.selectedId, tree.nodeById, scanPath, onStateChange]);
 
   const startWatch = useCallback((rootPath: string) => {
     if (fsEventsRef.current) { fsEventsRef.current.close(); fsEventsRef.current = null; }
@@ -378,8 +406,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     onScanPath(path); // record recent only
     doScan(path);
   }, [doScan, onScanPath]);
-
-  const handleScanPath = useCallback((path: string) => { openLocation(path); }, [openLocation]);
 
   // Stable identity (reads tree via ref) so TreeTable's React.memo holds across
   // unrelated parent re-renders.
@@ -722,6 +748,39 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     getScanning: () => status === "scanning",
     getNodeById: () => tree.nodeById,
     getAgentApi: () => agentApi,
+    getSidebarModel: () => {
+      // Read tree state via the live ref so the model is always current even if
+      // this handle closure is a render behind; data/scanPath/etc. come from the
+      // closure (they're in the dep array below, so the handle is fresh on commit).
+      const t = treeRef.current;
+      return {
+        data,
+        nodeById: t.nodeById,
+        unit: t.unit,
+        scanPath,
+        scanning: status === "scanning",
+        treeRows: t.visibleRows,
+        expanded: t.expanded,
+        selectedId: t.selectedId,
+        selectedNode: t.nodeById.get(t.selectedId),
+        errorCount: data?.errorCount ?? 0,
+        onNavigate: handleNavigate,
+        onScanPathInput: setScanPathState,
+        onScan: () => { onScanPath(scanPath); doScan(); },
+        onCancel: cancelScan,
+        onRefresh: () => doScan(undefined, undefined, true),
+        onUp: handleNavigateParent,
+        onNewFolder: handleNewFolder,
+        onCollapseAll: () => t.expandToLevel(0),
+        onOpenLocation: openLocation,
+        onToggleExpand: t.toggleExpand,
+        onSelectFolder: handleNavigate,
+        onOpen: runOpen,
+        onReveal: runReveal,
+        onCopyPath: runCopyPath,
+        onScanPath: openLocation,
+      };
+    },
     doScan: () => doScan(),
     doCancel: cancelScan,
     doScanPath: (path) => { setScanPathState(path); doScan(path); },
@@ -769,7 +828,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       if (tree.sortDir !== dir) tree.setSortKey(key as SortKey);
     },
   }), [status, data, progress, errorMessage, scanPath, tree, cancelScan, agentApi,
-       doScan, handleNavigateParent, handleExpand, handleNewFolder, selectedNode,
+       doScan, handleNavigate, handleNavigateParent, handleExpand, handleNewFolder, selectedNode,
+       openLocation, runOpen, runReveal, onScanPath,
        runRename, runRenamePath, runDelete, runDeletePaths, runMoveTo, runCopyPath, runCopyFiles]);
 
   // Bottom-panel (treemap) vertical resize.
@@ -794,97 +854,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     window.addEventListener("mouseup", onUp);
   }, [panelHeight, onPanelHeightChange]);
 
-  // Side-bar horizontal resize.
-  const handleSidebarResize = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    sidebarDragRef.current = { x: e.clientX, w: sidebarWidth };
-    const onMove = (ev: MouseEvent) => {
-      if (!sidebarDragRef.current) return;
-      const delta = ev.clientX - sidebarDragRef.current.x;
-      onSidebarWidthChange(Math.max(170, Math.min(640, sidebarDragRef.current.w + delta)));
-    };
-    const onUp = () => {
-      sidebarDragRef.current = null;
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.body.style.cursor = "ew-resize";
-    document.body.style.userSelect = "none";
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  }, [sidebarWidth, onSidebarWidthChange]);
-
   const showTreemapView = activeView === "treemap";
 
   return (
     <div className="wb-tab" data-tab-id={tabId} style={active ? undefined : { display: "none" }}>
-      {sidebarOpen && (
-        <>
-          <div className="sidebar" style={{ width: sidebarWidth, flex: `0 0 ${sidebarWidth}px` }}>
-            <ActivityBar
-              activeView={activeView}
-              sidebarOpen={sidebarOpen}
-              onSelect={onSelectView}
-              bookmarkCount={bookmarkList.length}
-              errorCount={data?.errorCount ?? 0}
-              chatOpen={chatOpen}
-              onToggleChat={onToggleChat}
-              darkMode={darkMode}
-              onToggleTheme={onToggleTheme}
-            />
-            <SideBar
-              view={activeView}
-              data={data}
-              nodeById={tree.nodeById}
-              unit={tree.unit as Unit}
-              onNavigate={handleNavigate}
-              scanPath={scanPath}
-              scanning={status === "scanning"}
-              onScanPathInput={setScanPathState}
-              onScan={() => { onScanPath(scanPath); doScan(); }}
-              onCancel={cancelScan}
-              onRefresh={() => doScan(undefined, undefined, true)}
-              onUp={handleNavigateParent}
-              onNewFolder={handleNewFolder}
-              onCollapseAll={() => tree.expandToLevel(0)}
-              drives={drives}
-              specialFolders={specialFolders}
-              bookmarkList={bookmarkList}
-              onOpenLocation={openLocation}
-              treeRows={tree.visibleRows}
-              expanded={tree.expanded}
-              selectedId={tree.selectedId}
-              onToggleExpand={tree.toggleExpand}
-              onSelectFolder={handleNavigate}
-              selectedNode={selectedNode}
-              onOpen={runOpen}
-              onReveal={runReveal}
-              onCopyPath={runCopyPath}
-              onScanPath={handleScanPath}
-              onRemoveBookmark={onToggleBookmark}
-            />
-          </div>
-          <div className="resizer-x" onMouseDown={handleSidebarResize} />
-        </>
-      )}
-
       <div className="editor-region">
-        {active && (
-          <TabBar
-            tabs={tabBarMeta}
-            activeId={activeTabId}
-            onActivate={onActivateTab}
-            onClose={onCloseTab}
-            onNew={onNewTab}
-            onReorder={onReorderTab}
-            onFolderDrop={onFolderDrop}
-          />
-        )}
-
         {showTreemapView ? (
           <>
+            {toolbarVisible && (
             <div className="editor-toolbar">
               <label>
                 Size
@@ -907,6 +884,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                 </select>
               </label>
             </div>
+            )}
             <div className="editor-stack">
               <div className="editor-main">
                 <Treemap
@@ -932,6 +910,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           </>
         ) : (
           <>
+            {toolbarVisible && (
             <div className="editor-toolbar">
               <label>
                 Size
@@ -968,6 +947,15 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                 style={{ height: 24, width: 150, background: "var(--vsc-input-bg)", border: "1px solid var(--vsc-border)", color: "var(--text)" }}
               />
               <button onClick={() => setFilterDialogOpen(true)} title="Advanced filter">Rules</button>
+              <span className="sep" />
+              <ConfigureColumnsMenu
+                visibleColumns={visibleColumns}
+                onVisibleColumnsChange={onVisibleColumnsChange}
+                decimals={decimals}
+                onDecimalsChange={onDecimalsChange}
+                unit={tree.unit}
+                onUnitChange={tree.setUnit}
+              />
               <span className="spacer" />
               <button onClick={handleOpenTerminal} title="Open terminal here (Ctrl+`)">Terminal</button>
               <button
@@ -976,6 +964,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                 title="Toggle treemap panel"
               >Treemap</button>
             </div>
+            )}
 
             <div className="editor-stack">
               <div className="editor-main">
@@ -1060,18 +1049,16 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   );
 });
 
-// Stops the App-level render cascade: when App re-renders (e.g. another tab's
-// scan progress or a tab switch), inactive tabs are skipped unless a prop that
-// affects their rendered output actually changed. `tabBarMeta` (a fresh array
-// every render) and `activeTabId` are only consumed by the active tab's TabBar,
-// so they are ignored for inactive tabs. The active tab always re-renders, and
-// any tab re-renders when its own internal state changes (memo only blocks
-// parent-driven renders).
+// Stops the App-level render cascade: when App re-renders (e.g. another pane's
+// scan progress, a tab switch, or a focus change), a hidden/inactive pane is
+// skipped unless one of its own props actually changed. The visible tab always
+// re-renders; any tab re-renders when its internal state changes (memo only
+// blocks parent-driven renders). All remaining props are stable identities
+// (memoized callbacks, primitives, or Sets that change identity on edit).
 function arePropsEqual(prev: WorkspaceTabProps, next: WorkspaceTabProps): boolean {
   if (prev.active !== next.active) return false;
   if (next.active) return false;
   for (const k of Object.keys(next) as (keyof WorkspaceTabProps)[]) {
-    if (k === "tabBarMeta" || k === "activeTabId") continue;
     if (prev[k] !== next[k]) return false;
   }
   return true;

@@ -165,6 +165,6 @@ export type SortKey =
   | "size" | "allocated" | "files" | "folders" | "percent"
   | "attributes" | "owner"
   | "modified" | "created" | "accessed"
-  | "avgFileSize" | "pathLength" | "dirLevel";
+  | "avgFileSize" | "pathLength" | "dirLevel" | "compressionRate";
 export type Metric = "size" | "allocated" | "files" | "folders";
 export type Unit = "auto" | "tb" | "gb" | "mb" | "kb" | "bytes";

@@ -4,6 +4,52 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.0.0] - 2026-05-31
+
+### Added
+
+#### AI Assistant (multi-agent)
+- **Explicit multi-agent system**: an Orchestrator coordinates two specialized sub-agents — a read-only **Search** agent that investigates the scan and a mutating **Action** agent that performs file operations.
+- **Two-tier approval workflow**: a Tier-1 plan-approval card gates handing work to the Action agent, and a Tier-2 action card gates each individual mutating operation — replacing the previous in-chat verbal confirmations.
+- **Persistent per-tool allowlist**: a Cursor-style "Always allow" option remembers approved tools (machine-local) so they run without a card on later calls, alongside a **Skip** option that cleanly declines a single step; allowlisted tools are managed from the assistant's settings dialog.
+- **Persistent chat history**: assistant conversations are saved as sessions and can be restored from the title bar.
+- Model picker spanning local Ollama and cloud providers (OpenAI, Anthropic) with machine-local API keys.
+- Markdown rendering of assistant replies.
+- Visible "thinking" indicators with collapsible reasoning blocks.
+- Multimodal image input to attach pictures as context for a question.
+
+#### Configure Columns
+- **TreeSize-style Configure Columns menu**, reachable from the per-pane editor toolbar ("Columns") and from the title-bar **View** menu — both share the same control.
+- Expanded column set grouped into **Common**, **Date and time**, and **Extended**: Full Path, Folder Path, Type, Attributes, Creation/Last Accessed/Last Modified dates, Avg. File Size, Path Length, Dir Level, and Compression.
+- **Decimal-places** control (0–5) and an **Automatic Units** toggle.
+- **Reset Columns** restores the default details list.
+- Owner, Author, File Version, Description, and Permissions are listed but disabled, pending scanner support.
+
+#### Split view
+- **VS Code-style split editor panes**: multiple resizable editor groups, each with its own tab bar.
+- A single shared left **Explorer** side bar across all panes, driven by the focused pane's active tab.
+- Drag tabs to reorder within a group or move them across editor groups; a **Split editor right** button on the tab strip opens a new pane.
+- Per-editor-group **toolbar hide/show** toggle on the tab strip.
+
+### Changed
+
+- Removed the redundant AI chat icon from the activity bar; the assistant is now toggled from the title bar.
+- View preferences (visible columns, decimal places) and the split-pane layout now persist across sessions (`visibleColumns`, `decimals`, and `paneGroups` in settings).
+- Rebuilt and re-embedded the frontend bundle (`frontend/dist`) so the shipped UI matches the current source.
+
+### Fixed
+
+#### AI Assistant
+- The assistant no longer fabricates file names or sizes: requests that need real data now force a read-only Search investigation so replies reflect the actual scan.
+- Fixed the assistant quitting early or returning a blank turn — real findings gathered mid-run are returned if the model stalls, a notice is shown when the step budget is exhausted, and the Orchestrator is nudged once to follow through on an action request after Search locates the files.
+- Transient process notices (retries, forced steps, step-limit, empty-response, and guard nudges) are now cleared when a turn ends, leaving the final answer, the step timeline, and any genuine errors.
+
+#### Stability
+- The Electron main process no longer crashes with a fatal error dialog on benign broken-pipe errors (EPIPE/ECONNRESET/EOF) from its own stdout/stderr or from the Rust server's pipes during shutdown.
+- The tree table header and rows now render from a single dynamic column-grid template, fixing header/row misalignment at narrow widths or with non-default column counts.
+
+---
+
 ## [0.2.0] - 2026-05-26
 
 ### Added

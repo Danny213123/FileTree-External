@@ -757,6 +757,16 @@ input:focus, select:focus {
 }
 .rb-col-reset-icon { font-size: 20px; opacity: 0.6; flex-shrink: 0; padding-top: 1px; }
 
+/* Configure-columns toolbar trigger (lives in .editor-toolbar) */
+.cfg-cols-btn { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.cfg-cols-btn.active { background: var(--vsc-list-hover); color: var(--text); }
+.cfg-cols-decimals { display: flex; gap: 2px; padding: 2px 10px 5px; }
+.cfg-cols-decimals button {
+  width: 24px; height: 22px; padding: 0; justify-content: center;
+  border: 1px solid var(--vsc-border); border-radius: 3px; font-size: 12px;
+}
+.cfg-cols-decimals button.rb-active { background: rgba(0,120,212,0.18); color: var(--accent, #0078d4); font-weight: 600; }
+
 /* Address / navigation bar */
 .ribbon-address {
   display: flex;
@@ -874,7 +884,9 @@ input:focus, select:focus {
 
 .table-head, .row {
   display: grid;
-  grid-template-columns: minmax(240px, 1.7fr) 90px 90px 72px 72px 108px 128px;
+  /* Column template is set inline by TreeTable from the visible-column
+     descriptors (the single source of truth), so the header and rows always
+     share the same dynamic template at any width or column count. */
   align-items: center;
 }
 
@@ -3003,7 +3015,8 @@ input:focus, select:focus {
   .top-actions { justify-content: flex-start; }
   .workspace { grid-template-columns: 1fr; }
   .side-pane { display: none; }
-  .table-head, .row { grid-template-columns: minmax(240px, 1fr) 100px 90px 72px 72px 100px 130px; }
+  /* No .table-head/.row column override here: the inline dynamic grid template
+     from TreeTable is authoritative at every width (prevents header/row desync). */
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -3221,28 +3234,53 @@ input:focus, select:focus {
 .resizer-y { height: 6px; flex: 0 0 6px; cursor: ns-resize; background: transparent; margin: -3px 0; z-index: 15; position: relative; }
 .resizer-y:hover, .resizer-y.active { background: var(--vsc-focus); }
 
+/* ── Editor group (one split pane: tab bar on top, editor below) ── */
+.editor-group {
+  display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  background: var(--vsc-editor-bg); overflow: hidden;
+}
+/* Subtle focused-pane accent (only present when there is more than one pane). */
+.editor-group.focused > .workspace-tabbar { box-shadow: inset 0 2px 0 var(--vsc-focus); }
+
 /* ── Per-tab workbench region (side bar + editor) ─────────── */
 .wb-tab { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; }
 
 /* ── Editor region ─────────────────────────────────────────── */
 .editor-region { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; background: var(--vsc-editor-bg); overflow: hidden; }
-.editor-region > .workspace-tabbar {
+.editor-group > .workspace-tabbar {
   height: 35px; min-height: 35px; flex: 0 0 35px; background: var(--vsc-titlebar-bg);
   border-bottom: 1px solid var(--vsc-border); padding: 0; gap: 0; align-items: stretch;
 }
-.editor-region .wtab {
+.editor-group .wtab {
   height: 35px; border: 0; border-right: 1px solid var(--vsc-border); border-radius: 0;
   background: transparent; color: var(--muted); padding: 0 10px; min-width: 120px;
   border-top: 1px solid transparent;
 }
-.editor-region .wtab:hover { background: var(--vsc-list-hover); color: var(--text); }
-.editor-region .wtab-active {
+.editor-group .wtab:hover { background: var(--vsc-list-hover); color: var(--text); }
+.editor-group .wtab-active {
   background: var(--vsc-editor-bg); color: var(--text);
   border-top: 1px solid var(--vsc-focus); border-radius: 0; z-index: auto;
 }
-.editor-region .wtab-active:hover { background: var(--vsc-editor-bg); }
-.editor-region .wtab-new { height: 35px; background: transparent; border: 0; border-radius: 0; color: var(--text-4); width: 30px; }
-.editor-region .wtab-new:hover { background: var(--vsc-list-hover); color: var(--text); }
+.editor-group .wtab-active:hover { background: var(--vsc-editor-bg); }
+.editor-group .wtab-new { height: 35px; background: transparent; border: 0; border-radius: 0; color: var(--text-4); width: 30px; }
+.editor-group .wtab-new:hover { background: var(--vsc-list-hover); color: var(--text); }
+/* Push the right-hand action buttons (toolbar toggle + split editor) to the far
+   right of the tab bar and keep them pinned there while the tabs scroll
+   horizontally underneath. */
+.editor-group .wtab-spacer { flex: 1 1 auto; min-width: 0; }
+.editor-group .wtab-actions {
+  position: sticky; right: 0; flex: 0 0 auto;
+  display: flex; align-items: stretch;
+  background: var(--vsc-titlebar-bg);
+  border-left: 1px solid var(--vsc-border);
+}
+.editor-group .wtab-actions .wtab-new { margin: 0; align-self: stretch; }
+.editor-group .wtab-split { border-left: 1px solid var(--vsc-border); }
+.editor-group .wtab-split:hover { background: var(--vsc-list-hover); }
+/* Toolbar-toggle reflects the hidden state with a pressed look, matching the
+   title-bar toggle buttons (chat/terminal). */
+.editor-group .wtab-toolbar-toggle.active { background: var(--vsc-list-selected); color: var(--text); }
+.editor-group .wtab-toolbar-toggle.active:hover { background: var(--vsc-list-selected); color: var(--text); }
 .editor-stack { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .editor-main { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; position: relative; }
 .editor-toolbar {
@@ -3657,6 +3695,29 @@ input:focus, select:focus {
 .approval-card-actions button { height: 26px; font-size: 12px; padding: 0 12px; border-radius: 4px; }
 .agent-btn-ghost { background: transparent; border: 1px solid transparent; color: var(--muted); margin-left: auto; }
 .agent-btn-ghost:hover { color: var(--text); background: var(--vsc-list-hover); }
+.agent-btn-reject:hover { color: var(--text); background: var(--vsc-list-hover); }
+.approval-status.auto { color: var(--accent); }
+
+/* Cursor-style review-box controls: Skip + an "Allow" split menu */
+.approval-actions-spacer { flex: 1 1 auto; }
+.approval-allow { position: relative; margin-left: 0; }
+.approval-allow-trigger { display: inline-flex; align-items: center; gap: 4px; margin-left: 0; border: 1px solid var(--vsc-border); color: var(--text-2); }
+.approval-allow-trigger:hover { color: var(--text); background: var(--vsc-list-hover); }
+.approval-allow-menu { position: absolute; right: 0; bottom: calc(100% + 5px); z-index: 40; min-width: 215px; display: flex; flex-direction: column; gap: 2px; padding: 4px; background: var(--bg-3); border: 1px solid var(--vsc-border); border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,0.45); }
+.approval-allow-menu button { display: flex; align-items: center; gap: 7px; width: 100%; height: auto; min-height: 30px; padding: 6px 9px; justify-content: flex-start; text-align: left; background: transparent; border: 0; border-radius: 4px; color: var(--text-2); font-size: 12px; white-space: nowrap; }
+.approval-allow-menu button:hover { background: var(--vsc-list-hover); color: var(--text); }
+.approval-allow-menu .bi { color: var(--accent); flex: 0 0 auto; }
+
+/* Allowlist manager in the chat Settings sheet */
+.chat-keys-allow { display: flex; flex-direction: column; gap: 5px; }
+.chat-keys-allow-head { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+.allow-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.allow-row { display: flex; align-items: center; gap: 7px; padding: 4px 7px; font-size: 12px; color: var(--text-2); background: var(--surface); border: 1px solid var(--vsc-border); border-radius: 4px; }
+.allow-row .bi { color: var(--accent-2); flex: 0 0 auto; }
+.allow-row .spacer { flex: 1; }
+.allow-row .allow-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.allow-row button.icon { width: 18px; height: 18px; padding: 0; border: 0; background: transparent; color: var(--muted-2); display: inline-flex; align-items: center; justify-content: center; }
+.allow-row button.icon:hover { color: var(--danger); }
 
 /* ── In-panel chat history ───────────────────────────────────── */
 .chatpanel { position: relative; }

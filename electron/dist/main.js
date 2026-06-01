@@ -74,6 +74,38 @@ catch (e) {
 }
 let serverProcess = null;
 let mainWindow = null;
+// ── Broken-pipe safety ────────────────────────────────────────────────────────
+// A closed *peer* pipe must never crash the app. When the read end of a stream
+// we write to has already gone away (our own stdout/stderr when launched
+// detached, the Rust server's stdout on shutdown, or an aborted socket), Node
+// raises EPIPE/ECONNRESET/EOF — sometimes synchronously from inside a "data"
+// handler. Left unhandled this pops Electron's fatal "A JavaScript error
+// occurred in the main process" dialog. These codes are the benign counterpart
+// of the Rust side's "connection aborted (os error 10053)" log, so we swallow
+// only them and let every other error surface as before.
+const BENIGN_PIPE_CODES = ["EPIPE", "ECONNRESET", "EOF"];
+function isBenignPipeError(err) {
+    const code = err?.code;
+    return !!code && BENIGN_PIPE_CODES.includes(code);
+}
+// Log a stream "error" unless it is a benign broken-pipe (then ignore it).
+function handleStreamError(label, err) {
+    if (isBenignPipeError(err))
+        return;
+    console.error(`[electron] ${label} stream error:`, err);
+}
+// Our own stdout/stderr can have their read end closed; guard against the
+// resulting async EPIPE so a logging write never becomes fatal.
+process.stdout.on("error", (err) => handleStreamError("stdout", err));
+process.stderr.on("error", (err) => handleStreamError("stderr", err));
+// Last-resort guard for a synchronously-thrown broken pipe that escapes the
+// handlers above. Kept deliberately narrow: only the benign pipe codes are
+// ignored, so real bugs still surface in the logs.
+process.on("uncaughtException", (err) => {
+    if (isBenignPipeError(err))
+        return; // benign broken pipe from server stdout/socket — ignore
+    console.error(err);
+});
 // ── Port helpers ─────────────────────────────────────────────────────────────
 function getFreePort() {
     return new Promise((resolve, reject) => {
@@ -124,8 +156,25 @@ async function startRustServer(port) {
     serverProcess = (0, child_process_1.spawn)(serverBin, ["serve", "--port", String(port)], {
         stdio: ["ignore", "pipe", "pipe"],
     });
-    serverProcess.stdout?.on("data", (d) => process.stdout.write(d));
-    serverProcess.stderr?.on("data", (d) => process.stderr.write(d));
+    // Forward the server's logs to ours. The destination (our stdout/stderr) may
+    // have a closed read end, making write() throw EPIPE synchronously — which is
+    // exactly the crash we are fixing — so only write while it's still open and
+    // swallow benign broken-pipe errors instead of letting them go fatal.
+    const forwardLog = (dest, chunk) => {
+        try {
+            if (dest.writable && !dest.destroyed)
+                dest.write(chunk);
+        }
+        catch (err) {
+            if (!isBenignPipeError(err))
+                throw err;
+        }
+    };
+    serverProcess.stdout?.on("data", (d) => forwardLog(process.stdout, d));
+    serverProcess.stderr?.on("data", (d) => forwardLog(process.stderr, d));
+    // The server's pipes can also emit their own 'error' on teardown; don't crash.
+    serverProcess.stdout?.on("error", (err) => handleStreamError("server stdout", err));
+    serverProcess.stderr?.on("error", (err) => handleStreamError("server stderr", err));
     serverProcess.on("exit", (code) => {
         console.log(`[electron] Server exited with code ${code}`);
     });
