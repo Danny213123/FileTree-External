@@ -97,6 +97,17 @@ pub(crate) struct DupesProgress {
     pub(crate) files_hashed: AtomicU64,
 }
 
+/// One persistent content-hash cache entry. Keyed by file path; the
+/// `(size, mtime)` pair is the validity stamp — a cached `hash` is reused only
+/// when both still match, so a changed file is re-hashed. `hash` is the full
+/// FNV-1a content hash produced by `dupes::fnv1a_file`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HashCacheEntry {
+    pub(crate) size: u64,
+    pub(crate) mtime: u64,
+    pub(crate) hash: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct AppState {
     pub(crate) initial_path: PathBuf,
@@ -109,6 +120,11 @@ pub(crate) struct AppState {
     pub(crate) dupes_cancel: Arc<AtomicBool>,
     pub(crate) ignore_list: Mutex<IgnoreList>,
     pub(crate) ignore_list_path: PathBuf,
+    /// Persistent content-hash cache `(path) -> (size, mtime, hash)` so unchanged
+    /// files are never re-hashed across repeat duplicate scans. Persisted to
+    /// `%APPDATA%\FileTree\hash_cache.json`.
+    pub(crate) hash_cache: Mutex<HashMap<PathBuf, HashCacheEntry>>,
+    pub(crate) hash_cache_path: PathBuf,
 }
 
 #[derive(Debug)]

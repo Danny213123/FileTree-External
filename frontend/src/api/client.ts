@@ -546,6 +546,45 @@ export async function fetchDupesV2(
   return getJson<import("./types").DupesV2Result>(`/api/dupes-v2?${params}`, signal);
 }
 
+export interface DupeHashFile {
+  path: string;
+  size: number;
+  mtime: number; // seconds since epoch
+}
+
+export interface DupeHashGroup {
+  paths: string[];
+}
+
+export interface DupeHashResult {
+  groups: DupeHashGroup[];
+  errors: string[];
+}
+
+/**
+ * Content-verify a client-aggregated candidate list. The server groups by size,
+ * hashes (cached + parallel) only size-collision files, optionally byte-confirms,
+ * and returns byte-identical path groups. No filesystem walk happens server-side.
+ */
+export async function fetchDupesHash(
+  files: DupeHashFile[],
+  confirmBytes = true,
+  signal?: AbortSignal,
+): Promise<DupeHashResult> {
+  const body = JSON.stringify({ files, confirmBytes });
+  const res = await fetch("/api/dupes-hash", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    signal,
+  });
+  if (!res.ok) {
+    if (res.status === 499) return { groups: [], errors: ["Hashing canceled"] };
+    return { groups: [], errors: [`HTTP ${res.status}`] };
+  }
+  return res.json() as Promise<DupeHashResult>;
+}
+
 export async function dupeAction(
   action: "delete" | "move" | "copy",
   paths: string[],

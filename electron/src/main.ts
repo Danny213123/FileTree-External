@@ -148,14 +148,20 @@ function waitForServer(port: number, timeoutMs = 10000): Promise<void> {
 // ── Server launch ─────────────────────────────────────────────────────────────
 
 async function startRustServer(port: number): Promise<void> {
-  // Find the server binary next to the Electron app, or in the repo root.
-  // app.getAppPath() = .../FileTree/electron  (where package.json lives)
+  // Find the server binary. When packaged by electron-builder it ships as an
+  // extraResource at <resources>/filetree.exe (process.resourcesPath). In dev it
+  // lives in the repo's target/release. app.getAppPath() = .../FileTree/electron
+  // (where package.json lives), so the repo root is one level up.
   const repoRoot = path.join(app.getAppPath(), "..");
-  const candidates = [
-    path.join(repoRoot, "target", "release", "filetree.exe"),   // dev build
-    path.join(repoRoot, "filetree-server.exe"),                  // packaged
-    path.join(app.getAppPath(), "filetree-server.exe"),          // bundled next to electron/
-  ];
+  const candidates = app.isPackaged
+    ? [
+        path.join(process.resourcesPath, "filetree.exe"),          // packaged (extraResources)
+      ]
+    : [
+        path.join(repoRoot, "target", "release", "filetree.exe"),  // dev build
+        path.join(repoRoot, "filetree-server.exe"),                // legacy fallback
+        path.join(app.getAppPath(), "filetree-server.exe"),        // legacy fallback
+      ];
 
   let serverBin = candidates.find((p) => fs.existsSync(p));
   if (!serverBin) {
@@ -844,6 +850,9 @@ ipcMain.on("ondragstart", (event, arg: string | string[]) => {
 ipcMain.handle("copyText", (_event, text: string) => {
   clipboard.writeText(text);
 });
+
+// Read text from the clipboard (terminal paste fallback).
+ipcMain.handle("clipboardReadText", () => clipboard.readText());
 
 // Read a file off disk and return a base64 data URL so attached image *paths*
 // (dragged from the file tree) can be sent to vision-capable models. Capped so

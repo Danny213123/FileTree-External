@@ -8,6 +8,23 @@
 /.claude/
 /.planning/
 
+# Generated planning / spec artifacts (GSD-style; regenerated on demand, not part
+# of the product). The directories above already cover copies kept under them;
+# the rules below catch the loose copies that land at the repo root. Real docs
+# (README.md, CHANGELOG.md, LICENSE*, CONTRIBUTING.md) are intentionally NOT listed.
+/AI-SPEC.md
+/SPEC.md
+/PLAN.md
+/RESEARCH.md
+/REVIEW.md
+/EVAL-REVIEW.md
+/UI-SPEC.md
+/UI-REVIEW.md
+/SECURITY.md
+/VERIFICATION.md
+/PATTERNS.md
+/INGEST-*.md
+
 # Frontend build artifacts
 /frontend/node_modules/
 
@@ -31,3 +48,9 @@ run.bat
 *.zip
 *.csv
 /electron/taglinter.yml
+
+# --- electron-builder packaging output (large binaries; never tracked) ---
+# The portable .exe and NSIS installer are produced here by `npm run package`.
+# If you ever need the binaries in the repo, ship them via a GitHub Release or
+# Git LFS instead of committing them.
+/electron/release/

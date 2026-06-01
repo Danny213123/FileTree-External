@@ -19,6 +19,52 @@ function getTerminalAPI(): TerminalAPI | null {
   return (window as unknown as { electronAPI?: { terminal?: TerminalAPI } }).electronAPI?.terminal ?? null;
 }
 
+// ── Clipboard helpers ─────────────────────────────────────────────────────────
+// Prefer the async web Clipboard API (available in the Electron renderer). If the
+// renderer blocks direct clipboard access, fall back to the Electron IPC bridge.
+// Everything is wrapped so a missing/denied clipboard just no-ops instead of
+// throwing into xterm's key path.
+async function clipboardWrite(text: string): Promise<void> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch { /* fall through to the Electron bridge */ }
+  try {
+    (window as unknown as { electronAPI?: { copyText?: (t: string) => void } })
+      .electronAPI?.copyText?.(text);
+  } catch { /* clipboard unavailable — fail gracefully */ }
+}
+
+async function clipboardRead(): Promise<string> {
+  try {
+    if (navigator.clipboard?.readText) {
+      return await navigator.clipboard.readText();
+    }
+  } catch { /* fall through to the Electron bridge */ }
+  try {
+    const api = (window as unknown as { electronAPI?: { clipboardReadText?: () => Promise<string> } }).electronAPI;
+    if (api?.clipboardReadText) return await api.clipboardReadText();
+  } catch { /* clipboard unavailable — fail gracefully */ }
+  return "";
+}
+
+// Copy the terminal's current selection. Returns true when there was a selection
+// to copy (used to decide whether Ctrl+C should suppress SIGINT).
+function copyTermSelection(term: Terminal): boolean {
+  if (!term.hasSelection()) return false;
+  const sel = term.getSelection();
+  if (sel) void clipboardWrite(sel);
+  return true;
+}
+
+// Read the clipboard and route it through xterm's normal input path (paste →
+// onData → pty), so pasted text reaches the shell exactly like typed input.
+function pasteIntoTerm(term: Terminal): void {
+  void clipboardRead().then((text) => { if (text) term.paste(text); });
+}
+
 interface TermEntry {
   term: Terminal;
   fit: FitAddon;
@@ -63,6 +109,9 @@ export function TerminalPanel({
   const [activeId, setActiveId] = useState<number | null>(null);
   const [profiles, setProfiles] = useState<TerminalProfile[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
+  // Right-click context menu: anchor position + which session it targets + whether
+  // that terminal currently has a selection (Copy shown only when it does).
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; localId: number; hasSel: boolean } | null>(null);
 
   const terms = useRef(new Map<number, TermEntry>());
   const containers = useRef(new Map<number, HTMLDivElement | null>());
@@ -130,6 +179,32 @@ export function TerminalPanel({
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.open(container);
+
+      // Copy/paste shortcuts (VSCode / Windows-terminal style). Returning false
+      // stops xterm from also processing the key; everything we don't handle
+      // passes straight through to the shell unchanged.
+      term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
+        if (e.type !== "keydown" || !e.ctrlKey || e.altKey || e.metaKey) return true;
+        if (e.code === "KeyC") {
+          // Ctrl+Shift+C → always copy the selection.
+          // Ctrl+C → copy only when there's a selection; with no selection let
+          // xterm send ^C/SIGINT to the shell as usual.
+          if (e.shiftKey || term.hasSelection()) {
+            e.preventDefault();
+            copyTermSelection(term);
+            return false;
+          }
+          return true;
+        }
+        if (e.code === "KeyV") {
+          // Ctrl+V and Ctrl+Shift+V → paste the clipboard into the shell.
+          e.preventDefault();
+          pasteIntoTerm(term);
+          return false;
+        }
+        return true;
+      });
+
       try { fit.fit(); } catch { /* not laid out yet */ }
 
       const entry: TermEntry = { term, fit, ptyId: null, dead: false };
@@ -188,6 +263,29 @@ export function TerminalPanel({
     const theme = xtermTheme(darkMode);
     for (const e of terms.current.values()) e.term.options.theme = theme;
   }, [darkMode]);
+
+  // Dismiss the right-click menu on any outside click, scroll, resize, blur, or Escape.
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = () => setCtxMenu(null);
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setCtxMenu(null); };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, [ctxMenu]);
+
+  const openCtxMenu = useCallback((e: React.MouseEvent, localId: number) => {
+    e.preventDefault();
+    const hasSel = terms.current.get(localId)?.term.hasSelection() ?? false;
+    setCtxMenu({ x: e.clientX, y: e.clientY, localId, hasSel });
+  }, []);
 
   const closeSession = useCallback((localId: number) => {
     const entry = terms.current.get(localId);
@@ -285,8 +383,38 @@ export function TerminalPanel({
             className="terminal-surface"
             style={{ display: s.localId === activeId ? "block" : "none" }}
             ref={(el) => { containers.current.set(s.localId, el); }}
+            onContextMenu={(e) => openCtxMenu(e, s.localId)}
           />
         ))}
+        {ctxMenu && (
+          <div
+            className="context-menu terminal-context-menu"
+            style={{ top: ctxMenu.y, left: ctxMenu.x }}
+            onMouseDown={(e) => e.stopPropagation()}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            {ctxMenu.hasSel && (
+              <button
+                onClick={() => {
+                  const entry = terms.current.get(ctxMenu.localId);
+                  if (entry) copyTermSelection(entry.term);
+                  setCtxMenu(null);
+                }}
+              >
+                Copy
+              </button>
+            )}
+            <button
+              onClick={() => {
+                const entry = terms.current.get(ctxMenu.localId);
+                if (entry) { pasteIntoTerm(entry.term); entry.term.focus(); }
+                setCtxMenu(null);
+              }}
+            >
+              Paste
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

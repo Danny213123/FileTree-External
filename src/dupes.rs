@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::export::push_json_string;
-use crate::model::{DupesProgress, NodeRecord, ScanResult};
+use crate::model::{DupesProgress, HashCacheEntry, NodeRecord, ScanResult};
 
 // ── Core types ─────────────────────────────────────────────────────────────
 
@@ -93,6 +93,320 @@ fn fnv1a_file_sample(path: &Path, size: u64) -> io::Result<FileFingerprint> {
     fnv1a_update(&mut hash, &buffer[..read]);
 
     Ok(FileFingerprint { hash, complete: false })
+}
+
+// ── Candidate-list hash engine (POST /api/dupes-hash) ───────────────────────
+//
+// The dedicated Duplicates page aggregates candidate file metadata on the
+// client (from already-scanned tabs + caches) and posts only the size-collision
+// candidates here, so this engine NEVER walks the filesystem. It groups by size,
+// uses a persistent `(path,size,mtime)->hash` cache, hashes uncached candidates
+// in parallel (sample fingerprint first to skip lone files, then a full FNV
+// hash), and optionally does a byte-wise confirm so confirmed groups are truly
+// identical (eliminates the astronomically rare 64-bit hash collision).
+
+/// One candidate file as provided by the client.
+#[derive(Debug, Clone)]
+pub(crate) struct HashInput {
+    pub(crate) path: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) mtime: u64,
+}
+
+/// Read up to `buf.len()` bytes, looping past short reads / EINTR so a single
+/// call yields a full buffer (or the remaining tail at EOF).
+fn read_full(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+/// True when `a` and `b` are byte-for-byte identical. Assumes equal size is the
+/// caller's expectation but re-checks it defensively.
+fn files_identical(a: &Path, b: &Path) -> io::Result<bool> {
+    let mut fa = File::open(a)?;
+    let mut fb = File::open(b)?;
+    let mut ba = vec![0u8; 64 * 1024];
+    let mut bb = vec![0u8; 64 * 1024];
+    loop {
+        let na = read_full(&mut fa, &mut ba)?;
+        let nb = read_full(&mut fb, &mut bb)?;
+        if na != nb {
+            return Ok(false);
+        }
+        if na == 0 {
+            return Ok(true);
+        }
+        if ba[..na] != bb[..nb] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Partition a set of same-size, same-hash candidate indices into byte-identical
+/// equivalence classes. Virtually always returns a single class, but guards
+/// against hash collisions when the caller asked for byte confirmation.
+fn byte_confirm_partition(indices: &[usize], files: &[HashInput], errors: &Mutex<Vec<String>>) -> Vec<Vec<usize>> {
+    let mut classes: Vec<Vec<usize>> = Vec::new();
+    'outer: for &idx in indices {
+        for class in classes.iter_mut() {
+            match files_identical(&files[class[0]].path, &files[idx].path) {
+                Ok(true) => {
+                    class.push(idx);
+                    continue 'outer;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    errors
+                        .lock()
+                        .expect("hash errors lock")
+                        .push(format!("{}: {}", files[idx].path.display(), e));
+                    continue 'outer;
+                }
+            }
+        }
+        classes.push(vec![idx]);
+    }
+    classes
+}
+
+/// Run `work` items across up to `threads` worker threads, calling `f(index)`
+/// for each item index. Cooperative cancellation via `cancel`. Uses scoped
+/// threads so `f` can borrow surrounding state without `Arc`.
+fn parallel_for<F>(count: usize, threads: usize, cancel: Option<&Arc<AtomicBool>>, f: F)
+where
+    F: Fn(usize) + Sync,
+{
+    if count == 0 {
+        return;
+    }
+    let workers = threads.clamp(1, 64).min(count);
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= count {
+                    break;
+                }
+                f(i);
+            });
+        }
+    });
+}
+
+/// Group client-provided candidates into byte-identical sets. Returns the
+/// groups (as index lists into `files`), any per-file errors, and whether the
+/// persistent hash cache was modified (so the caller can persist it).
+pub(crate) fn hash_candidate_groups(
+    files: &[HashInput],
+    confirm_bytes: bool,
+    cache: &Mutex<HashMap<PathBuf, HashCacheEntry>>,
+    progress: Option<&Arc<DupesProgress>>,
+    cancel: Option<&Arc<AtomicBool>>,
+    threads: usize,
+) -> (Vec<Vec<usize>>, Vec<String>, bool) {
+    // 1. Bucket by size — only equal-size files can be byte-identical.
+    let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (idx, f) in files.iter().enumerate() {
+        by_size.entry(f.size).or_default().push(idx);
+    }
+    let buckets: Vec<Vec<usize>> = by_size.into_values().filter(|v| v.len() > 1).collect();
+
+    // 2. Seed known hashes from the persistent cache (one lock, no I/O held).
+    let mut full_hash: Vec<Option<u64>> = vec![None; files.len()];
+    {
+        let guard = cache.lock().expect("hash_cache lock");
+        for bucket in &buckets {
+            for &i in bucket {
+                if let Some(entry) = guard.get(&files[i].path) {
+                    if entry.size == files[i].size && entry.mtime == files[i].mtime {
+                        full_hash[i] = Some(entry.hash);
+                    }
+                }
+            }
+        }
+    }
+
+    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    // 3. Sample-fingerprint phase: cheap pre-filter for uncached candidates so a
+    //    lone file (unique by size+sample) never triggers a full read.
+    let uncached: Vec<usize> = buckets
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&i| full_hash[i].is_none())
+        .collect();
+    let sample_fp: Vec<Mutex<Option<FileFingerprint>>> = (0..files.len()).map(|_| Mutex::new(None)).collect();
+    parallel_for(uncached.len(), threads, cancel, |k| {
+        let i = uncached[k];
+        match fnv1a_file_sample(&files[i].path, files[i].size) {
+            Ok(fp) => *sample_fp[i].lock().expect("sample lock") = Some(fp),
+            Err(e) => errors
+                .lock()
+                .expect("hash errors lock")
+                .push(format!("{}: {}", files[i].path.display(), e)),
+        }
+    });
+    if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+        return (Vec::new(), Vec::new(), false);
+    }
+
+    // 4. Decide which uncached files still need a full hash: any uncached file
+    //    that shares a sample fingerprint with another uncached file in its
+    //    bucket, OR sits in a bucket that already has cached (full-hash) files.
+    let mut need_full: Vec<usize> = Vec::new();
+    for bucket in &buckets {
+        let cached_present = bucket.iter().any(|&i| full_hash[i].is_some());
+        let mut by_sample: HashMap<u64, Vec<usize>> = HashMap::new();
+        for &i in bucket {
+            if full_hash[i].is_some() {
+                continue;
+            }
+            let fp = *sample_fp[i].lock().expect("sample lock");
+            if let Some(fp) = fp {
+                by_sample.entry(fp.hash).or_default().push(i);
+            }
+        }
+        for (_, members) in by_sample {
+            if members.len() > 1 || cached_present {
+                need_full.extend(members);
+            }
+        }
+    }
+
+    if let Some(p) = progress {
+        p.files_hashing.store(need_full.len() as u64, Ordering::Relaxed);
+        p.files_hashed.store(0, Ordering::Relaxed);
+    }
+
+    // 5. Full-hash phase (parallel). Collect (index, hash) then merge.
+    let computed: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+    parallel_for(need_full.len(), threads, cancel, |k| {
+        let i = need_full[k];
+        match fnv1a_file(&files[i].path) {
+            Ok(h) => computed.lock().expect("computed lock").push((i, h)),
+            Err(e) => errors
+                .lock()
+                .expect("hash errors lock")
+                .push(format!("{}: {}", files[i].path.display(), e)),
+        }
+        if let Some(p) = progress {
+            p.files_hashed.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+        return (Vec::new(), Vec::new(), false);
+    }
+
+    let computed = computed.into_inner().expect("computed lock");
+    let mut cache_dirty = false;
+    if !computed.is_empty() {
+        let mut guard = cache.lock().expect("hash_cache lock");
+        for &(i, h) in &computed {
+            full_hash[i] = Some(h);
+            guard.insert(
+                files[i].path.clone(),
+                HashCacheEntry { size: files[i].size, mtime: files[i].mtime, hash: h },
+            );
+        }
+        cache_dirty = true;
+    }
+
+    // 6. Group: within each size bucket, cluster by full hash, then optionally
+    //    byte-confirm each cluster before emitting it as a duplicate group.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for bucket in &buckets {
+        let mut by_full: HashMap<u64, Vec<usize>> = HashMap::new();
+        for &i in bucket {
+            if let Some(h) = full_hash[i] {
+                by_full.entry(h).or_default().push(i);
+            }
+        }
+        for (_, members) in by_full {
+            if members.len() < 2 {
+                continue;
+            }
+            if confirm_bytes {
+                for class in byte_confirm_partition(&members, files, &errors) {
+                    if class.len() >= 2 {
+                        groups.push(class);
+                    }
+                }
+            } else {
+                groups.push(members);
+            }
+        }
+    }
+
+    (groups, errors.into_inner().expect("hash errors lock"), cache_dirty)
+}
+
+// ── Persistent content-hash cache (JSON) ────────────────────────────────────
+
+/// Load the hash cache from a JSON array of `["path", size, mtime, hash]` rows.
+pub(crate) fn load_hash_cache(path: &Path) -> HashMap<PathBuf, HashCacheEntry> {
+    let mut map = HashMap::new();
+    let Ok(raw) = fs::read_to_string(path) else { return map; };
+    for line in raw.lines() {
+        let line = line.trim().trim_end_matches(',');
+        if !line.starts_with('[') {
+            continue;
+        }
+        if let Some((p, size, mtime, hash)) = parse_hash_row(line) {
+            map.insert(PathBuf::from(p), HashCacheEntry { size, mtime, hash });
+        }
+    }
+    map
+}
+
+/// Persist the hash cache as a JSON array of `["path", size, mtime, hash]` rows.
+pub(crate) fn save_hash_cache(path: &Path, cache: &HashMap<PathBuf, HashCacheEntry>) -> io::Result<()> {
+    let mut out = String::from("[\n");
+    let mut first = true;
+    for (p, e) in cache {
+        if !first {
+            out.push_str(",\n");
+        }
+        first = false;
+        out.push('[');
+        push_json_string(&mut out, &p.to_string_lossy());
+        out.push(',');
+        out.push_str(&e.size.to_string());
+        out.push(',');
+        out.push_str(&e.mtime.to_string());
+        out.push(',');
+        out.push_str(&e.hash.to_string());
+        out.push(']');
+    }
+    out.push_str("\n]\n");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, out)
+}
+
+/// Parse a line like `["C:\\a.bin",1024,1730000000,1234567890]`.
+fn parse_hash_row(line: &str) -> Option<(String, u64, u64, u64)> {
+    let s = line.strip_prefix('[')?.trim_start();
+    let (path, rest) = parse_json_string(s)?;
+    let rest = rest.trim_start().strip_prefix(',')?;
+    let mut nums = rest.trim_end_matches(']').split(',');
+    let size = nums.next()?.trim().parse().ok()?;
+    let mtime = nums.next()?.trim().parse().ok()?;
+    let hash = nums.next()?.trim().parse().ok()?;
+    Some((path, size, mtime, hash))
 }
 
 // ── Build candidate file list from scan result ──────────────────────────────
@@ -1026,8 +1340,29 @@ pub(crate) fn groups_to_json(
         out.push_str(",\"waste\":");
         out.push_str(&group.waste.to_string());
         out.push_str(",\"files\":[");
+        // Reference is files[0]; per-file match breakdown is scored relative to
+        // it so the client's delta columns work the same for the server-side
+        // fallback as for the client-first content path.
+        let reference = group.files.first();
         for (fi, f) in group.files.iter().enumerate() {
             if fi > 0 { out.push(','); }
+            let is_ref = f.is_ref;
+            let (name_m, size_m, date_m): (u8, u8, u8) = match reference {
+                Some(r) if !is_ref => (
+                    if f.name.eq_ignore_ascii_case(&r.name) { 100 } else { 0 },
+                    if f.size == r.size { 100 } else { 0 },
+                    if f.modified == r.modified { 100 } else { 0 },
+                ),
+                _ => (100, 100, 100),
+            };
+            let content_m: u8 = if is_ref {
+                100
+            } else if mode == ScanMode::Exact {
+                100
+            } else {
+                group.score
+            };
+            let file_score: u8 = if is_ref { 100 } else { group.score };
             out.push('{');
             out.push_str("\"path\":");
             push_json_string(&mut out, &f.path.to_string_lossy());
@@ -1039,7 +1374,17 @@ pub(crate) fn groups_to_json(
             out.push_str(&f.modified.to_string());
             out.push_str(",\"ref\":");
             out.push_str(if f.is_ref { "true" } else { "false" });
-            out.push('}');
+            out.push_str(",\"score\":");
+            out.push_str(&file_score.to_string());
+            out.push_str(",\"match\":{\"name\":");
+            out.push_str(&name_m.to_string());
+            out.push_str(",\"size\":");
+            out.push_str(&size_m.to_string());
+            out.push_str(",\"date\":");
+            out.push_str(&date_m.to_string());
+            out.push_str(",\"content\":");
+            out.push_str(&content_m.to_string());
+            out.push_str("}}");
         }
         out.push_str("]}");
     }

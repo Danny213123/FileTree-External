@@ -4,6 +4,43 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.1.0] - 2026-06-01
+
+### Added
+
+#### Duplicates Finder (dupeGuru-style)
+- **Dedicated Duplicates view**: a new activity-bar entry opens a duplicate-finder workspace with its own configuration side bar and a results table in the editor area, replacing the older in-tab duplicate finder.
+- **Multi-root, content-verified detection**: scan one or more roots and confirm matches by actual file content, not just size or name. A new `POST /api/dupes-hash` endpoint buckets files by size, hashes collisions in parallel (FNV sample hash → full hash), and can finish with an optional byte-for-byte confirmation pass to eliminate false positives.
+- **Persistent content-hash cache**: computed hashes are cached at `%APPDATA%\FileTree\hash_cache.json` and reused across scans, so repeat runs skip re-hashing unchanged files.
+- **Composable match criteria**: combine Content, Size, Name, and Date rules — each independently markable as *required* — with a fuzzy-name similarity threshold and a configurable date tolerance.
+- **Filters**: narrow a run by path, extension, and size before hashing.
+- **Delta-scored results table**: a virtualized table shows an overall **Match %** plus per-criterion deltas, with **Dupes-only** and **Δ-values** toggles, in-table search, resizable and sortable columns, and a **Columns** menu.
+- **Batch operations**: delete, move, copy, make-reference, and export selected duplicates, plus reveal-in-Explorer — all driven from the results table.
+
+#### Terminal
+- **Copy and paste in the integrated terminal**: Ctrl+C copies the current selection (and still sends ^C/SIGINT when nothing is selected), Ctrl+Shift+C always copies, and Ctrl+V / Ctrl+Shift+V paste the clipboard into the shell.
+- **Right-click context menu** on a terminal with Copy (shown only when there is a selection) and Paste.
+- Clipboard access uses the renderer's async Clipboard API with an Electron IPC bridge fallback (`copyText` / `clipboardReadText`), failing gracefully when the clipboard is unavailable.
+
+#### Packaging
+- **One-step Windows distributables** via `electron-builder` (`npm run package` in `electron/`): a portable `.exe` and an NSIS installer. The Rust backend (`filetree.exe`) is bundled as an app resource and the main process resolves it from `process.resourcesPath` when packaged, so end users need no Node, Rust, or build scripts installed.
+
+### Changed
+
+- The mutating Duplicates routes (`POST /api/dupes-hash`, `/api/dupes-action`, `/api/dupes-make-ref`, `/api/dupes-cancel`, and `DELETE /api/dupes-ignore`) are now correctly whitelisted by the request router instead of being rejected as GET-only.
+- Rebuilt and re-embedded the frontend bundle (`frontend/dist`) so the shipped UI matches the current source.
+
+### Fixed
+
+- Duplicate actions now invalidate both the server-side scan cache and the content-hash cache for the affected paths, so results no longer reference files that were just moved or deleted.
+- Name-column resizing in the tree table no longer jumps or fights the surrounding columns.
+
+### Removed
+
+- The old, unmounted `DuplicateFinder.tsx` component, superseded by the dedicated Duplicates view (`DuplicatesConfigPanel` + `DuplicatesResults`, backed by the `useDuplicates` hook and `duplicatesEngine`).
+
+---
+
 ## [1.0.0] - 2026-05-31
 
 ### Added

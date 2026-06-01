@@ -9,7 +9,9 @@ import {
   saveSettings,
 } from "./api/client";
 import type { AppSettings } from "./api/client";
-import type { DriveEntry, SpecialFolder, SortKey, Unit } from "./api/types";
+import type { DriveEntry, SpecialFolder, SortKey, Unit, ScanResult } from "./api/types";
+import { useDuplicatesController } from "./hooks/useDuplicates";
+import { DuplicatesResults } from "./components/DuplicatesResults";
 import { DEFAULT_VISIBLE_COLUMNS } from "./components/TreeTable";
 import { pushRecent, loadRecentPaths, setRecentPaths } from "./components/RibbonBar";
 import { StatusBar } from "./components/StatusBar";
@@ -51,7 +53,10 @@ interface EditorGroup {
 }
 
 const MAX_GROUPS = 4;
-const MIN_GROUP_WIDTH = 280;
+// Floor a single split pane can shrink to. Kept modest so two panes comfortably
+// coexist inside the editor area (between the side bar and the chat panel) on a
+// typical window; wider/maximized windows fit 3–4.
+const MIN_GROUP_WIDTH = 180;
 const DEFAULT_GROUP_WIDTH = 520;
 
 // Side-bar resize bounds (was previously inside WorkspaceTab).
@@ -179,6 +184,17 @@ export default function App() {
     return tab?.ref.current ?? null;
   }, [tabs, groups, focusedGroupId]);
 
+  // Every open tab's in-memory scan — the Duplicates page aggregates these (plus
+  // the client scanCache) before walking any uncached target, so already-scanned
+  // roots cost nothing. Stable identity (reads the live tabsRef mirror).
+  const getScanResults = useCallback((): ScanResult[] => {
+    return tabsRef.current
+      .map((t) => t.ref.current?.getData() ?? null)
+      .filter((r): r is ScanResult => !!r);
+  }, []);
+
+  const dupes = useDuplicatesController({ getScanResults, threads, defaultIncludeHidden: includeHidden });
+
   // Ctrl+` toggle: open the terminal at the active tab's root, or hide it.
   const handleToggleTerminal = useCallback(() => {
     if (terminalOpenRef.current) { setTerminalOpen(false); return; }
@@ -304,7 +320,7 @@ export default function App() {
       }
       if (settings.decimals !== undefined) setDecimals(settings.decimals);
       // Layout
-      if (settings.activeView && ["explorer", "search", "treemap", "bookmarks", "errors"].includes(settings.activeView)) {
+      if (settings.activeView && ["explorer", "search", "treemap", "duplicates", "bookmarks", "errors"].includes(settings.activeView)) {
         setActiveView(settings.activeView as ViewId);
       }
       if (settings.sidebarOpen !== undefined) setSidebarOpen(settings.sidebarOpen);
@@ -884,12 +900,13 @@ export default function App() {
                 onCopyPath={sidebarModel.onCopyPath}
                 onScanPath={sidebarModel.onScanPath}
                 onRemoveBookmark={handleToggleBookmark}
+                dupes={dupes}
               />
             </div>
             <div className="resizer-x" onMouseDown={handleSidebarResize} />
           </>
         )}
-        <div className="workbench-tabs" style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex" }}>
+        <div className="workbench-tabs" style={activeView === "duplicates" ? { display: "none" } : undefined}>
           {groups.map((group, gi) => {
             const isLast = gi === groups.length - 1;
             const isFocused = group.id === focusedGroupId;
@@ -904,9 +921,13 @@ export default function App() {
                 )}
                 <div
                   className={`editor-group${isFocused && groups.length > 1 ? " focused" : ""}`}
+                  // The last pane flexes to fill leftover space; earlier panes
+                  // keep their resized width but stay shrinkable (flex-shrink:1)
+                  // so a tight editor area squeezes them down to MIN_GROUP_WIDTH
+                  // instead of overflowing the container into the chat panel.
                   style={isLast
                     ? { flex: "1 1 0", minWidth: MIN_GROUP_WIDTH, minHeight: 0 }
-                    : { flex: `0 0 ${group.width ?? DEFAULT_GROUP_WIDTH}px`, minWidth: MIN_GROUP_WIDTH, minHeight: 0 }}
+                    : { flex: `0 1 ${group.width ?? DEFAULT_GROUP_WIDTH}px`, minWidth: MIN_GROUP_WIDTH, minHeight: 0 }}
                   onMouseDownCapture={() => { if (focusedGroupId !== group.id) setFocusedGroupId(group.id); }}
                 >
                   <TabBar
@@ -970,6 +991,12 @@ export default function App() {
             );
           })}
         </div>
+
+        {activeView === "duplicates" && (
+          <div className="dupes-editor">
+            <DuplicatesResults ctrl={dupes} />
+          </div>
+        )}
 
         {chatOpen && (
           <>

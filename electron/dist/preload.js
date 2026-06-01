@@ -16,6 +16,9 @@ electron_1.contextBridge.exposeInMainWorld("electronAPI", {
     },
     // Clipboard: copy file path as text.
     copyText: (text) => electron_1.ipcRenderer.invoke("copyText", text),
+    // Clipboard: read text (fallback for terminal paste when the renderer blocks
+    // the async web Clipboard API).
+    clipboardReadText: () => electron_1.ipcRenderer.invoke("clipboardReadText"),
     // Clipboard: copy files as CF_HDROP (paste in Explorer).
     copyFiles: (paths) => electron_1.ipcRenderer.invoke("copyFiles", paths),
     // Move files into a folder via the Windows shell (IFileOperation). Shows the

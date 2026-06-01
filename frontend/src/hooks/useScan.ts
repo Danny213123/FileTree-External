@@ -87,7 +87,7 @@ interface ErrorLine { type: "error"; error: string; }
 
 type StreamLine = MetaLine | NodeLine | DoneLine | ScanningLine | ErrorLine;
 
-async function readNdjsonStream(
+export async function readNdjsonStream(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   onProgress: (nodeCount: number, elapsed: number) => void,
 ): Promise<ScanResult> {

@@ -135,18 +135,55 @@ export interface DupeFilter {
 
 export type DupeScanMode = "exact" | "filename" | "audio";
 
+/** Per-file match breakdown vs the group's reference file (files[0]). Each
+ *  field is a 0-100 score; the reference scores 100 on every axis. */
+export interface DupeMatch {
+  name: number;     // filename similarity (exact => 100/0; fuzzy => Sørensen-Dice)
+  size: number;     // 100 when byte length is equal
+  date: number;     // 100 when modified time is within tolerance
+  content: number;  // 100 when byte-identical (content criterion)
+}
+
 export interface DupeFileV2 {
   path: string;
   name: string;
   size: number;
   modified: number;   // seconds since epoch
   ref: boolean;
+  /** Overall match % vs the reference (0-100). Reference is 100. */
+  score?: number;
+  /** Per-criterion breakdown vs the reference. */
+  match?: DupeMatch;
 }
 
 export interface DupeGroupV2 {
   score: number;      // 100 for exact; 0-100 for fuzzy
   waste: number;      // bytes wasted by duplicates
   files: DupeFileV2[];
+}
+
+// ── Duplicates Finder criteria (client-side composable matching) ────────────
+
+export type DupeCriterionKey = "name" | "size" | "date" | "content";
+
+export interface DupeCriterionState {
+  /** Criterion participates in matching and shows as a delta column. */
+  enabled: boolean;
+  /** A duplicate must match the reference on this criterion to stay in the group. */
+  required: boolean;
+}
+
+export interface DupeCriteria {
+  name: DupeCriterionState;
+  size: DupeCriterionState;
+  date: DupeCriterionState;
+  content: DupeCriterionState;
+  /** Name comparison: fuzzy (Sørensen-Dice) vs exact filename. */
+  nameFuzzy: boolean;
+  /** Fuzzy name similarity threshold (0-100). */
+  nameThreshold: number;
+  /** Date-modified tolerance in seconds (0 = exact). */
+  dateToleranceSec: number;
 }
 
 export interface DupesV2Result {
