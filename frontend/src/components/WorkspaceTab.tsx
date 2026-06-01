@@ -5,7 +5,7 @@ import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCa
 import {
   revealPath, openPath, shellContextMenu, createFolder, fetchScan,
   copyPath, renameItem, moveItems, deletePath, copyFiles,
-  hasNativeMove, moveItemsNative, fetchDupesV2,
+  hasNativeMove, moveItemsNative, fetchDupesV2, runCommand,
 } from "../api/client";
 import type { ScanOptions } from "../api/client";
 import type { NodeRecord, SortKey } from "../api/types";
@@ -174,6 +174,9 @@ interface WorkspaceTabProps {
   onScanPath: (path: string) => void;
   onStateChange: () => void;
   onOpenTerminal?: (cwd: string) => void;
+  // Open `path` in a new workspace tab of editor group `groupId` (falls back to
+  // the focused group). Used when a native folder drag is dropped on a tab strip.
+  onOpenFolderInTab?: (path: string, groupId?: string) => void;
 }
 
 const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(function WorkspaceTab(
@@ -185,6 +188,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
     onClose3D, onToggleBookmark, onScanPath, onStateChange, onOpenTerminal,
+    onOpenFolderInTab,
   }: WorkspaceTabProps,
   ref,
 ) {
@@ -704,6 +708,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     }
   }, [doScan, runMoveWithConflicts]);
 
+  // After a native drag moved item(s) OUT of this tree (a true move to Explorer
+  // or another app), the source is gone from disk; drop our cached scan and
+  // rescan so a moved-out folder doesn't keep showing in an expanded parent.
+  const handleAfterExternalMove = useCallback(() => {
+    invalidateAllScanCache();
+    doScan(undefined, undefined, true);
+  }, [doScan]);
+
   // ── Agent API facade (used by the right-side ChatPanel) ──────────────────
   const agentApi = useMemo<AgentApi>(() => ({
     getScanPath: () => scanPath,
@@ -717,15 +729,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       return { groups: res.groups.map((g) => ({ waste: g.waste, files: g.files.map((f) => ({ path: f.path, size: f.size })) })) };
     },
     moveItems: async (paths: string[], destination: string) => handleInternalMove(paths, destination),
-    deleteItems: async (paths: string[]) => {
-      const errors: string[] = [];
-      for (const p of paths) {
-        try { await deletePath(p); } catch (e) { errors.push(`${p}: ${(e as Error).message}`); }
-      }
-      invalidateAllScanCache();
-      doScan(undefined, undefined, true);
-      return errors.length ? { ok: false, error: errors.join("; ") } : { ok: true };
-    },
     renameItem: async (path: string, newName: string) => {
       const r = await renameItem(path, newName);
       if (r.ok) { invalidateAllScanCache(); doScan(undefined, undefined, true); }
@@ -736,6 +739,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       catch (e) { return { ok: false, error: (e as Error).message }; }
     },
     reveal: async (path: string) => { revealPath(path); },
+    // Run an approved shell command, then refresh the tree (deletions, recycle,
+    // etc. change the folder). cwd defaults to this tab's scanned folder.
+    runCommand: async (command: string, cwd?: string) => {
+      const res = await runCommand(command, cwd ?? scanPath);
+      invalidateAllScanCache();
+      doScan(undefined, undefined, true);
+      return res;
+    },
   }), [scanPath, data, tree.nodeById, openLocation, doScan, handleInternalMove]);
 
   useImperativeHandle(ref, () => ({
@@ -988,6 +999,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   onContextMenu={handleContextMenu}
                   onCopySelected={runCopyFiles}
                   onMoveItems={handleInternalMove}
+                  onOpenFolderInTab={onOpenFolderInTab}
+                  onAfterExternalMove={handleAfterExternalMove}
                   onSortChange={handleSortChange}
                   bookmarks={bookmarkSet}
                   onToggleBookmark={onToggleBookmark}
@@ -1022,6 +1035,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                         dragDrop={tmDragDrop}
                         onSelect={tree.setSelectedId}
                         onNavigate={handleNavigate}
+                        onMoveItems={handleInternalMove}
                         onOpen={handleTreemapOpen}
                         onClose3D={onClose3D}
                       />

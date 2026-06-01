@@ -51,9 +51,11 @@ electron_1.contextBridge.exposeInMainWorld("electronAPI", {
         return () => electron_1.ipcRenderer.removeListener("nativeDropInternal", listener);
     },
     // A native drag-out ended without an internal drop (external move/copy or
-    // cancel). The renderer should just clear its drag UI state.
+    // cancel). The renderer clears its drag UI state and, when `info.outcome` is
+    // an external move, may rescan (a moved-out folder is gone from disk). `info`
+    // is omitted on the error-fallback path.
     onNativeDropEnd: (cb) => {
-        const listener = (_evt) => cb();
+        const listener = (_evt, info) => cb(info);
         electron_1.ipcRenderer.on("nativeDropEnd", listener);
         return () => electron_1.ipcRenderer.removeListener("nativeDropEnd", listener);
     },

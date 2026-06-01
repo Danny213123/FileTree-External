@@ -841,7 +841,10 @@ electron_1.ipcMain.on("ondragstart", (event, arg) => {
                 win.webContents.send("nativeDropInternal", clientX, clientY, filePaths);
             }
             else {
-                win?.webContents.send("nativeDropEnd");
+                // Forward the real OS outcome (and which sources were removed) so the
+                // renderer can rescan after an external MOVE that deleted a directory —
+                // otherwise a folder dragged out of an expanded parent lingers in the tree.
+                win?.webContents.send("nativeDropEnd", { outcome: result.outcome, deleted: result.deleted });
             }
             return;
         }

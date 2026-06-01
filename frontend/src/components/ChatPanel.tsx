@@ -13,9 +13,14 @@ import {
 } from "../lib/llm";
 import { runOrchestrator } from "../lib/agents";
 import type { AgentEvent } from "../lib/agents";
+import { ALWAYS_APPROVE_TOOLS } from "../lib/agents/runtime";
 import type { AgentKind, RunStatus, StepStatus, ToolCallView } from "../lib/agents/types";
 import { loadAiSettings, saveAiSettings, keyFor, type AiSettings } from "../lib/aiSettings";
 import { loadChatSession, saveChatSession, loadChatIndex, deleteChatSession, type ChatSessionBlob, type ChatSessionMeta } from "../lib/chatSessions";
+import { scanStreamUrl, fetchDupesV2 } from "../api/client";
+import { getCached, setCached } from "../lib/scanCache";
+import { readNdjsonStream } from "../hooks/useScan";
+import type { NodeRecord, ScanResult, ExtensionStat } from "../api/types";
 import { Icon } from "./Icon";
 import { Markdown } from "./Markdown";
 
@@ -29,6 +34,9 @@ interface ChatPanelProps {
   onNewSession?: () => void;
   /** Open an existing conversation by id (used by the in-panel history view). */
   onRestoreSession?: (id: string) => void;
+  /** Scan settings used when pre-scanning attached folders for an isolated scope. */
+  includeHidden?: boolean;
+  threads?: number;
 }
 
 // A reference to past context (a message in this chat or a whole past chat),
@@ -55,6 +63,8 @@ interface ToolState {
   requiresApproval: boolean;
   status: StepStatus;
   summary?: string;
+  /** Verbose result (run_command stdout/stderr/exit) shown in the action card. */
+  output?: string;
 }
 type OrderItem = { kind: "tool"; callId: string } | { kind: "child"; childId: string };
 interface RunState {
@@ -109,7 +119,68 @@ interface NativeDropAPI {
 }
 const dropAPI = (): NativeDropAPI => (window as unknown as { electronAPI?: NativeDropAPI }).electronAPI ?? {};
 
-export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewSession, onRestoreSession }: ChatPanelProps) {
+// Merge several attached-folder scans into one synthetic scope: a single root
+// node with summed totals plus every node re-IDed so only the root is id 0.
+// The agent tools key off `path` (unique) and "id > 0" — never parent/children —
+// so flat sequential ids are safe, and each original folder root surfaces as a
+// top-level directory item.
+function mergeScans(scans: ScanResult[], label: string): { result: ScanResult; nodes: NodeRecord[] } {
+  let size = 0, allocated = 0, files = 0, folders = 0;
+  const nodes: NodeRecord[] = [];
+  const extMap = new Map<string, ExtensionStat>();
+  let nextId = 1;
+  for (const scan of scans) {
+    for (const n of scan.nodes) {
+      if (n.id === 0) {
+        size += n.size; allocated += n.allocated; files += n.files; folders += n.folders;
+      }
+      nodes.push({ ...n, id: nextId++ });
+    }
+    for (const e of scan.extensionStats ?? []) {
+      const cur = extMap.get(e.ext) ?? { ext: e.ext, bytes: 0, allocated: 0, files: 0 };
+      cur.bytes += e.bytes; cur.allocated += e.allocated; cur.files += e.files;
+      extMap.set(e.ext, cur);
+    }
+  }
+  const root: NodeRecord = {
+    id: 0, parent: null, name: label, path: label, dir: true, link: false,
+    hidden: false, readonly: false, size, allocated, files, folders,
+    modified: 0, created: 0, accessed: 0, depth: 0, errors: 0, extension: "", children: [],
+  };
+  nodes.unshift(root);
+  const result: ScanResult = {
+    ...scans[0],
+    rootPath: label,
+    nodeCount: nodes.length,
+    nodes,
+    topFiles: [],
+    duplicateCandidates: [],
+    extensionStats: [...extMap.values()].sort((a, b) => b.bytes - a.bytes),
+  };
+  return { result, nodes };
+}
+
+// Wrap a tab's AgentApi so the read surface (scan path/result/nodes + duplicate
+// finding) is served from the attached folder scan(s) instead of the focused
+// tab. All path-based operations (move/rename/create/reveal/run_command/scan/
+// refresh) fall through to the underlying api unchanged via the spread.
+function buildScopedApi(base: AgentApi, dirs: string[], scans: ScanResult[]): AgentApi {
+  const single = scans.length === 1;
+  const label = single ? dirs[0] : dirs.join(", ");
+  const { result, nodes } = single ? { result: scans[0], nodes: scans[0].nodes } : mergeScans(scans, label);
+  return {
+    ...base,
+    getScanPath: () => label,
+    getScanResult: () => result,
+    getNodes: () => nodes,
+    findDuplicates: async (minSizeBytes: number) => {
+      const res = await fetchDupesV2({ paths: dirs, mode: "exact", minSize: minSizeBytes });
+      return { groups: res.groups.map((g) => ({ waste: g.waste, files: g.files.map((f) => ({ path: f.path, size: f.size })) })) };
+    },
+  };
+}
+
+export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewSession, onRestoreSession, includeHidden = false, threads }: ChatPanelProps) {
   const [ai, setAi] = useState<AiSettings>(() => loadAiSettings());
   const [groups, setGroups] = useState<ModelGroup[]>([]);
   const [modelStatus, setModelStatus] = useState<"unknown" | "ok" | "offline">("unknown");
@@ -290,7 +361,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
           const r = prev[ev.runId];
           const t = r?.tools[ev.callId];
           if (!r || !t) return prev;
-          return { ...prev, [ev.runId]: { ...r, tools: { ...r.tools, [ev.callId]: { ...t, status: ev.status, summary: ev.summary ?? t.summary } } } };
+          return { ...prev, [ev.runId]: { ...r, tools: { ...r.tools, [ev.callId]: { ...t, status: ev.status, summary: ev.summary ?? t.summary, output: ev.output ?? t.output } } } };
         });
         break;
       case "agent_end":
@@ -321,10 +392,11 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     }
   }, []);
 
-  const requestApproval = useCallback((callId: string, _view: ToolCallView) => {
+  const requestApproval = useCallback((callId: string, view: ToolCallView) => {
     // Once the user picks "Approve all in this run", later actions in the same
-    // turn resolve immediately without surfacing another card.
-    if (runAutoApproveRef.current) return Promise.resolve(true);
+    // turn resolve immediately without surfacing another card — EXCEPT tools in
+    // ALWAYS_APPROVE_TOOLS (run_command), which must be confirmed every time.
+    if (runAutoApproveRef.current && !ALWAYS_APPROVE_TOOLS.has(view.name)) return Promise.resolve(true);
     return new Promise<boolean>((resolve) => {
       approvalRef.current[callId] = (approved: boolean) => {
         delete approvalRef.current[callId];
@@ -566,10 +638,43 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     const attachedCtx = buildAttachedContext(attachedSnapshot);
     const combinedContext = [refBlock, attachedCtx].filter(Boolean).join("\n\n");
 
+    // Attached folders define an ISOLATED scope: pre-scan each one and build a
+    // scoped AgentApi so every tool (listing, sizes, duplicates, scanSummary)
+    // runs against the attached folder(s) instead of the focused tab's scan —
+    // without disturbing any open tab. File operations still delegate to the
+    // underlying tab api unchanged.
+    const attachedDirs = attachedSnapshot
+      .filter((a) => a.kind === "path" && a.isDir && a.path)
+      .map((a) => a.path as string);
+
     try {
+      let effectiveApi = api;
+      if (attachedDirs.length) {
+        const scoped: { dir: string; scan: ScanResult }[] = [];
+        for (const dir of attachedDirs) {
+          try {
+            let scan = getCached(dir);
+            if (!scan) {
+              const res = await fetch(scanStreamUrl({ path: dir, includeHidden, threads }), { signal: controller.signal });
+              if (res.ok && res.body) {
+                scan = await readNdjsonStream(res.body.getReader(), () => {});
+                setCached(dir, scan);
+              }
+            }
+            if (scan) scoped.push({ dir, scan });
+          } catch (e) {
+            if ((e as Error).name === "AbortError") throw e;
+            applyEvent({ kind: "notice", level: "warn", text: `Couldn't read attached folder ${dir}: ${(e as Error).message}` });
+          }
+        }
+        if (scoped.length) {
+          effectiveApi = buildScopedApi(api, scoped.map((s) => s.dir), scoped.map((s) => s.scan));
+        }
+      }
+
       const res = await runOrchestrator(
         {
-          provider, model: selectedModel, apiKey, api,
+          provider, model: selectedModel, apiKey, api: effectiveApi,
           autoApprove, signal: controller.signal,
           emit: applyEvent, requestApproval, newId: uid,
           // Read the allowlist live so an "Always allow" chosen mid-run applies
@@ -586,7 +691,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
       abortRef.current = null;
       resolveAllApprovals(false);
     }
-  }, [busy, getAgentApi, selectedModel, provider, apiKey, attached, references, autoApprove, applyEvent, requestApproval, resolveAllApprovals, buildAttachedContext]);
+  }, [busy, getAgentApi, selectedModel, provider, apiKey, attached, references, autoApprove, applyEvent, requestApproval, resolveAllApprovals, buildAttachedContext, includeHidden, threads]);
 
   const stop = useCallback(() => {
     abortRef.current?.abort();
@@ -1021,21 +1126,26 @@ function ActionCard({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { 
   const paths = (tool.args.paths as string[]) ?? (tool.args.path ? [String(tool.args.path)] : []);
   const dest = tool.args.destination as string | undefined;
   const newName = tool.args.new_name as string | undefined;
+  const isCmd = tool.tool === "run_command";
+  const cwd = isCmd ? (tool.args.cwd as string | undefined) : undefined;
   const pending = tool.status === "pending";
   const dotClass = tool.status === "error" ? "err" : tool.status === "rejected" ? "rej" : tool.status === "done" ? "ok" : pending ? "wait" : "run";
   const statusLabel = tool.status === "rejected" ? "Skipped" : tool.status === "done" ? (tool.summary || "Done") : tool.status === "error" ? (tool.summary || "Failed") : "";
   // Ran without surfacing a card (global auto-approve or an allowlisted tool).
   const autoRan = !tool.requiresApproval && tool.status !== "pending";
+  // run_command can never be bypassed, so don't offer the allow/approve-all menu.
+  const canAllow = !ALWAYS_APPROVE_TOOLS.has(tool.tool);
   return (
     <div className={`approval-card action-card ${tool.status}`}>
       <div className="approval-card-head">
         <span className={`tool-dot ${dotClass}`} />
-        <span className="approval-card-title">Action agent wants to run</span>
+        <span className="approval-card-title">{isCmd ? "Action agent wants to run a command" : "Action agent wants to run"}</span>
         {autoRan && <span className="approval-status auto" title="Ran without a review card (auto-approved or on the allowlist)">Auto-approved</span>}
         {!pending && statusLabel && <span className={`approval-status ${tool.status === "error" ? "err" : tool.status === "done" ? "ok" : "rej"}`}>{statusLabel}</span>}
       </div>
       <div className="approval-card-body">
-        <div className="approval-command"><Icon name="terminal" size={12} /><code>{humanizeCommand(tool)}</code></div>
+        <div className={`approval-command${isCmd ? " cmd" : ""}`}><Icon name="terminal" size={12} /><code>{humanizeCommand(tool)}</code></div>
+        {cwd && <div className="approval-meta">Working dir: <code>{cwd}</code></div>}
         {dest && <div className="approval-meta">Destination: <code>{dest}</code></div>}
         {newName && <div className="approval-meta">New name: <code>{newName}</code></div>}
         {paths.length > 0 && (
@@ -1044,13 +1154,18 @@ function ActionCard({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { 
             {paths.length > 10 && <li>…and {paths.length - 10} more</li>}
           </ul>
         )}
+        {tool.output && <pre className="approval-output">{tool.output}</pre>}
       </div>
       {pending && (
         <div className="approval-card-actions">
           <button className="agent-btn-approve" onClick={() => onApprove(tool.callId)}>Approve</button>
           <button className="agent-btn-reject" onClick={() => onReject(tool.callId)}>Skip</button>
-          <span className="approval-actions-spacer" />
-          <AllowMenu callId={tool.callId} tool={tool.tool} label={`Always allow ${tool.tool}`} onAllowlist={onAllowlist} onApproveAll={onApproveAll} />
+          {canAllow && (
+            <>
+              <span className="approval-actions-spacer" />
+              <AllowMenu callId={tool.callId} tool={tool.tool} label={`Always allow ${tool.tool}`} onAllowlist={onAllowlist} onApproveAll={onApproveAll} />
+            </>
+          )}
         </div>
       )}
     </div>
@@ -1089,7 +1204,7 @@ function humanizeCommand(tool: ToolState): string {
   const n = paths.length;
   const items = `${n} item${n === 1 ? "" : "s"}`;
   switch (tool.tool) {
-    case "delete_items": return `Delete ${items} to the Recycle Bin`;
+    case "run_command": return String(tool.args.command ?? "");
     case "move_items": return `Move ${items} to ${basename(String(tool.args.destination ?? ""))}`;
     case "rename_item": return `Rename ${basename(String(tool.args.path ?? ""))} → ${String(tool.args.new_name ?? "")}`;
     case "create_folder": return `Create folder ${basename(String(tool.args.path ?? ""))}`;
@@ -1350,7 +1465,7 @@ function SettingsMenu({ ai, autoApprove, onChange, onToggleAuto, onRemoveAllow, 
   onClose: () => void;
 }) {
   const ALLOW_LABELS: Record<string, string> = {
-    delete_items: "Delete to Recycle Bin",
+    run_command: "Run command",
     move_items: "Move items",
     rename_item: "Rename item",
     create_folder: "Create folder",

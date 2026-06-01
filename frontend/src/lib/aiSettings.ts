@@ -9,7 +9,8 @@ export interface AiSettings {
   model: string;
   keys: { openai: string; anthropic: string };
   // Tool names the user chose to "always allow" — these run without surfacing a
-  // per-action approval card (e.g. "delete_items", "delegate_to_action").
+  // per-action approval card (e.g. "move_items", "delegate_to_action"). Note:
+  // run_command can never be allow-listed; it always requires explicit approval.
   allow: string[];
 }
 

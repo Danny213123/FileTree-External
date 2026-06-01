@@ -117,6 +117,11 @@ export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, on
     <div
       ref={barRef}
       className="workspace-tabbar"
+      // Stable marker so a native folder drag (which carries no HTML5 MIME data)
+      // can detect the tab strip by coordinates and open the folder in a new tab
+      // of THIS group — see TreeTable's onNativeDropInternal handler.
+      data-tabstrip="1"
+      data-group-id={groupId}
       onDragOver={(e) => {
         // Tab drags that reach the bar (empty area, or a tab from another group)
         // show a reorder indicator; per-tab handlers stopPropagation for hovers
