@@ -86,6 +86,13 @@ interface TreeTableProps {
   onCopySelected?: () => void;
   /** Called when the user drags rows from inside FileTree onto a folder row. */
   onMoveItems?: (sourcePaths: string[], destinationFolder: string) => Promise<MoveItemsResult | void> | MoveItemsResult | void;
+  /** Open a folder in a new workspace tab. Used when a native folder drag is
+   *  dropped on a tab strip; `groupId` selects which editor group's bar. */
+  onOpenFolderInTab?: (path: string, groupId?: string) => void;
+  /** Called after a native drag moved item(s) OUT (to Explorer / another app)
+   *  and removed a directory from the source, so the owner can invalidate the
+   *  scan cache and rescan (the moved-out folder would otherwise linger). */
+  onAfterExternalMove?: () => void;
   /** id of the row whose name is being edited inline (null/undefined = none). */
   renamingId?: number | null;
   /** Commit an inline rename for the given row id with the typed name. */
@@ -205,6 +212,8 @@ function TreeTableInner({
   onToggleBookmark,
   onCopySelected,
   onMoveItems,
+  onOpenFolderInTab,
+  onAfterExternalMove,
   renamingId,
   onRenameCommit,
   onRenameCancel,
@@ -218,6 +227,19 @@ function TreeTableInner({
   // the real drop target (the same folder shown highlighted), so we move into
   // it directly instead of re-deriving it from drop coordinates.
   const lastFolderTargetRef = useRef<string | null>(null);
+  // Set on the origin instance when the native drag is a SINGLE folder (mirrors
+  // the old HTML5 `application/x-filetree-folder-path`): dropping it on a tab
+  // strip opens it in a new tab instead of moving. Null for files / multi-drag.
+  const nativeFolderTabPathRef = useRef<string | null>(null);
+  // True when the current native drag includes at least one directory; gates the
+  // post-external-move rescan so a moved-out folder doesn't linger in the tree.
+  const nativeDragHadDirRef = useRef<boolean>(false);
+  // Latest values of the optional owner callbacks, read inside the IPC listener
+  // effect without forcing it to re-subscribe when their identities change.
+  const onOpenFolderInTabRef = useRef(onOpenFolderInTab);
+  onOpenFolderInTabRef.current = onOpenFolderInTab;
+  const onAfterExternalMoveRef = useRef(onAfterExternalMove);
+  onAfterExternalMoveRef.current = onAfterExternalMove;
   type ElectronAPI = {
     // Fire-and-forget: main runs the native shell drag while the renderer stays
     // responsive (auto-scroll + folder highlight keep working during the drag).
@@ -228,8 +250,12 @@ function TreeTableInner({
     onNativeDropInternal?: (
       cb: (clientX: number, clientY: number, paths: string[]) => void,
     ) => () => void;
-    // The native drag ended externally or was cancelled: clear drag UI.
-    onNativeDropEnd?: (cb: () => void) => () => void;
+    // The native drag ended externally or was cancelled: clear drag UI. The
+    // optional payload reports the real OS outcome so the renderer can rescan
+    // after an external move that removed a directory from the source.
+    onNativeDropEnd?: (
+      cb: (info?: { outcome: string; deleted: string[] }) => void,
+    ) => () => void;
     // TEMP diagnostic: forward a renderer log line to the main-process terminal.
     diag?: (message: string) => void;
   };
@@ -444,21 +470,44 @@ function TreeTableInner({
   useEffect(() => {
     const api = electronAPI();
     if (!api?.onNativeDropInternal) return;
+    const clearNativeDrag = () => {
+      nativeDragOriginRef.current = false;
+      lastFolderTargetRef.current = null;
+      nativeFolderTabPathRef.current = null;
+      nativeDragHadDirRef.current = false;
+    };
     const offInternal = api.onNativeDropInternal((clientX, clientY, paths) => {
       const origin = nativeDragOriginRef.current;
       const tracked = lastFolderTargetRef.current;
+      const folderTabPath = nativeFolderTabPathRef.current;
       api?.diag?.(`[diag] internal-drop ENTER origin=${origin} tracked=${tracked ?? "(none)"} paths=${paths.length} xy=${clientX},${clientY}`);
       // Only the instance that started the drag acts. Other tabs keep a mounted
       // (display:none) TreeTable and would otherwise all handle this same IPC.
       if (!origin) return;
 
+      const elAtPoint = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+
+      // Dropped on a tab strip: native drags carry no HTML5 MIME, so the old
+      // "drag a folder onto the tab bar = open it in a new tab" path can't fire
+      // from TabBar anymore. Reproduce it here — a SINGLE folder drag (tracked in
+      // nativeFolderTabPathRef) opens in a new tab of the targeted editor group;
+      // file / multi-selection drags on the bar do nothing (as before).
+      const tabStrip = elAtPoint?.closest<HTMLElement>("[data-tabstrip]");
+      if (tabStrip && folderTabPath) {
+        const groupId = tabStrip.dataset.groupId || undefined;
+        api?.diag?.(`[diag] internal-drop -> open folder in tab group=${groupId ?? "(focused)"}`);
+        clearNativeDrag();
+        resetDragState();
+        onOpenFolderInTabRef.current?.(folderTabPath, groupId);
+        return;
+      }
+
       // If the drop landed outside the tree (e.g. on the AI chat panel), let that
       // surface claim the paths — don't perform a tree move into the last
       // highlighted folder.
-      const overTree = !!(document.elementFromPoint(clientX, clientY) as HTMLElement | null)?.closest(".table-pane");
+      const overTree = !!elAtPoint?.closest(".table-pane");
       if (!overTree) {
-        nativeDragOriginRef.current = false;
-        lastFolderTargetRef.current = null;
+        clearNativeDrag();
         resetDragState();
         return;
       }
@@ -468,14 +517,12 @@ function TreeTableInner({
       // point only if no folder was tracked.
       let destPath = tracked ?? undefined;
       if (!destPath) {
-        const el = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
-        const row = el?.closest<HTMLElement>(".row");
+        const row = elAtPoint?.closest<HTMLElement>(".row");
         if (row?.dataset.nodeDir === "1") destPath = row.dataset.nodePath;
       }
       const movable = destPath ? paths.filter((src) => src && src !== destPath) : [];
       api?.diag?.(`[diag] internal-drop dest=${destPath ?? "(none)"} willMove=${movable.length}`);
-      nativeDragOriginRef.current = false;
-      lastFolderTargetRef.current = null;
+      clearNativeDrag();
       if (destPath && movable.length > 0) {
         const target = destPath;
         window.setTimeout(() => { void runInternalMove(movable, target); }, 0);
@@ -483,10 +530,16 @@ function TreeTableInner({
       }
       resetDragState();
     });
-    const offEnd = api.onNativeDropEnd?.(() => {
-      nativeDragOriginRef.current = false;
-      lastFolderTargetRef.current = null;
+    const offEnd = api.onNativeDropEnd?.((info) => {
+      const wasOrigin = nativeDragOriginRef.current;
+      const hadDir = nativeDragHadDirRef.current;
+      clearNativeDrag();
       resetDragState();
+      // A folder that was dragged OUT (true move) is gone from disk but may still
+      // sit in an expanded parent here; rescan so the tree reflects the move.
+      if (wasOrigin && hadDir && info?.outcome === "external-move") {
+        onAfterExternalMoveRef.current?.();
+      }
     });
     return () => { offInternal?.(); offEnd?.(); };
   }, [runInternalMove, resetDragState]);
@@ -600,20 +653,30 @@ function TreeTableInner({
                   e.dataTransfer.effectAllowed = draggedNodes.some((draggedNode) => draggedNode.dir) ? "copyMove" : "move";
                   dragPathsRef.current = draggedPaths;
                   const api = electronAPI();
-                  const useNativeDrag = !!api && draggedNodes.every((draggedNode) => !draggedNode.dir);
+                  // Files AND folders (and mixed selections) all take the native
+                  // shell drag when running under Electron: the SHDoDragDrop
+                  // payload is path-agnostic and accepts directories, so folders
+                  // drag out to Explorer (a true move) exactly like files. Only
+                  // the pure-web fallback (no Electron API) uses the HTML5 drag.
+                  const useNativeDrag = !!api;
                   if (useNativeDrag) {
-                    // Files: hand the drag to the native shell drag (fire-and-forget
-                    // so the renderer stays responsive). Chromium still fires
+                    // Hand the drag to the native shell drag (fire-and-forget so
+                    // the renderer stays responsive). Chromium still fires
                     // dragover on the page during the drag (folder highlight +
                     // auto-scroll work). The drop is completed by main via
-                    // onNativeDropInternal (internal move) or onNativeDropEnd
-                    // (external move/copy/cancel). Folders fall through to a pure
-                    // HTML5 drag (internal move only).
+                    // onNativeDropInternal (internal move / open-in-tab) or
+                    // onNativeDropEnd (external move/copy/cancel).
                     e.preventDefault(); // suppress Chromium's HTML5 drag; native drag takes over
                     // Mark this instance as the drag origin and reset the tracked
                     // target; the nativeDropInternal IPC will only act here.
                     nativeDragOriginRef.current = true;
                     lastFolderTargetRef.current = null;
+                    // A lone folder may be dropped on a tab strip to open it in a
+                    // new tab (mirrors the old HTML5 folder-path payload); track
+                    // whether any directory is involved so a drag-OUT can rescan.
+                    nativeFolderTabPathRef.current =
+                      draggedNodes.length === 1 && draggedNodes[0].dir ? draggedPaths[0] : null;
+                    nativeDragHadDirRef.current = draggedNodes.some((draggedNode) => draggedNode.dir);
                     api.diag?.(`[diag] native dragstart paths=${draggedPaths.length}`);
                     api.startDrag(draggedPaths);
                   }

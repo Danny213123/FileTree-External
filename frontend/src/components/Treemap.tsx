@@ -2,7 +2,6 @@ import { useMemo, useState, memo, useEffect, useRef, useCallback } from "react";
 import type { NodeRecord, Metric, Unit } from "../api/types";
 import { layoutTreemap } from "../utils/treeLayout";
 import { formatBytes, formatCount } from "../utils/formatBytes";
-import { moveItem } from "../api/client";
 import { Treemap3DModal } from "./Treemap3DModal";
 import { NodeTooltip } from "./NodeTooltip";
 
@@ -291,6 +290,10 @@ interface TreemapProps {
   dragDrop: boolean;
   onSelect: (id: number) => void;
   onNavigate: (id: number) => void;
+  /** Move folder(s) into a destination folder (same path as the tree's drag
+   *  handler: shell IFileOperation / `/api/move-items`, with the self/descendant
+   *  guard and conflict handling). Dropping one folder onto another moves it in. */
+  onMoveItems?: (sourcePaths: string[], destinationFolder: string) => Promise<{ ok: boolean; error?: string } | void> | { ok: boolean; error?: string } | void;
   onOpen?: (id: number) => void;
   onClose3D?: () => void;
 }
@@ -298,7 +301,7 @@ interface TreemapProps {
 export const Treemap = memo(function Treemap({
   nodeById, selectedId, metric, unit, detail, darkMode,
   showSingleFiles, show3D, showHierarchy, showLegend, showLabels, dragDrop,
-  onSelect, onNavigate, onOpen, onClose3D,
+  onSelect, onNavigate, onMoveItems, onOpen, onClose3D,
 }: TreemapProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -561,12 +564,14 @@ export const Treemap = memo(function Treemap({
     const src = nodeById.get(srcId);
     const dst = nodeById.get(dstId);
     if (!src || !dst || !dst.dir) return;
-    const srcName = src.path.split(/[\\/]/).pop() ?? src.name;
-    const sep = dst.path.endsWith("\\") || dst.path.endsWith("/") ? "" : "\\";
-    const newPath = dst.path + sep + srcName;
-    const result = await moveItem(src.path, newPath);
-    if (!result.ok) alert(`Move failed: ${result.error}`);
-  }, [dragSourceId, nodeById, redrawOverlay]);
+    // Move the dragged item INTO the destination folder using the same path the
+    // tree uses (shell IFileOperation move via /api/move-items, with the
+    // self/descendant guard and conflict handling). The old direct moveItem()
+    // call hit POST /api/move, which the Rust server doesn't whitelist — so it
+    // 405'd and treemap folder moves silently did nothing.
+    const result = await onMoveItems?.([src.path], dst.path);
+    if (result && !result.ok) alert(`Move failed: ${result.error}`);
+  }, [dragSourceId, nodeById, redrawOverlay, onMoveItems]);
 
   return (
     <>

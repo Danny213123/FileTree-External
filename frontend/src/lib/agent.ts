@@ -8,6 +8,15 @@
 
 import type { NodeRecord, ScanResult } from "../api/types";
 
+export interface RunCommandResult {
+  ok: boolean;
+  exit_code?: number | null;
+  stdout?: string;
+  stderr?: string;
+  truncated?: boolean;
+  error?: string;
+}
+
 export interface AgentApi {
   getScanPath: () => string;
   getScanResult: () => ScanResult | null;
@@ -16,10 +25,13 @@ export interface AgentApi {
   refresh: () => Promise<void>;
   findDuplicates: (minSizeBytes: number) => Promise<{ groups: { waste: number; files: { path: string; size: number }[] }[] }>;
   moveItems: (paths: string[], destination: string) => Promise<{ ok: boolean; error?: string }>;
-  deleteItems: (paths: string[]) => Promise<{ ok: boolean; error?: string }>;
   renameItem: (path: string, newName: string) => Promise<{ ok: boolean; error?: string }>;
   createFolder: (path: string) => Promise<{ ok: boolean; error?: string }>;
   reveal: (path: string) => Promise<void>;
+  // Run an arbitrary shell command (approval-gated in the UI). Used for general
+  // CLI work and, crucially, for deletions via the Recycle Bin recipe so the
+  // model can report a real exit code instead of fabricating "moved to trash".
+  runCommand: (command: string, cwd?: string) => Promise<RunCommandResult>;
 }
 
 export interface ToolDef {
@@ -35,7 +47,16 @@ export interface ToolDef {
   };
 }
 
-export const MUTATING_TOOLS = new Set(["move_items", "delete_items", "rename_item", "create_folder"]);
+export const MUTATING_TOOLS = new Set(["move_items", "rename_item", "create_folder", "run_command"]);
+
+// The exact PowerShell recipe the model must use to delete files/folders so they
+// land in the Recycle Bin (recoverable) rather than being destroyed. Embedded in
+// the run_command tool description and the Action agent's system prompt.
+export const RECYCLE_RECIPE = [
+  "Add-Type -AssemblyName Microsoft.VisualBasic",
+  "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('C:\\path\\file.ext','OnlyErrorDialogs','SendToRecycleBin')",
+  "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('C:\\path\\dir','OnlyErrorDialogs','SendToRecycleBin')",
+].join("\n");
 
 // ── Read-only tools (Search agent) ───────────────────────────
 export const SEARCH_TOOLS: ToolDef[] = [
@@ -151,12 +172,20 @@ export const ACTION_TOOLS: ToolDef[] = [
   {
     type: "function",
     function: {
-      name: "delete_items",
-      description: "Send files/folders to the Recycle Bin. Destructive: requires user confirmation.",
+      name: "run_command",
+      description:
+        "Run a shell command on the user's Windows machine (PowerShell by default). Every command is shown to the user for explicit approval before it runs, and you get back the real exit code plus captured stdout/stderr. Use this for general CLI work AND for deletions.\n" +
+        "To DELETE a file or folder, you MUST send it to the Recycle Bin (recoverable) using this exact recipe — never use Remove-Item or rm, and never claim something was deleted unless this returns exit 0:\n" +
+        RECYCLE_RECIPE +
+        "\nReplace the example paths with the real absolute path(s) from the scan; call run_command once per item or chain the lines for several items.",
       parameters: {
         type: "object",
-        properties: { paths: { type: "array", items: { type: "string" }, description: "Absolute paths to delete." } },
-        required: ["paths"],
+        properties: {
+          command: { type: "string", description: "The exact command line to run (PowerShell syntax by default)." },
+          cwd: { type: "string", description: "Optional absolute working directory. Defaults to the scanned folder." },
+          shell: { type: "string", enum: ["powershell", "cmd"], description: "Shell to use. Defaults to powershell." },
+        },
+        required: ["command"],
       },
     },
   },
@@ -386,9 +415,11 @@ export async function executeTool(name: string, args: Record<string, unknown>, a
       const destination = String(args.destination || "");
       return await api.moveItems(paths, destination);
     }
-    case "delete_items": {
-      const paths = (args.paths as string[]) ?? [];
-      return await api.deleteItems(paths);
+    case "run_command": {
+      const command = String(args.command || "");
+      if (!command.trim()) return { ok: false, error: "command required" };
+      const cwd = args.cwd ? String(args.cwd) : undefined;
+      return await api.runCommand(command, cwd);
     }
     case "rename_item": {
       const path = String(args.path || "");
@@ -457,6 +488,20 @@ export function formatFindings(tool: string, result: unknown): string {
 // orchestrator when summarizing a sub-agent's work.
 export function summarizeToolResult(tool: string, result: unknown): string {
   const r = result as Record<string, unknown>;
+  // run_command reports its own status from the real exit code, so handle it
+  // before the generic ok===false shortcut (which would hide the exit/stderr).
+  if (tool === "run_command") {
+    if (typeof r?.error === "string" && r.error) return r.error;
+    const code = r?.exit_code;
+    const codeLabel = code === null || code === undefined ? "?" : String(code);
+    const firstLine = (s: unknown) => String(s ?? "").split(/\r?\n/).map((l) => l.trim()).find((l) => l.length) ?? "";
+    if (r?.ok) {
+      const out = firstLine(r.stdout);
+      return out ? `exit ${codeLabel} · ${out}` : `exit ${codeLabel}`;
+    }
+    const err = firstLine(r?.stderr) || firstLine(r?.stdout);
+    return err ? `exit ${codeLabel} · ${err}` : `exit ${codeLabel} (failed)`;
+  }
   if (r?.ok === false) return String(r.error ?? "failed");
   switch (tool) {
     case "get_stats":
@@ -473,8 +518,6 @@ export function summarizeToolResult(tool: string, result: unknown): string {
       return `${(r.extensions as unknown[])?.length ?? 0} extensions`;
     case "move_items":
       return "moved";
-    case "delete_items":
-      return "deleted";
     case "rename_item":
       return "renamed";
     case "create_folder":
@@ -486,4 +529,24 @@ export function summarizeToolResult(tool: string, result: unknown): string {
     default:
       return "done";
   }
+}
+
+// Verbose, multi-line output for a tool result, rendered inside the approval
+// card so the user can verify what actually happened. Only run_command produces
+// output worth showing in full (the real stdout/stderr + exit code); everything
+// else returns "" and the card falls back to its compact summary.
+export function formatToolOutput(tool: string, result: unknown): string {
+  if (tool !== "run_command") return "";
+  const r = result as Record<string, unknown>;
+  if (typeof r?.error === "string" && r.error && r.exit_code === undefined && r.stdout === undefined) {
+    return r.error;
+  }
+  const code = r?.exit_code;
+  const lines: string[] = [`exit code: ${code === null || code === undefined ? "(none)" : code}`];
+  const stdout = String(r?.stdout ?? "").replace(/\s+$/, "");
+  const stderr = String(r?.stderr ?? "").replace(/\s+$/, "");
+  if (stdout) lines.push("stdout:", stdout);
+  if (stderr) lines.push("stderr:", stderr);
+  if (r?.truncated) lines.push("(output truncated)");
+  return lines.join("\n");
 }

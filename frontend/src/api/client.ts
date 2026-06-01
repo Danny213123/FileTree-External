@@ -157,6 +157,44 @@ export async function deletePath(
   return { ok: false, error: text };
 }
 
+export interface RunCommandResult {
+  ok: boolean;
+  exit_code?: number | null;
+  stdout?: string;
+  stderr?: string;
+  truncated?: boolean;
+  error?: string;
+}
+
+/**
+ * Run a shell command via the backend (POST /api/run-command). The server runs
+ * it (PowerShell by default, or cmd), enforces a wall-clock timeout, caps the
+ * captured output, and returns the real exit code + stdout/stderr. The AI
+ * assistant gates every command behind an approval card before calling this.
+ */
+export async function runCommand(
+  command: string,
+  cwd?: string,
+  opts?: { shell?: "powershell" | "cmd"; timeoutMs?: number },
+): Promise<RunCommandResult> {
+  const res = await fetch("/api/run-command", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      command,
+      ...(cwd ? { cwd } : {}),
+      ...(opts?.shell ? { shell: opts.shell } : {}),
+      ...(opts?.timeoutMs != null ? { timeout_ms: opts.timeoutMs } : {}),
+    }),
+  });
+  if (!res.ok) return { ok: false, error: await responseErrorText(res) };
+  try {
+    return (await res.json()) as RunCommandResult;
+  } catch {
+    return { ok: false, error: "Invalid response from run-command" };
+  }
+}
+
 export async function moveItem(src: string, dst: string): Promise<{ ok: boolean; error?: string }> {
   const params = new URLSearchParams({ src, dst });
   const res = await fetch(`/api/move?${params}`, { method: "POST" });

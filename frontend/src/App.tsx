@@ -414,6 +414,17 @@ export default function App() {
     openTabInGroup(focusedGroupIdRef.current, path);
   }, [openTabInGroup]);
 
+  // Open a folder in a new tab of a SPECIFIC group (used when a native folder
+  // drag is dropped on that group's tab strip — see TreeTable). Falls back to
+  // the focused group when no/unknown group id is supplied. Stable identity so
+  // it doesn't defeat WorkspaceTab's memoization.
+  const handleOpenFolderInTab = useCallback((path: string, groupId?: string) => {
+    const target = groupId && groupsRef.current.some((g) => g.id === groupId)
+      ? groupId
+      : focusedGroupIdRef.current;
+    openTabInGroup(target, path);
+  }, [openTabInGroup]);
+
   const handleActivateTab = useCallback((groupId: string, tabId: string) => {
     setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, activeTabId: tabId } : g)));
     setFocusedGroupId(groupId);
@@ -983,6 +994,7 @@ export default function App() {
                         onToggleBookmark={handleToggleBookmark}
                         onScanPath={handleScanPath}
                         onStateChange={notifyState}
+                        onOpenFolderInTab={handleOpenFolderInTab}
                       />
                     );
                   })}
@@ -1005,6 +1017,8 @@ export default function App() {
               width={chatWidth}
               sessionId={chatSessionId}
               getAgentApi={() => getActiveRef()?.getAgentApi() ?? null}
+              includeHidden={includeHidden}
+              threads={threads}
               onClose={() => setChatOpen(false)}
               onNewSession={handleNewAgentSession}
               onRestoreSession={handleRestoreSession}

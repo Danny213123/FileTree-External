@@ -10,9 +10,14 @@
 // instead of fabricated prose. This is what stops a weak model from inventing
 // file names/sizes when it refuses to delegate to the Search agent.
 
-import { MUTATING_TOOLS } from "../agent";
+import { MUTATING_TOOLS, formatToolOutput } from "../agent";
 import { llmStream, type LlmImage, type LlmMessage, type LlmToolCall } from "../llm";
 import type { AgentSpec, RunContext, RunResult } from "./types";
+
+// Tools that ALWAYS surface an approval card, no matter the user's auto-approve
+// setting or allowlist. run_command runs arbitrary shell, so the user must see
+// and confirm the exact command every single time — it can never be bypassed.
+export const ALWAYS_APPROVE_TOOLS = new Set(["run_command"]);
 
 export async function runAgent(
   spec: AgentSpec,
@@ -56,8 +61,12 @@ export async function runAgent(
     // tools, so a forced call never silently runs a mutating action.)
     const isPlanDelegation = call.name === "delegate_to_action";
     // Mutating/plan calls need a review card, unless the user globally
-    // auto-approves or has "always allowed" this specific tool.
-    const requiresApproval = (mutating || isPlanDelegation) && !ctx.autoApprove && !ctx.allowTool(call.name);
+    // auto-approves or has "always allowed" this specific tool. Tools in
+    // ALWAYS_APPROVE_TOOLS (run_command) override that escape hatch entirely —
+    // they always require an explicit, per-call approval.
+    const alwaysApprove = ALWAYS_APPROVE_TOOLS.has(call.name);
+    const requiresApproval =
+      alwaysApprove || ((mutating || isPlanDelegation) && !ctx.autoApprove && !ctx.allowTool(call.name));
     ctx.emit({ kind: "tool_start", runId, callId: call.id, tool: call.name, args: call.args, mutating, requiresApproval });
 
     let approved = true;
@@ -93,7 +102,8 @@ export async function runAgent(
       }
     }
 
-    ctx.emit({ kind: "tool_update", runId, callId: call.id, status: stepStatus, summary });
+    const output = formatToolOutput(call.name, resultObj);
+    ctx.emit({ kind: "tool_update", runId, callId: call.id, status: stepStatus, summary, output: output || undefined });
     history.push({ role: "tool", content: safeJson(resultObj), toolCallId: call.id, toolName: call.name });
     return { result: resultObj, status: stepStatus };
   }

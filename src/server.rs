@@ -283,6 +283,125 @@ fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
+/// Decode raw bytes to a String, truncating to `max` bytes (UTF-8-lossy so a cut
+/// mid-codepoint is replaced rather than panicking). Returns (text, truncated).
+fn cap_output(bytes: &[u8], max: usize) -> (String, bool) {
+    if bytes.len() > max {
+        (String::from_utf8_lossy(&bytes[..max]).into_owned(), true)
+    } else {
+        (String::from_utf8_lossy(bytes).into_owned(), false)
+    }
+}
+
+/// Run a shell command for the AI assistant's `run_command` tool and return the
+/// JSON response body `{ ok, exit_code, stdout, stderr, truncated }`.
+///
+/// Defaults to `powershell -NoProfile -NonInteractive -Command <command>`;
+/// `shell == "cmd"` runs `cmd /C <command>`. stdout/stderr are drained on
+/// background threads (so a full pipe can't deadlock) while the main loop polls
+/// for completion and kills the child once `timeout_ms` elapses. Output is
+/// capped per stream.
+fn run_shell_command(command: &str, cwd: &str, shell: &str, timeout_ms: u64) -> String {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const MAX_OUTPUT: usize = 64 * 1024;
+
+    let mut cmd = if shell.eq_ignore_ascii_case("cmd") {
+        let mut c = Command::new("cmd");
+        c.args(["/C", command]);
+        c
+    } else {
+        let mut c = Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+        c
+    };
+    if !cwd.trim().is_empty() {
+        cmd.current_dir(cwd);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW);
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let mut body = String::from("{\"ok\":false,\"exit_code\":null,\"stdout\":\"\",\"stderr\":");
+            push_json_string(&mut body, &format!("Failed to start command: {error}"));
+            body.push_str(",\"truncated\":false}");
+            return body;
+        }
+    };
+
+    // Drain stdout/stderr concurrently so a child that writes more than the pipe
+    // buffer can't block while we poll for the deadline.
+    let out_reader = child.stdout.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let err_reader = child.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut timed_out = false;
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break None,
+        }
+    };
+
+    // The pipes are closed once the child exits or is killed, so these joins
+    // return promptly.
+    let stdout_bytes = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr_bytes = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+
+    let (stdout_str, out_trunc) = cap_output(&stdout_bytes, MAX_OUTPUT);
+    let (mut stderr_str, err_trunc) = cap_output(&stderr_bytes, MAX_OUTPUT);
+    if timed_out {
+        if !stderr_str.is_empty() {
+            stderr_str.push('\n');
+        }
+        stderr_str.push_str(&format!("Command timed out after {timeout_ms} ms and was terminated."));
+    }
+    let exit_code: Option<i32> = exit_status.as_ref().and_then(|s| s.code());
+    let ok = !timed_out && exit_code == Some(0);
+
+    let mut body = String::from("{\"ok\":");
+    body.push_str(if ok { "true" } else { "false" });
+    body.push_str(",\"exit_code\":");
+    match exit_code {
+        Some(code) => body.push_str(&code.to_string()),
+        None => body.push_str("null"),
+    }
+    body.push_str(",\"stdout\":");
+    push_json_string(&mut body, &stdout_str);
+    body.push_str(",\"stderr\":");
+    push_json_string(&mut body, &stderr_str);
+    body.push_str(",\"truncated\":");
+    body.push_str(if out_trunc || err_trunc { "true" } else { "false" });
+    body.push('}');
+    body
+}
+
 /// Parse the `files` array of `{ path, size, mtime }` objects from the
 /// /api/dupes-hash request body. Quote-aware so paths containing braces (e.g.
 /// `{guid}` folders) don't confuse object boundary detection.
@@ -406,7 +525,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         "/api/bookmarks", "/api/settings", "/api/ai-chat", "/api/watch", "/api/delete",
         "/api/copy-path", "/api/rename", "/api/move-items", "/api/copy-files", "/api/drag-out",
         "/api/dupes-hash", "/api/dupes-action", "/api/dupes-make-ref", "/api/dupes-cancel",
-        "/api/dupes-ignore",
+        "/api/dupes-ignore", "/api/run-command",
     ];
     let method_allowed = request.method == "GET"
         || (request.method == "POST" && post_routes.contains(&route.as_str()))
@@ -1113,6 +1232,26 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     respond_json(&mut stream, 400, "Bad request", &body)
                 }
             }
+        }
+        "/api/run-command" => {
+            // Run an arbitrary shell command on behalf of the AI assistant. This is
+            // approval-gated in the UI (every command is shown and confirmed before
+            // it reaches here), so the server just executes it, enforces a
+            // wall-clock timeout, and returns the real exit code + captured output.
+            let body_str = String::from_utf8_lossy(&request.body);
+            let command = extract_json_str(&body_str, "command").unwrap_or_default();
+            if command.trim().is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing command");
+            }
+            let cwd = extract_json_str(&body_str, "cwd").unwrap_or_default();
+            let shell = extract_json_str(&body_str, "shell").unwrap_or_default();
+            // Default 30s; clamp to a sane ceiling so a runaway command can't pin a
+            // worker thread forever.
+            let timeout_ms = extract_json_u64(&body_str, "timeout_ms")
+                .unwrap_or(30_000)
+                .clamp(1_000, 600_000);
+            let body = run_shell_command(&command, &cwd, &shell, timeout_ms);
+            respond_json(&mut stream, 200, "OK", &body)
         }
         "/api/mkdir" => {
             let Some(path) = query.get("path") else {

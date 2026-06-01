@@ -4,6 +4,35 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.2.0] - 2026-06-01
+
+### Added
+
+#### AI Assistant
+- **Approval-gated `run_command` tool**: the Action agent can run shell commands through a new `POST /api/run-command` endpoint, which executes via `std::process::Command` (`powershell -NoProfile -NonInteractive -Command` by default, or `cmd /C` when `shell: "cmd"`), drains stdout/stderr on background threads, enforces a 30-second default wall-clock timeout (clamped 1s–600s, killing overruns), and caps each stream at 64 KB — returning `{ ok, exit_code, stdout, stderr, truncated }`. Every command **requires explicit approval and can never be auto-approved or allowlisted** (`ALWAYS_APPROVE_TOOLS`); the exact command, captured stdout/stderr, and real exit code are shown in the approval card and in chat for verification.
+- **Recycle Bin deletes**: the assistant removes files and folders to the Windows Recycle Bin via a `Microsoft.VisualBasic.FileIO.FileSystem` (`SendToRecycleBin`) PowerShell recipe, so AI-driven deletions are recoverable.
+
+#### Drag-and-drop
+- **Folder drag parity with files**: folders and mixed file+folder selections now use the native Windows shell drag (`SHDoDragDrop`). A folder can be dragged out to Explorer/the desktop as a true move (the source directory is removed via the shell `IFileOperation`), dropped onto another folder row across split panes for an internal move, and dragged to the tab bar to open it in a new tab.
+
+### Changed
+
+- The AI assistant treats an **attached folder as an isolated scope**: `ChatPanel` pre-scans the attached directories and builds a scoped `AgentApi` (overriding `getNodes`/`getScanResult`/`getScanPath`/`findDuplicates`) that every tool and the scan summary run against, without disturbing the open tabs.
+- Folder and mixed-selection drags route through the native shell drag instead of the HTML5-only path; the tree invalidates its cache and rescans after an external folder move so it reflects the change.
+- Treemap folder moves are routed through `/api/move-items` (via the shared internal-move handler), gaining the same conflict/merge handling as the tree table.
+
+### Fixed
+
+- **AI scope**: the assistant now scans and operates on the folder you attached rather than the focused tab's scan, so duplicate-finding and file operations target the right directory.
+- **AI deletes**: deletions requested of the assistant now actually execute and report their real exit code instead of silently failing while claiming files were "moved to Recycle Bin".
+- **Treemap move**: dragging a folder onto a treemap tile no longer fails with a 405 — it is routed through the whitelisted `/api/move-items` route.
+
+### Removed
+
+- The broken `delete_items` AI tool, which permanently hard-deleted files, swallowed failures, and falsely reported "moved to Recycle Bin" — superseded by the approval-gated `run_command` Recycle Bin recipe.
+
+---
+
 ## [1.1.0] - 2026-06-01
 
 ### Added

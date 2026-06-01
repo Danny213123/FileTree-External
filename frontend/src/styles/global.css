@@ -3851,7 +3851,12 @@ input:focus, select:focus {
 .approval-command .bi { color: var(--accent); flex: 0 0 auto; }
 .approval-command code { font-family: var(--vsc-mono); font-size: 11.5px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .approval-meta { font-size: 11px; color: var(--text-3); }
-.approval-meta code { font-family: var(--vsc-mono); color: var(--text-2); }
+.approval-meta code { font-family: var(--vsc-mono); color: var(--text-2); word-break: break-all; }
+/* run_command shows the full (possibly multi-line) command, so let it wrap. */
+.approval-command.cmd { align-items: flex-start; }
+.approval-command.cmd code { white-space: pre-wrap; word-break: break-word; overflow: visible; max-height: 140px; overflow-y: auto; }
+/* Captured stdout/stderr + exit code from a run_command, shown for verification. */
+.approval-output { margin: 0; font-family: var(--vsc-mono); font-size: 11px; line-height: 1.45; color: var(--text-3); background: var(--bg-4); border: 1px solid var(--vsc-border); border-radius: 5px; padding: 6px 8px; white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow: auto; }
 .approval-card-actions { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--vsc-border); flex-wrap: wrap; }
 .approval-card-actions button { height: 26px; font-size: 12px; padding: 0 12px; border-radius: 4px; }
 .agent-btn-ghost { background: transparent; border: 1px solid transparent; color: var(--muted); margin-left: auto; }

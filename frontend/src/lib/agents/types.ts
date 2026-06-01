@@ -26,7 +26,7 @@ export type AgentEvent =
   // text never lingers on screen above the corrected answer.
   | { kind: "text_reset"; runId: string }
   | { kind: "tool_start"; runId: string; callId: string; tool: string; args: Record<string, unknown>; mutating: boolean; requiresApproval: boolean }
-  | { kind: "tool_update"; runId: string; callId: string; status: StepStatus; summary?: string }
+  | { kind: "tool_update"; runId: string; callId: string; status: StepStatus; summary?: string; output?: string }
   | { kind: "agent_end"; runId: string; agent: AgentKind; status: RunStatus; summary?: string }
   | { kind: "notice"; runId?: string; level: "info" | "warn" | "error"; text: string };
 

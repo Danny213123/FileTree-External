@@ -388,7 +388,7 @@ mod windows_impl {
         FileOperation, IContextMenu, IContextMenu2, IFileOperation, IShellFolder, IShellItem,
         SHBindToParent, SHCreateItemFromParsingName, SHCreateShellItemArrayFromIDLists,
         SHDoDragDrop, SHParseDisplayName, BHID_DataObject, CMF_CANRENAME, CMF_EXPLORE, CMF_NORMAL,
-        CMINVOKECOMMANDINFO, GCS_VERBA, IShellItemArray,
+        CMINVOKECOMMANDINFO, FOF_ALLOWUNDO, FOF_NO_UI, GCS_VERBA, IShellItemArray,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -530,13 +530,23 @@ mod windows_impl {
                 "cancel"
             } else if is_external {
                 if is_move {
+                    // True move: the external target already received a copy, so
+                    // remove the source here. Files use DeleteFileW (fast). A
+                    // directory needs a recursive removal — use the shell file
+                    // engine (handles nested trees / long paths and is recoverable
+                    // via the Recycle Bin), falling back to a filesystem remove.
                     for path in &existing {
-                        // Files only (the renderer restricts native drag to files).
-                        if Path::new(path).is_file() {
+                        let p = Path::new(path);
+                        let removed = if p.is_dir() {
+                            shell_delete_dir(path)
+                        } else if p.is_file() {
                             let wide = to_wide(path);
-                            if DeleteFileW(PCWSTR(wide.as_ptr())).is_ok() {
-                                deleted.push(path.clone());
-                            }
+                            DeleteFileW(PCWSTR(wide.as_ptr())).is_ok()
+                        } else {
+                            false
+                        };
+                        if removed {
+                            deleted.push(path.clone());
                         }
                     }
                     "external-move"
@@ -559,6 +569,37 @@ mod windows_impl {
                 deleted,
             })
         }
+    }
+
+    /// Remove a moved-out source *directory* (the external target already
+    /// received its copy, so this completes a true move). Prefers the shell file
+    /// engine (`IFileOperation`): it recurses the whole tree, copes with long
+    /// paths / junctions, and — with `FOF_ALLOWUNDO` — sends the folder to the
+    /// Recycle Bin so a mistaken move stays recoverable (degrading to a permanent
+    /// delete when recycling isn't possible). `FOF_NO_UI` keeps it silent (no
+    /// progress, confirmation, or error dialogs). Falls back to a recursive
+    /// filesystem remove if the shell engine is unavailable. Runs on the UI
+    /// thread, which is already an OLE/STA apartment (see `drag`). Returns whether
+    /// the directory is gone afterward.
+    fn shell_delete_dir(path: &str) -> bool {
+        let shelled = (|| -> windows::core::Result<()> {
+            unsafe {
+                let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
+                op.SetOperationFlags(FOF_NO_UI | FOF_ALLOWUNDO)?;
+                let wide = to_wide(path);
+                let item: IShellItem =
+                    SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)?;
+                op.DeleteItem(&item, None)?;
+                op.PerformOperations()?;
+                Ok(())
+            }
+        })();
+        if shelled.is_ok() && !Path::new(path).exists() {
+            return true;
+        }
+        // Fallback: recursive filesystem remove (e.g. shell engine unavailable).
+        let _ = std::fs::remove_dir_all(path);
+        !Path::new(path).exists()
     }
 
     /// Move `sources` into `dest` with the shell file-operation engine, showing
