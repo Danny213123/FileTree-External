@@ -31,12 +31,22 @@ electron_1.contextBridge.exposeInMainWorld("electronAPI", {
     // Clipboard: read text (fallback for terminal paste when the renderer blocks
     // the async web Clipboard API).
     clipboardReadText: () => electron_1.ipcRenderer.invoke("clipboardReadText"),
-    // Clipboard: copy files as CF_HDROP (paste in Explorer).
+    // Clipboard: copy files as CF_HDROP (paste in Explorer & other apps).
     copyFiles: (paths) => electron_1.ipcRenderer.invoke("copyFiles", paths),
+    // Clipboard: write the selection as CF_HDROP with a drop effect — cut=true ⇒
+    // MOVE (Paste relocates), cut=false ⇒ COPY. Resolves true when real CF_HDROP
+    // was written (native addon present), false when it degraded to text.
+    clipboardWriteFiles: (paths, cut) => electron_1.ipcRenderer.invoke("clipboardWriteFiles", paths, cut),
+    // Clipboard: read a CF_HDROP file list (+ whether it was a Cut) for
+    // paste-into-folder. Resolves { paths: [], preferMove: false } when empty.
+    clipboardReadFiles: () => electron_1.ipcRenderer.invoke("clipboardReadFiles"),
     // Move files into a folder via the Windows shell (IFileOperation). Shows the
     // real native dialogs — progress, Replace/Skip/Keep both, "source and
     // destination file names are the same", elevation — exactly like Explorer.
     moveItemsNative: (paths, destination) => electron_1.ipcRenderer.invoke("moveItemsNative", paths, destination),
+    // Copy files into a folder via the Windows shell (IFileOperation) — same
+    // guarded engine + native dialogs as moveItemsNative, for paste-copy / drag-in.
+    copyItemsNative: (paths, destination) => electron_1.ipcRenderer.invoke("copyItemsNative", paths, destination),
     // Best-effort restore of a recycled item to its original path (Phase 6 undo).
     // Resolves true when the item was found in the Recycle Bin and put back; false
     // when it couldn't be located (the renderer then tells the user to restore it
