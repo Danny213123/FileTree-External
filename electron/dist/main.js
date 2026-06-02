@@ -39,13 +39,14 @@ const net = __importStar(require("net"));
 const fs = __importStar(require("fs"));
 const child_process_1 = require("child_process");
 const crypto_1 = require("crypto");
-// Per-session local auth token. Minted once at startup, handed to the Rust
-// server via the FILETREE_AUTH_TOKEN env var and to the renderer via a
-// synchronous IPC call from the preload — never over HTTP. The server requires
-// it as the `X-FileTree-Token` header on destructive routes (delete / move /
-// move-items / rename / dupes-action / run-command), so another local process
-// that can reach the 127.0.0.1 server still can't drive a destructive op
-// (it can neither read this token nor forge it).
+// Per-session local auth token. Minted once at startup and handed to the Rust
+// server via the FILETREE_AUTH_TOKEN env var. The server requires it as the
+// `X-FileTree-Token` header on destructive routes (delete / move / move-items /
+// rename / dupes-action / run-command). The token is NEVER exposed to the
+// renderer: mutating requests are proxied through main via the `mutate` IPC
+// (see below), which attaches the header server-side. So neither a malicious
+// page (XSS) nor another local process that can reach the 127.0.0.1 server can
+// read or forge it.
 const AUTH_TOKEN = (0, crypto_1.randomBytes)(32).toString("hex");
 let nativeDragFiles = null;
 let nativeMoveItems = null;
@@ -105,6 +106,10 @@ catch (e) {
 }
 let serverProcess = null;
 let mainWindow = null;
+// Port the Rust server is listening on (127.0.0.1). Set once at startup and
+// used by the `mutate` IPC proxy so the renderer never needs to know it to
+// reach the local API.
+let serverPort = 0;
 // ── Broken-pipe safety ────────────────────────────────────────────────────────
 // A closed *peer* pipe must never crash the app. When the read end of a stream
 // we write to has already gone away (our own stdout/stderr when launched
@@ -244,17 +249,24 @@ function createWindow(port) {
             preload: path.join(__dirname, "preload.js"),
             contextIsolation: true,
             nodeIntegration: false,
-            // Allow loading from localhost.
+            // Full OS-level renderer sandbox. The preload only uses sandbox-safe
+            // Electron APIs (contextBridge / ipcRenderer / webUtils) and no Node
+            // built-ins, and the native addon is loaded in MAIN (not the preload),
+            // so enabling this needs no preload changes.
+            sandbox: true,
             webSecurity: true,
         },
     });
-    mainWindow.loadURL(`http://127.0.0.1:${port}/`);
-    // When a folder/file is dropped onto the Electron window from Explorer,
-    // Chromium fires "will-navigate" with a file:// URL. Intercept it and
-    // forward the path to the renderer instead of navigating away.
+    const appOrigin = `http://127.0.0.1:${port}`;
+    mainWindow.loadURL(`${appOrigin}/`);
+    // Keep the renderer pinned to its own origin. A file:// "navigation" is how
+    // Chromium reports a file/folder dropped onto the window from Explorer — we
+    // intercept it and forward the path instead. Same-origin navigations are
+    // allowed; external http/https links open in the user's browser; everything
+    // else is blocked so a hijacked page can't navigate the app off-origin.
     mainWindow.webContents.on("will-navigate", (e, url) => {
-        e.preventDefault();
         if (url.startsWith("file://")) {
+            e.preventDefault();
             try {
                 const filePath = decodeURIComponent(new URL(url).pathname).replace(/^\//, "");
                 // Normalize Windows path (remove leading slash before drive letter)
@@ -262,7 +274,30 @@ function createWindow(port) {
                 mainWindow?.webContents.send("externalDrop", [p]);
             }
             catch { /* ignore malformed URLs */ }
+            return;
         }
+        let target = null;
+        try {
+            target = new URL(url);
+        }
+        catch { /* malformed */ }
+        if (target && target.origin === appOrigin)
+            return; // same-origin: allow
+        e.preventDefault();
+        if (target && (target.protocol === "http:" || target.protocol === "https:")) {
+            void electron_1.shell.openExternal(url);
+        }
+    });
+    // Deny in-app popups/new windows. External http/https links open in the
+    // user's default browser; anything else (file:, custom schemes) is dropped.
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+        try {
+            const u = new URL(url);
+            if (u.protocol === "http:" || u.protocol === "https:")
+                void electron_1.shell.openExternal(url);
+        }
+        catch { /* ignore malformed URLs */ }
+        return { action: "deny" };
     });
     mainWindow.on("closed", () => {
         mainWindow = null;
@@ -322,7 +357,6 @@ function showFallbackContextMenu(win, filePath, x, y) {
     catch {
         return false;
     } })();
-    const escaped = filePath.replace(/'/g, "''");
     const fileTreeSubmenu = [
         { label: "Open in new tab", enabled: isDir, click: () => win?.webContents.send("externalDrop", [filePath]) },
         { label: "Show in Explorer", click: () => electron_1.shell.showItemInFolder(filePath) },
@@ -349,10 +383,15 @@ function showFallbackContextMenu(win, filePath, x, y) {
     ];
     if (isDir) {
         items.push({ label: "Open", click: () => electron_1.shell.openPath(filePath) });
-        items.push({ label: "Open in Terminal", click: () => (0, child_process_1.spawn)("cmd.exe", ["/k", `cd /d "${filePath}"`], { detached: true, stdio: "ignore" }) });
+        // Set the start directory via `cwd` rather than interpolating the path into
+        // a `cd /d "<path>"` shell string — argv-only spawn (no shell) means a path
+        // containing cmd metacharacters (& | > ^ ") can't inject commands.
+        items.push({ label: "Open in Terminal", click: () => (0, child_process_1.spawn)("cmd.exe", ["/k"], { cwd: filePath, detached: true, stdio: "ignore" }) });
     }
     else {
         items.push({ label: "Open", click: () => electron_1.shell.openPath(filePath) });
+        // argv-only (no shell): the path is a discrete CreateProcess argument to
+        // rundll32, never parsed by a command interpreter.
         items.push({ label: "Open with...", click: () => (0, child_process_1.spawn)("rundll32.exe", ["shell32.dll,OpenAs_RunDLL", filePath], { detached: true, stdio: "ignore" }) });
     }
     items.push({ type: "separator" });
@@ -367,15 +406,33 @@ function showFallbackContextMenu(win, filePath, x, y) {
     items.push({
         label: "Properties",
         click: () => {
-            const ps = `(New-Object -ComObject Shell.Application).Namespace('${escaped.replace(/\\[^\\]*$/, "")}').ParseName('${path.basename(filePath).replace(/'/g, "''")}').InvokeVerb('Properties')`;
-            (0, child_process_1.spawn)("powershell.exe", ["-WindowStyle", "Hidden", "-Command", ps], { detached: true, stdio: "ignore" });
+            // Never interpolate the (untrusted) path into the PowerShell command.
+            // Pass it out of band via an env var and read it with $env: + -LiteralPath
+            // so wildcards/quotes/metacharacters in the path can't alter the command.
+            const ps = "$p = $env:FILETREE_PROP_PATH; " +
+                "(New-Object -ComObject Shell.Application)" +
+                ".Namespace((Split-Path -LiteralPath $p))" +
+                ".ParseName((Split-Path -LiteralPath $p -Leaf))" +
+                ".InvokeVerb('Properties')";
+            (0, child_process_1.spawn)("powershell.exe", ["-NoProfile", "-WindowStyle", "Hidden", "-Command", ps], {
+                detached: true,
+                stdio: "ignore",
+                env: { ...process.env, FILETREE_PROP_PATH: filePath },
+            });
         },
     });
     const menu = electron_1.Menu.buildFromTemplate(items);
     menu.popup({ window: win ?? undefined, x, y });
 }
 function showHybridShellContextMenu(win, filePath, x, y) {
+    // Injection-safe by construction: the path is base64-encoded before it is
+    // embedded (so it can only ever be `[A-Za-z0-9+/=]` inside the single-quoted
+    // literal), the coordinates are coerced to plain integers, and the whole
+    // script is handed to PowerShell via -EncodedCommand (a single argv element,
+    // never a shell-parsed string). No untrusted value reaches a command parser.
     const encodedPath = Buffer.from(filePath, "utf16le").toString("base64");
+    const px = Number.isFinite(x) ? Math.round(x) : 0;
+    const py = Number.isFinite(y) ? Math.round(y) : 0;
     const script = `
 $ErrorActionPreference = 'Stop'
 $path = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}'))
@@ -521,7 +578,7 @@ public class HybridShellMenu {
   }
 }
 '@
-$action = [HybridShellMenu]::Show($path, ${Math.round(x)}, ${Math.round(y)})
+$action = [HybridShellMenu]::Show($path, ${px}, ${py})
 if ($action) { [Console]::Out.WriteLine("FILETREE_ACTION:" + $action) }
 `.trim();
     const encodedCommand = Buffer.from(script, "utf16le").toString("base64");
@@ -565,12 +622,118 @@ if ($action) { [Console]::Out.WriteLine("FILETREE_ACTION:" + $action) }
 electron_1.ipcMain.on("diag", (_event, message) => {
     console.log("[renderer]", message);
 });
-// The preload fetches the session token synchronously at load so the renderer
-// can attach it as the `X-FileTree-Token` header on destructive API calls.
-// Delivered over IPC (never HTTP), so a process that can only reach the
-// localhost server can't read it.
-electron_1.ipcMain.on("getAuthToken", (event) => {
-    event.returnValue = AUTH_TOKEN;
+// ── Mutating-request proxy ────────────────────────────────────────────────────
+// The session token is NEVER handed to the renderer. Instead the renderer asks
+// main to perform a mutating (POST) request to the local Rust server; main
+// attaches the `X-FileTree-Token` header here. So a compromised renderer can
+// still only invoke routes the server already exposes — it can never read or
+// forge the token, nor point the request at a foreign host.
+async function parseProxyResponse(res) {
+    const text = await res.text();
+    if (!text)
+        return null;
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        return text;
+    }
+}
+electron_1.ipcMain.handle("mutate", async (_event, route, body) => {
+    if (typeof route !== "string")
+        return { ok: false, status: 0, data: "invalid route" };
+    const base = `http://127.0.0.1:${serverPort}`;
+    // Resolve the route against the local server and confirm it can't escape that
+    // origin (e.g. a route like "@evil.com" or an absolute URL that would turn the
+    // authority into a different host). Anything off-origin is refused.
+    let url;
+    try {
+        const resolved = new URL(route, base + "/");
+        if (resolved.origin !== base)
+            return { ok: false, status: 0, data: "route escapes local server origin" };
+        url = resolved.href;
+    }
+    catch {
+        return { ok: false, status: 0, data: "invalid route" };
+    }
+    try {
+        const res = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-FileTree-Token": AUTH_TOKEN },
+            body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        return { ok: res.ok, status: res.status, data: await parseProxyResponse(res) };
+    }
+    catch (e) {
+        return { ok: false, status: 0, data: e.message };
+    }
+});
+// ── Encrypted secret storage (AI API keys) ────────────────────────────────────
+// Keys are encrypted with the OS keystore (DPAPI on Windows) via Electron's
+// safeStorage and persisted as base64 under userData, so they never sit in the
+// renderer's localStorage. When the OS keystore is unavailable (rare; e.g. a
+// headless Linux box) we fall back to a base64 "plain:" record so the feature
+// still round-trips — see SECRETS limitation note in the report.
+function secretsFilePath() {
+    return path.join(electron_1.app.getPath("userData"), "secrets.json");
+}
+function readSecretsStore() {
+    try {
+        const raw = fs.readFileSync(secretsFilePath(), "utf8");
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : {};
+    }
+    catch {
+        return {};
+    }
+}
+function writeSecretsStore(store) {
+    const file = secretsFilePath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(store), { encoding: "utf8" });
+}
+electron_1.ipcMain.handle("secrets:get", (_event, key) => {
+    if (typeof key !== "string" || !key)
+        return null;
+    const stored = readSecretsStore()[key];
+    if (typeof stored !== "string")
+        return null;
+    if (stored.startsWith("plain:")) {
+        try {
+            return Buffer.from(stored.slice("plain:".length), "base64").toString("utf8");
+        }
+        catch {
+            return null;
+        }
+    }
+    if (!electron_1.safeStorage.isEncryptionAvailable())
+        return null;
+    try {
+        return electron_1.safeStorage.decryptString(Buffer.from(stored, "base64"));
+    }
+    catch {
+        return null;
+    }
+});
+electron_1.ipcMain.handle("secrets:set", (_event, key, value) => {
+    if (typeof key !== "string" || !key)
+        throw new Error("invalid secret key");
+    if (typeof value !== "string")
+        throw new Error("invalid secret value");
+    const store = readSecretsStore();
+    store[key] = electron_1.safeStorage.isEncryptionAvailable()
+        ? electron_1.safeStorage.encryptString(value).toString("base64")
+        : "plain:" + Buffer.from(value, "utf8").toString("base64");
+    writeSecretsStore(store);
+});
+electron_1.ipcMain.handle("secrets:delete", (_event, key) => {
+    if (typeof key !== "string" || !key)
+        return;
+    const store = readSecretsStore();
+    if (key in store) {
+        delete store[key];
+        writeSecretsStore(store);
+    }
 });
 const llmAbort = new Map();
 electron_1.ipcMain.on("llmCancel", (_event, reqId) => {
@@ -930,21 +1093,54 @@ electron_1.ipcMain.handle("clipboardReadText", () => electron_1.clipboard.readTe
 // Read a file off disk and return a base64 data URL so attached image *paths*
 // (dragged from the file tree) can be sent to vision-capable models. Capped so
 // we never blow up the IPC channel / model request with a giant payload.
+// Only these image types are ever read here — this IPC exists solely to turn an
+// image *path* into a data URL for vision attachments / thumbnail previews.
+const READABLE_IMAGE_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+};
 electron_1.ipcMain.handle("readFileBase64", async (_event, filePath) => {
     try {
+        if (typeof filePath !== "string" || !filePath.trim())
+            return { error: "invalid path" };
         const MAX = 12 * 1024 * 1024; // 12 MB
-        const stat = fs.statSync(filePath);
-        if (!stat.isFile())
-            return { error: "not a file" };
+        // Canonicalize first: resolve `.`/`..` and follow every symlink to the real
+        // on-disk target. A crafted relative path or a symlink that points outside
+        // the tree therefore can't trick us into reading an indirect file — we only
+        // ever act on the fully-resolved real path.
+        let real;
+        try {
+            real = fs.realpathSync.native(path.resolve(filePath));
+        }
+        catch {
+            return { error: "file not found" };
+        }
+        // Must be an existing *regular* file. lstat on the already-resolved path
+        // rejects a final-component symlink, directories, and devices/FIFOs/sockets
+        // (so this can't be pointed at \\.\PhysicalDrive0, a named pipe, etc.).
+        const stat = fs.lstatSync(real);
+        if (stat.isSymbolicLink() || !stat.isFile())
+            return { error: "not a regular file" };
         if (stat.size > MAX)
             return { error: "file too large (max 12 MB)" };
-        const buf = await fs.promises.readFile(filePath);
-        const ext = path.extname(filePath).toLowerCase();
-        const mediaType = ext === ".png" ? "image/png" :
-            ext === ".gif" ? "image/gif" :
-                ext === ".webp" ? "image/webp" :
-                    ext === ".bmp" ? "image/bmp" :
-                        "image/jpeg";
+        // Constrain the surface to known image types so this handler can't be
+        // repurposed to exfiltrate arbitrary files (keys, configs, source, …).
+        const ext = path.extname(real).toLowerCase();
+        const mediaType = READABLE_IMAGE_TYPES[ext];
+        if (!mediaType)
+            return { error: "unsupported file type" };
+        // Defense-in-depth: never read out of the Windows/system directory even if
+        // an image happens to live there.
+        const realLower = real.toLowerCase();
+        const sysRoot = path.resolve(process.env.SystemRoot || "C:\\Windows").toLowerCase();
+        if (realLower === sysRoot || realLower.startsWith(sysRoot + path.sep)) {
+            return { error: "access denied" };
+        }
+        const buf = await fs.promises.readFile(real);
         return { dataUrl: `data:${mediaType};base64,${buf.toString("base64")}`, mediaType };
     }
     catch (e) {
@@ -1100,6 +1296,10 @@ electron_1.ipcMain.handle("shellContextMenu", async (event, paths, x, y) => {
                 case "open-new-tab":
                     handleFileTreeContextAction(win, list[0], "open-new-tab");
                     break;
+                // Reveal the right-clicked item in Explorer with it selected.
+                case "show-in-explorer":
+                    electron_1.shell.showItemInFolder(list[0]);
+                    break;
                 // "" → the shell already performed the command (Open, Cut, Copy, Delete,
                 // Properties, Send to, third-party verbs); the fs watcher reflects any
                 // disk change, so there is nothing more to do here.
@@ -1224,10 +1424,67 @@ electron_1.ipcMain.on("terminalKill", (_event, id) => {
     }
     catch { /* session gone */ }
 });
+// ── Content-Security-Policy ───────────────────────────────────────────────────
+// Injected on every response in the default session so the renderer document is
+// locked down even though it is served over http from the local Rust server.
+//
+//   default-src 'self'      — baseline: only this origin (http://127.0.0.1:<port>).
+//   script-src  'self'      — only the bundled module; NO inline/eval. The Vite
+//                             build is a single same-origin <script type=module>
+//                             with no inline scripts, so this is airtight.
+//   style-src   'self'
+//               'unsafe-inline' — required: React sets inline style attributes
+//                             throughout (virtualized tree/treemap) and xterm.js
+//                             injects <style> at runtime. Neither uses a nonce.
+//   img-src     'self' data: blob: — thumbnails are same-origin (/api/thumbnail);
+//                             chat image attachments are data: URLs; exports use
+//                             blob: object URLs.
+//   font-src    'self' data: — the build inlines no webfonts today; allow both
+//                             defensively for same-origin/inlined fonts.
+//   media-src   'self' data: blob: — same-origin/preview media.
+//   connect-src 'self'      — every fetch/EventSource the renderer makes is
+//                             same-origin to the Rust server (/api/*, SSE). Ollama
+//                             is proxied through that server (/api/ai-chat) and the
+//                             OpenAI/Anthropic cloud calls run in MAIN over IPC, so
+//                             the renderer never needs a cross-origin connection.
+//   frame-src   'self' blob: — the "print report as PDF" flow renders the
+//                             server HTML into a hidden, script-less sandboxed
+//                             <iframe> whose src is a blob: URL; allow that (and
+//                             same-origin) but no external frames.
+//   object-src  'none'; base-uri 'self'; form-action 'self' — remove
+//                             plugin/base-tag/redirect vectors.
+const CONTENT_SECURITY_POLICY = [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "media-src 'self' data: blob:",
+    "connect-src 'self'",
+    "frame-src 'self' blob:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+].join("; ");
+function installContentSecurityPolicy() {
+    electron_1.session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+        const responseHeaders = { ...(details.responseHeaders ?? {}) };
+        // Make our policy authoritative: drop any CSP the upstream may have set
+        // (case-insensitively) before injecting ours.
+        for (const key of Object.keys(responseHeaders)) {
+            if (key.toLowerCase() === "content-security-policy")
+                delete responseHeaders[key];
+        }
+        responseHeaders["Content-Security-Policy"] = [CONTENT_SECURITY_POLICY];
+        callback({ responseHeaders });
+    });
+}
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 electron_1.app.whenReady().then(async () => {
     try {
+        installContentSecurityPolicy();
         const port = await getFreePort();
+        serverPort = port;
         await startRustServer(port);
         createWindow(port);
     }
