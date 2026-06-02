@@ -1,20 +1,20 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const electron_1 = require("electron");
-// Per-session local auth token, fetched synchronously from main at preload time
-// (over IPC, never HTTP). The renderer sends it as the `X-FileTree-Token` header
-// on destructive API calls; the Rust server rejects those routes without it.
-let authToken = "";
-try {
-    authToken = electron_1.ipcRenderer.sendSync("getAuthToken") ?? "";
-}
-catch {
-    authToken = "";
-}
 // Expose a safe API to the renderer that replaces window.chrome.webview.
 electron_1.contextBridge.exposeInMainWorld("electronAPI", {
-    // Per-session token the renderer must attach to destructive API requests.
-    authToken,
+    // Perform a mutating (POST) request against the local Rust server. The session
+    // token is attached in MAIN (never exposed here), so the renderer can drive
+    // destructive routes without ever holding the secret. `route` is a server path
+    // like "/api/delete?path=…"; `body`, when present, is JSON-encoded.
+    mutate: (route, body) => electron_1.ipcRenderer.invoke("mutate", route, body),
+    // Encrypted secret storage (AI API keys) backed by the OS keystore via
+    // Electron safeStorage in MAIN. Values never touch localStorage.
+    secrets: {
+        get: (key) => electron_1.ipcRenderer.invoke("secrets:get", key),
+        set: (key, value) => electron_1.ipcRenderer.invoke("secrets:set", key, value),
+        delete: (key) => electron_1.ipcRenderer.invoke("secrets:delete", key),
+    },
     // Fire-and-forget: starting the drag must NOT block the renderer. Main calls
     // Electron's webContents.startDrag, which hands the drag to Chromium so the
     // renderer stays responsive — auto-scroll and internal drop-to-move
