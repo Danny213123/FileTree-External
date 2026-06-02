@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use crate::export::push_json_string;
 use crate::io::now_ms;
 use crate::json;
-use crate::model::ScanResult;
+use crate::model::{node_abs_path, ScanResult};
 
 const SNAPSHOT_VERSION: u32 = 1;
 /// Cap on the number of diff rows returned to the UI. The full per-path diff of
@@ -122,13 +122,17 @@ pub(crate) fn save_snapshot(result: &ScanResult, label: &str) -> io::Result<Snap
         body.extend_from_slice(line.as_bytes());
         body.push(b'\n');
     }
-    for node in &result.nodes {
-        if node.path.is_empty() {
+    let nodes = &result.nodes;
+    for node in nodes {
+        // Files have their path interned away (see `node_abs_path`); reconstruct
+        // the absolute path so a snapshot still records every file, not just dirs.
+        let abs = node_abs_path(nodes, node.id);
+        if abs.is_empty() {
             continue;
         }
-        let mut line = String::with_capacity(node.path.len() + 48);
+        let mut line = String::with_capacity(abs.len() + 48);
         line.push_str("{\"p\":");
-        push_json_string(&mut line, &node.path);
+        push_json_string(&mut line, &abs);
         let _ = write!(
             line,
             ",\"s\":{},\"a\":{},\"f\":{},\"d\":{},\"dir\":{}}}",
@@ -299,13 +303,17 @@ pub(crate) fn load_snapshot(id: &str) -> Option<(SnapMeta, EntryMap)> {
 /// diffed against a saved snapshot without first persisting it.
 pub(crate) fn scan_entry_map(result: &ScanResult) -> EntryMap {
     let mut map: EntryMap = HashMap::with_capacity(result.nodes.len() + 16);
-    for n in &result.nodes {
-        if n.path.is_empty() {
+    let nodes = &result.nodes;
+    for n in nodes {
+        // Reconstruct interned-away file paths so the live map mirrors a saved
+        // snapshot (which records absolute paths for every entry).
+        let abs = node_abs_path(nodes, n.id);
+        if abs.is_empty() {
             continue;
         }
         map.insert(
-            n.path.to_lowercase(),
-            Entry { path: n.path.clone(), size: n.size, is_dir: n.is_dir },
+            abs.to_lowercase(),
+            Entry { path: abs, size: n.size, is_dir: n.is_dir },
         );
     }
     map

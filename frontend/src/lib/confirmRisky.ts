@@ -13,8 +13,12 @@
 // Overwrite/replace already has its own explicit dialog (the conflict prompt /
 // the native Windows collision dialog), so it is not re-confirmed here.
 //
-// `confirmRisky` returns true to proceed. When the operation isn't risky it
-// returns true WITHOUT prompting.
+// `confirmRisky` resolves to true to proceed. When the operation isn't risky it
+// resolves true WITHOUT prompting. The prompt is the themed in-app confirm
+// modal (see ../lib/dialogs), so callers MUST await it — the destructive work
+// runs only after the returned promise resolves true.
+
+import { confirmDialog } from "./dialogs";
 
 /** Tunable risk thresholds. Centralized so the policy is easy to find + adjust. */
 export const RISK_THRESHOLDS = {
@@ -41,13 +45,33 @@ export interface RiskInput {
 }
 
 /**
- * Decide whether `input` is risky enough to confirm, and if so prompt the user.
- * Returns true to proceed (either not risky, or the user confirmed).
+ * Decide whether `input` is risky enough to confirm, and if so prompt the user
+ * with the themed confirm modal. Resolves true to proceed (either not risky, or
+ * the user confirmed). Callers must await this before performing the operation.
  */
-export function confirmRisky(input: RiskInput): boolean {
+export async function confirmRisky(input: RiskInput): Promise<boolean> {
   if (input.itemCount <= 0) return true;
   if (!isRisky(input)) return true; // frictionless path
-  return window.confirm(buildMessage(input));
+  return confirmDialog({
+    title: confirmTitle(input),
+    message: buildMessage(input),
+    confirmLabel: confirmLabel(input),
+    danger: input.kind === "delete" && !!input.permanent,
+  });
+}
+
+/** Short modal title for the risk prompt. */
+function confirmTitle(input: RiskInput): string {
+  if (input.kind === "delete") return input.permanent ? "Permanently delete" : "Delete";
+  if (input.kind === "copy") return "Copy items";
+  return input.crossDrive ? "Move to another drive" : "Move items";
+}
+
+/** Action-button label for the risk prompt. */
+function confirmLabel(input: RiskInput): string {
+  if (input.kind === "delete") return input.permanent ? "Delete permanently" : "Move to Recycle Bin";
+  if (input.kind === "copy") return "Copy";
+  return "Move";
 }
 
 /** True when the operation trips any risk rule. Exposed for callers that want

@@ -1,4 +1,4 @@
-import { useMemo, useState, memo, useEffect, useRef, useCallback } from "react";
+import { useMemo, useState, memo, useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from "react";
 import type { NodeRecord, Metric, Unit } from "../api/types";
 import { layoutTreemap } from "../utils/treeLayout";
 import { formatBytes, formatCount } from "../utils/formatBytes";
@@ -234,17 +234,24 @@ function drawOverlay(
   selectedId: number,
   hoverId: number | null,
   dragOverId: number | null,
+  darkMode: boolean,
 ) {
   ctx.clearRect(0, 0, canvasW, canvasH);
+
+  // Theme-aware highlight strokes: a light stroke reads on the dark-navy fills,
+  // a dark stroke reads on the light pastel fills. (Drag stays amber on both.)
+  const hoverHeaderTint = darkMode ? "rgba(255,255,255,0.14)" : "rgba(0,0,0,0.10)";
+  const hoverStroke = darkMode ? "rgba(255,255,255,0.7)" : "rgba(0,0,0,0.5)";
+  const selectStroke = darkMode ? "#ffffff" : "#1f2430";
 
   const hov = hoverId != null ? rectById.get(hoverId) : undefined;
   if (hov) {
     if (hov.pxLabelH > 0) {
-      ctx.fillStyle = "rgba(255,255,255,0.14)";
+      ctx.fillStyle = hoverHeaderTint;
       ctx.fillRect(hov.px, hov.py, hov.pw, hov.pxLabelH);
     }
     if (hoverId !== selectedId) {
-      ctx.strokeStyle = "rgba(255,255,255,0.7)";
+      ctx.strokeStyle = hoverStroke;
       ctx.lineWidth = 2;
       ctx.strokeRect(hov.px + 1, hov.py + 1, hov.pw - 2, hov.ph - 2);
     }
@@ -252,7 +259,7 @@ function drawOverlay(
 
   const sel = rectById.get(selectedId);
   if (sel) {
-    ctx.strokeStyle = "#ffffff";
+    ctx.strokeStyle = selectStroke;
     ctx.lineWidth = 2;
     ctx.strokeRect(sel.px + 1, sel.py + 1, sel.pw - 2, sel.ph - 2);
   }
@@ -275,6 +282,31 @@ function hitTest(rects: FlatRect[], mx: number, my: number): FlatRect | null {
   }
   return null;
 }
+
+// Imperative hover-tooltip layer. The tooltip's node/position lives in THIS small
+// memoized component's own state and is driven through an imperative handle, so
+// showing/hiding it (or following the cursor) never re-renders the Treemap body —
+// the canvas + thousands of cells stay put while only this leaf updates. Moving
+// the mouse no longer churns React: the parent schedules show()/hide() via a ref.
+export interface TreemapTooltipHandle {
+  show: (node: NodeRecord, x: number, y: number) => void;
+  hide: () => void;
+}
+
+const TreemapTooltip = memo(
+  forwardRef<TreemapTooltipHandle, { unit: Unit }>(function TreemapTooltip({ unit }, ref) {
+    const [tip, setTip] = useState<{ node: NodeRecord; x: number; y: number } | null>(null);
+    useImperativeHandle(ref, () => ({
+      show: (node, x, y) => setTip({ node, x, y }),
+      // Functional update returns the same reference when already hidden, so a
+      // hide() during continuous mouse movement (the common case) is a no-op and
+      // triggers no re-render.
+      hide: () => setTip((prev) => (prev ? null : prev)),
+    }), []);
+    if (!tip) return null;
+    return <NodeTooltip node={tip.node} unit={unit} anchorX={tip.x} anchorY={tip.y} />;
+  }),
+);
 
 interface TreemapProps {
   nodeById: Map<number, NodeRecord>;
@@ -316,7 +348,9 @@ export const Treemap = memo(function Treemap({
   const moveRafRef = useRef<number>(0);
   const pendingMoveRef = useRef<{ mx: number; my: number; cx: number; cy: number } | null>(null);
   const tooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [tooltip, setTooltip] = useState<{ node: NodeRecord; x: number; y: number } | null>(null);
+  // Tooltip lives in a memoized child driven imperatively (see TreemapTooltip), so
+  // hover never re-renders this component or repaints the treemap body.
+  const tooltipApiRef = useRef<TreemapTooltipHandle>(null);
   const isDraggingRef = useRef(false);
 
   useEffect(() => {
@@ -448,8 +482,8 @@ export const Treemap = memo(function Treemap({
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    drawOverlay(ctx, canvas.width, canvas.height, rectById, selectedId, hoverIdRef.current, dragOverIdRef.current);
-  }, [rectById, selectedId]);
+    drawOverlay(ctx, canvas.width, canvas.height, rectById, selectedId, hoverIdRef.current, dragOverIdRef.current, darkMode);
+  }, [rectById, selectedId, darkMode]);
 
   useEffect(() => {
     cancelAnimationFrame(overlayRafRef.current);
@@ -495,11 +529,11 @@ export const Treemap = memo(function Treemap({
     if (changed) redrawOverlay();
 
     if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
-    setTooltip(null);
+    tooltipApiRef.current?.hide();
     if (hit && hitNode) {
       const cx = pm.cx, cy = pm.cy;
       tooltipTimerRef.current = setTimeout(() => {
-        setTooltip({ node: hitNode, x: cx, y: cy });
+        tooltipApiRef.current?.show(hitNode, cx, cy);
       }, 400);
     }
   }, [flatRects, nodeById, redrawOverlay]);
@@ -522,7 +556,7 @@ export const Treemap = memo(function Treemap({
     pendingMoveRef.current = null;
     if (hoverIdRef.current !== null) { hoverIdRef.current = null; redrawOverlay(); }
     if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
-    setTooltip(null);
+    tooltipApiRef.current?.hide();
   }, [redrawOverlay]);
 
   const handleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -612,14 +646,7 @@ export const Treemap = memo(function Treemap({
             height={containerSize.h}
             className="treemap-overlay"
           />
-          {tooltip && (
-            <NodeTooltip
-              node={tooltip.node}
-              unit={unit}
-              anchorX={tooltip.x}
-              anchorY={tooltip.y}
-            />
-          )}
+          <TreemapTooltip ref={tooltipApiRef} unit={unit} />
         </div>
       </div>
       {showLegend && legendItems.length > 0 && (

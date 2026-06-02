@@ -21,23 +21,69 @@ pub(crate) enum Cell {
     Float(f64),
 }
 
-/// Build a one-sheet `.xlsx` workbook (returns the raw archive bytes).
-///
-/// `sheet_name` shows on the tab; `headers` is the first (bold-ish) row; each
-/// inner `Vec<Cell>` is one data row. Rows are capped by the caller (Excel's
-/// hard limit is 1,048,576 rows).
-pub(crate) fn workbook(sheet_name: &str, headers: &[&str], rows: &[Vec<Cell>]) -> Vec<u8> {
-    let sheet = build_sheet_xml(headers, rows);
+/// Assemble a one-sheet workbook from an already-built worksheet XML string.
+/// Used by [`workbook`] and by streaming callers that build the sheet via
+/// [`SheetWriter`], so the only large buffers are the sheet XML and the final
+/// store-ZIP (the CRC-32 forces one pass over the bytes — no extra copy beyond
+/// that is made).
+pub(crate) fn workbook_from_sheet(sheet_name: &str, sheet_xml: &str) -> Vec<u8> {
     let workbook = build_workbook_xml(sheet_name);
-
     let parts: [(&str, &[u8]); 5] = [
         ("[Content_Types].xml", CONTENT_TYPES.as_bytes()),
         ("_rels/.rels", ROOT_RELS.as_bytes()),
         ("xl/workbook.xml", workbook.as_bytes()),
         ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS.as_bytes()),
-        ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+        ("xl/worksheets/sheet1.xml", sheet_xml.as_bytes()),
     ];
     zip_store(&parts)
+}
+
+/// Builds the worksheet XML one row at a time. A large export streams rows in
+/// (each transient `&[Cell]` is consumed immediately) rather than materialising
+/// a `Vec<Vec<Cell>>` of the whole sheet. Every text cell is still formula-
+/// guarded via [`write_inline_str_cell`].
+pub(crate) struct SheetWriter {
+    out: String,
+    row: usize,
+}
+
+impl SheetWriter {
+    pub(crate) fn new(headers: &[&str]) -> Self {
+        let mut out = String::with_capacity(64 * 1024);
+        out.push_str(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>",
+        );
+        let _ = write!(out, "<row r=\"1\">");
+        for (c, h) in headers.iter().enumerate() {
+            write_inline_str_cell(&mut out, c, 1, h);
+        }
+        out.push_str("</row>");
+        Self { out, row: 1 }
+    }
+
+    pub(crate) fn push_row(&mut self, cells: &[Cell]) {
+        self.row += 1;
+        let row_num = self.row;
+        let _ = write!(self.out, "<row r=\"{row_num}\">");
+        for (c, cell) in cells.iter().enumerate() {
+            match cell {
+                Cell::Text(s) => write_inline_str_cell(&mut self.out, c, row_num, s),
+                Cell::Int(n) => {
+                    let _ = write!(self.out, "<c r=\"{}{}\"><v>{}</v></c>", col_letters(c), row_num, n);
+                }
+                Cell::Float(f) => {
+                    let _ = write!(self.out, "<c r=\"{}{}\"><v>{}</v></c>", col_letters(c), row_num, f);
+                }
+            }
+        }
+        self.out.push_str("</row>");
+    }
+
+    pub(crate) fn finish(mut self) -> String {
+        self.out.push_str("</sheetData></worksheet>");
+        self.out
+    }
 }
 
 const CONTENT_TYPES: &str = concat!(
@@ -82,45 +128,14 @@ fn build_workbook_xml(sheet_name: &str) -> String {
     )
 }
 
-fn build_sheet_xml(headers: &[&str], rows: &[Vec<Cell>]) -> String {
-    let approx = rows.len().saturating_mul(64) + 512;
-    let mut out = String::with_capacity(approx);
-    out.push_str(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>",
-    );
-
-    // Header row (row 1).
-    let _ = write!(out, "<row r=\"1\">");
-    for (c, h) in headers.iter().enumerate() {
-        write_inline_str_cell(&mut out, c, 1, h);
-    }
-    out.push_str("</row>");
-
-    // Data rows (start at row 2).
-    for (r, row) in rows.iter().enumerate() {
-        let row_num = r + 2;
-        let _ = write!(out, "<row r=\"{row_num}\">");
-        for (c, cell) in row.iter().enumerate() {
-            match cell {
-                Cell::Text(s) => write_inline_str_cell(&mut out, c, row_num, s),
-                Cell::Int(n) => {
-                    let _ = write!(out, "<c r=\"{}{}\"><v>{}</v></c>", col_letters(c), row_num, n);
-                }
-                Cell::Float(f) => {
-                    let _ = write!(out, "<c r=\"{}{}\"><v>{}</v></c>", col_letters(c), row_num, f);
-                }
-            }
-        }
-        out.push_str("</row>");
-    }
-
-    out.push_str("</sheetData></worksheet>");
-    out
-}
-
 fn write_inline_str_cell(out: &mut String, col: usize, row: usize, value: &str) {
     let _ = write!(out, "<c r=\"{}{}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">", col_letters(col), row);
+    // Formula-injection hardening (mirrors the CSV export): neutralize a leading
+    // = + - @ TAB CR with a single quote so a spreadsheet treats the cell as
+    // literal text rather than a formula. Headers never trigger this.
+    if crate::export::needs_formula_guard(value) {
+        out.push('\'');
+    }
     xml_escape(out, value);
     out.push_str("</t></is></c>");
 }
@@ -258,11 +273,10 @@ mod tests {
 
     #[test]
     fn workbook_is_a_valid_zip() {
-        let rows = vec![
-            vec![Cell::Text("a.txt".into()), Cell::Int(123)],
-            vec![Cell::Text("b & <c>".into()), Cell::Float(4.5)],
-        ];
-        let bytes = workbook("Scan", &["Name", "Size"], &rows);
+        let mut sheet = SheetWriter::new(&["Name", "Size"]);
+        sheet.push_row(&[Cell::Text("a.txt".into()), Cell::Int(123)]);
+        sheet.push_row(&[Cell::Text("b & <c>".into()), Cell::Float(4.5)]);
+        let bytes = workbook_from_sheet("Scan", &sheet.finish());
         // ZIP local-file signature at the front, EOCD signature near the end.
         assert_eq!(&bytes[0..4], &0x0403_4b50u32.to_le_bytes());
         assert!(bytes.windows(4).any(|w| w == 0x0605_4b50u32.to_le_bytes()));

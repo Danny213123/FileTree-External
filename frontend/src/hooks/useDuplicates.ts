@@ -18,6 +18,8 @@ import {
 } from "../api/client";
 import { readNdjsonStream } from "./useScan";
 import { getCached, invalidate, setCached } from "../lib/scanCache";
+import { confirmDialog } from "../lib/dialogs";
+import { toast } from "../lib/toast";
 import {
   bestSourceForTarget,
   buildContentGroups,
@@ -423,10 +425,17 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
   const deleteSelected = useCallback(async () => {
     const paths = [...selected];
     if (!paths.length) return;
-    const verb = deleteMode === "permanent" ? "permanently delete" : "send to Recycle Bin";
-    if (!window.confirm(`${verb} ${paths.length} file${paths.length > 1 ? "s" : ""}?`)) return;
-    const res = await dupeAction("delete", paths, { permanent: deleteMode === "permanent" });
-    if (res.errors.length) window.alert(`Some files could not be deleted:\n${res.errors.join("\n")}`);
+    const permanent = deleteMode === "permanent";
+    const verb = permanent ? "permanently delete" : "send to Recycle Bin";
+    const proceed = await confirmDialog({
+      title: permanent ? "Permanently delete" : "Delete",
+      message: `${verb} ${paths.length} file${paths.length > 1 ? "s" : ""}?${permanent ? "\n\nThis can\u2019t be undone." : ""}`,
+      confirmLabel: permanent ? "Delete permanently" : "Move to Recycle Bin",
+      danger: permanent,
+    });
+    if (!proceed) return;
+    const res = await dupeAction("delete", paths, { permanent });
+    if (res.errors.length) toast.error(`Some files could not be deleted:\n${res.errors.join("\n")}`);
     const removed = new Set(paths.map(normalizeForKey));
     setGroups((prev) =>
       sortGroupsByWaste(pruneGroups(prev, removed, criteriaRef.current, repriRef.current, criteriaRef.current.content.enabled)),
@@ -438,11 +447,11 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
   const moveSelected = useCallback(async () => {
     const paths = [...selected];
     if (!paths.length || !destPath.trim()) {
-      window.alert("Select files and set a destination folder.");
+      toast.warn("Select files and set a destination folder.");
       return;
     }
     const res = await dupeAction("move", paths, { dest: destPath.trim() });
-    if (res.errors.length) window.alert(`Some files could not be moved:\n${res.errors.join("\n")}`);
+    if (res.errors.length) toast.error(`Some files could not be moved:\n${res.errors.join("\n")}`);
     const removed = new Set(paths.map(normalizeForKey));
     setGroups((prev) =>
       sortGroupsByWaste(pruneGroups(prev, removed, criteriaRef.current, repriRef.current, criteriaRef.current.content.enabled)),
@@ -454,11 +463,11 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
   const copySelected = useCallback(async () => {
     const paths = [...selected];
     if (!paths.length || !destPath.trim()) {
-      window.alert("Select files and set a destination folder.");
+      toast.warn("Select files and set a destination folder.");
       return;
     }
     const res = await dupeAction("copy", paths, { dest: destPath.trim() });
-    if (res.errors.length) window.alert(`Some files could not be copied:\n${res.errors.join("\n")}`);
+    if (res.errors.length) toast.error(`Some files could not be copied:\n${res.errors.join("\n")}`);
     invalidateAffected([], destPath.trim());
   }, [selected, destPath, invalidateAffected]);
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle, memo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle, useSyncExternalStore, memo } from "react";
 import { useScan, reconstructChildren } from "../hooks/useScan";
 import { useTreeState } from "../hooks/useTreeState";
 import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
@@ -14,6 +14,8 @@ import type { NodeRecord, SortKey } from "../api/types";
 import { isNoOpMove, type AgentApi } from "../lib/agent";
 import { confirmRisky, isCrossDrive } from "../lib/confirmRisky";
 import { pushUndo, parentDir } from "../lib/undo";
+import { toast, type ToastAction } from "../lib/toast";
+import { promptDialog } from "../lib/dialogs";
 import { TreeTable } from "./TreeTable";
 import { ConfigureColumnsMenu } from "./ConfigureColumnsMenu";
 import { Treemap } from "./Treemap";
@@ -22,13 +24,16 @@ import { ConflictDialog, type ConflictChoice } from "./ConflictDialog";
 import { FilterDialog } from "./FilterDialog";
 import { Breadcrumb } from "./Breadcrumb";
 import { Icon } from "./Icon";
-import type { ScanStatus } from "../hooks/useScan";
+import type { ScanStatus, ProgressStore } from "../hooks/useScan";
 import type { ScanResult, Metric, Unit } from "../api/types";
 
 export interface WorkspaceTabHandle {
   getStatus: () => ScanStatus;
   getData: () => ScanResult | null;
   getProgress: () => { nodes: number; elapsed: number } | null;
+  /** The live scan-progress store, so a tiny subscriber (e.g. the status bar
+   *  counter) can re-render on progress ticks WITHOUT re-rendering this pane. */
+  getProgressStore: () => ProgressStore;
   getErrorMessage: () => string;
   getVisibleCount: () => number;
   getScanPath: () => string;
@@ -173,6 +178,11 @@ function basenameFromPath(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+/** "1 item" / "N items" — small helper for toast/notice copy. */
+function itemsLabel(n: number): string {
+  return n === 1 ? "1 item" : `${n} items`;
+}
+
 // Filesystem-watch tuning. Patching is O(n) over the whole node array, so on big
 // scans we throttle hard and only patch folders the user actually has open.
 const WATCH_DEBOUNCE_MS = 700;
@@ -222,6 +232,9 @@ interface WorkspaceTabProps {
   // Open `path` in a new workspace tab of editor group `groupId` (falls back to
   // the focused group). Used when a native folder drag is dropped on a tab strip.
   onOpenFolderInTab?: (path: string, groupId?: string) => void;
+  // Reverse the most recent reversible op (the same handler Ctrl+Z runs). Wired
+  // to the "Undo (Ctrl+Z)" action link on move/rename/recycle success toasts.
+  onUndo?: () => void;
 }
 
 const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(function WorkspaceTab(
@@ -233,15 +246,24 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
     onClose3D, onToggleBookmark, onScanPath, onStateChange, onOpenTerminal,
-    onOpenFolderInTab,
+    onOpenFolderInTab, onUndo,
   }: WorkspaceTabProps,
   ref,
 ) {
   const [scanPath, setScanPathState] = useState(initialPath);
+  // Stable "Undo (Ctrl+Z)" action for success toasts — reads the latest onUndo
+  // via a ref so the action keeps a stable identity (no re-render churn) while
+  // always invoking the current undo handler.
+  const onUndoRef = useRef(onUndo);
+  onUndoRef.current = onUndo;
+  const undoAction = useMemo<ToastAction>(
+    () => ({ label: "Undo (Ctrl+Z)", onClick: () => onUndoRef.current?.() }),
+    [],
+  );
   const [filterDialogOpen, setFilterDialogOpen] = useState(false);
   const dragStartRef = useRef<{ y: number; h: number } | null>(null);
 
-  const { data, status, errorMessage, progress, startScan, startRefresh, cancelScan } = useScan();
+  const { data, status, errorMessage, progressStore, startScan, startRefresh, cancelScan } = useScan();
   const tree = useTreeState();
   // Latest tree snapshot for stable callbacks / async watch handlers (avoids
   // recreating callbacks every render and reading stale expansion state).
@@ -350,7 +372,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
 
-  useEffect(() => { onStateChange(); }, [status, progress, onStateChange]);
+  // Status transitions (idle→scanning→done/…) are rare and meaningful, so they
+  // notify App. Progress ticks deliberately do NOT live here anymore: they flow
+  // through progressStore to the status-bar counter + scan overlay only, so a
+  // scan no longer re-renders App/this pane on every tick.
+  useEffect(() => { onStateChange(); }, [status, onStateChange]);
 
   // The Explorer side bar lives once in App (shared, left of the editor groups)
   // and pulls its data from the focused pane's getSidebarModel(). When THIS is
@@ -593,13 +619,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const handleDblClick = useCallback((id: number) => {
     const node = treeRef.current.nodeById.get(id);
     if (!node) return;
-    if (node.dir) {
-      // Drill in = rescan this folder as the new root (records history).
-      openLocation(node.path);
-    } else {
-      openPath(node.path);
-    }
-  }, [openLocation]);
+    // Double-clicking a folder opens it in a real File Explorer window (#11);
+    // in-app drill-in stays available via the expand chevron / breadcrumb /
+    // "Open in new tab". Files open in their default app, unchanged.
+    openPath(node.path);
+  }, []);
 
   const handleSortChange = useCallback((k: SortKey) => { treeRef.current.setSortKey(k); }, []);
 
@@ -632,8 +656,15 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       : selected?.parent != null
         ? (tree.nodeById.get(selected.parent)?.path ?? scanPath)
         : scanPath;
-    const name = window.prompt("New folder name:");
-    if (!name?.trim()) return;
+    const name = await promptDialog({
+      title: "New folder",
+      label: "Folder name",
+      placeholder: "New folder",
+      confirmLabel: "Create",
+      validate: (v) =>
+        /[\\/:*?"<>|]/.test(v) ? 'A name can\u2019t contain \\ / : * ? " < > |' : null,
+    });
+    if (name == null) return; // canceled
     const sep = base.endsWith("\\") || base.endsWith("/") ? "" : "\\";
     const full = base + sep + name.trim();
     try {
@@ -643,7 +674,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       pushUndo({ kind: "mkdir", path: full });
       doScan();
     } catch (e) {
-      alert(`Could not create folder: ${e instanceof Error ? e.message : e}`);
+      toast.error(`Could not create folder: ${e instanceof Error ? e.message : e}`);
     }
   }, [tree, scanPath, doScan]);
 
@@ -722,12 +753,13 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     const newName = rawName.trim();
     if (!newName || newName === node.name) return;
     const result = await renameItem(node.path, newName);
-    if (!result.ok) { alert(`Rename failed: ${result.error ?? "unknown error"}`); return; }
+    if (!result.ok) { toast.error(`Rename failed: ${result.error ?? "unknown error"}`); return; }
     // Phase 6: record the reverse (rename back to the original name) for Ctrl+Z.
     pushUndo({ kind: "rename", parent: parentDir(node.path), from: node.name, to: newName });
+    toast.success(`Renamed to \u201C${newName}\u201D.`, { action: undoAction });
     invalidateAllScanCache();
     doScan(undefined, undefined, true);
-  }, [tree.nodeById, doScan]);
+  }, [tree.nodeById, doScan, undoAction]);
 
   const runDeletePaths = useCallback(async (paths?: string[], permanent = false) => {
     const targetPaths = paths && paths.length > 0 ? dedupeNestedPaths(paths, nodeByPath) : selectedPaths;
@@ -738,7 +770,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     // A small recyclable delete is recoverable from the Recycle Bin (and now
     // audited), so it stays frictionless — no prompt.
     const totalBytes = targetPaths.reduce((sum, p) => sum + (nodeByPath.get(p)?.size ?? 0), 0);
-    const proceed = confirmRisky({
+    const proceed = await confirmRisky({
       kind: "delete",
       permanent,
       itemCount: targetPaths.length,
@@ -767,15 +799,20 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     if (recycled.length > 0) pushUndo({ kind: "recycle", paths: recycled });
     if (purged > 0) pushUndo({ kind: "permanentDelete", count: purged });
     doScan();
+    // A recycle is reversible — offer Undo. (A permanent delete is not, so it
+    // gets no Undo affordance.)
+    if (recycled.length > 0 && failures.length === 0) {
+      toast.success(`Moved ${itemsLabel(recycled.length)} to the Recycle Bin.`, { action: undoAction });
+    }
     if (failures.length > 0) {
       const verb = permanent ? "delete" : "move to the Recycle Bin";
       const shown = failures.slice(0, 10).join("\n");
       const more = failures.length > 10 ? `\n…and ${failures.length - 10} more` : "";
-      window.alert(
+      toast.error(
         `Could not ${verb} ${failures.length} of ${targetPaths.length} item${targetPaths.length === 1 ? "" : "s"}:\n\n${shown}${more}`,
       );
     }
-  }, [nodeByPath, selectedPaths, doScan]);
+  }, [nodeByPath, selectedPaths, doScan, undoAction]);
 
   const runDelete = useCallback(() => { void runDeletePaths(); }, [runDeletePaths]);
 
@@ -846,7 +883,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     if (sources.length === 0 || !destination) return;
     const byPath = nodeByPathRef.current;
     const copyBytes = sources.reduce((sum, s) => sum + (byPath.get(s)?.size ?? 0), 0);
-    const proceed = confirmRisky({
+    const proceed = await confirmRisky({
       kind: "copy",
       crossDrive: isCrossDrive(sources, destination),
       itemCount: sources.length,
@@ -892,7 +929,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     // confirmed separately by the conflict / native collision dialog.)
     const byPath = nodeByPathRef.current;
     const moveBytes = realSources.reduce((sum, s) => sum + (byPath.get(s)?.size ?? 0), 0);
-    const proceedMove = confirmRisky({
+    const proceedMove = await confirmRisky({
       kind: "move",
       crossDrive: isCrossDrive(realSources, destination),
       itemCount: realSources.length,
@@ -939,6 +976,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           destination,
           items: realSources.map((s) => ({ name: basenameFromPath(s), originalParent: parentDir(s) })),
         });
+        // Reversible move — offer Undo on a clean success (partial failures are
+        // surfaced by the caller, so we don't also claim success there).
+        if (outcome.ok) {
+          toast.success(`Moved ${itemsLabel(realSources.length)} to \u201C${basenameFromPath(destination)}\u201D.`, { action: undoAction });
+        }
       }
       invalidateAllScanCache();
       doScan(undefined, undefined, true);
@@ -947,7 +989,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       suppressWatchRef.current = false;
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
-  }, [doScan, runMoveWithConflicts]);
+  }, [doScan, runMoveWithConflicts, undoAction]);
 
   // Paste CF_HDROP files into the focused folder. A Cut pastes as a MOVE through
   // the existing guarded move flow (handleInternalMove: no-op/descendant guards,
@@ -988,10 +1030,15 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // (browser / dev) fallback, which handleInternalMove selects internally.
   const runMoveTo = useCallback(async () => {
     if (selectedPaths.length === 0) return;
-    const dest = window.prompt("Move to folder:");
-    if (!dest?.trim()) return;
+    const dest = await promptDialog({
+      title: "Move to folder",
+      label: "Destination folder",
+      placeholder: "C:\\path\\to\\folder",
+      confirmLabel: "Move",
+    });
+    if (dest == null) return; // canceled
     const outcome = await handleInternalMove(selectedPaths, dest.trim());
-    if (!outcome.ok) { alert(`Move failed: ${outcome.error ?? "unknown error"}`); return; }
+    if (!outcome.ok) { toast.error(`Move failed: ${outcome.error ?? "unknown error"}`); return; }
   }, [selectedPaths, handleInternalMove]);
 
   // After a native drag moved item(s) OUT of this tree (a true move to Explorer
@@ -1042,7 +1089,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   useImperativeHandle(ref, () => ({
     getStatus: () => status,
     getData: () => data,
-    getProgress: () => progress,
+    getProgress: () => progressStore.get(),
+    getProgressStore: () => progressStore,
     getErrorMessage: () => errorMessage,
     getVisibleCount: () => tree.visibleRows.length,
     getScanPath: () => scanPath,
@@ -1146,7 +1194,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     },
     showNotice: (message) => setMoveNotice(message),
     refresh: () => { invalidateAllScanCache(); doScan(undefined, undefined, true); },
-  }), [status, data, progress, errorMessage, scanPath, tree, cancelScan, agentApi,
+  }), [status, data, progressStore, errorMessage, scanPath, tree, cancelScan, agentApi,
        doScan, handleNavigate, handleNavigateParent, handleExpand, handleNewFolder, selectedNode,
        openLocation, goBack, goForward, navHistory, runOpen, runReveal, onScanPath,
        runRename, runRenamePath, runDelete, runDeletePaths, runMoveTo, runCopyPath, runCopyFiles,
@@ -1178,15 +1226,34 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const breadcrumbPath = data?.rootPath || scanPath;
   const canBack = navHistory.index > 0;
   const canForward = navHistory.index < navHistory.stack.length - 1;
+  // No parent at a drive/volume root (parentDirOf returns null) → disable Up,
+  // matching the existing Back/Forward disabled treatment.
+  const breadcrumbParent = parentDirOf(breadcrumbPath);
+  const canUp = !!breadcrumbParent && !samePath(breadcrumbParent, breadcrumbPath);
+
+  // Inactive tabs stay MOUNTED — so their scan/tree state, imperative ref, the
+  // shared Explorer side bar, the status bar and the Duplicates cross-tab scan
+  // aggregation all keep reading this pane — but render NONE of their heavy
+  // content. The virtualized TreeTable and the two Treemap canvases are
+  // unmounted, freeing their DOM + canvas backing stores and skipping any
+  // background canvas redraws / row reconciliation while hidden (previously they
+  // stayed in the DOM behind `display:none`). Every piece of important state
+  // lives in this component's hooks (useScan / useTreeState / selection /
+  // history), so it survives activate↔deactivate untouched; only transient view
+  // state (e.g. table scroll offset) resets when the pane is shown again.
+  if (!active) {
+    return <div className="wb-tab" data-tab-id={tabId} style={{ display: "none" }} aria-hidden="true" />;
+  }
 
   return (
-    <div className="wb-tab" data-tab-id={tabId} style={active ? undefined : { display: "none" }}>
+    <div className="wb-tab" data-tab-id={tabId}>
       <div className="editor-region">
         <Breadcrumb
           path={breadcrumbPath}
           scanning={status === "scanning"}
           canBack={canBack}
           canForward={canForward}
+          canUp={canUp}
           onNavigate={openLocation}
           onBack={goBack}
           onForward={goForward}
@@ -1334,6 +1401,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   onRenameCommit={commitRename}
                   onRenameCancel={cancelRename}
                 />
+                {/* In-editor scan feedback: while a scan is in flight and the
+                    tree is still empty (initial/large scans blank the grid), show
+                    a centered overlay with the live node count + Cancel over a few
+                    skeleton rows. A refresh keeps the old tree visible, so rows are
+                    present and this never shows. */}
+                {status === "scanning" && tree.visibleRows.length === 0 && (
+                  <ScanOverlay progressStore={progressStore} onCancel={cancelScan} />
+                )}
               </div>
 
               {panelOpen && (
@@ -1407,3 +1482,39 @@ function arePropsEqual(prev: WorkspaceTabProps, next: WorkspaceTabProps): boolea
 }
 
 export const WorkspaceTab = memo(WorkspaceTabInner, arePropsEqual);
+
+// Centered scan overlay shown over the (empty) tree while a scan streams in.
+// Reuses the duplicates scan's spinner + sweeping progress bar (.df-scanning-
+// spinner / .df-progress-*) so in-editor feedback matches that view, and layers
+// a few shimmering skeleton rows behind the card to hint at the incoming table.
+const SKELETON_WIDTHS = [62, 48, 71, 40, 58, 45, 66, 52];
+
+function ScanOverlay({ progressStore, onCancel }: { progressStore: ProgressStore; onCancel: () => void }) {
+  // Subscribe to live progress here (a tiny leaf) so each tick re-renders only
+  // this counter, not the surrounding pane.
+  const progress = useSyncExternalStore(progressStore.subscribe, progressStore.get);
+  const nodes = progress?.nodes ?? 0;
+  return (
+    <div className="scan-overlay" role="status" aria-live="polite">
+      <div className="scan-skeleton" aria-hidden="true">
+        {SKELETON_WIDTHS.map((w, i) => (
+          <div className="skeleton-row" key={i}>
+            <span className="skeleton-bar skeleton-name" style={{ width: `${w}%` }} />
+            <span className="skeleton-bar skeleton-size" />
+          </div>
+        ))}
+      </div>
+      <div className="scan-overlay-card">
+        <div className="df-scanning-spinner" />
+        <div className="scan-overlay-title">Scanning…</div>
+        <div className="scan-overlay-count">{nodes.toLocaleString()} items</div>
+        <div className="df-progress-track">
+          <div className="df-progress-bar df-progress-bar-sweep" />
+        </div>
+        <button type="button" className="scan-overlay-cancel" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}

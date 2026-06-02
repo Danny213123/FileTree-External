@@ -1,26 +1,38 @@
+import { useSyncExternalStore } from "react";
 import { formatCount } from "../utils/formatBytes";
 import { formatDuration } from "../utils/formatDate";
 import type { ScanResult } from "../api/types";
-import type { ScanStatus, ScanProgress } from "../hooks/useScan";
+import type { ScanStatus, ProgressStore } from "../hooks/useScan";
 import { Icon } from "./Icon";
 
 interface StatusBarProps {
   scanResult: ScanResult | null;
   status: ScanStatus;
   errorMessage: string;
-  progress: ScanProgress | null;
+  /** The focused pane's live progress store (or null when no pane is focused).
+   *  Subscribed below so scan-progress ticks re-render only this bar. */
+  progressStore: ProgressStore | null;
   visibleCount: number;
   scanPath?: string;
 }
+
+// Stable no-op subscribe / null snapshot so useSyncExternalStore can be called
+// unconditionally even when there's no store yet (null focused pane).
+const NOOP_SUBSCRIBE = () => () => {};
+const GET_NULL = () => null;
 
 export function StatusBar({
   scanResult,
   status,
   errorMessage,
-  progress,
+  progressStore,
   visibleCount,
   scanPath,
 }: StatusBarProps) {
+  const progress = useSyncExternalStore(
+    progressStore?.subscribe ?? NOOP_SUBSCRIBE,
+    progressStore?.get ?? GET_NULL,
+  );
   let statusText = "Ready";
   if (status === "scanning") {
     statusText = progress ? `Scanning… ${formatCount(progress.nodes)} items` : "Scanning…";

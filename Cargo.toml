@@ -8,3 +8,6 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+# Compile the built renderer (frontend/dist) into the binary so the single
+# executable can serve every Vite-emitted chunk without shipping loose files.
+include_dir = "0.7"

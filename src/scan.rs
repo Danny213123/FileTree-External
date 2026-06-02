@@ -515,7 +515,12 @@ fn scan_directory_win32(
             id: 0, // assigned below
             parent: Some(dir_id),
             name: name_str.into_owned(),
-            path: entry_path_str.clone(),
+            // Path interning: only directories (and the root) keep their full
+            // path; a file's is reconstructed on demand from its parent dir +
+            // name (see `model::node_abs_path`), removing the largest per-file
+            // allocation. `entry_path_str` is still moved into `depth_limit_paths`
+            // below for the depth-limited-directory case.
+            path: if is_dir { entry_path_str.clone() } else { String::new() },
             is_dir,
             is_link,
             hidden,
@@ -698,7 +703,10 @@ fn scan_directory_portable(
             id: 0,
             parent: Some(dir_id),
             name,
-            path: path_string.clone(),
+            // Path interning: files drop their path (rebuilt from parent dir +
+            // name via `model::node_abs_path`); dirs keep it. `path_string` is
+            // still moved into `depth_limit_paths` below for depth-limited dirs.
+            path: if is_dir { path_string.clone() } else { String::new() },
             is_dir,
             is_link,
             hidden,

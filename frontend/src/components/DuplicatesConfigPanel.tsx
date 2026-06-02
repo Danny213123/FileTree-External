@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { DriveEntry, DupeCriterionKey, ReprioritizeCriterion, SpecialFolder } from "../api/types";
 import type { DuplicatesController } from "../hooks/useDuplicates";
 import { Icon } from "./Icon";
+import { DriveCapacityBar } from "./DriveCapacityBar";
 
 const REPRIORITIZE_OPTIONS: { value: ReprioritizeCriterion; label: string }[] = [
   { value: "largest",      label: "Largest file" },
@@ -56,11 +57,14 @@ function ScanTargets({ drives, selectedPaths, customPaths, onToggle, onAddCustom
       {expanded && (
         <div className="df-targets-body">
           {drives.map((d) => (
-            <label key={d.root} className="df-target-row">
-              <input type="checkbox" className="df-checkbox" checked={selectedSet.has(d.root)} onChange={() => onToggle(d.root)} />
-              <span className="df-target-icon"><Icon name="hdd" size={13} /></span>
-              <span className="df-target-path">{d.root}</span>
-              {d.label && <span className="df-target-label">{d.label}</span>}
+            <label key={d.root} className="df-target-row df-target-drive">
+              <span className="df-target-main">
+                <input type="checkbox" className="df-checkbox" checked={selectedSet.has(d.root)} onChange={() => onToggle(d.root)} />
+                <span className="df-target-icon"><Icon name="hdd" size={13} /></span>
+                <span className="df-target-path">{d.root}</span>
+                {d.label && <span className="df-target-label">{d.label}</span>}
+              </span>
+              <DriveCapacityBar total={d.total} free={d.free} />
             </label>
           ))}
           {customPaths.filter((p) => !drivePaths.includes(p)).map((p) => (

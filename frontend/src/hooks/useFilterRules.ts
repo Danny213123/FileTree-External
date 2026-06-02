@@ -159,6 +159,70 @@ export function isActiveRule(rule: FilterRule): boolean {
   return rule.value.trim() !== "";
 }
 
+// ── ReDoS hardening for user-supplied patterns ───────────────────────────────
+// Filter rules accept raw regular expressions ("matches Regular Expression") and
+// globs. JavaScript's regex engine backtracks and has no timeout, so a
+// pathological pattern can freeze the UI thread (catastrophic backtracking). We
+// bound the pattern + subject length, reject patterns with nested unbounded
+// quantifiers (the classic blow-up, e.g. `(a+)+`), cache compiled patterns, and
+// never throw — a rejected/invalid pattern simply matches nothing.
+const MAX_PATTERN_LEN = 1000;
+const MAX_SUBJECT_LEN = 4096;
+const regexCache = new Map<string, RegExp | null>();
+
+/** Detect nested unbounded quantifiers (regex "star height" > 1) — e.g. `(a+)+`,
+ *  `(a*)*`, `((ab)*)+` — the usual source of exponential backtracking. */
+function hasNestedQuantifier(source: string): boolean {
+  const isQuant = (ch: string | undefined): boolean => ch === "*" || ch === "+";
+  const groupHasQuantifier: boolean[] = [];
+  let escaped = false;
+  let inClass = false;
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i];
+    if (escaped) { escaped = false; continue; }
+    if (c === "\\") { escaped = true; continue; }
+    if (inClass) { if (c === "]") inClass = false; continue; }
+    if (c === "[") { inClass = true; continue; }
+    if (c === "(") { groupHasQuantifier.push(false); continue; }
+    if (c === ")") {
+      const bodyQuantified = groupHasQuantifier.pop() ?? false;
+      const next = source[i + 1];
+      if (bodyQuantified && isQuant(next)) return true;
+      // Quantifying this whole group counts toward its parent group's body.
+      if (isQuant(next) && groupHasQuantifier.length) {
+        groupHasQuantifier[groupHasQuantifier.length - 1] = true;
+      }
+      continue;
+    }
+    if (isQuant(c) && groupHasQuantifier.length) {
+      groupHasQuantifier[groupHasQuantifier.length - 1] = true;
+    }
+  }
+  return false;
+}
+
+/** Compile a user pattern defensively. Returns null (never throws) when the
+ *  pattern is too long, structurally dangerous, or syntactically invalid. */
+function compileSafeRegex(source: string, flags: string): RegExp | null {
+  if (!source || source.length > MAX_PATTERN_LEN) return null;
+  const cacheKey = `${flags}\u0000${source}`;
+  const cached = regexCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  let compiled: RegExp | null = null;
+  if (!hasNestedQuantifier(source)) {
+    try { compiled = new RegExp(source, flags); } catch { compiled = null; }
+  }
+  if (regexCache.size > 256) regexCache.clear();
+  regexCache.set(cacheKey, compiled);
+  return compiled;
+}
+
+/** Cap subject length so even a near-pathological pattern can't run against an
+ *  unexpectedly huge string. */
+function boundSubject(value: string): string {
+  return value.length > MAX_SUBJECT_LEN ? value.slice(0, MAX_SUBJECT_LEN) : value;
+}
+
 // ── Predicates per field kind ────────────────────────────────────────────────
 
 function textSubject(field: FilterField, name: string, path: string, owner: string): string {
@@ -176,7 +240,12 @@ function textSubject(field: FilterField, name: string, path: string, owner: stri
   }
 }
 
-function testText(rule: FilterRule, name: string, path: string, owner: string): boolean {
+// Text predicate over a PRE-COMPILED rule: the (cached, ReDoS-guarded) RegExp
+// for regex/glob operators is built once per rule by compileRules() and reused
+// here for every node — no per-node compilation or even cache lookup. Non-regex
+// operators (contains/startsWith/…) are plain string ops.
+function testTextCompiled(cr: CompiledRule, name: string, path: string, owner: string): boolean {
+  const { rule, regex } = cr;
   const v = rule.value.toLowerCase();
   if (!v) return true;
   const subject = textSubject(rule.field, name, path, owner);
@@ -197,11 +266,12 @@ function testText(rule: FilterRule, name: string, path: string, owner: string): 
         return subject === v;
       case "matchesPattern":
       case "notMatchesPattern":
-        return wildcardMatch(v, subject);
       case "matchesRegex":
       case "notMatchesRegex":
-        try { return new RegExp(rule.value, "i").test(subject); }
-        catch { return false; }
+        // `regex` was produced via compileSafeRegex (length/star-height guards,
+        // never throws). A null result = invalid/dangerous pattern → matches
+        // nothing. Subject is still length-capped per match.
+        return regex ? regex.test(boundSubject(subject)) : false;
       default:
         return false;
     }
@@ -277,40 +347,84 @@ function testType(rule: FilterRule, extension: string): boolean {
   return rule.operator === "isNotOneOf" ? !isMatch : isMatch;
 }
 
-/** Returns true if a node passes a single rule. */
-function testRule(rule: FilterRule, node: FilterableNode): boolean {
-  switch (fieldKind(rule.field)) {
-    case "size": return testSize(rule, node.size);
-    case "date": return testDate(rule, node.modified);
-    case "type": return testType(rule, node.extension);
-    default: return testText(rule, node.name, node.path, node.owner ?? "");
+/** Returns true if a node passes a single PRE-COMPILED rule. */
+function testRuleCompiled(cr: CompiledRule, node: FilterableNode): boolean {
+  switch (fieldKind(cr.rule.field)) {
+    case "size": return testSize(cr.rule, node.size);
+    case "date": return testDate(cr.rule, node.modified);
+    case "type": return testType(cr.rule, node.extension);
+    default: return testTextCompiled(cr, node.name, node.path, node.owner ?? "");
   }
 }
 
-function wildcardMatch(pattern: string, value: string): boolean {
-  // Simple glob: * matches any, ? matches one
-  const regex = pattern
+/** Translate a simple glob (`*` = any, `?` = one) into an anchored regex source.
+ *  Collapse runs of '*' first (glob `**` ≡ `*`) so the compiled regex never
+ *  contains adjacent ".*.*", a catastrophic-backtracking trap, then escape
+ *  metacharacters and translate. Returned to compileSafeRegex which applies the
+ *  length / star-height guards. */
+function globToRegexSource(pattern: string): string {
+  const body = pattern
+    .replace(/\*+/g, "*")
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*/g, ".*")
     .replace(/\?/g, ".");
-  try { return new RegExp(`^${regex}$`, "i").test(value); }
-  catch { return false; }
+  return `^${body}$`;
 }
 
-/** Returns true if a node passes all active rules (with And/Or logic). */
-export function applyRules(rules: FilterRule[], node: FilterableNode): boolean {
-  const active = rules.filter(isActiveRule);
-  if (active.length === 0) return true;
+// ── Precompiled rules ─────────────────────────────────────────────────────────
+// A rule's RegExp (regex / glob operators) is compiled ONCE — here — instead of
+// once per visible node. compileRules() runs only when the rule set changes (it's
+// memoized by the caller), so the per-row match path reuses one cached, ReDoS-
+// guarded RegExp. compileSafeRegex still enforces the pattern-length and
+// nested-quantifier (star-height) limits and never throws.
+
+/** A filter rule paired with its precompiled RegExp (for regex/glob operators).
+ *  `regex` is null when the pattern is empty, too long, structurally dangerous,
+ *  or syntactically invalid, and undefined for non-regex operators. */
+export interface CompiledRule {
+  rule: FilterRule;
+  regex?: RegExp | null;
+}
+
+/** Precompile a rule set: keep only the active rules and compile each regex/glob
+ *  operator's RegExp once (via the guarded, cached compileSafeRegex). Memoize the
+ *  result (see useTreeState) so it is built per rule-set change, not per row. */
+export function compileRules(rules: FilterRule[]): CompiledRule[] {
+  return rules.filter(isActiveRule).map((rule): CompiledRule => {
+    switch (rule.operator) {
+      case "matchesRegex":
+      case "notMatchesRegex":
+        return { rule, regex: compileSafeRegex(rule.value, "i") };
+      case "matchesPattern":
+      case "notMatchesPattern":
+        return { rule, regex: compileSafeRegex(globToRegexSource(rule.value.toLowerCase()), "i") };
+      default:
+        return { rule };
+    }
+  });
+}
+
+/** Returns true if a node passes all precompiled rules (with And/Or logic).
+ *  The hot path: called once per node with already-compiled RegExps. */
+export function applyCompiledRules(compiled: CompiledRule[], node: FilterableNode): boolean {
+  if (compiled.length === 0) return true;
 
   // First rule always applies as-is; subsequent rules use their join.
-  let result = testRule(active[0], node);
-  for (let i = 1; i < active.length; i++) {
-    const r = active[i];
-    if (r.join === "or") {
-      result = result || testRule(r, node);
+  let result = testRuleCompiled(compiled[0], node);
+  for (let i = 1; i < compiled.length; i++) {
+    const c = compiled[i];
+    if (c.rule.join === "or") {
+      result = result || testRuleCompiled(c, node);
     } else {
-      result = result && testRule(r, node);
+      result = result && testRuleCompiled(c, node);
     }
   }
   return result;
+}
+
+/** Convenience wrapper that compiles + applies in one call. NOT for hot paths
+ *  (it recompiles each call); virtualized lists should memoize compileRules()
+ *  and call applyCompiledRules() per row instead. */
+export function applyRules(rules: FilterRule[], node: FilterableNode): boolean {
+  return applyCompiledRules(compileRules(rules), node);
 }

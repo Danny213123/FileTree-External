@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub(crate) use crate::dupes::IgnoreList;
 
@@ -26,6 +26,12 @@ pub(crate) struct NodeRecord {
     pub(crate) id: usize,
     pub(crate) parent: Option<usize>,
     pub(crate) name: String,
+    /// Absolute path — but INTERNED to cut scan memory: only directory (and root)
+    /// nodes store it; file nodes leave this empty and their path is rebuilt on
+    /// demand from the parent directory's path + `name` (see [`node_abs_path`]).
+    /// Since files dominate a scan and each would otherwise repeat its parent's
+    /// full prefix, this removes the single largest per-node allocation. Read a
+    /// node's absolute path via [`node_abs_path`], never `node.path` directly.
     pub(crate) path: String,
     pub(crate) is_dir: bool,
     pub(crate) is_link: bool,
@@ -56,6 +62,40 @@ pub(crate) struct NodeRecord {
 pub(crate) struct ScanError {
     pub(crate) path: String,
     pub(crate) message: String,
+}
+
+/// Reconstruct the absolute path of node `id`. Directory and root nodes carry
+/// their full path; file nodes have it interned away (empty `path`), so theirs
+/// is rebuilt from the parent directory path + file name. This is the single
+/// source of truth for "what is this node's path" — every endpoint that emits an
+/// absolute path (exports, dupes, diff, scan-root checks) must go through it so
+/// interning stays transparent.
+pub(crate) fn node_abs_path(nodes: &[NodeRecord], id: usize) -> String {
+    let Some(node) = nodes.get(id) else {
+        return String::new();
+    };
+    if !node.path.is_empty() {
+        return node.path.clone();
+    }
+    // Interned file node: a file's parent is always a directory, which keeps its
+    // full path, so one join yields the correct absolute path at any depth.
+    match node.parent.and_then(|pid| nodes.get(pid)) {
+        Some(parent) if !parent.path.is_empty() => join_abs(&parent.path, &node.name),
+        _ => node.name.clone(),
+    }
+}
+
+/// Join a parent directory path and a child name. Mirrors `scan::join_path`'s
+/// separator handling so a reconstructed path is byte-identical to what the scan
+/// originally stored.
+fn join_abs(parent: &str, name: &str) -> String {
+    let mut s = String::with_capacity(parent.len() + 1 + name.len());
+    s.push_str(parent);
+    if !parent.ends_with('\\') && !parent.ends_with('/') {
+        s.push('\\');
+    }
+    s.push_str(name);
+    s
 }
 
 #[derive(Clone, Debug)]
@@ -121,12 +161,169 @@ pub(crate) struct HashCacheEntry {
     pub(crate) hash: u64,
 }
 
+/// Upper bound on the in-memory scan-result cache, measured in estimated
+/// resident bytes. The cache holds whole walked trees (`Arc<ScanResult>`);
+/// without a cap a session that scans several large roots would grow without
+/// limit. ~512 MB keeps a few big trees hot (so multi-root duplicate scans reuse
+/// them) while bounding peak memory — least-recently-used roots evict first once
+/// the running total exceeds this.
+pub(crate) const SCAN_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+struct ScanCacheEntry {
+    result: Arc<ScanResult>,
+    inserted: Instant,
+    last_used: u64,
+    bytes: usize,
+}
+
+/// Bounded LRU cache of recent scan results, keyed by normalized root path and
+/// evicted by total estimated bytes. Replaces the previously unbounded
+/// `HashMap<String, (Arc<ScanResult>, Instant)>`: cache hits for the scan and
+/// duplicate routes still work, but resident memory can no longer grow without
+/// limit. Recency is tracked with a monotonically increasing tick so eviction
+/// drops the least-recently-used root.
+pub(crate) struct ScanCache {
+    entries: HashMap<String, ScanCacheEntry>,
+    cap_bytes: usize,
+    total_bytes: usize,
+    tick: u64,
+}
+
+impl std::fmt::Debug for ScanCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanCache")
+            .field("entries", &self.entries.len())
+            .field("total_bytes", &self.total_bytes)
+            .field("cap_bytes", &self.cap_bytes)
+            .finish()
+    }
+}
+
+impl Default for ScanCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScanCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            cap_bytes: SCAN_CACHE_MAX_BYTES,
+            total_bytes: 0,
+            tick: 0,
+        }
+    }
+
+    fn bump(&mut self) -> u64 {
+        self.tick = self.tick.wrapping_add(1);
+        self.tick
+    }
+
+    /// Look up `key`, returning a cheap `Arc` clone only when the entry is still
+    /// within `ttl`. Records the access for LRU recency.
+    pub(crate) fn get_fresh(&mut self, key: &str, ttl: Duration) -> Option<Arc<ScanResult>> {
+        let tick = self.bump();
+        let entry = self.entries.get_mut(key)?;
+        if entry.inserted.elapsed() >= ttl {
+            return None;
+        }
+        entry.last_used = tick;
+        Some(Arc::clone(&entry.result))
+    }
+
+    /// Look up `key` ignoring TTL (the "current view" the user is looking at).
+    /// Records the access for LRU recency.
+    pub(crate) fn get_any(&mut self, key: &str) -> Option<Arc<ScanResult>> {
+        let tick = self.bump();
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = tick;
+        Some(Arc::clone(&entry.result))
+    }
+
+    /// Insert (or replace) `key`, then evict least-recently-used roots until the
+    /// running byte total fits under the cap. The just-inserted entry is never
+    /// the eviction victim.
+    pub(crate) fn insert(&mut self, key: String, result: Arc<ScanResult>) {
+        let bytes = estimate_scan_bytes(&result);
+        let tick = self.bump();
+        if let Some(prev) = self.entries.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(prev.bytes);
+        }
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.entries.insert(
+            key.clone(),
+            ScanCacheEntry {
+                result,
+                inserted: Instant::now(),
+                last_used: tick,
+                bytes,
+            },
+        );
+        self.evict_to_cap(&key);
+    }
+
+    fn evict_to_cap(&mut self, keep: &str) {
+        while self.total_bytes > self.cap_bytes && self.entries.len() > 1 {
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(k, _)| k.as_str() != keep)
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone());
+            let Some(victim) = victim else { break };
+            if let Some(removed) = self.entries.remove(&victim) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
+            }
+        }
+    }
+
+    /// Evict entries that are descendants OR ancestors of `path`. A move/rename
+    /// changes both the subtree and every parent aggregate up to the root, so all
+    /// of them are stale.
+    pub(crate) fn invalidate(&mut self, path: &str) {
+        let norm = path.replace('\\', "/").to_lowercase();
+        let mut freed = 0usize;
+        self.entries.retain(|k, e| {
+            let keep = !k.starts_with(&norm) && !norm.starts_with(k.as_str());
+            if !keep {
+                freed = freed.saturating_add(e.bytes);
+            }
+            keep
+        });
+        self.total_bytes = self.total_bytes.saturating_sub(freed);
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Rough resident-byte estimate of a cached scan: node structs + their heap
+/// strings + children index vectors + a small per-error allowance. Only used to
+/// drive LRU eviction, so an approximation is fine (and cheap: one pass over a
+/// buffer we just finished building).
+fn estimate_scan_bytes(result: &ScanResult) -> usize {
+    let mut bytes = result
+        .nodes
+        .len()
+        .saturating_mul(std::mem::size_of::<NodeRecord>());
+    for n in &result.nodes {
+        bytes = bytes.saturating_add(n.name.len() + n.path.len() + n.extension.len() + n.owner.len());
+        bytes = bytes.saturating_add(n.children.len().saturating_mul(std::mem::size_of::<usize>()));
+    }
+    bytes = bytes.saturating_add(result.errors.len().saturating_mul(96));
+    bytes
+}
+
 #[derive(Debug)]
 pub(crate) struct AppState {
     pub(crate) initial_path: PathBuf,
     pub(crate) last_scan: Mutex<Option<Arc<ScanResult>>>,
-    /// Per-path scan result cache keyed by lowercase path. TTL enforced in server.rs.
-    pub(crate) scan_cache: Mutex<HashMap<String, (Arc<ScanResult>, Instant)>>,
+    /// Per-path scan-result cache keyed by normalized lowercase path, bounded by
+    /// total estimated bytes with LRU eviction (see [`ScanCache`]). TTL freshness
+    /// is enforced via `get_fresh`.
+    pub(crate) scan_cache: Mutex<ScanCache>,
     /// Cached shell icon BMPs, keyed by lowercase extension (no dot).
     pub(crate) icon_cache: Mutex<HashMap<String, Vec<u8>>>,
     pub(crate) dupes_progress: Arc<DupesProgress>,
@@ -143,6 +340,11 @@ pub(crate) struct AppState {
     /// routes. `None` when the server is launched standalone without a token
     /// (dev), in which case those routes fall back to POST-only with no token.
     pub(crate) auth_token: Option<String>,
+    /// Canonicalized directories the user has scanned this session. File-content
+    /// reads (file-text / thumbnail / owner) are confined to paths located under
+    /// one of these roots, so a request can't read arbitrary files outside the
+    /// trees the user actually opened. Populated by the scan routes.
+    pub(crate) scan_roots: Mutex<Vec<PathBuf>>,
 }
 
 #[derive(Debug)]

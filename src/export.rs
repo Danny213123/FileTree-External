@@ -4,7 +4,13 @@ use std::path::PathBuf;
 
 use crate::cli::{APP_NAME, APP_VERSION};
 use crate::io::{default_thread_count, epoch_ms_to_utc, path_to_string};
-use crate::model::{AppState, ScanResult};
+use crate::model::{node_abs_path, AppState, ScanResult};
+
+/// Max data rows (one per node) emitted by the streaming CSV / XML exports before
+/// truncating, with a clearly-marked trailing indicator. Bounds the output and
+/// the server's memory for multi-million-node scans. The CLI one-shot exporters
+/// pass `usize::MAX` (full export to a file).
+pub(crate) const EXPORT_ROW_CAP: usize = 1_000_000;
 
 /// Write scan result JSON directly to any `Write` impl (e.g. a TCP stream).
 /// Avoids materialising a 300-400 MB intermediate String for large scans.
@@ -262,14 +268,30 @@ fn emit_id_array_w(buf: &mut Vec<u8>, ids: &[usize]) {
     buf.push(b']');
 }
 
-pub(crate) fn scan_result_to_csv(result: &ScanResult) -> String {
-    let mut output = String::from(
-        "Path,Name,Type,Size,Allocated,Files,Folders,PercentOfParent,ModifiedUtc,Hidden,Readonly,Link,Errors,Owner\n",
-    );
-    for node in &result.nodes {
+/// Stream the scan as CSV (one row per node) directly to `w`, capping at
+/// `max_rows` data rows. Reconstructs each node's absolute path via
+/// `node_abs_path` (file paths are interned away) and formula-guards EVERY text
+/// cell through `push_csv_field`. Accumulates into a reused ~32 KB buffer and
+/// flushes incrementally, so peak memory is ~constant regardless of scan size.
+/// On truncation, appends a clearly-marked trailing indicator row.
+pub(crate) fn write_scan_result_csv<W: Write>(
+    w: &mut W,
+    result: &ScanResult,
+    max_rows: usize,
+) -> std::io::Result<()> {
+    w.write_all(
+        b"Path,Name,Type,Size,Allocated,Files,Folders,PercentOfParent,ModifiedUtc,Hidden,Readonly,Link,Errors,Owner\n",
+    )?;
+    let nodes = &result.nodes;
+    let mut buf = String::with_capacity(64 * 1024);
+    let mut written = 0usize;
+    for node in nodes {
+        if written >= max_rows {
+            break;
+        }
         let parent_size = node
             .parent
-            .and_then(|parent| result.nodes.get(parent))
+            .and_then(|parent| nodes.get(parent))
             .map(|parent| parent.size)
             .unwrap_or(node.size);
         let percent = if parent_size > 0 {
@@ -277,36 +299,63 @@ pub(crate) fn scan_result_to_csv(result: &ScanResult) -> String {
         } else {
             0.0
         };
-        push_csv_field(&mut output, &node.path);
-        output.push(',');
-        push_csv_field(&mut output, &node.name);
-        output.push(',');
-        output.push_str(if node.is_dir { "Directory" } else { "File" });
-        output.push(',');
-        output.push_str(&node.size.to_string());
-        output.push(',');
-        output.push_str(&node.allocated.to_string());
-        output.push(',');
-        output.push_str(&node.files.to_string());
-        output.push(',');
-        output.push_str(&node.folders.to_string());
-        output.push(',');
-        output.push_str(&format!("{percent:.4}"));
-        output.push(',');
-        push_csv_field(&mut output, &epoch_ms_to_utc(node.modified_ms));
-        output.push(',');
-        output.push_str(if node.hidden { "true" } else { "false" });
-        output.push(',');
-        output.push_str(if node.readonly { "true" } else { "false" });
-        output.push(',');
-        output.push_str(if node.is_link { "true" } else { "false" });
-        output.push(',');
-        output.push_str(&node.errors.to_string());
-        output.push(',');
-        push_csv_field(&mut output, &node.owner);
-        output.push('\n');
+        push_csv_field(&mut buf, &node_abs_path(nodes, node.id));
+        buf.push(',');
+        push_csv_field(&mut buf, &node.name);
+        buf.push(',');
+        buf.push_str(if node.is_dir { "Directory" } else { "File" });
+        buf.push(',');
+        buf.push_str(&node.size.to_string());
+        buf.push(',');
+        buf.push_str(&node.allocated.to_string());
+        buf.push(',');
+        buf.push_str(&node.files.to_string());
+        buf.push(',');
+        buf.push_str(&node.folders.to_string());
+        buf.push(',');
+        buf.push_str(&format!("{percent:.4}"));
+        buf.push(',');
+        push_csv_field(&mut buf, &epoch_ms_to_utc(node.modified_ms));
+        buf.push(',');
+        buf.push_str(if node.hidden { "true" } else { "false" });
+        buf.push(',');
+        buf.push_str(if node.readonly { "true" } else { "false" });
+        buf.push(',');
+        buf.push_str(if node.is_link { "true" } else { "false" });
+        buf.push(',');
+        buf.push_str(&node.errors.to_string());
+        buf.push(',');
+        push_csv_field(&mut buf, &node.owner);
+        buf.push('\n');
+        written += 1;
+        if buf.len() >= 32 * 1024 {
+            w.write_all(buf.as_bytes())?;
+            buf.clear();
+        }
     }
-    output
+    if !buf.is_empty() {
+        w.write_all(buf.as_bytes())?;
+    }
+    if nodes.len() > written {
+        // Truncation indicator. The leading field is guarded too (a '#' is not a
+        // formula trigger, but keep the path through push_csv_field for symmetry).
+        let note = format!(
+            "# TRUNCATED: exported {written} of {} rows (EXPORT_ROW_CAP={})\n",
+            nodes.len(),
+            EXPORT_ROW_CAP
+        );
+        w.write_all(note.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Full (uncapped) CSV as a `String` — used by the CLI one-shot exporter. The
+/// server route streams via [`write_scan_result_csv`] instead of materialising
+/// this. Shares the same row logic (and formula guarding).
+pub(crate) fn scan_result_to_csv(result: &ScanResult) -> String {
+    let mut buf: Vec<u8> = Vec::with_capacity(result.nodes.len().saturating_mul(96) + 128);
+    write_scan_result_csv(&mut buf, result, usize::MAX).expect("vec write cannot fail");
+    String::from_utf8(buf).expect("csv is valid utf8")
 }
 
 // ── Richer report exports (roadmap item #8): HTML, XML, XLSX ──────────────────
@@ -413,7 +462,7 @@ pub(crate) fn scan_result_to_html(result: &ScanResult) -> String {
         for &id in &result.summary.largest_dirs {
             if let Some(node) = result.nodes.get(id) {
                 h.push_str("<tr><td>");
-                push_html_escaped(&mut h, &node.path);
+                push_html_escaped(&mut h, &node_abs_path(&result.nodes, id));
                 h.push_str("</td><td class=\"num\">");
                 h.push_str(&human_bytes(node.size));
                 h.push_str("</td><td class=\"num\">");
@@ -431,13 +480,12 @@ pub(crate) fn scan_result_to_html(result: &ScanResult) -> String {
             if let Some(node) = result.nodes.get(id) {
                 let parent_path = node
                     .parent
-                    .and_then(|p| result.nodes.get(p))
-                    .map(|p| p.path.as_str())
-                    .unwrap_or("");
+                    .map(|p| node_abs_path(&result.nodes, p))
+                    .unwrap_or_default();
                 h.push_str("<tr><td>");
                 push_html_escaped(&mut h, &node.name);
                 h.push_str("</td><td>");
-                push_html_escaped(&mut h, parent_path);
+                push_html_escaped(&mut h, &parent_path);
                 h.push_str("</td><td class=\"num\">");
                 h.push_str(&human_bytes(node.size));
                 h.push_str("</td></tr>");
@@ -509,7 +557,7 @@ pub(crate) fn scan_result_to_html(result: &ScanResult) -> String {
             h.push_str("<tr><td>");
             push_html_escaped(&mut h, &node.name);
             h.push_str("</td><td class=\"path\">");
-            push_html_escaped(&mut h, &node.path);
+            push_html_escaped(&mut h, &node_abs_path(&result.nodes, id));
             h.push_str("</td><td>");
             h.push_str(if node.is_dir { "Folder" } else { "File" });
             h.push_str("</td><td class=\"num\">");
@@ -567,8 +615,16 @@ fn push_card(output: &mut String, label: &str, value: &str) {
 /// Structured XML serialization of the scan: metadata, the precomputed analytics
 /// summary, and a flat `<node>` list carrying `id`/`parent` references (mirrors
 /// the JSON export's shape, which is robust for arbitrarily deep trees).
-pub(crate) fn scan_result_to_xml(result: &ScanResult) -> String {
-    let mut x = String::with_capacity(result.nodes.len().saturating_mul(160) + 4096);
+/// Stream the scan as XML directly to `w`, capping the flat node list at
+/// `max_nodes`. Reconstructs interned-away file paths via `node_abs_path`,
+/// flushes in ~32 KB chunks (constant peak memory), and emits a comment marker
+/// when the node list is truncated.
+pub(crate) fn write_scan_result_xml<W: Write>(
+    w: &mut W,
+    result: &ScanResult,
+    max_nodes: usize,
+) -> std::io::Result<()> {
+    let mut x = String::with_capacity(64 * 1024);
     x.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<filetreeScan app=\"");
     push_xml_escaped(&mut x, APP_NAME);
     x.push_str("\" version=\"");
@@ -580,7 +636,7 @@ pub(crate) fn scan_result_to_xml(result: &ScanResult) -> String {
         result.scanned_at_ms, result.elapsed_ms, result.thread_count, result.nodes.len(), result.errors.len()
     ));
 
-    // Analytics summary.
+    // Analytics summary (small, capped collections).
     x.push_str("<summary>");
     x.push_str("<byType>");
     for stat in &result.summary.extension_stats {
@@ -596,9 +652,17 @@ pub(crate) fn scan_result_to_xml(result: &ScanResult) -> String {
     }
     x.push_str("</byAge></summary>");
 
-    // Flat node list.
+    // Flat node list (streamed + capped).
     x.push_str("<nodes>");
-    for node in &result.nodes {
+    w.write_all(x.as_bytes())?;
+    x.clear();
+
+    let nodes = &result.nodes;
+    let mut written = 0usize;
+    for node in nodes {
+        if written >= max_nodes {
+            break;
+        }
         x.push_str("<node id=\"");
         x.push_str(&node.id.to_string());
         x.push('"');
@@ -608,7 +672,7 @@ pub(crate) fn scan_result_to_xml(result: &ScanResult) -> String {
         x.push_str(" name=\"");
         push_xml_escaped(&mut x, &node.name);
         x.push_str("\" path=\"");
-        push_xml_escaped(&mut x, &node.path);
+        push_xml_escaped(&mut x, &node_abs_path(nodes, node.id));
         x.push_str(&format!(
             "\" type=\"{}\" size=\"{}\" allocated=\"{}\" files=\"{}\" folders=\"{}\" depth=\"{}\"",
             if node.is_dir { "dir" } else { "file" },
@@ -623,9 +687,35 @@ pub(crate) fn scan_result_to_xml(result: &ScanResult) -> String {
         x.push_str("\" owner=\"");
         push_xml_escaped(&mut x, &node.owner);
         x.push_str("\"/>");
+        written += 1;
+        if x.len() >= 32 * 1024 {
+            w.write_all(x.as_bytes())?;
+            x.clear();
+        }
+    }
+    if !x.is_empty() {
+        w.write_all(x.as_bytes())?;
+        x.clear();
+    }
+    if nodes.len() > written {
+        x.push_str(&format!(
+            "<!-- TRUNCATED: {} of {} nodes (EXPORT_ROW_CAP={}) -->",
+            written,
+            nodes.len(),
+            EXPORT_ROW_CAP
+        ));
     }
     x.push_str("</nodes></filetreeScan>");
-    x
+    w.write_all(x.as_bytes())?;
+    Ok(())
+}
+
+/// Full (uncapped) XML as a `String` — used by the CLI one-shot exporter. The
+/// server route streams via [`write_scan_result_xml`] instead.
+pub(crate) fn scan_result_to_xml(result: &ScanResult) -> String {
+    let mut buf: Vec<u8> = Vec::with_capacity(result.nodes.len().saturating_mul(160) + 4096);
+    write_scan_result_xml(&mut buf, result, usize::MAX).expect("vec write cannot fail");
+    String::from_utf8(buf).expect("xml is valid utf8")
 }
 
 /// Build a real `.xlsx` workbook of the scan via the dependency-free writer in
@@ -633,7 +723,7 @@ pub(crate) fn scan_result_to_xml(result: &ScanResult) -> String {
 /// well within Excel's row limit and bound memory (the bytes live in RAM while
 /// the store-ZIP is assembled); the cap is noted to the caller in #8's report.
 pub(crate) fn scan_result_to_xlsx(result: &ScanResult) -> Vec<u8> {
-    use crate::xlsx::Cell;
+    use crate::xlsx::{Cell, SheetWriter};
     const XLSX_ROW_CAP: usize = 100_000;
 
     let headers = [
@@ -641,7 +731,9 @@ pub(crate) fn scan_result_to_xlsx(result: &ScanResult) -> Vec<u8> {
         "PercentOfParent", "ModifiedUtc", "Hidden", "Readonly", "Link", "Owner", "Extension",
     ];
     let ids = largest_by_size(result, XLSX_ROW_CAP);
-    let mut rows: Vec<Vec<Cell>> = Vec::with_capacity(ids.len());
+    // Stream rows straight into the worksheet XML rather than collecting a
+    // `Vec<Vec<Cell>>` of every row first (avoids a redundant full-buffer copy).
+    let mut sheet = SheetWriter::new(&headers);
     for id in ids {
         let Some(node) = result.nodes.get(id) else { continue };
         let parent_size = node
@@ -654,8 +746,8 @@ pub(crate) fn scan_result_to_xlsx(result: &ScanResult) -> Vec<u8> {
         } else {
             0.0
         };
-        rows.push(vec![
-            Cell::Text(node.path.clone()),
+        sheet.push_row(&[
+            Cell::Text(node_abs_path(&result.nodes, id)),
             Cell::Text(node.name.clone()),
             Cell::Text(if node.is_dir { "Directory".into() } else { "File".into() }),
             Cell::Int(node.size),
@@ -671,7 +763,7 @@ pub(crate) fn scan_result_to_xlsx(result: &ScanResult) -> Vec<u8> {
             Cell::Text(node.extension.clone()),
         ]);
     }
-    crate::xlsx::workbook("Scan", &headers, &rows)
+    crate::xlsx::workbook_from_sheet("Scan", &sheet.finish())
 }
 
 pub(crate) fn app_config_json(state: &AppState) -> String {
@@ -904,6 +996,9 @@ pub(crate) fn push_csv_field(output: &mut String, value: &str) {
         value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r');
     if needs_quotes {
         output.push('"');
+        if needs_formula_guard(value) {
+            output.push('\'');
+        }
         for ch in value.chars() {
             if ch == '"' {
                 output.push('"');
@@ -912,8 +1007,23 @@ pub(crate) fn push_csv_field(output: &mut String, value: &str) {
         }
         output.push('"');
     } else {
+        if needs_formula_guard(value) {
+            output.push('\'');
+        }
         output.push_str(value);
     }
+}
+
+/// Formula-injection guard (OWASP CSV/spreadsheet injection): a cell whose first
+/// byte is `=`, `+`, `-`, `@`, TAB, or CR is interpreted as a formula by Excel /
+/// Google Sheets / LibreOffice. Prefixing a single quote makes the spreadsheet
+/// treat the value as literal text instead of executing it. Used for both CSV
+/// fields and XLSX text cells.
+pub(crate) fn needs_formula_guard(value: &str) -> bool {
+    matches!(
+        value.as_bytes().first(),
+        Some(b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r')
+    )
 }
 
 #[cfg(test)]

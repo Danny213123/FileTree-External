@@ -6,6 +6,7 @@ import { formatBytes } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
 import { openPath, revealPath } from "../api/client";
 import { Icon } from "./Icon";
+import { EmptyState } from "./EmptyState";
 import { FixedDropdown } from "./ConfigureColumnsMenu";
 
 const ROW_HEIGHT = 24;
@@ -429,11 +430,7 @@ function MatchBar({ pct }: { pct: number }) {
 }
 
 function DfEmpty({ icon, title, sub, error }: { icon: "duplicates" | "warning" | "check"; title: string; sub: string; error?: boolean }) {
-  return (
-    <div className={`df-empty${error ? " df-empty-error" : ""}`}>
-      <div className="df-empty-icon"><Icon name={icon} size={28} /></div>
-      <div className="df-empty-title">{title}</div>
-      <div className="df-empty-sub">{sub}</div>
-    </div>
-  );
+  // Thin wrapper over the shared EmptyState so the duplicates view and the rest
+  // of the app share one empty-state treatment.
+  return <EmptyState icon={icon} title={title} hint={sub} error={error} />;
 }

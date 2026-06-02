@@ -7,6 +7,7 @@ import { ExtensionsTab } from "./ExtensionsTab";
 import { AgeTab } from "./AgeTab";
 import { ByOwnerTab } from "./ByOwnerTab";
 import { CompareTab } from "./CompareTab";
+import { EmptyState } from "./EmptyState";
 
 // TreeSize-style analytics reports. All data is computed server-side and shipped
 // in the scan meta line (topFiles, largestDirs, extensionStats, ageStats), so
@@ -37,7 +38,11 @@ export function ReportsView({ data, nodeById, onNavigate }: ReportsViewProps) {
   if (!data) {
     return (
       <div className="reports-view">
-        <div className="empty">Run a scan to see reports.</div>
+        <EmptyState
+          icon="bar-chart"
+          title="No scan loaded"
+          hint="Run a scan to see Top Files, Largest Folders, and other reports for this folder."
+        />
       </div>
     );
   }

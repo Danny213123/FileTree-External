@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
-use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
+use crate::dupes::{hash_candidate_groups, HashInput};
 use crate::export::{push_id_array, push_json_string};
 use crate::model::{
-    AgeBucket, DuplicateCandidate, ExtensionStat, NodeRecord, ScanError, ScanResult, ScanSummary,
+    node_abs_path, AgeBucket, DuplicateCandidate, ExtensionStat, HashCacheEntry, NodeRecord,
+    ScanResult, ScanSummary,
 };
 
 /// Filter parameters for duplicate search.
@@ -29,8 +30,23 @@ pub(crate) struct DupeFilter {
 }
 
 /// Full-detail duplicate scan. Returns JSON with file paths, names, sizes, dates.
-pub(crate) fn duplicates_full_json(result: &ScanResult, filter: DupeFilter, limit: usize) -> String {
-    let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
+///
+/// Delegates hashing to the single shared pipeline [`hash_candidate_groups`]
+/// (size-group → head/tail sample → full FNV hash only for sample-colliding
+/// groups, reusing the persistent `(path,size,mtime)→hash` cache) instead of
+/// full-hashing every same-size file itself. The rich filtering (extension /
+/// name / date / directional keep-vs-search) and the JSON response shape are
+/// unchanged.
+pub(crate) fn duplicates_full_json(
+    result: &ScanResult,
+    filter: DupeFilter,
+    limit: usize,
+    cache: &Mutex<HashMap<PathBuf, HashCacheEntry>>,
+    cache_path: Option<&Path>,
+    threads: usize,
+) -> String {
+    // 1. Apply the rich filters once, keeping node ids for the response.
+    let mut candidate_ids: Vec<usize> = Vec::new();
     for node in &result.nodes {
         if node.is_dir || node.size == 0 || node.size < filter.min_size {
             continue;
@@ -40,11 +56,8 @@ pub(crate) fn duplicates_full_json(result: &ScanResult, filter: DupeFilter, limi
                 continue;
             }
         }
-        if !filter.extensions.is_empty() {
-            let ext = node.extension.to_lowercase();
-            if !filter.extensions.contains(&ext) {
-                continue;
-            }
+        if !filter.extensions.is_empty() && !filter.extensions.contains(&node.extension.to_lowercase()) {
+            continue;
         }
         if !filter.name_pattern.is_empty() {
             let lower = node.name.to_lowercase();
@@ -53,7 +66,9 @@ pub(crate) fn duplicates_full_json(result: &ScanResult, filter: DupeFilter, limi
             } else {
                 lower.contains(&filter.name_pattern)
             };
-            if !matches { continue; }
+            if !matches {
+                continue;
+            }
         }
         if filter.date_from > 0 && node.modified_ms < filter.date_from {
             continue;
@@ -61,32 +76,41 @@ pub(crate) fn duplicates_full_json(result: &ScanResult, filter: DupeFilter, limi
         if filter.date_to > 0 && node.modified_ms > filter.date_to {
             continue;
         }
-        by_size.entry(node.size).or_default().push(node.id);
+        candidate_ids.push(node.id);
     }
 
-    let directional = !filter.keep_prefix.is_empty() || !filter.search_prefix.is_empty();
+    // 2. Hash through the unified pipeline. `inputs[k]` is parallel to
+    //    `candidate_ids[k]`; emitted group indices are indices into `inputs`.
+    let inputs: Vec<HashInput> = candidate_ids
+        .iter()
+        .map(|&id| HashInput {
+            path: PathBuf::from(node_abs_path(&result.nodes, id)),
+            size: result.nodes[id].size,
+            mtime: result.nodes[id].modified_ms / 1000,
+        })
+        .collect();
+    let (hash_groups, hash_errors) =
+        hash_candidate_groups(&inputs, false, cache, cache_path, None, None, threads);
 
-    let mut groups = Vec::<(u64, u64, Vec<usize>)>::new();
-    let mut hash_errors = Vec::<String>::new();
-    for (size, ids) in by_size.into_iter().filter(|(_, ids)| ids.len() > 1) {
-        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
-        for id in ids {
-            match fnv1a_file(Path::new(&result.nodes[id].path)) {
-                Ok(hash) => by_hash.entry(hash).or_default().push(id),
-                Err(error) => hash_errors.push(format!("{}: {}", result.nodes[id].path, error)),
+    // Reconstructed absolute path for input index `k` (used for emission and the
+    // directional prefix tests).
+    let path_at = |k: usize| inputs[k].path.to_string_lossy().into_owned();
+
+    // 3. Group into (size, hash, idxs), applying the directional keep/search filter.
+    let directional = !filter.keep_prefix.is_empty() || !filter.search_prefix.is_empty();
+    let mut groups: Vec<(u64, u64, Vec<usize>)> = Vec::new();
+    for (hash, idxs) in hash_groups {
+        let size = inputs[idxs[0]].size;
+        if directional {
+            let has_keep = filter.keep_prefix.is_empty()
+                || idxs.iter().any(|&k| path_at(k).starts_with(&filter.keep_prefix));
+            let has_search = filter.search_prefix.is_empty()
+                || idxs.iter().any(|&k| path_at(k).starts_with(&filter.search_prefix));
+            if !has_keep || !has_search {
+                continue;
             }
         }
-        for (hash, ids) in by_hash.into_iter().filter(|(_, ids)| ids.len() > 1) {
-            if directional {
-                // Require ≥1 file in keep_prefix AND ≥1 file in search_prefix.
-                let has_keep = filter.keep_prefix.is_empty()
-                    || ids.iter().any(|&id| result.nodes[id].path.starts_with(&filter.keep_prefix));
-                let has_search = filter.search_prefix.is_empty()
-                    || ids.iter().any(|&id| result.nodes[id].path.starts_with(&filter.search_prefix));
-                if !has_keep || !has_search { continue; }
-            }
-            groups.push((size, hash, ids));
-        }
+        groups.push((size, hash, idxs));
     }
 
     groups.sort_by(|left, right| {
@@ -97,41 +121,44 @@ pub(crate) fn duplicates_full_json(result: &ScanResult, filter: DupeFilter, limi
     groups.truncate(limit);
 
     let mut output = String::from("{\"groups\":[");
-    for (index, (size, hash, ids)) in groups.iter().enumerate() {
-        if index > 0 { output.push(','); }
+    for (index, (size, hash, idxs)) in groups.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
         // For directional mode, count only the search-side files as duplicates.
         let dupe_count = if directional && !filter.search_prefix.is_empty() {
-            ids.iter().filter(|&&id| result.nodes[id].path.starts_with(&filter.search_prefix)).count()
+            idxs.iter().filter(|&&k| path_at(k).starts_with(&filter.search_prefix)).count()
         } else {
-            ids.len().saturating_sub(1)
+            idxs.len().saturating_sub(1)
         };
         let waste = size.saturating_mul(dupe_count as u64);
         output.push('{');
         output.push_str("\"size\":"); output.push_str(&size.to_string());
         output.push_str(",\"hash\":"); push_json_string(&mut output, &format!("{hash:016x}"));
         output.push_str(",\"waste\":"); output.push_str(&waste.to_string());
-        output.push_str(",\"count\":"); output.push_str(&ids.len().to_string());
+        output.push_str(",\"count\":"); output.push_str(&idxs.len().to_string());
         output.push_str(",\"directional\":"); output.push_str(if directional { "true" } else { "false" });
         output.push_str(",\"files\":[");
         // In directional mode, sort originals first.
-        let mut sorted_ids = ids.clone();
+        let mut sorted: Vec<usize> = idxs.clone();
         if directional && !filter.keep_prefix.is_empty() {
-            sorted_ids.sort_by_key(|&id| {
-                if result.nodes[id].path.starts_with(&filter.keep_prefix) { 0u8 } else { 1u8 }
-            });
+            sorted.sort_by_key(|&k| if path_at(k).starts_with(&filter.keep_prefix) { 0u8 } else { 1u8 });
         }
-        for (fi, &id) in sorted_ids.iter().enumerate() {
-            if fi > 0 { output.push(','); }
-            let node = &result.nodes[id];
+        for (fi, &k) in sorted.iter().enumerate() {
+            if fi > 0 {
+                output.push(',');
+            }
+            let node = &result.nodes[candidate_ids[k]];
+            let path = path_at(k);
             let is_original = if directional && !filter.keep_prefix.is_empty() {
-                node.path.starts_with(&filter.keep_prefix)
+                path.starts_with(&filter.keep_prefix)
             } else {
                 fi == 0
             };
             output.push('{');
             output.push_str("\"id\":"); output.push_str(&node.id.to_string());
             output.push_str(",\"name\":"); push_json_string(&mut output, &node.name);
-            output.push_str(",\"path\":"); push_json_string(&mut output, &node.path);
+            output.push_str(",\"path\":"); push_json_string(&mut output, &path);
             output.push_str(",\"size\":"); output.push_str(&node.size.to_string());
             output.push_str(",\"modified\":"); output.push_str(&node.modified_ms.to_string());
             output.push_str(",\"original\":"); output.push_str(if is_original { "true" } else { "false" });
@@ -141,44 +168,55 @@ pub(crate) fn duplicates_full_json(result: &ScanResult, filter: DupeFilter, limi
     }
     output.push_str("],\"errors\":[");
     for (ei, err) in hash_errors.iter().take(50).enumerate() {
-        if ei > 0 { output.push(','); }
+        if ei > 0 {
+            output.push(',');
+        }
         push_json_string(&mut output, err);
     }
     output.push_str("]}");
     output
 }
 
-pub(crate) fn exact_duplicates_json(result: &ScanResult, min_size: u64, limit: usize) -> String {
-    let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
+/// Exact (byte-identical) duplicate groups above `min_size`. Delegates hashing
+/// to the shared [`hash_candidate_groups`] pipeline (sampling + persistent cache)
+/// rather than full-hashing every same-size file. JSON shape is unchanged
+/// (`{minSize, groups:[{size,hash,waste,ids}], errors:[{path,message}]}`).
+pub(crate) fn exact_duplicates_json(
+    result: &ScanResult,
+    min_size: u64,
+    limit: usize,
+    cache: &Mutex<HashMap<PathBuf, HashCacheEntry>>,
+    cache_path: Option<&Path>,
+    threads: usize,
+) -> String {
+    let mut candidate_ids: Vec<usize> = Vec::new();
     for node in &result.nodes {
         if !node.is_dir && node.size >= min_size && node.size > 0 {
-            by_size.entry(node.size).or_default().push(node.id);
+            candidate_ids.push(node.id);
         }
     }
+    let inputs: Vec<HashInput> = candidate_ids
+        .iter()
+        .map(|&id| HashInput {
+            path: PathBuf::from(node_abs_path(&result.nodes, id)),
+            size: result.nodes[id].size,
+            mtime: result.nodes[id].modified_ms / 1000,
+        })
+        .collect();
+    let (hash_groups, hash_errors) =
+        hash_candidate_groups(&inputs, false, cache, cache_path, None, None, threads);
 
-    let mut groups = Vec::<(u64, u64, Vec<usize>)>::new();
-    let mut hash_errors = Vec::<ScanError>::new();
-    for (size, ids) in by_size.into_iter().filter(|(_, ids)| ids.len() > 1) {
-        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
-        for id in ids {
-            match fnv1a_file(Path::new(&result.nodes[id].path)) {
-                Ok(hash) => by_hash.entry(hash).or_default().push(id),
-                Err(error) => hash_errors.push(ScanError {
-                    path: result.nodes[id].path.clone(),
-                    message: error.to_string(),
-                }),
-            }
-        }
-        for (hash, ids) in by_hash.into_iter().filter(|(_, ids)| ids.len() > 1) {
-            groups.push((size, hash, ids));
-        }
+    // Map input indices back to node ids for the response.
+    let mut groups: Vec<(u64, u64, Vec<usize>)> = Vec::new();
+    for (hash, idxs) in hash_groups {
+        let size = inputs[idxs[0]].size;
+        let ids: Vec<usize> = idxs.iter().map(|&k| candidate_ids[k]).collect();
+        groups.push((size, hash, ids));
     }
 
     groups.sort_by(|left, right| {
         let left_waste = left.0.saturating_mul(left.2.len().saturating_sub(1) as u64);
-        let right_waste = right
-            .0
-            .saturating_mul(right.2.len().saturating_sub(1) as u64);
+        let right_waste = right.0.saturating_mul(right.2.len().saturating_sub(1) as u64);
         right_waste.cmp(&left_waste)
     });
     groups.truncate(limit);
@@ -203,36 +241,23 @@ pub(crate) fn exact_duplicates_json(result: &ScanResult, min_size: u64, limit: u
         output.push('}');
     }
     output.push_str("],\"errors\":[");
-    for (index, error) in hash_errors.iter().take(200).enumerate() {
+    for (index, err) in hash_errors.iter().take(200).enumerate() {
         if index > 0 {
             output.push(',');
         }
+        // The pipeline returns "path: message" strings; split once to recover the
+        // {path, message} object shape (a Windows path's drive colon is "C:\",
+        // never "C: ", so the first ": " is the separator we added).
+        let (path, message) = err.split_once(": ").unwrap_or((err.as_str(), ""));
         output.push('{');
         output.push_str("\"path\":");
-        push_json_string(&mut output, &error.path);
+        push_json_string(&mut output, path);
         output.push_str(",\"message\":");
-        push_json_string(&mut output, &error.message);
+        push_json_string(&mut output, message);
         output.push('}');
     }
     output.push_str("]}");
     output
-}
-
-fn fnv1a_file(path: &Path) -> io::Result<u64> {
-    let mut file = File::open(path)?;
-    let mut buffer = [0u8; 1024 * 1024];
-    let mut hash = 0xcbf29ce484222325u64;
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        for byte in &buffer[..read] {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    Ok(hash)
 }
 
 /// Compute all capped analytics once. Called when a scan finalises (see

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { Metric, Unit, DriveEntry, SpecialFolder, SortKey } from "../api/types";
+import { exitApp } from "../api/client";
 
 type RibbonTab = "home" | "scan" | "view" | "duplicates" | "treemapChart" | "options";
 
@@ -1302,7 +1303,7 @@ function FileMenu({
   const csvUrl = hasScan ? `/api/export.csv?path=${encodeURIComponent(scanPath)}` : "#";
   const jsonUrl = hasScan ? `/api/export.json?path=${encodeURIComponent(scanPath)}` : "#";
 
-  const doExit = () => { close(); fetch("/api/exit").catch(() => {}); };
+  const doExit = () => { close(); exitApp().catch(() => {}); };
   const doNewInstance = () => { close(); window.open(window.location.href, "_blank"); };
 
   // anchor position

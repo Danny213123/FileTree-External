@@ -5,6 +5,7 @@ import { formatBytes, formatCount } from "../utils/formatBytes";
 import { DetailsTab } from "./DetailsTab";
 import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
+import { EmptyState } from "./EmptyState";
 
 const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "tif", "tiff", "avif", "heic", "ico"]);
 const VIDEO_EXTS = new Set(["mp4", "mkv", "mov", "avi", "wmv", "webm", "m4v", "flv"]);
@@ -86,7 +87,16 @@ export function InspectorPane({
 }
 
 function PreviewBody({ node, unit }: { node: NodeRecord | undefined; unit: Unit }) {
-  if (!node) return <div className="inspector-empty">Select a file to preview.</div>;
+  if (!node) {
+    return (
+      <EmptyState
+        compact
+        icon="image"
+        title="Nothing selected"
+        hint="Select a file or folder to preview it here."
+      />
+    );
+  }
   if (node.dir) return <FolderPreview node={node} unit={unit} />;
 
   const ext = (node.extension ?? "").toLowerCase();
