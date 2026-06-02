@@ -3,7 +3,10 @@ use std::fs;
 use std::io::{self as sio};
 use std::path::{Path, PathBuf};
 
-use crate::export::{scan_result_to_csv, scan_result_to_json};
+use crate::export::{
+    scan_result_to_csv, scan_result_to_html, scan_result_to_json, scan_result_to_xlsx,
+    scan_result_to_xml,
+};
 use crate::io::{
     current_dir_or_dot, default_thread_count, first_positional_arg, has_flag, option_value,
     split_patterns,
@@ -61,11 +64,17 @@ fn print_usage() {
 Usage:
   filetree                              Start server on port 7878 (for Electron)
   filetree serve [--path PATH] [--port PORT]
-  filetree scan PATH [--format json|csv] [--out FILE] [--threads N] [--exclude PATTERNS]
+  filetree scan PATH [--format json|csv|html|xml|xlsx] [--out FILE] [--threads N] [--exclude PATTERNS] [--owners]
 
 Examples:
   filetree serve --path C:\\ --port 7878
-  filetree scan D:\\Data --format csv --out report.csv
+  filetree scan D:\\Data --format csv  --out report.csv
+  filetree scan D:\\Data --format html --out report.html
+  filetree scan D:\\Data --format xlsx --out report.xlsx
+
+Notes:
+  html  Self-contained report (open it and use Print > Save as PDF for a PDF).
+  xlsx  Real Excel workbook (largest 100,000 entries by size).
 "
     );
 }
@@ -88,16 +97,22 @@ fn run_scan_command(args: &[String]) -> sio::Result<()> {
         threads: option_value(args, "--threads")
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(default_thread_count),
+        collect_owners: has_flag(args, "--owners"),
     };
 
     let result = scan_path(options)?;
-    let body = match format.as_str() {
-        "csv" => scan_result_to_csv(&result),
-        "json" => scan_result_to_json(&result),
+    // All formats render to bytes so the binary .xlsx and the text formats share
+    // one atomic-write path. `xlsx` is the only binary output.
+    let bytes: Vec<u8> = match format.as_str() {
+        "csv" => scan_result_to_csv(&result).into_bytes(),
+        "json" => scan_result_to_json(&result).into_bytes(),
+        "html" => scan_result_to_html(&result).into_bytes(),
+        "xml" => scan_result_to_xml(&result).into_bytes(),
+        "xlsx" => scan_result_to_xlsx(&result),
         other => {
             return Err(sio::Error::new(
                 sio::ErrorKind::InvalidInput,
-                format!("unsupported format '{other}'"),
+                format!("unsupported format '{other}' (use json|csv|html|xml|xlsx)"),
             ));
         }
     };
@@ -107,9 +122,18 @@ fn run_scan_command(args: &[String]) -> sio::Result<()> {
         // destination. A crash/error mid-write can't leave a half-written or
         // truncated export in place — the user either gets the old file or the
         // complete new one (Phase 3).
-        write_atomic(Path::new(&out), body.as_bytes())?;
+        write_atomic(Path::new(&out), &bytes)?;
+    } else if format == "xlsx" {
+        // Binary workbook to a terminal would be garbage — require a file.
+        return Err(sio::Error::new(
+            sio::ErrorKind::InvalidInput,
+            "the xlsx format requires --out FILE".to_string(),
+        ));
     } else {
-        println!("{body}");
+        use std::io::Write as _;
+        let mut stdout = sio::stdout();
+        stdout.write_all(&bytes)?;
+        stdout.write_all(b"\n")?;
     }
 
     Ok(())

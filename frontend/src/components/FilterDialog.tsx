@@ -4,18 +4,21 @@ import {
   type FilterField,
   type FilterOperator,
   type FilterJoin,
+  type SizeUnit,
   FIELD_LABELS,
   OPERATOR_LABELS,
+  SIZE_UNIT_LABELS,
   makeRule,
+  fieldKind,
+  operatorsForField,
+  ruleForField,
 } from "../hooks/useFilterRules";
 
-const FIELDS: FilterField[] = ["name", "path", "parentFolder", "anyParentFolder"];
-const OPERATORS: FilterOperator[] = [
-  "startsWith", "contains", "endsWith", "equals",
-  "matchesPattern", "matchesRegex",
-  "notEquals", "notStartsWith", "notContains", "notEndsWith",
-  "notMatchesPattern", "notMatchesRegex",
+const FIELDS: FilterField[] = [
+  "name", "path", "parentFolder", "anyParentFolder",
+  "size", "date", "type", "owner",
 ];
+const SIZE_UNITS = Object.keys(SIZE_UNIT_LABELS) as SizeUnit[];
 
 interface FilterDialogProps {
   initialRules: FilterRule[];
@@ -69,6 +72,12 @@ export function FilterDialog({ initialRules, onApply, onClose }: FilterDialogPro
     setRules((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
   }
 
+  // Switching fields re-bases the rule onto the new field's default operator and
+  // clears stale values (a byte count is meaningless once the field becomes Name).
+  function changeField(id: string, field: FilterField) {
+    setRules((prev) => prev.map((r) => (r.id === id ? ruleForField(r, field) : r)));
+  }
+
   function moveRule(id: string, dir: -1 | 1) {
     setRules((prev) => {
       const idx = prev.findIndex((r) => r.id === id);
@@ -112,33 +121,31 @@ export function FilterDialog({ initialRules, onApply, onClose }: FilterDialogPro
               <select
                 className="fd-select fd-field"
                 value={rule.field}
-                onChange={(e) => updateRule(rule.id, { field: e.target.value as FilterField })}
+                onChange={(e) => changeField(rule.id, e.target.value as FilterField)}
               >
                 {FIELDS.map((f) => (
                   <option key={f} value={f}>{FIELD_LABELS[f]}</option>
                 ))}
               </select>
 
-              {/* Operator dropdown */}
+              {/* Operator dropdown — options depend on the field's kind */}
               <select
                 className="fd-select fd-op"
                 value={rule.operator}
                 onChange={(e) => updateRule(rule.id, { operator: e.target.value as FilterOperator })}
               >
-                {OPERATORS.map((op) => (
+                {operatorsForField(rule.field).map((op) => (
                   <option key={op} value={op}>{OPERATOR_LABELS[op]}</option>
                 ))}
               </select>
 
-              {/* Value input */}
-              <input
-                ref={idx === 0 ? firstInputRef : undefined}
-                className="fd-value"
-                type="text"
-                placeholder="Enter value"
-                value={rule.value}
-                onChange={(e) => updateRule(rule.id, { value: e.target.value })}
-                onKeyDown={(e) => { if (e.key === "Enter") handleApply(); }}
+              {/* Value input(s) — text/type get a text box; size gets number(s)
+                  + unit; date gets date picker(s). "between" adds a second box. */}
+              <RuleValue
+                rule={rule}
+                inputRef={idx === 0 ? firstInputRef : undefined}
+                onChange={(patch) => updateRule(rule.id, patch)}
+                onEnter={handleApply}
               />
 
               {/* Delete */}
@@ -180,6 +187,103 @@ export function FilterDialog({ initialRules, onApply, onClose }: FilterDialogPro
         </div>
       </div>
     </div>
+  );
+}
+
+function RuleValue({
+  rule,
+  inputRef,
+  onChange,
+  onEnter,
+}: {
+  rule: FilterRule;
+  inputRef?: React.RefObject<HTMLInputElement>;
+  onChange: (patch: Partial<FilterRule>) => void;
+  onEnter: () => void;
+}) {
+  const kind = fieldKind(rule.field);
+  const onKey = (e: React.KeyboardEvent) => { if (e.key === "Enter") onEnter(); };
+
+  if (kind === "size") {
+    return (
+      <div className="fd-value fd-value-compound">
+        <input
+          ref={inputRef}
+          className="fd-num"
+          type="number"
+          min="0"
+          step="any"
+          placeholder="0"
+          value={rule.value}
+          onChange={(e) => onChange({ value: e.target.value })}
+          onKeyDown={onKey}
+        />
+        {rule.operator === "between" && (
+          <>
+            <span className="fd-and-lbl">and</span>
+            <input
+              className="fd-num"
+              type="number"
+              min="0"
+              step="any"
+              placeholder="0"
+              value={rule.value2 ?? ""}
+              onChange={(e) => onChange({ value2: e.target.value })}
+              onKeyDown={onKey}
+            />
+          </>
+        )}
+        <select
+          className="fd-select fd-unit"
+          value={rule.sizeUnit ?? "mb"}
+          onChange={(e) => onChange({ sizeUnit: e.target.value as SizeUnit })}
+        >
+          {SIZE_UNITS.map((u) => (
+            <option key={u} value={u}>{SIZE_UNIT_LABELS[u]}</option>
+          ))}
+        </select>
+      </div>
+    );
+  }
+
+  if (kind === "date") {
+    return (
+      <div className="fd-value fd-value-compound">
+        <input
+          ref={inputRef}
+          className="fd-date"
+          type="date"
+          value={rule.value}
+          onChange={(e) => onChange({ value: e.target.value })}
+          onKeyDown={onKey}
+        />
+        {rule.operator === "between" && (
+          <>
+            <span className="fd-and-lbl">and</span>
+            <input
+              className="fd-date"
+              type="date"
+              value={rule.value2 ?? ""}
+              onChange={(e) => onChange({ value2: e.target.value })}
+              onKeyDown={onKey}
+            />
+          </>
+        )}
+      </div>
+    );
+  }
+
+  // text + type fields share a single text box.
+  return (
+    <input
+      ref={inputRef}
+      className="fd-value"
+      type="text"
+      placeholder={kind === "type" ? "jpg, png, mp4…" : "Enter value"}
+      value={rule.value}
+      onChange={(e) => onChange({ value: e.target.value })}
+      onKeyDown={onKey}
+    />
   );
 }
 

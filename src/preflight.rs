@@ -62,6 +62,53 @@ pub(crate) fn free_space(_path: &Path) -> Option<u64> {
     None
 }
 
+/// Free-to-caller and total bytes for the volume that contains `path`, as
+/// `(free, total)`. `None` when it can't be queried. GetDiskFreeSpaceExW
+/// returns both in one call, so the drive list (capacity/used bars) reuses the
+/// same Win32 entry point as `free_space`.
+#[cfg(windows)]
+pub(crate) fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut free_to_caller: u64 = 0;
+    let mut total: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            &mut total,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        Some((free_to_caller, total))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn disk_space(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
 /// Recursive on-disk size of a file or directory, in bytes. Best-effort:
 /// unreadable entries are skipped and symlinks are NOT followed (so a link
 /// cycle can't spin forever and a junction isn't double-counted).

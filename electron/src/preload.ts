@@ -37,9 +37,20 @@ contextBridge.exposeInMainWorld("electronAPI", {
   clipboardReadText: (): Promise<string> =>
     ipcRenderer.invoke("clipboardReadText"),
 
-  // Clipboard: copy files as CF_HDROP (paste in Explorer).
+  // Clipboard: copy files as CF_HDROP (paste in Explorer & other apps).
   copyFiles: (paths: string[]): Promise<void> =>
     ipcRenderer.invoke("copyFiles", paths),
+
+  // Clipboard: write the selection as CF_HDROP with a drop effect — cut=true ⇒
+  // MOVE (Paste relocates), cut=false ⇒ COPY. Resolves true when real CF_HDROP
+  // was written (native addon present), false when it degraded to text.
+  clipboardWriteFiles: (paths: string[], cut: boolean): Promise<boolean> =>
+    ipcRenderer.invoke("clipboardWriteFiles", paths, cut),
+
+  // Clipboard: read a CF_HDROP file list (+ whether it was a Cut) for
+  // paste-into-folder. Resolves { paths: [], preferMove: false } when empty.
+  clipboardReadFiles: (): Promise<{ paths: string[]; preferMove: boolean }> =>
+    ipcRenderer.invoke("clipboardReadFiles"),
 
   // Move files into a folder via the Windows shell (IFileOperation). Shows the
   // real native dialogs — progress, Replace/Skip/Keep both, "source and
@@ -49,6 +60,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
     destination: string,
   ): Promise<{ aborted: boolean; moved: number; skipped: number; failed: number }> =>
     ipcRenderer.invoke("moveItemsNative", paths, destination),
+
+  // Copy files into a folder via the Windows shell (IFileOperation) — same
+  // guarded engine + native dialogs as moveItemsNative, for paste-copy / drag-in.
+  copyItemsNative: (
+    paths: string[],
+    destination: string,
+  ): Promise<{ aborted: boolean; moved: number; skipped: number; failed: number }> =>
+    ipcRenderer.invoke("copyItemsNative", paths, destination),
 
   // Best-effort restore of a recycled item to its original path (Phase 6 undo).
   // Resolves true when the item was found in the Recycle Bin and put back; false

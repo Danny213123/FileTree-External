@@ -22,7 +22,7 @@ const COL_GROUPS = GROUP_ORDER.map((group) => ({
 // native scan in `src/model.rs` + serialize it in `src/export.rs`, then rebuild
 // it on the client in `useScan.ts` (reconstructChildren) and add it to
 // ALL_COLUMNS / SortKey — only then can it be toggled here.
-const DEFERRED_COLUMNS = ["Owner", "Author", "File Version", "Description", "Permissions"];
+const DEFERRED_COLUMNS = ["Author", "File Version", "Description", "Permissions"];
 
 /**
  * Fixed-position dropdown anchored under its trigger. Escapes overflow:hidden

@@ -12,6 +12,7 @@ const VIEW_TITLES: Record<ViewId, string> = {
   explorer: "Explorer",
   search: "Search",
   treemap: "Treemap",
+  reports: "Reports",
   duplicates: "Duplicates",
   bookmarks: "Bookmarks",
   errors: "Problems",
@@ -98,12 +99,34 @@ function ExplorerView(props: SideBarProps) {
       </div>
       {locOpen && (
         <div className="loc-list">
-          {props.drives.map((d) => (
-            <div key={d.root} className="loc-item" title={d.root} onClick={() => props.onOpenLocation(d.root)}>
-              <span className="loc-ico"><Icon name="hdd" size={14} /></span>
-              <span className="loc-name">{d.label || d.root}</span>
-            </div>
-          ))}
+          {props.drives.map((d) => {
+            // Capacity/used bar (Explorer + TreeSize parity). total === 0 means
+            // the volume couldn't be queried (e.g. empty CD) → show name only.
+            const used = d.total > 0 ? Math.max(0, d.total - d.free) : 0;
+            const pct = d.total > 0 ? Math.min(100, (used / d.total) * 100) : 0;
+            const level = pct >= 90 ? " crit" : pct >= 75 ? " warn" : "";
+            return (
+              <div
+                key={d.root}
+                className="loc-item loc-drive"
+                title={d.total > 0 ? `${d.label || d.root} — ${fmtSize(d.free)} free of ${fmtSize(d.total)}` : d.root}
+                onClick={() => props.onOpenLocation(d.root)}
+              >
+                <div className="loc-drive-row">
+                  <span className="loc-ico"><Icon name="hdd" size={14} /></span>
+                  <span className="loc-name">{d.label || d.root}</span>
+                </div>
+                {d.total > 0 && (
+                  <div className="drive-cap">
+                    <div className="drive-cap-track">
+                      <div className={`drive-cap-fill${level}`} style={{ width: `${pct}%` }} />
+                    </div>
+                    <div className="drive-cap-label">{fmtSize(d.free)} free of {fmtSize(d.total)}</div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
           {props.specialFolders.map((f) => (
             <div key={f.path} className="loc-item" title={f.path} onClick={() => props.onOpenLocation(f.path)}>
               <span className="loc-ico"><Icon name="folder" size={14} /></span>
@@ -246,7 +269,11 @@ function SearchView(props: SideBarProps) {
 
 export function SideBar(props: SideBarProps) {
   const { view } = props;
-  const showFolderActions = view === "explorer" || view === "treemap";
+  // Reports/Treemap reuse the Explorer body so the scan controls, drive list
+  // (with capacity bars) and folder tree stay available while their main panel
+  // (treemap / analytics reports) shows in the editor area.
+  const showExplorerBody = view === "explorer" || view === "treemap" || view === "reports";
+  const showFolderActions = showExplorerBody;
 
   return (
     <div className="sidebar">
@@ -262,7 +289,7 @@ export function SideBar(props: SideBarProps) {
         )}
       </div>
 
-      {(view === "explorer" || view === "treemap") && <ExplorerView {...props} />}
+      {showExplorerBody && <ExplorerView {...props} />}
 
       {view === "search" && <SearchView {...props} />}
 

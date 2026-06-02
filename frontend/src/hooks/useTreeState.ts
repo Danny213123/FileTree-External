@@ -1,6 +1,7 @@
 import { useState, useCallback, useMemo } from "react";
 import type { NodeRecord, SortKey, Metric, Unit } from "../api/types";
 import { type FilterRule, applyRules } from "./useFilterRules";
+import { attributeLetters } from "../lib/attributes";
 
 export interface TreeState {
   expanded: Set<number>;
@@ -109,9 +110,13 @@ function compareNodes(
       left = a.size > 0 && a.allocated < a.size ? 1 - a.allocated / a.size : 0;
       right = b.size > 0 && b.allocated < b.size ? 1 - b.allocated / b.size : 0;
       break;
+    case "owner":
+      left = (a.owner ?? "").toLowerCase();
+      right = (b.owner ?? "").toLowerCase();
+      break;
     case "attributes":
-      left = [a.hidden ? "H" : "", a.readonly ? "R" : "", a.link ? "L" : ""].join("");
-      right = [b.hidden ? "H" : "", b.readonly ? "R" : "", b.link ? "L" : ""].join("");
+      left = attributeLetters(a);
+      right = attributeLetters(b);
       break;
     case "percent":
     case "size":
@@ -224,7 +229,7 @@ function collectVisibleRows(
   const hasSimpleFilter = !hasActiveRules && filter.length > 0;
 
   const passesFilter = (node: NodeRecord): boolean => {
-    if (hasActiveRules) return applyRules(filterRules, node.name, node.path);
+    if (hasActiveRules) return applyRules(filterRules, node);
     if (hasSimpleFilter) return node.name.toLowerCase().includes(filter.toLowerCase());
     return true;
   };
@@ -383,7 +388,7 @@ export function useTreeState(): UseTreeStateReturn {
         setSortDir((d) => (d === 1 ? -1 : 1));
       } else {
         setSortKeyState(key);
-        const ascendingByDefault: SortKey[] = ["name", "path", "folderPath", "type", "attributes", "pathLength"];
+        const ascendingByDefault: SortKey[] = ["name", "path", "folderPath", "type", "attributes", "owner", "pathLength"];
         setSortDir(ascendingByDefault.includes(key) ? 1 : -1);
       }
     },

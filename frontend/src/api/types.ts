@@ -18,6 +18,12 @@ export interface NodeRecord {
   errors: number;
   extension: string;
   children: number[];
+  /** Owner account ("DOMAIN\\user"). Present only when owner collection was
+   *  enabled for the scan; "" / undefined otherwise. */
+  owner?: string;
+  /** Raw Windows file-attribute bitmask (FILE_ATTRIBUTE_*); 0/undefined when
+   *  unavailable. Decode flags with the masks in `lib/attributes.ts`. */
+  attributes?: number;
 }
 
 export interface ExtensionStat {
@@ -56,6 +62,9 @@ export interface ScanResult {
   errorCount: number;
   nodes: NodeRecord[];
   topFiles: number[];
+  /** Node ids of the largest directories (computed server-side, capped at 100).
+   *  Streamed in the scan meta line; reused by the Reports "Largest Folders" view. */
+  largestDirs: number[];
   extensionStats: ExtensionStat[];
   ageStats: AgeStat[];
   duplicateCandidates: DuplicateCandidate[];
@@ -65,6 +74,10 @@ export interface ScanResult {
 export interface DriveEntry {
   root: string;
   label: string;
+  /** Total bytes on the volume, 0 when it couldn't be queried. */
+  total: number;
+  /** Free bytes available to the caller, 0 when it couldn't be queried. */
+  free: number;
 }
 
 export interface DriveList {
@@ -205,3 +218,59 @@ export type SortKey =
   | "avgFileSize" | "pathLength" | "dirLevel" | "compressionRate";
 export type Metric = "size" | "allocated" | "files" | "folders";
 export type Unit = "auto" | "tb" | "gb" | "mb" | "kb" | "bytes";
+
+// ── Scan snapshots + growth diff (roadmap #5) ──────────────────────────────
+
+/** One saved snapshot's metadata (also the manifest entry shape). */
+export interface SnapshotMeta {
+  id: string;
+  rootPath: string;
+  /** Epoch ms the underlying scan was taken. */
+  scannedAt: number;
+  /** Epoch ms the snapshot was saved. */
+  savedAt: number;
+  label: string;
+  nodeCount: number;
+  /** Aggregated total bytes of the scanned root at capture time. */
+  totalSize: number;
+}
+
+export interface SnapshotList {
+  snapshots: SnapshotMeta[];
+}
+
+export type DiffStatus = "added" | "removed" | "grown" | "shrunk";
+
+/** One per-path delta between two snapshots (or snapshot vs current scan). */
+export interface DiffRow {
+  path: string;
+  name: string;
+  status: DiffStatus;
+  oldSize: number;
+  newSize: number;
+  /** newSize - oldSize (can be negative). */
+  delta: number;
+  dir: boolean;
+}
+
+export interface DiffSummary {
+  added: number;
+  removed: number;
+  grown: number;
+  shrunk: number;
+  /** Net byte change across all paths. */
+  netDelta: number;
+  oldTotal: number;
+  newTotal: number;
+  /** Total number of changed rows before the display cap. */
+  rowCount: number;
+  /** True when `rows` was truncated to the server cap. */
+  capped: boolean;
+}
+
+export interface DiffResult {
+  a: SnapshotMeta;
+  b: SnapshotMeta;
+  summary: DiffSummary;
+  rows: DiffRow[];
+}

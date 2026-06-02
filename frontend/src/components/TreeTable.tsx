@@ -7,6 +7,7 @@ import { NodeTooltip } from "./NodeTooltip";
 import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
 import { eqPath, isNoOpMove } from "../lib/agent";
+import { attributeLetters, attributeList } from "../lib/attributes";
 
 const ROW_HEIGHT = 20;
 // Smallest a column may be dragged to, so a header never collapses to nothing.
@@ -38,6 +39,7 @@ export const ALL_COLUMNS: ColumnDef[] = [
   { key: "created",         label: "Creation Date", width: 132, align: "right",  group: "date" },
   { key: "accessed",        label: "Last Accessed", width: 132, align: "right",  group: "date" },
   { key: "modified",        label: "Last Modified", width: 132, align: "right",  group: "date" },
+  { key: "owner",           label: "Owner",         width: 160, align: "left",   group: "extended" },
   { key: "avgFileSize",     label: "Avg. File Size",width: 104, align: "right",  group: "extended" },
   { key: "pathLength",      label: "Path Length",   width: 90,  align: "right",  group: "extended" },
   { key: "dirLevel",        label: "Dir Level",     width: 82,  align: "right",  group: "extended" },
@@ -52,10 +54,6 @@ function folderPathOf(path: string): string {
   return path.replace(/[^/\\]*$/, "") || path;
 }
 
-/** Compact H/R/L attribute string (Hidden / Read-only / Link). */
-function attributesOf(node: NodeRecord): string {
-  return [node.hidden ? "H" : "", node.readonly ? "R" : "", node.link ? "L" : ""].filter(Boolean).join("") || "—";
-}
 
 type MoveItemsResult = { ok: boolean; error?: string };
 
@@ -380,7 +378,8 @@ function TreeTableInner({
         case "type":            content = node.dir ? "Folder" : (node.extension ? node.extension.toUpperCase() : "File"); break;
         case "files":           content = formatCount(node.files); break;
         case "folders":         content = isBundle ? "" : formatCount(node.folders); break;
-        case "attributes":      content = attributesOf(node); break;
+        case "attributes":    { content = attributeLetters(node); const list = attributeList(node); title = list.length ? list.join(", ") : undefined; break; }
+        case "owner":           content = node.owner || "—"; title = node.owner || undefined; break;
         case "created":         content = (node.created ?? 0) > 0 ? formatDate(node.created) : "—"; break;
         case "accessed":        content = (node.accessed ?? 0) > 0 ? formatDate(node.accessed) : "—"; break;
         case "modified":        content = node.modified ? formatDate(node.modified) : ""; break;

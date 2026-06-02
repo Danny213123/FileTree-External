@@ -57,6 +57,8 @@ pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -
         e!(",\"depth\":{}", node.depth);
         e!(",\"errors\":{}", node.errors);
         e!(",\"extension\":"); emit_json_str(&mut buf, &node.extension);
+        e!(",\"owner\":"); emit_json_str(&mut buf, &node.owner);
+        e!(",\"attributes\":{}", node.attributes);
         e!("}}");
 
         // Flush every 8192 nodes to keep the buffer bounded (~3 MB at a time).
@@ -204,6 +206,8 @@ pub(crate) fn write_scan_result_ndjson<W: Write>(w: &mut W, result: &ScanResult)
         e!(",\"depth\":{}", node.depth);
         e!(",\"errors\":{}", node.errors);
         e!(",\"extension\":"); emit_json_str(&mut buf, &node.extension);
+        e!(",\"owner\":"); emit_json_str(&mut buf, &node.owner);
+        e!(",\"attributes\":{}", node.attributes);
         e!("}}");
         buf.push(b'\n');
 
@@ -260,7 +264,7 @@ fn emit_id_array_w(buf: &mut Vec<u8>, ids: &[usize]) {
 
 pub(crate) fn scan_result_to_csv(result: &ScanResult) -> String {
     let mut output = String::from(
-        "Path,Name,Type,Size,Allocated,Files,Folders,PercentOfParent,ModifiedUtc,Hidden,Readonly,Link,Errors\n",
+        "Path,Name,Type,Size,Allocated,Files,Folders,PercentOfParent,ModifiedUtc,Hidden,Readonly,Link,Errors,Owner\n",
     );
     for node in &result.nodes {
         let parent_size = node
@@ -298,9 +302,376 @@ pub(crate) fn scan_result_to_csv(result: &ScanResult) -> String {
         output.push_str(if node.is_link { "true" } else { "false" });
         output.push(',');
         output.push_str(&node.errors.to_string());
+        output.push(',');
+        push_csv_field(&mut output, &node.owner);
         output.push('\n');
     }
     output
+}
+
+// ── Richer report exports (roadmap item #8): HTML, XML, XLSX ──────────────────
+// All three are dependency-free (this crate has no external deps): HTML/XML are
+// hand-written text; XLSX is a hand-built Office-Open-XML package (see
+// `crate::xlsx`). Each reuses the analytics precomputed on `ScanResult::summary`,
+// so a report reflects the same "top files / by type / by age" the UI shows.
+
+/// Human-readable byte size (e.g. `1.50 GB`) for report tables.
+pub(crate) fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.2} {}", UNITS[unit])
+}
+
+fn push_html_escaped(output: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&#39;"),
+            c => output.push(c),
+        }
+    }
+}
+
+fn push_xml_escaped(output: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&apos;"),
+            // XML 1.0 forbids C0 control chars except tab/newline/return.
+            c if (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r' => {}
+            c => output.push(c),
+        }
+    }
+}
+
+/// Indices of the (up to) `limit` largest nodes by size, descending — used for
+/// the "largest entries" table in the HTML report and the rows of the XLSX.
+fn largest_by_size(result: &ScanResult, limit: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..result.nodes.len()).collect();
+    idx.sort_unstable_by(|&a, &b| result.nodes[b].size.cmp(&result.nodes[a].size));
+    idx.truncate(limit);
+    idx
+}
+
+/// Self-contained HTML report: scanned root, totals, analytics (largest folders,
+/// top files, by type, by age, duplicate candidates) and a largest-entries
+/// table. Inline CSS + a "Print / Save as PDF" button, so the same file doubles
+/// as the print-to-PDF path (#8: PDF = print the HTML report).
+pub(crate) fn scan_result_to_html(result: &ScanResult) -> String {
+    const TABLE_CAP: usize = 1000;
+    let root = result.nodes.first();
+    let total_size = root.map(|n| n.size).unwrap_or(0);
+    let total_files = root.map(|n| n.files).unwrap_or(0);
+    let total_folders = root.map(|n| n.folders).unwrap_or(0);
+
+    let mut h = String::with_capacity(64 * 1024);
+    h.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
+    h.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>FileTree Report — ");
+    push_html_escaped(&mut h, &result.root_path);
+    h.push_str("</title><style>");
+    h.push_str(REPORT_CSS);
+    h.push_str("</style></head><body>");
+
+    // Header + actions.
+    h.push_str("<header class=\"rpt-head\"><div><h1>FileTree Report</h1><div class=\"rpt-root\">");
+    push_html_escaped(&mut h, &result.root_path);
+    h.push_str("</div></div><button class=\"rpt-print\" onclick=\"window.print()\">Print / Save as PDF</button></header>");
+
+    // Totals cards.
+    h.push_str("<section class=\"rpt-cards\">");
+    push_card(&mut h, "Total size", &human_bytes(total_size));
+    push_card(&mut h, "Files", &total_files.to_string());
+    push_card(&mut h, "Folders", &total_folders.to_string());
+    push_card(&mut h, "Items scanned", &result.nodes.len().to_string());
+    h.push_str("</section>");
+
+    // Scan metadata.
+    h.push_str("<section class=\"rpt-meta\"><span>Scanned ");
+    push_html_escaped(&mut h, &epoch_ms_to_utc(result.scanned_at_ms));
+    h.push_str(&format!(
+        "</span><span>{} ms</span><span>{} threads</span><span>{} errors</span><span>{} v{}</span></section>",
+        result.elapsed_ms, result.thread_count, result.errors.len(), APP_NAME, APP_VERSION
+    ));
+
+    // Largest folders.
+    if !result.summary.largest_dirs.is_empty() {
+        h.push_str("<h2>Largest folders</h2><table><thead><tr><th>Folder</th><th class=\"num\">Size</th><th class=\"num\">Files</th></tr></thead><tbody>");
+        for &id in &result.summary.largest_dirs {
+            if let Some(node) = result.nodes.get(id) {
+                h.push_str("<tr><td>");
+                push_html_escaped(&mut h, &node.path);
+                h.push_str("</td><td class=\"num\">");
+                h.push_str(&human_bytes(node.size));
+                h.push_str("</td><td class=\"num\">");
+                h.push_str(&node.files.to_string());
+                h.push_str("</td></tr>");
+            }
+        }
+        h.push_str("</tbody></table>");
+    }
+
+    // Top files.
+    if !result.summary.top_files.is_empty() {
+        h.push_str("<h2>Top files</h2><table><thead><tr><th>File</th><th>Folder</th><th class=\"num\">Size</th></tr></thead><tbody>");
+        for &id in &result.summary.top_files {
+            if let Some(node) = result.nodes.get(id) {
+                let parent_path = node
+                    .parent
+                    .and_then(|p| result.nodes.get(p))
+                    .map(|p| p.path.as_str())
+                    .unwrap_or("");
+                h.push_str("<tr><td>");
+                push_html_escaped(&mut h, &node.name);
+                h.push_str("</td><td>");
+                push_html_escaped(&mut h, parent_path);
+                h.push_str("</td><td class=\"num\">");
+                h.push_str(&human_bytes(node.size));
+                h.push_str("</td></tr>");
+            }
+        }
+        h.push_str("</tbody></table>");
+    }
+
+    // By type.
+    if !result.summary.extension_stats.is_empty() {
+        h.push_str("<h2>By type</h2><table><thead><tr><th>Extension</th><th class=\"num\">Size</th><th class=\"num\">Files</th></tr></thead><tbody>");
+        for stat in &result.summary.extension_stats {
+            h.push_str("<tr><td>");
+            push_html_escaped(&mut h, if stat.ext.is_empty() { "(none)" } else { &stat.ext });
+            h.push_str("</td><td class=\"num\">");
+            h.push_str(&human_bytes(stat.bytes));
+            h.push_str("</td><td class=\"num\">");
+            h.push_str(&stat.files.to_string());
+            h.push_str("</td></tr>");
+        }
+        h.push_str("</tbody></table>");
+    }
+
+    // By age.
+    if !result.summary.age_stats.is_empty() {
+        h.push_str("<h2>By age</h2><table><thead><tr><th>Age</th><th class=\"num\">Size</th><th class=\"num\">Files</th></tr></thead><tbody>");
+        for stat in &result.summary.age_stats {
+            h.push_str("<tr><td>");
+            push_html_escaped(&mut h, stat.label);
+            h.push_str("</td><td class=\"num\">");
+            h.push_str(&human_bytes(stat.bytes));
+            h.push_str("</td><td class=\"num\">");
+            h.push_str(&stat.files.to_string());
+            h.push_str("</td></tr>");
+        }
+        h.push_str("</tbody></table>");
+    }
+
+    // Duplicate candidates (only if the scan computed any).
+    if !result.summary.duplicate_candidates.is_empty() {
+        h.push_str("<h2>Duplicate candidates</h2><table><thead><tr><th>Name</th><th class=\"num\">Size each</th><th class=\"num\">Copies</th><th class=\"num\">Wasted</th></tr></thead><tbody>");
+        for group in &result.summary.duplicate_candidates {
+            h.push_str("<tr><td>");
+            push_html_escaped(&mut h, &group.name);
+            h.push_str("</td><td class=\"num\">");
+            h.push_str(&human_bytes(group.size));
+            h.push_str("</td><td class=\"num\">");
+            h.push_str(&group.ids.len().to_string());
+            h.push_str("</td><td class=\"num\">");
+            h.push_str(&human_bytes(group.waste));
+            h.push_str("</td></tr>");
+        }
+        h.push_str("</tbody></table>");
+    }
+
+    // Largest entries table (capped — the analytics above are the headline).
+    let largest = largest_by_size(result, TABLE_CAP);
+    h.push_str("<h2>Largest entries");
+    if result.nodes.len() > largest.len() {
+        h.push_str(&format!(
+            " <span class=\"rpt-note\">(top {} of {})</span>",
+            largest.len(),
+            result.nodes.len()
+        ));
+    }
+    h.push_str("</h2><table><thead><tr><th>Name</th><th>Path</th><th>Type</th><th class=\"num\">Size</th><th>Modified</th><th>Owner</th></tr></thead><tbody>");
+    for &id in &largest {
+        if let Some(node) = result.nodes.get(id) {
+            h.push_str("<tr><td>");
+            push_html_escaped(&mut h, &node.name);
+            h.push_str("</td><td class=\"path\">");
+            push_html_escaped(&mut h, &node.path);
+            h.push_str("</td><td>");
+            h.push_str(if node.is_dir { "Folder" } else { "File" });
+            h.push_str("</td><td class=\"num\">");
+            h.push_str(&human_bytes(node.size));
+            h.push_str("</td><td>");
+            push_html_escaped(&mut h, &epoch_ms_to_utc(node.modified_ms));
+            h.push_str("</td><td>");
+            push_html_escaped(&mut h, &node.owner);
+            h.push_str("</td></tr>");
+        }
+    }
+    h.push_str("</tbody></table>");
+
+    h.push_str("<footer class=\"rpt-foot\">Generated by ");
+    h.push_str(APP_NAME);
+    h.push_str(" v");
+    h.push_str(APP_VERSION);
+    h.push_str("</footer></body></html>");
+    h
+}
+
+const REPORT_CSS: &str = "\
+:root{color-scheme:light}\
+*{box-sizing:border-box}\
+body{margin:0;padding:24px;font:14px/1.5 'Segoe UI',system-ui,sans-serif;color:#1b1f24;background:#f6f8fa}\
+.rpt-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:16px}\
+h1{font-size:22px;margin:0}\
+.rpt-root{color:#57606a;word-break:break-all;font-family:Consolas,monospace}\
+.rpt-print{cursor:pointer;border:1px solid #d0d7de;background:#fff;border-radius:6px;padding:8px 14px;font-size:13px}\
+.rpt-print:hover{background:#f3f4f6}\
+.rpt-cards{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px}\
+.rpt-card{background:#fff;border:1px solid #d8dee4;border-radius:8px;padding:12px 16px;min-width:140px}\
+.rpt-card .lbl{font-size:12px;color:#57606a}\
+.rpt-card .val{font-size:20px;font-weight:600}\
+.rpt-meta{display:flex;flex-wrap:wrap;gap:14px;color:#57606a;font-size:12px;margin-bottom:20px}\
+h2{font-size:16px;margin:24px 0 8px;border-bottom:2px solid #d8dee4;padding-bottom:4px}\
+.rpt-note{font-size:12px;font-weight:400;color:#57606a}\
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d8dee4;border-radius:8px;overflow:hidden;margin-bottom:8px}\
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #eaeef2;font-size:13px}\
+th{background:#f3f4f6;font-weight:600}\
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}\
+td.path{color:#57606a;font-family:Consolas,monospace;font-size:12px;word-break:break-all}\
+tr:last-child td{border-bottom:none}\
+.rpt-foot{margin-top:24px;color:#8b949e;font-size:12px}\
+@media print{body{padding:0;background:#fff}.rpt-print{display:none}table,.rpt-card{border-color:#ccc}h2{page-break-after:avoid}tr{page-break-inside:avoid}}";
+
+fn push_card(output: &mut String, label: &str, value: &str) {
+    output.push_str("<div class=\"rpt-card\"><div class=\"lbl\">");
+    push_html_escaped(output, label);
+    output.push_str("</div><div class=\"val\">");
+    push_html_escaped(output, value);
+    output.push_str("</div></div>");
+}
+
+/// Structured XML serialization of the scan: metadata, the precomputed analytics
+/// summary, and a flat `<node>` list carrying `id`/`parent` references (mirrors
+/// the JSON export's shape, which is robust for arbitrarily deep trees).
+pub(crate) fn scan_result_to_xml(result: &ScanResult) -> String {
+    let mut x = String::with_capacity(result.nodes.len().saturating_mul(160) + 4096);
+    x.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<filetreeScan app=\"");
+    push_xml_escaped(&mut x, APP_NAME);
+    x.push_str("\" version=\"");
+    push_xml_escaped(&mut x, APP_VERSION);
+    x.push_str("\" rootPath=\"");
+    push_xml_escaped(&mut x, &result.root_path);
+    x.push_str(&format!(
+        "\" scannedAtMs=\"{}\" elapsedMs=\"{}\" threadCount=\"{}\" nodeCount=\"{}\" errorCount=\"{}\">",
+        result.scanned_at_ms, result.elapsed_ms, result.thread_count, result.nodes.len(), result.errors.len()
+    ));
+
+    // Analytics summary.
+    x.push_str("<summary>");
+    x.push_str("<byType>");
+    for stat in &result.summary.extension_stats {
+        x.push_str("<ext name=\"");
+        push_xml_escaped(&mut x, &stat.ext);
+        x.push_str(&format!("\" bytes=\"{}\" allocated=\"{}\" files=\"{}\"/>", stat.bytes, stat.allocated, stat.files));
+    }
+    x.push_str("</byType><byAge>");
+    for stat in &result.summary.age_stats {
+        x.push_str("<bucket label=\"");
+        push_xml_escaped(&mut x, stat.label);
+        x.push_str(&format!("\" bytes=\"{}\" files=\"{}\"/>", stat.bytes, stat.files));
+    }
+    x.push_str("</byAge></summary>");
+
+    // Flat node list.
+    x.push_str("<nodes>");
+    for node in &result.nodes {
+        x.push_str("<node id=\"");
+        x.push_str(&node.id.to_string());
+        x.push('"');
+        if let Some(parent) = node.parent {
+            x.push_str(&format!(" parent=\"{parent}\""));
+        }
+        x.push_str(" name=\"");
+        push_xml_escaped(&mut x, &node.name);
+        x.push_str("\" path=\"");
+        push_xml_escaped(&mut x, &node.path);
+        x.push_str(&format!(
+            "\" type=\"{}\" size=\"{}\" allocated=\"{}\" files=\"{}\" folders=\"{}\" depth=\"{}\"",
+            if node.is_dir { "dir" } else { "file" },
+            node.size, node.allocated, node.files, node.folders, node.depth
+        ));
+        x.push_str(&format!(
+            " hidden=\"{}\" readonly=\"{}\" link=\"{}\" modifiedMs=\"{}\"",
+            node.hidden, node.readonly, node.is_link, node.modified_ms
+        ));
+        x.push_str(" extension=\"");
+        push_xml_escaped(&mut x, &node.extension);
+        x.push_str("\" owner=\"");
+        push_xml_escaped(&mut x, &node.owner);
+        x.push_str("\"/>");
+    }
+    x.push_str("</nodes></filetreeScan>");
+    x
+}
+
+/// Build a real `.xlsx` workbook of the scan via the dependency-free writer in
+/// `crate::xlsx`. Capped at the largest `XLSX_ROW_CAP` entries by size to stay
+/// well within Excel's row limit and bound memory (the bytes live in RAM while
+/// the store-ZIP is assembled); the cap is noted to the caller in #8's report.
+pub(crate) fn scan_result_to_xlsx(result: &ScanResult) -> Vec<u8> {
+    use crate::xlsx::Cell;
+    const XLSX_ROW_CAP: usize = 100_000;
+
+    let headers = [
+        "Path", "Name", "Type", "Size", "Allocated", "Files", "Folders",
+        "PercentOfParent", "ModifiedUtc", "Hidden", "Readonly", "Link", "Owner", "Extension",
+    ];
+    let ids = largest_by_size(result, XLSX_ROW_CAP);
+    let mut rows: Vec<Vec<Cell>> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(node) = result.nodes.get(id) else { continue };
+        let parent_size = node
+            .parent
+            .and_then(|p| result.nodes.get(p))
+            .map(|p| p.size)
+            .unwrap_or(node.size);
+        let percent = if parent_size > 0 {
+            (node.size as f64 / parent_size as f64) * 100.0
+        } else {
+            0.0
+        };
+        rows.push(vec![
+            Cell::Text(node.path.clone()),
+            Cell::Text(node.name.clone()),
+            Cell::Text(if node.is_dir { "Directory".into() } else { "File".into() }),
+            Cell::Int(node.size),
+            Cell::Int(node.allocated),
+            Cell::Int(node.files),
+            Cell::Int(node.folders),
+            Cell::Float((percent * 10000.0).round() / 10000.0),
+            Cell::Text(epoch_ms_to_utc(node.modified_ms)),
+            Cell::Text(node.hidden.to_string()),
+            Cell::Text(node.readonly.to_string()),
+            Cell::Text(node.is_link.to_string()),
+            Cell::Text(node.owner.clone()),
+            Cell::Text(node.extension.clone()),
+        ]);
+    }
+    crate::xlsx::workbook("Scan", &headers, &rows)
 }
 
 pub(crate) fn app_config_json(state: &AppState) -> String {
@@ -313,10 +684,11 @@ pub(crate) fn app_config_json(state: &AppState) -> String {
 }
 
 pub(crate) fn drives_json() -> String {
-    // Build list of {root, label} objects.
+    // Build list of {root, label, total, free} objects. total/free are bytes;
+    // 0 means "couldn't be queried" (the UI then hides the capacity bar).
     let drives = enumerate_drives();
     let mut output = String::from("{\"drives\":[");
-    for (index, (root, label)) in drives.iter().enumerate() {
+    for (index, (root, label, total, free)) in drives.iter().enumerate() {
         if index > 0 {
             output.push(',');
         }
@@ -324,6 +696,10 @@ pub(crate) fn drives_json() -> String {
         push_json_string(&mut output, root);
         output.push_str(",\"label\":");
         push_json_string(&mut output, label);
+        output.push_str(",\"total\":");
+        output.push_str(&total.to_string());
+        output.push_str(",\"free\":");
+        output.push_str(&free.to_string());
         output.push('}');
     }
     output.push_str("]}");
@@ -399,8 +775,10 @@ pub(crate) fn special_folders_json() -> String {
     output
 }
 
-/// Returns (root_path, volume_label) for each available drive.
-fn enumerate_drives() -> Vec<(String, String)> {
+/// Returns (root_path, volume_label, total_bytes, free_bytes) for each available
+/// drive. total/free are 0 when the volume's capacity couldn't be queried
+/// (e.g. an empty CD/removable drive), so callers can treat 0 as "unknown".
+fn enumerate_drives() -> Vec<(String, String, u64, u64)> {
     let mut result = Vec::new();
 
     #[cfg(windows)]
@@ -472,16 +850,22 @@ fn enumerate_drives() -> Vec<(String, String)> {
             } else {
                 label
             };
-            result.push((root, format!("{display} ({letter}:)")));
+            // Capacity/free for the used-vs-total bar. Unqueryable volumes (e.g.
+            // an empty CD/removable drive) report 0/0 → UI hides the bar.
+            let (free, total) =
+                crate::preflight::disk_space(std::path::Path::new(&root)).unwrap_or((0, 0));
+            result.push((root, format!("{display} ({letter}:)"), total, free));
         }
     }
 
     #[cfg(not(windows))]
     {
-        result.push(("/".to_string(), "Root (/)".to_string()));
+        let (free, total) =
+            crate::preflight::disk_space(std::path::Path::new("/")).unwrap_or((0, 0));
+        result.push(("/".to_string(), "Root (/)".to_string(), total, free));
         if let Some(home) = env::var_os("HOME") {
             let path = PathBuf::from(home).display().to_string();
-            result.push((path.clone(), format!("Home ({})", path)));
+            result.push((path.clone(), format!("Home ({})", path), 0, 0));
         }
     }
 
