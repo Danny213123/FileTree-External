@@ -23,7 +23,7 @@ export interface AgentApi {
   getNodes: () => NodeRecord[];
   scanFolder: (path: string) => Promise<void>;
   refresh: () => Promise<void>;
-  findDuplicates: (minSizeBytes: number) => Promise<{ groups: { waste: number; files: { path: string; size: number }[] }[] }>;
+  findDuplicates: (minSizeBytes: number, signal?: AbortSignal) => Promise<{ groups: { waste: number; files: { path: string; size: number }[] }[] }>;
   moveItems: (paths: string[], destination: string) => Promise<{ ok: boolean; error?: string }>;
   renameItem: (path: string, newName: string) => Promise<{ ok: boolean; error?: string }>;
   createFolder: (path: string) => Promise<{ ok: boolean; error?: string }>;
@@ -47,16 +47,29 @@ export interface ToolDef {
   };
 }
 
-export const MUTATING_TOOLS = new Set(["move_items", "rename_item", "create_folder", "run_command"]);
+export const MUTATING_TOOLS = new Set(["move_items", "rename_item", "create_folder", "run_command", "recycle_items"]);
 
-// The exact PowerShell recipe the model must use to delete files/folders so they
-// land in the Recycle Bin (recoverable) rather than being destroyed. Embedded in
-// the run_command tool description and the Action agent's system prompt.
-export const RECYCLE_RECIPE = [
-  "Add-Type -AssemblyName Microsoft.VisualBasic",
-  "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('C:\\path\\file.ext','OnlyErrorDialogs','SendToRecycleBin')",
-  "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('C:\\path\\dir','OnlyErrorDialogs','SendToRecycleBin')",
-].join("\n");
+// Build ONE resilient PowerShell batch that sends every given path to the
+// Recycle Bin (recoverable). It continues past per-item failures, handles file
+// vs folder, collects the failures, and exits non-zero if any item failed — so
+// the model gets a real exit code instead of fabricating "moved to trash".
+// Each path is single-quote-escaped (' -> '') for safe embedding in the array.
+export function buildRecycleCommand(paths: string[]): string {
+  const escaped = paths.map((p) => `'${p.replace(/'/g, "''")}'`).join(",");
+  return [
+    "Add-Type -AssemblyName Microsoft.VisualBasic",
+    `$paths = @(${escaped})`,
+    "$failed = @()",
+    "foreach ($p in $paths) {",
+    "  try {",
+    "    if (Test-Path -LiteralPath $p -PathType Container) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p,'OnlyErrorDialogs','SendToRecycleBin') }",
+    "    elseif (Test-Path -LiteralPath $p) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,'OnlyErrorDialogs','SendToRecycleBin') }",
+    "    else { $failed += \"$p (not found)\" }",
+    "  } catch { $failed += \"$p ($($_.Exception.Message))\" }",
+    "}",
+    "if ($failed.Count) { Write-Error ('Failed: ' + ($failed -join '; ')); exit 1 } else { Write-Output \"Recycled $($paths.Count) item(s).\"; exit 0 }",
+  ].join("\n");
+}
 
 // ── Read-only tools (Search agent) ───────────────────────────
 export const SEARCH_TOOLS: ToolDef[] = [
@@ -172,12 +185,25 @@ export const ACTION_TOOLS: ToolDef[] = [
   {
     type: "function",
     function: {
+      name: "recycle_items",
+      description:
+        "Delete files and/or folders by sending them to the Windows Recycle Bin (recoverable). This is the ONLY way to delete — NEVER use run_command, Remove-Item, or rm to delete anything. Pass EVERY path you want to delete in a SINGLE call via the `paths` array (do NOT call this once per file); they are shown to the user as ONE approval card and recycled together, and you get back a real exit code (0 = all recycled). Never claim a file was deleted unless this returns exit 0.",
+      parameters: {
+        type: "object",
+        properties: {
+          paths: { type: "array", items: { type: "string" }, description: "Absolute paths of every file/folder to send to the Recycle Bin — include them all in this one call." },
+        },
+        required: ["paths"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "run_command",
       description:
-        "Run a shell command on the user's Windows machine (PowerShell by default). Every command is shown to the user for explicit approval before it runs, and you get back the real exit code plus captured stdout/stderr. Use this for general CLI work AND for deletions.\n" +
-        "To DELETE a file or folder, you MUST send it to the Recycle Bin (recoverable) using this exact recipe — never use Remove-Item or rm, and never claim something was deleted unless this returns exit 0:\n" +
-        RECYCLE_RECIPE +
-        "\nReplace the example paths with the real absolute path(s) from the scan; call run_command once per item or chain the lines for several items.",
+        "Run a shell command on the user's Windows machine (PowerShell by default). Every command is shown to the user for explicit approval before it runs, and you get back the real exit code plus captured stdout/stderr. Use this for general (non-delete) CLI work. " +
+        "For deletions use recycle_items, never run_command (and never use Remove-Item or rm).",
       parameters: {
         type: "object",
         properties: {
@@ -226,18 +252,41 @@ function mb(bytes: number): number {
 }
 
 // ── Path helpers (string-only, no fs) ────────────────────────
-function parentOf(p: string): string {
+// Windows-safe normalization shared by every path comparison below: unify
+// separators (/ → \), drop trailing separators, and lowercase (NTFS/Windows are
+// case-insensitive). Comparing normalized forms is what makes the move guards
+// reliable regardless of how a path was typed or which slash style it used.
+export function normPath(p: string): string {
+  return p.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+export function parentOf(p: string): string {
   const norm = p.replace(/[\\/]+$/, "");
   const idx = Math.max(norm.lastIndexOf("\\"), norm.lastIndexOf("/"));
   return idx > 0 ? norm.slice(0, idx) : norm;
 }
-function eqPath(a: string, b: string): boolean {
-  return a.replace(/[\\/]+$/, "").toLowerCase() === b.replace(/[\\/]+$/, "").toLowerCase();
+export function eqPath(a: string, b: string): boolean {
+  return normPath(a) === normPath(b);
 }
-function underPath(child: string, dir: string): boolean {
-  const c = child.replace(/[\\/]+$/, "").toLowerCase();
-  const d = dir.replace(/[\\/]+$/, "").toLowerCase();
-  return c === d || c.startsWith(d + "\\") || c.startsWith(d + "/");
+export function underPath(child: string, dir: string): boolean {
+  const c = normPath(child);
+  const d = normPath(dir);
+  return c === d || c.startsWith(d + "\\");
+}
+// True when moving `source` into `destination` would do nothing meaningful — or
+// would be outright unsafe. Returns true when ANY of these hold:
+//   • source IS the destination (dropping a folder onto itself),
+//   • the destination lives inside the source (moving into your own descendant),
+//   • the source already sits directly in the destination (same-folder no-op).
+// Case-insensitive and separator-normalized so it behaves on Windows. Shared by
+// the tree drag, the treemap drag, and the "Move to…" action so they all refuse
+// the exact same no-ops instead of each guarding differently (or not at all).
+export function isNoOpMove(source: string, destination: string): boolean {
+  if (!source || !destination) return false;
+  return (
+    eqPath(source, destination) ||
+    underPath(destination, source) ||
+    eqPath(parentOf(source), destination)
+  );
 }
 
 // Two-pointer wildcard match (* and ?), mirrors the Rust backend matcher.
@@ -329,7 +378,7 @@ export function describeToolCall(name: string, rawArgs: unknown): ToolCallView {
 
 // Execute a tool call and return a compact JSON-serializable result to feed back
 // to the model as a role:"tool" message.
-export async function executeTool(name: string, args: Record<string, unknown>, api: AgentApi): Promise<unknown> {
+export async function executeTool(name: string, args: Record<string, unknown>, api: AgentApi, signal?: AbortSignal): Promise<unknown> {
   switch (name) {
     case "get_stats": {
       const result = api.getScanResult();
@@ -390,7 +439,7 @@ export async function executeTool(name: string, args: Record<string, unknown>, a
     }
     case "find_duplicates": {
       const minBytes = Math.max(0, (Number(args.min_size_mb) || 1) * 1e6);
-      const res = await api.findDuplicates(minBytes);
+      const res = await api.findDuplicates(minBytes, signal);
       const groups = res.groups.slice(0, 20).map((g) => ({
         waste_mb: mb(g.waste),
         files: g.files.map((f) => f.path),
@@ -414,6 +463,12 @@ export async function executeTool(name: string, args: Record<string, unknown>, a
       const paths = (args.paths as string[]) ?? [];
       const destination = String(args.destination || "");
       return await api.moveItems(paths, destination);
+    }
+    case "recycle_items": {
+      const raw = args.paths;
+      const paths = Array.isArray(raw) ? raw.map((p) => String(p)).filter((p) => p.trim()) : [];
+      if (!paths.length) return { ok: false, error: "paths required" };
+      return await api.runCommand(buildRecycleCommand(paths));
     }
     case "run_command": {
       const command = String(args.command || "");

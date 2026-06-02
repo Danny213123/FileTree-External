@@ -6,7 +6,6 @@
 import {
   ACTION_TOOLS,
   SEARCH_TOOLS,
-  RECYCLE_RECIPE,
   executeTool,
   formatFindings,
   scanContext,
@@ -110,7 +109,7 @@ export function searchSpec(api: AgentApi): AgentSpec {
       scanContext(api),
     ].join("\n"),
     runTool: async (name, args, ctx) => {
-      const result = await executeTool(name, args, ctx.api);
+      const result = await executeTool(name, args, ctx.api, ctx.signal);
       return { result, summary: summarizeToolResult(name, result), status: stepStatusOf(result) };
     },
     // Findings are only real if a read-only tool actually ran. If the model
@@ -135,11 +134,10 @@ export function actionSpec(api: AgentApi): AgentSpec {
     tools: ACTION_TOOLS,
     systemPrompt: [
       "You are the Action agent inside FileTree, a disk-usage explorer.",
-      "You perform file changes: move, rename, create folders, and run shell commands.",
-      "You change files ONLY by calling the tools (move_items, rename_item, create_folder, run_command). Never write a sentence claiming a file was moved, deleted, renamed, or that a command ran — only a real tool call counts. If you have not called the tool, nothing has happened.",
-      "To DELETE files or folders, call run_command with this exact PowerShell recipe so they go to the Recycle Bin (recoverable) — never claim a file was deleted unless run_command returns exit code 0:",
-      RECYCLE_RECIPE,
-      "Replace the example paths with the real absolute path(s) from your task. Do not use Remove-Item or rm for deletions.",
+      "You perform file changes: move, delete (recycle), rename, create folders, and run shell commands.",
+      "You change files ONLY by calling the tools (move_items, recycle_items, rename_item, create_folder, run_command). Never write a sentence claiming a file was moved, deleted, renamed, or that a command ran — only a real tool call counts. If you have not called the tool, nothing has happened.",
+      "To DELETE files or folders, call recycle_items ONCE, passing ALL of the absolute paths to delete in its `paths` array. They go to the Recycle Bin (recoverable), the user sees a SINGLE approval card for the whole batch, and you get back a real exit code — never claim anything was deleted unless recycle_items returns exit code 0. Do NOT delete with run_command/Remove-Item/rm, and do NOT call recycle_items once per file.",
+      "Use run_command only for general (non-delete) shell work.",
       "Every action is shown to the user for explicit approval before it runs, so call tools directly with precise absolute Windows paths.",
       "Use ONLY the exact absolute paths given in your task. If your task does not contain a concrete absolute path, do NOT guess or pick a file yourself — reply that an explicit path is required.",
       "Only perform the changes described in your task. Do not invent extra deletions or run unrelated commands.",
@@ -148,7 +146,7 @@ export function actionSpec(api: AgentApi): AgentSpec {
       scanContext(api),
     ].join("\n"),
     runTool: async (name, args, ctx) => {
-      const result = await executeTool(name, args, ctx.api);
+      const result = await executeTool(name, args, ctx.api, ctx.signal);
       return { result, summary: summarizeToolResult(name, result), status: stepStatusOf(result) };
     },
   };
@@ -201,6 +199,7 @@ export function orchestratorSpec(api: AgentApi, attachedContext: string): AgentS
       "Do not narrate intentions like 'I will investigate' without acting. If you decide a step is needed, call the tool in that same turn — describing it is not doing it.",
       "To change files (move, delete, rename, create folder) call delegate_to_action. NEVER ask the user to confirm a change in chat, and NEVER ask them to retype, paste, or supply file paths — every proposed change is shown to the user as an on-screen approval card that they Approve or Reject, so just call delegate_to_action directly when a change is warranted. When you delegate an action you MUST include the exact absolute path(s) copied verbatim from the Search agent's findings — never delegate a vague action such as 'delete the largest file', and never propose deleting or moving a file you have not seen in Search findings. If the user rejects, acknowledge it and stop; do not retry the same action.",
       "Workflow: (1) briefly state your plan, (2) call delegate_to_search (or delegate_to_action) with one focused, self-contained task, (3) wait for the result, delegating again if needed, (4) give a clear, concise final answer in plain text with no tool call. Do not fabricate paths, sizes, or results.",
+      "After a delete or move action SUCCEEDS, do NOT automatically re-run a duplicate search (or any other search) just to double-check your own work. If the Action agent's report shows the targeted files were recycled/moved (exit code 0), summarize what was done and finalize with plain text. Only delegate_to_search again if the action failed or only partially succeeded, or the user explicitly asks for a fresh scan.",
       "Use absolute Windows paths exactly as they appear in the findings the Search agent returns.",
       attachedContext ? "\nUser-attached context:\n" + attachedContext : "",
       "",

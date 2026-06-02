@@ -51,6 +51,15 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
     };
     let hash_cache = load_hash_cache(&hash_cache_path);
 
+    // Per-session local auth token: Electron mints a random token at startup and
+    // passes it to this process via FILETREE_AUTH_TOKEN (out of band — never over
+    // HTTP), and to the renderer via IPC, so only the app can drive the
+    // destructive mutation routes. A blank/absent value means "no token" (e.g. a
+    // standalone dev launch), and those routes then fall back to POST-only.
+    let auth_token = std::env::var("FILETREE_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+
     let state = Arc::new(AppState {
         initial_path,
         last_scan: Mutex::new(None),
@@ -62,6 +71,7 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
         ignore_list_path,
         hash_cache: Mutex::new(hash_cache),
         hash_cache_path,
+        auth_token,
     });
 
     println!("{} is running at http://127.0.0.1:{port}", APP_NAME);
@@ -89,6 +99,20 @@ fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
     }
+}
+
+/// Length-and-content compare in constant time, so a token check can't be
+/// brute-forced by timing. Returns true only when both byte slices are equal.
+fn tokens_match(provided: &str, expected: &str) -> bool {
+    let (a, b) = (provided.as_bytes(), expected.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 fn remove_after_copy(path: &Path) -> sio::Result<()> {
@@ -141,6 +165,14 @@ fn rename_or_copy_remove(src: &Path, dst: &Path) -> sio::Result<()> {
     match fs::rename(src, dst) {
         Ok(_) => Ok(()),
         Err(rename_error) => {
+            // A failed rename here means a cross-volume (or cross-device) move,
+            // so we fall back to copy + remove. Pre-flight the destination
+            // drive's free space first: never start a copy we can't finish.
+            if let Some(dest_dir) = dst.parent() {
+                if let Err(message) = crate::preflight::ensure_space_for_copy(src, dest_dir) {
+                    return Err(sio::Error::new(sio::ErrorKind::Other, message));
+                }
+            }
             copy_path_recursive(src, dst).map_err(|copy_error| {
                 sio::Error::new(
                     copy_error.kind(),
@@ -517,6 +549,24 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
 
     let (route, query) = split_target(&request.target);
 
+    // Destructive routes mutate the filesystem or run shell commands. They are
+    // POST-only — a bare `GET /api/delete?path=...` from any local process (or a
+    // drive-by localhost navigation/<img> request) must never trigger them — AND,
+    // when the server was started with a session token, they require a matching
+    // `X-FileTree-Token` header. Electron mints that token at startup, hands it
+    // to this process via the FILETREE_AUTH_TOKEN env var and to the renderer via
+    // IPC (out of band — the token never travels over HTTP, so scraping `GET /`
+    // can't reveal it). This is the lockdown for gaps #2/#18.
+    const DESTRUCTIVE_ROUTES: [&str; 6] = [
+        "/api/delete",
+        "/api/move",
+        "/api/move-items",
+        "/api/rename",
+        "/api/dupes-action",
+        "/api/run-command",
+    ];
+    let is_destructive = DESTRUCTIVE_ROUTES.contains(&route.as_str());
+
     // Allow POST for bookmarks, settings, and the mutating Duplicates routes; all
     // others are GET-only. The Duplicates delete/move/copy/make-ref/ignore/hash
     // endpoints are POST (ignore-list clear is DELETE) and were previously
@@ -527,9 +577,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         "/api/dupes-hash", "/api/dupes-action", "/api/dupes-make-ref", "/api/dupes-cancel",
         "/api/dupes-ignore", "/api/run-command",
     ];
-    let method_allowed = request.method == "GET"
-        || (request.method == "POST" && post_routes.contains(&route.as_str()))
-        || (request.method == "DELETE" && route.as_str() == "/api/dupes-ignore");
+    let method_allowed = if is_destructive {
+        // No GET fall-through for destructive routes.
+        request.method == "POST"
+    } else {
+        request.method == "GET"
+            || (request.method == "POST" && post_routes.contains(&route.as_str()))
+            || (request.method == "DELETE" && route.as_str() == "/api/dupes-ignore")
+    };
     if !method_allowed {
         respond_text(
             &mut stream,
@@ -538,6 +593,24 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             "Method not supported for this route",
         )?;
         return Ok(());
+    }
+
+    // Token gate: enforced on destructive routes whenever a session token was
+    // configured (always true under Electron). A standalone/dev launch with no
+    // token configured keeps the POST-only protection above but skips this check.
+    if is_destructive {
+        if let Some(expected) = state.auth_token.as_deref() {
+            let provided = request.auth_token.as_deref().unwrap_or("");
+            if !tokens_match(provided, expected) {
+                respond_text(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "Missing or invalid FileTree session token",
+                )?;
+                return Ok(());
+            }
+        }
     }
     match route.as_str() {
         "/" | "/index.html" => respond_bytes(
@@ -1209,11 +1282,34 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 return respond_text(&mut stream, 400, "Bad request", "Missing path");
             };
             let path_buf = PathBuf::from(path);
-            let delete_result = if path_buf.is_dir() {
-                fs::remove_dir_all(&path_buf)
+            // Recoverable by default: route deletes through the Recycle Bin
+            // (shared `recycle_path`, which recurses directories) unless the
+            // caller explicitly opted into a permanent delete (?permanent=1|true).
+            // The client already sends this param; the server previously ignored
+            // it and ALWAYS did a permanent `fs::remove_*` — the data-loss path
+            // this closes.
+            let permanent = query
+                .get("permanent")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let delete_result = if permanent {
+                crate::recycle::delete_path_permanent(&path_buf)
             } else {
-                fs::remove_file(&path_buf)
+                crate::recycle::recycle_path(&path_buf)
             };
+            // Audit every delete (recoverable or not) for forensics + future undo.
+            let err_text = delete_result
+                .as_ref()
+                .err()
+                .map(|e| crate::preflight::describe_fs_error(e, &path_buf));
+            crate::audit::record(crate::audit::Entry {
+                op: if permanent { "permanent-delete" } else { "delete" },
+                disposition: if permanent { "permanent" } else { "recycle" },
+                src: std::slice::from_ref(path),
+                error: err_text.as_deref(),
+                by: "server",
+                ..Default::default()
+            });
             match delete_result {
                 Ok(_) => {
                     // Invalidate cache for the parent directory
@@ -1227,7 +1323,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 }
                 Err(error) => {
                     let mut body = String::from("{\"error\":");
-                    push_json_string(&mut body, &error.to_string());
+                    push_json_string(
+                        &mut body,
+                        &crate::preflight::describe_fs_error(&error, &path_buf),
+                    );
                     body.push('}');
                     respond_json(&mut stream, 400, "Bad request", &body)
                 }
@@ -1258,7 +1357,31 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 return respond_text(&mut stream, 400, "Bad request", "Missing path");
             };
             let path_buf = PathBuf::from(path);
-            match fs::create_dir(&path_buf) {
+            // Path hygiene: reject reserved names / invalid chars / over-long
+            // paths up front with a clear message (Phase 3).
+            if let Some(name) = path_buf.file_name().and_then(|n| n.to_str()) {
+                if let Err(message) = crate::preflight::validate_name(name) {
+                    return respond_text(&mut stream, 400, "Bad request", &message);
+                }
+            }
+            if let Err(message) = crate::preflight::validate_path_length(&path_buf) {
+                return respond_text(&mut stream, 400, "Bad request", &message);
+            }
+            // create_dir_all (was create_dir): create missing intermediate
+            // directories and treat an already-existing folder as success.
+            let mkdir_result = fs::create_dir_all(&path_buf);
+            let err_text = mkdir_result
+                .as_ref()
+                .err()
+                .map(|e| crate::preflight::describe_fs_error(e, &path_buf));
+            crate::audit::record(crate::audit::Entry {
+                op: "mkdir",
+                dst: path,
+                error: err_text.as_deref(),
+                by: "server",
+                ..Default::default()
+            });
+            match mkdir_result {
                 Ok(_) => {
                     if let Some(parent) = path_buf.parent() {
                         invalidate_scan_cache(
@@ -1270,7 +1393,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 }
                 Err(error) => {
                     let mut body = String::from("{\"error\":");
-                    push_json_string(&mut body, &error.to_string());
+                    push_json_string(
+                        &mut body,
+                        &crate::preflight::describe_fs_error(&error, &path_buf),
+                    );
                     body.push('}');
                     respond_json(&mut stream, 400, "Bad request", &body)
                 }
@@ -1280,21 +1406,40 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let (Some(src), Some(dst)) = (query.get("src"), query.get("dst")) else {
                 return respond_text(&mut stream, 400, "Bad request", "Missing src or dst");
             };
-            match fs::rename(src, dst) {
+            let src_path = Path::new(src);
+            let dst_path = Path::new(dst);
+            // Honor the cross-volume free-space pre-flight + copy fallback.
+            let move_result = rename_or_copy_remove(src_path, dst_path);
+            let err_text = move_result
+                .as_ref()
+                .err()
+                .map(|e| crate::preflight::describe_fs_error(e, src_path));
+            crate::audit::record(crate::audit::Entry {
+                op: "move",
+                src: std::slice::from_ref(src),
+                dst,
+                error: err_text.as_deref(),
+                by: "server",
+                ..Default::default()
+            });
+            match move_result {
                 Ok(_) => {
                     // Invalidate cache for both source and destination parents
                     let mut cache = state.scan_cache.lock().expect("scan_cache lock");
-                    if let Some(p) = Path::new(src).parent() {
+                    if let Some(p) = src_path.parent() {
                         invalidate_scan_cache(&mut cache, &p.to_string_lossy());
                     }
-                    if let Some(p) = Path::new(dst).parent() {
+                    if let Some(p) = dst_path.parent() {
                         invalidate_scan_cache(&mut cache, &p.to_string_lossy());
                     }
                     respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
                 }
                 Err(error) => {
                     let mut body = String::from("{\"error\":");
-                    push_json_string(&mut body, &error.to_string());
+                    push_json_string(
+                        &mut body,
+                        &crate::preflight::describe_fs_error(&error, src_path),
+                    );
                     body.push('}');
                     respond_json(&mut stream, 400, "Bad request", &body)
                 }
@@ -1335,15 +1480,34 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             if path.is_empty() || new_name.is_empty() {
                 return respond_text(&mut stream, 400, "Bad request", "Missing path or newName");
             }
-            if new_name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
-                return respond_text(&mut stream, 400, "Bad request", "Invalid characters in newName");
+            // Path hygiene (Phase 3): reserved names, invalid chars, trailing
+            // dot/space — a superset of the previous bare character check.
+            if let Err(message) = crate::preflight::validate_name(&new_name) {
+                return respond_text(&mut stream, 400, "Bad request", &message);
             }
             let src = PathBuf::from(&path);
             let Some(parent) = src.parent() else {
                 return respond_text(&mut stream, 400, "Bad request", "Path has no parent");
             };
             let dst = parent.join(&new_name);
-            match fs::rename(&src, &dst) {
+            if let Err(message) = crate::preflight::validate_path_length(&dst) {
+                return respond_text(&mut stream, 400, "Bad request", &message);
+            }
+            let rename_result = fs::rename(&src, &dst);
+            let dst_str = dst.to_string_lossy().to_string();
+            let err_text = rename_result
+                .as_ref()
+                .err()
+                .map(|e| crate::preflight::describe_fs_error(e, &src));
+            crate::audit::record(crate::audit::Entry {
+                op: "rename",
+                src: std::slice::from_ref(&path),
+                dst: &dst_str,
+                error: err_text.as_deref(),
+                by: "server",
+                ..Default::default()
+            });
+            match rename_result {
                 Ok(_) => {
                     invalidate_scan_cache(
                         &mut state.scan_cache.lock().expect("scan_cache lock"),
@@ -1353,7 +1517,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 }
                 Err(error) => {
                     let mut body = String::from("{\"error\":");
-                    push_json_string(&mut body, &error.to_string());
+                    push_json_string(
+                        &mut body,
+                        &crate::preflight::describe_fs_error(&error, &src),
+                    );
                     body.push('}');
                     respond_json(&mut stream, 400, "Bad request", &body)
                 }
@@ -1401,6 +1568,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     }
                 }
                 let target = dest_buf.join(&name);
+                let target_str = target.to_string_lossy().to_string();
+
+                // Path hygiene (Phase 3): reject an over-long destination path
+                // before touching anything, with a clear message.
+                if let Err(message) = crate::preflight::validate_path_length(&target) {
+                    errors.push(format!("{p}: {message}"));
+                    continue;
+                }
 
                 // The very same file already lives here -> nothing to do.
                 if paths_refer_to_same_file(&src, &target) {
@@ -1408,22 +1583,46 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     continue;
                 }
 
-                let move_result = if target.exists() {
+                // Resolve the actual destination and run the move per the
+                // chosen conflict mode. `actual_dst` is what we audit (it differs
+                // from `target` in keep-both).
+                let (actual_dst, move_result) = if target.exists() {
                     match conflict.as_str() {
                         "skip" => {
                             skipped.push(p.clone());
                             continue;
                         }
                         "replace" => {
-                            if let Err(e) = remove_after_copy(&target) {
-                                errors.push(format!("{p}: could not replace existing item: {e}"));
+                            // Recycle (don't permanently nuke) the item being
+                            // overwritten so an accidental replace stays
+                            // recoverable from the Recycle Bin. Audit that delete.
+                            let recycle_result = crate::recycle::recycle_path(&target);
+                            let recycle_err = recycle_result
+                                .as_ref()
+                                .err()
+                                .map(|e| crate::preflight::describe_fs_error(e, &target));
+                            crate::audit::record(crate::audit::Entry {
+                                op: "recycle",
+                                disposition: "recycle",
+                                conflict: "replace",
+                                src: std::slice::from_ref(&target_str),
+                                error: recycle_err.as_deref(),
+                                by: "server",
+                                ..Default::default()
+                            });
+                            if let Err(e) = recycle_result {
+                                errors.push(format!(
+                                    "{p}: could not replace existing item: {}",
+                                    crate::preflight::describe_fs_error(&e, &target)
+                                ));
                                 continue;
                             }
-                            rename_or_copy_remove(&src, &target)
+                            (target.clone(), rename_or_copy_remove(&src, &target))
                         }
                         "keep-both" => {
                             let unique = unique_target(&dest_buf, &name);
-                            rename_or_copy_remove(&src, &unique)
+                            let result = rename_or_copy_remove(&src, &unique);
+                            (unique, result)
                         }
                         _ => {
                             // Detect mode: report the collision, touch nothing.
@@ -1432,17 +1631,38 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         }
                     }
                 } else {
-                    rename_or_copy_remove(&src, &target)
+                    (target.clone(), rename_or_copy_remove(&src, &target))
                 };
 
+                let actual_dst_str = actual_dst.to_string_lossy().to_string();
                 match move_result {
                     Ok(()) => {
+                        crate::audit::record(crate::audit::Entry {
+                            op: "move",
+                            conflict: &conflict,
+                            src: std::slice::from_ref(p),
+                            dst: &actual_dst_str,
+                            by: "server",
+                            ..Default::default()
+                        });
                         moved.push(p.clone());
                         if let Some(parent) = src.parent() {
                             touched_parents.push(parent.to_path_buf());
                         }
                     }
-                    Err(e) => errors.push(format!("{p}: {e}")),
+                    Err(e) => {
+                        let message = crate::preflight::describe_fs_error(&e, &src);
+                        crate::audit::record(crate::audit::Entry {
+                            op: "move",
+                            conflict: &conflict,
+                            src: std::slice::from_ref(p),
+                            dst: &actual_dst_str,
+                            error: Some(message.as_str()),
+                            by: "server",
+                            ..Default::default()
+                        });
+                        errors.push(format!("{p}: {message}"));
+                    }
                 }
             }
             touched_parents.push(dest_buf.clone());
@@ -1798,6 +2018,7 @@ fn read_http_request(stream: &TcpStream) -> sio::Result<HttpRequest> {
         .to_string();
 
     let mut content_length: usize = 0;
+    let mut auth_token: Option<String> = None;
     let mut line = String::new();
     loop {
         line.clear();
@@ -1810,6 +2031,13 @@ fn read_http_request(stream: &TcpStream) -> sio::Result<HttpRequest> {
         let lower = line.to_ascii_lowercase();
         if let Some(val) = lower.strip_prefix("content-length:") {
             content_length = val.trim().parse().unwrap_or(0);
+        } else if lower.starts_with("x-filetree-token:") {
+            // Preserve the original (case-sensitive) value; only the header NAME
+            // is matched case-insensitively. Split on the raw line so the token
+            // bytes aren't lowercased.
+            if let Some(val) = line.splitn(2, ':').nth(1) {
+                auth_token = Some(val.trim().to_string());
+            }
         }
     }
 
@@ -1825,6 +2053,7 @@ fn read_http_request(stream: &TcpStream) -> sio::Result<HttpRequest> {
         method,
         target,
         body,
+        auth_token,
     })
 }
 

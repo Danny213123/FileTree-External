@@ -1098,108 +1098,224 @@ pub(crate) fn reprioritize(groups: &mut [DupeGroupV2], criterion: ReprioritizeCr
 
 // ── Actions ─────────────────────────────────────────────────────────────────
 
-#[cfg(windows)]
-fn recycle_file(path: &Path) -> io::Result<()> {
-    use std::ffi::OsStr;
-    use std::iter::once;
-    use std::os::windows::ffi::OsStrExt;
-
-    // SHFileOperation requires a double-null-terminated wide string
-    let mut wide: Vec<u16> = OsStr::new(path).encode_wide().chain(once(0)).chain(once(0)).collect();
-
-    #[repr(C)]
-    #[allow(non_snake_case)]
-    struct SHFILEOPSTRUCTW {
-        hwnd: *mut std::ffi::c_void,
-        wFunc: u32,
-        pFrom: *const u16,
-        pTo: *const u16,
-        fFlags: u16,
-        fAnyOperationsAborted: i32,
-        hNameMappings: *mut std::ffi::c_void,
-        lpszProgressTitle: *const u16,
-    }
-
-    #[link(name = "shell32")]
-    unsafe extern "system" {
-        fn SHFileOperationW(lpFileOp: *mut SHFILEOPSTRUCTW) -> i32;
-    }
-
-    const FO_DELETE: u32 = 0x0003;
-    const FOF_ALLOWUNDO: u16 = 0x0040;
-    const FOF_NOCONFIRMATION: u16 = 0x0010;
-    const FOF_SILENT: u16 = 0x0004;
-
-    let mut op = SHFILEOPSTRUCTW {
-        hwnd: std::ptr::null_mut(),
-        wFunc: FO_DELETE,
-        pFrom: wide.as_mut_ptr(),
-        pTo: std::ptr::null(),
-        fFlags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT,
-        fAnyOperationsAborted: 0,
-        hNameMappings: std::ptr::null_mut(),
-        lpszProgressTitle: std::ptr::null(),
-    };
-
-    let ret = unsafe { SHFileOperationW(&mut op) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(ret))
-    }
-}
-
-#[cfg(not(windows))]
-fn recycle_file(path: &Path) -> io::Result<()> {
-    fs::remove_file(path)
-}
-
+/// Delete each path. Recoverable by default (Recycle Bin via the shared
+/// `recycle_path`, which recurses directories), permanent only when the caller
+/// explicitly asked for it. Both branches handle files AND directories — the
+/// old code used `fs::remove_file` only, so a selected duplicate *folder* (or a
+/// permanent delete of one) silently failed.
 pub(crate) fn action_delete(paths: &[PathBuf], permanent: bool) -> Vec<String> {
     let mut errors = Vec::new();
     for path in paths {
         let result = if permanent {
-            fs::remove_file(path)
+            crate::recycle::delete_path_permanent(path)
         } else {
-            recycle_file(path)
+            crate::recycle::recycle_path(path)
         };
+        // Audit every delete (Phase 5) for forensics + future undo.
+        let path_str = path.to_string_lossy().to_string();
+        let err_text = result
+            .as_ref()
+            .err()
+            .map(|e| crate::preflight::describe_fs_error(e, path));
+        crate::audit::record(crate::audit::Entry {
+            op: if permanent { "permanent-delete" } else { "delete" },
+            disposition: if permanent { "permanent" } else { "recycle" },
+            src: std::slice::from_ref(&path_str),
+            error: err_text.as_deref(),
+            by: "server",
+            ..Default::default()
+        });
         if let Err(e) = result {
-            errors.push(format!("{}: {}", path.display(), e));
+            errors.push(crate::preflight::describe_fs_error(&e, path));
         }
     }
     errors
 }
 
+/// Canonicalized "same on-disk object?" check. Guards against copying a file
+/// onto itself (which `fs::copy` would truncate to zero bytes — silent data
+/// loss) and against treating a same-file move as a collision.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// True when the destination lands inside `src_dir` itself (moving/copying a
+/// directory into its own subtree). `dst` usually doesn't exist yet, so its
+/// PARENT is canonicalized and compared against the source.
+fn dest_inside_dir(src_dir: &Path, dst: &Path) -> bool {
+    if let (Ok(s), Some(parent)) = (fs::canonicalize(src_dir), dst.parent()) {
+        if let Ok(p) = fs::canonicalize(parent) {
+            return p == s || p.starts_with(&s);
+        }
+    }
+    false
+}
+
+/// If `dst` is free, return it; otherwise append " (2)", " (3)", … before the
+/// extension (the Explorer "Keep both" rule) so an existing item is NEVER
+/// silently overwritten — the gap the old `fs::copy` clobber left open.
+fn unique_dst(dst: &Path) -> PathBuf {
+    if !dst.exists() {
+        return dst.to_path_buf();
+    }
+    let parent = dst
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = dst
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = dst.extension().map(|e| e.to_string_lossy().to_string());
+    let mut n: u32 = 2;
+    loop {
+        let candidate_name = match &ext {
+            Some(ext) => format!("{stem} ({n}).{ext}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = parent.join(candidate_name);
+        if !candidate.exists() || n >= 9999 {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Move each `src` to `dst`. Adds no-op / self-descendant guards and keep-both
+/// collision handling (an existing target is never silently clobbered), then
+/// tries an atomic rename, falling back to copy + remove for a cross-device move.
 pub(crate) fn action_move(src_dst: &[(PathBuf, PathBuf)]) -> Vec<String> {
     let mut errors = Vec::new();
     for (src, dst) in src_dst {
+        if !src.exists() {
+            errors.push(format!("{}: source does not exist", src.display()));
+            continue;
+        }
+        // Source already IS the destination object → nothing to do.
+        if same_file(src, dst) {
+            continue;
+        }
+        if src.is_dir() && dest_inside_dir(src, dst) {
+            errors.push(format!(
+                "{}: cannot move a folder into itself or one of its descendants",
+                src.display()
+            ));
+            continue;
+        }
         if let Some(parent) = dst.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 errors.push(format!("{}: {}", dst.display(), e));
                 continue;
             }
         }
-        // Try atomic rename first; fall back to copy+remove for cross-device
-        let result = fs::rename(src, dst).or_else(|_| {
-            fs::copy(src, dst).and_then(|_| fs::remove_file(src))
-        });
-        if let Err(e) = result {
-            errors.push(format!("{}: {}", src.display(), e));
+        // Keep-both on collision: route to a unique name rather than overwrite.
+        let target = if dst.exists() { unique_dst(dst) } else { dst.clone() };
+        // Try atomic rename first; fall back to copy + remove for cross-device.
+        // Pre-flight the destination's free space before starting a copy we
+        // might not be able to finish (Phase 3).
+        let result: io::Result<()> = match fs::rename(src, &target) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                let dest_dir = target.parent().unwrap_or_else(|| target.as_path());
+                if let Err(message) = crate::preflight::ensure_space_for_copy(src, dest_dir) {
+                    Err(io::Error::new(io::ErrorKind::Other, message))
+                } else {
+                    fs::copy(src, &target).and_then(|_| fs::remove_file(src))
+                }
+            }
+        };
+        // Audit the move (Phase 5): exact src -> dst supports a future undo.
+        let src_str = src.to_string_lossy().to_string();
+        let target_str = target.to_string_lossy().to_string();
+        match &result {
+            Ok(()) => crate::audit::record(crate::audit::Entry {
+                op: "move",
+                src: std::slice::from_ref(&src_str),
+                dst: &target_str,
+                by: "server",
+                ..Default::default()
+            }),
+            Err(e) => {
+                let message = crate::preflight::describe_fs_error(e, src);
+                crate::audit::record(crate::audit::Entry {
+                    op: "move",
+                    src: std::slice::from_ref(&src_str),
+                    dst: &target_str,
+                    error: Some(message.as_str()),
+                    by: "server",
+                    ..Default::default()
+                });
+                errors.push(message);
+            }
         }
     }
     errors
 }
 
+/// Copy each `src` to `dst`. Refuses a self-copy (which `fs::copy` would
+/// truncate) and self-descendant copies, and applies keep-both collision
+/// handling so an existing target is never silently overwritten.
 pub(crate) fn action_copy(src_dst: &[(PathBuf, PathBuf)]) -> Vec<String> {
     let mut errors = Vec::new();
     for (src, dst) in src_dst {
+        if !src.exists() {
+            errors.push(format!("{}: source does not exist", src.display()));
+            continue;
+        }
+        if same_file(src, dst) {
+            errors.push(format!(
+                "{}: source and destination are the same file",
+                src.display()
+            ));
+            continue;
+        }
+        if src.is_dir() && dest_inside_dir(src, dst) {
+            errors.push(format!(
+                "{}: cannot copy a folder into itself or one of its descendants",
+                src.display()
+            ));
+            continue;
+        }
         if let Some(parent) = dst.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 errors.push(format!("{}: {}", dst.display(), e));
                 continue;
             }
         }
-        if let Err(e) = fs::copy(src, dst) {
-            errors.push(format!("{}: {}", src.display(), e));
+        let target = if dst.exists() { unique_dst(dst) } else { dst.clone() };
+        // Pre-flight the destination's free space before starting the copy
+        // (Phase 3) — don't begin a copy we can't finish.
+        let dest_dir = target.parent().unwrap_or_else(|| target.as_path());
+        let result: io::Result<()> = match crate::preflight::ensure_space_for_copy(src, dest_dir) {
+            Err(message) => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Ok(()) => fs::copy(src, &target).map(|_| ()),
+        };
+        // Audit the copy (Phase 5).
+        let src_str = src.to_string_lossy().to_string();
+        let target_str = target.to_string_lossy().to_string();
+        match &result {
+            Ok(()) => crate::audit::record(crate::audit::Entry {
+                op: "copy",
+                src: std::slice::from_ref(&src_str),
+                dst: &target_str,
+                by: "server",
+                ..Default::default()
+            }),
+            Err(e) => {
+                let message = crate::preflight::describe_fs_error(e, src);
+                crate::audit::record(crate::audit::Entry {
+                    op: "copy",
+                    src: std::slice::from_ref(&src_str),
+                    dst: &target_str,
+                    error: Some(message.as_str()),
+                    by: "server",
+                    ..Default::default()
+                });
+                errors.push(message);
+            }
         }
     }
     errors

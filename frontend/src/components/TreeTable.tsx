@@ -6,6 +6,7 @@ import { formatDate } from "../utils/formatDate";
 import { NodeTooltip } from "./NodeTooltip";
 import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
+import { eqPath, isNoOpMove } from "../lib/agent";
 
 const ROW_HEIGHT = 20;
 // Smallest a column may be dragged to, so a header never collapses to nothing.
@@ -234,6 +235,10 @@ function TreeTableInner({
   // True when the current native drag includes at least one directory; gates the
   // post-external-move rescan so a moved-out folder doesn't linger in the tree.
   const nativeDragHadDirRef = useRef<boolean>(false);
+  // Set on the origin instance when an external MOVE is still transferring async
+  // (the OS copies on its own thread). The rescan is deferred to the later
+  // "nativeMoveSettled" event so it reflects disk state AFTER the move finishes.
+  const pendingExternalMoveRescanRef = useRef<boolean>(false);
   // Latest values of the optional owner callbacks, read inside the IPC listener
   // effect without forcing it to re-subscribe when their identities change.
   const onOpenFolderInTabRef = useRef(onOpenFolderInTab);
@@ -252,9 +257,16 @@ function TreeTableInner({
     ) => () => void;
     // The native drag ended externally or was cancelled: clear drag UI. The
     // optional payload reports the real OS outcome so the renderer can rescan
-    // after an external move that removed a directory from the source.
+    // after an external move that removed a directory from the source. When
+    // `deferred` is true the OS is still transferring async, so the rescan waits
+    // for onNativeMoveSettled instead of running immediately.
     onNativeDropEnd?: (
-      cb: (info?: { outcome: string; deleted: string[] }) => void,
+      cb: (info?: { outcome: string; deleted: string[]; deferred?: boolean }) => void,
+    ) => () => void;
+    // An async external MOVE finished transferring (the OS removed the sources);
+    // the initiating instance rescans now that the move is complete on disk.
+    onNativeMoveSettled?: (
+      cb: (info: { deleted: string[] }) => void,
     ) => () => void;
     // TEMP diagnostic: forward a renderer log line to the main-process terminal.
     diag?: (message: string) => void;
@@ -512,15 +524,20 @@ function TreeTableInner({
         return;
       }
 
-      // Primary target: the folder the user last highlighted during the drag
-      // (exactly what was shown highlighted). Fall back to hit-testing the drop
-      // point only if no folder was tracked.
-      let destPath = tracked ?? undefined;
-      if (!destPath) {
-        const row = elAtPoint?.closest<HTMLElement>(".row");
-        if (row?.dataset.nodeDir === "1") destPath = row.dataset.nodePath;
+      // Destination = the folder ACTUALLY under the release point. Hit-test the
+      // drop point first: a folder merely brushed over mid-drag (`tracked`) must
+      // NOT become the target when the user released somewhere else — that stale
+      // highlight is exactly how a folder once landed in the wrong place. The
+      // tracked folder may only corroborate the hit-tested one; if they disagree
+      // we trust where the pointer actually was. And if the release point is not
+      // over a folder row at all, there is no valid internal target (no move) —
+      // we do NOT silently fall back to the stale highlight.
+      const dropRow = elAtPoint?.closest<HTMLElement>('.row[data-node-dir="1"]');
+      const destPath = dropRow?.dataset.nodePath || undefined;
+      if (tracked && destPath && !eqPath(tracked, destPath)) {
+        api?.diag?.(`[diag] internal-drop tracked=${tracked} != dropPoint=${destPath}; using release point`);
       }
-      const movable = destPath ? paths.filter((src) => src && src !== destPath) : [];
+      const movable = destPath ? paths.filter((src) => src && !isNoOpMove(src, destPath)) : [];
       api?.diag?.(`[diag] internal-drop dest=${destPath ?? "(none)"} willMove=${movable.length}`);
       clearNativeDrag();
       if (destPath && movable.length > 0) {
@@ -533,15 +550,31 @@ function TreeTableInner({
     const offEnd = api.onNativeDropEnd?.((info) => {
       const wasOrigin = nativeDragOriginRef.current;
       const hadDir = nativeDragHadDirRef.current;
+      // Clear the drag UI state immediately so the app is responsive (and ready
+      // for a new drag) even while an async transfer is still running.
       clearNativeDrag();
       resetDragState();
-      // A folder that was dragged OUT (true move) is gone from disk but may still
-      // sit in an expanded parent here; rescan so the tree reflects the move.
+      // A folder dragged OUT (true move) is gone from disk but may still sit in
+      // an expanded parent here, so rescan to reflect the move. When the move is
+      // async (`deferred`), the OS is still copying on its own thread — defer the
+      // rescan to "nativeMoveSettled" so it reflects the FINAL disk state instead
+      // of running before the source is actually removed.
       if (wasOrigin && hadDir && info?.outcome === "external-move") {
-        onAfterExternalMoveRef.current?.();
+        if (info?.deferred) {
+          pendingExternalMoveRescanRef.current = true;
+        } else {
+          onAfterExternalMoveRef.current?.();
+        }
       }
     });
-    return () => { offInternal?.(); offEnd?.(); };
+    const offSettled = api.onNativeMoveSettled?.(() => {
+      // Only the instance that initiated the deferred async move rescans (it set
+      // the pending flag); other mounted tabs ignore this broadcast.
+      if (!pendingExternalMoveRescanRef.current) return;
+      pendingExternalMoveRescanRef.current = false;
+      onAfterExternalMoveRef.current?.();
+    });
+    return () => { offInternal?.(); offEnd?.(); offSettled?.(); };
   }, [runInternalMove, resetDragState]);
 
   return (
@@ -726,7 +759,7 @@ function TreeTableInner({
                   }
 
                   setDropTargetId(null);
-                  const movableSources = sources.filter((src) => src && src !== node.path);
+                  const movableSources = sources.filter((src) => src && !isNoOpMove(src, node.path));
                   if (movableSources.length === 0) {
                     resetDragState();
                     if (isExplorerFileDrag && sources.length === 0) {

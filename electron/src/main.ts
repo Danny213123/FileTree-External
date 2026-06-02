@@ -11,6 +11,16 @@ import * as path from "path";
 import * as net from "net";
 import * as fs from "fs";
 import { spawn, ChildProcess } from "child_process";
+import { randomBytes } from "crypto";
+
+// Per-session local auth token. Minted once at startup, handed to the Rust
+// server via the FILETREE_AUTH_TOKEN env var and to the renderer via a
+// synchronous IPC call from the preload — never over HTTP. The server requires
+// it as the `X-FileTree-Token` header on destructive routes (delete / move /
+// move-items / rename / dupes-action / run-command), so another local process
+// that can reach the 127.0.0.1 server still can't drive a destructive op
+// (it can neither read this token nor forge it).
+const AUTH_TOKEN = randomBytes(32).toString("hex");
 
 // ── Native drag-out addon ─────────────────────────────────────────────────────
 // Runs the Windows shell drag itself (SHDoDragDrop, synchronously on this UI
@@ -24,16 +34,23 @@ import { spawn, ChildProcess } from "child_process";
 //                       thread is busy in the modal drag loop).
 //   * "cancel"        — Esc; nothing happens.
 // If the addon can't load we fall back to Electron's copy-only startDrag.
-type NativeDragResult = { outcome: string; dropX: number; dropY: number; deleted: string[] };
-type NativeMoveResult = { aborted: boolean };
+type NativeDragResult = { outcome: string; dropX: number; dropY: number; deleted: string[]; deferred: boolean };
+type NativeMoveResult = { aborted: boolean; moved: number; skipped: number; failed: number };
+type NativeConfirmMoveResult = { deleted: string[] };
 type NativeContextMenuResult = { verb: string };
 let nativeDragFiles: ((paths: string[]) => NativeDragResult) | null = null;
 let nativeMoveItems:
   | ((sources: string[], dest: string, ownerHwnd: number) => Promise<NativeMoveResult>)
   | null = null;
+// Observes an async external move to completion (returns the removed sources) so
+// the renderer can rescan once the OS transfer actually finishes.
+let nativeConfirmMove: ((sources: string[]) => Promise<NativeConfirmMoveResult>) | null = null;
 let nativeContextMenu:
   | ((paths: string[], ownerHwnd: number) => NativeContextMenuResult)
   | null = null;
+// Best-effort restore of a recycled item back to its original path (Phase 6
+// undo). Resolves true when the item was found in the Recycle Bin and put back.
+let nativeRestore: ((originalPath: string) => Promise<boolean>) | null = null;
 
 // Integrated-terminal PTY exports from the same Rust addon (ConPTY-backed).
 type PtyChunk = { data: Buffer; exit: number | null };
@@ -46,7 +63,9 @@ try {
   const addon = require(path.join(__dirname, "filetree_drag.node")) as {
     dragFiles?: (paths: string[]) => NativeDragResult;
     moveItemsNative?: (sources: string[], dest: string, ownerHwnd: number) => Promise<NativeMoveResult>;
+    confirmExternalMove?: (sources: string[]) => Promise<NativeConfirmMoveResult>;
     showContextMenuNative?: (paths: string[], ownerHwnd: number) => NativeContextMenuResult;
+    restoreFromRecycleBin?: (originalPath: string) => Promise<boolean>;
     ptySpawn?: (program: string, args: string[], cwd: string, cols: number, rows: number) => number;
     ptyRead?: (id: number) => PtyChunk;
     ptyWrite?: (id: number, data: Buffer) => void;
@@ -55,7 +74,9 @@ try {
   };
   nativeDragFiles = typeof addon.dragFiles === "function" ? addon.dragFiles : null;
   nativeMoveItems = typeof addon.moveItemsNative === "function" ? addon.moveItemsNative : null;
+  nativeConfirmMove = typeof addon.confirmExternalMove === "function" ? addon.confirmExternalMove : null;
   nativeContextMenu = typeof addon.showContextMenuNative === "function" ? addon.showContextMenuNative : null;
+  nativeRestore = typeof addon.restoreFromRecycleBin === "function" ? addon.restoreFromRecycleBin : null;
   ptySpawn = typeof addon.ptySpawn === "function" ? addon.ptySpawn : null;
   ptyRead = typeof addon.ptyRead === "function" ? addon.ptyRead : null;
   ptyWrite = typeof addon.ptyWrite === "function" ? addon.ptyWrite : null;
@@ -63,13 +84,17 @@ try {
   ptyKill = typeof addon.ptyKill === "function" ? addon.ptyKill : null;
   if (!nativeDragFiles) console.warn("[electron] native drag addon missing dragFiles export");
   if (!nativeMoveItems) console.warn("[electron] native drag addon missing moveItemsNative export");
+  if (!nativeConfirmMove) console.warn("[electron] native drag addon missing confirmExternalMove export");
   if (!nativeContextMenu) console.warn("[electron] native drag addon missing showContextMenuNative export");
+  if (!nativeRestore) console.warn("[electron] native addon missing restoreFromRecycleBin export; recycle-undo will ask the user to restore manually");
   if (!ptySpawn) console.warn("[electron] native addon missing pty exports; terminal disabled");
 } catch (e) {
   console.warn("[electron] native drag addon unavailable; drag-out will copy:", e);
   nativeDragFiles = null;
   nativeMoveItems = null;
+  nativeConfirmMove = null;
   nativeContextMenu = null;
+  nativeRestore = null;
   ptySpawn = ptyRead = ptyWrite = ptyResize = ptyKill = null;
 }
 
@@ -173,6 +198,9 @@ async function startRustServer(port: number): Promise<void> {
 
   serverProcess = spawn(serverBin, ["serve", "--port", String(port)], {
     stdio: ["ignore", "pipe", "pipe"],
+    // Pass the session token out of band (env, not argv: argv is readable by
+    // other processes via the process list; the env block is not as trivially).
+    env: { ...process.env, FILETREE_AUTH_TOKEN: AUTH_TOKEN },
   });
 
   // Forward the server's logs to ours. The destination (our stdout/stderr) may
@@ -554,6 +582,14 @@ ipcMain.on("diag", (_event, message: string) => {
   console.log("[renderer]", message);
 });
 
+// The preload fetches the session token synchronously at load so the renderer
+// can attach it as the `X-FileTree-Token` header on destructive API calls.
+// Delivered over IPC (never HTTP), so a process that can only reach the
+// localhost server can't read it.
+ipcMain.on("getAuthToken", (event) => {
+  event.returnValue = AUTH_TOKEN;
+});
+
 // ── Cloud LLM gateway (OpenAI / Anthropic) ───────────────────────────────────
 // Ollama is reached directly from the renderer via the Rust server. Cloud
 // providers need TLS + SSE, which Node's global fetch handles here in main. We
@@ -813,7 +849,7 @@ ipcMain.on("ondragstart", (event, arg: string | string[]) => {
   if (nativeDragFiles) {
     try {
       const result = nativeDragFiles(filePaths);
-      console.log("[electron] native drag outcome=", result.outcome, "drop=", result.dropX, result.dropY, "deleted=", result.deleted);
+      console.log("[electron] native drag outcome=", result.outcome, "drop=", result.dropX, result.dropY, "deleted=", result.deleted, "deferred=", result.deferred);
       if (result.outcome === "internal" && win) {
         // dropX/dropY are physical screen pixels — convert to the renderer's
         // CSS pixel space (DIP relative to the web content origin) so it can
@@ -826,10 +862,19 @@ ipcMain.on("ondragstart", (event, arg: string | string[]) => {
           "dip=", dip.x, dip.y, "contentBounds=", bounds, "client=", clientX, clientY);
         win.webContents.send("nativeDropInternal", clientX, clientY, filePaths);
       } else {
-        // Forward the real OS outcome (and which sources were removed) so the
-        // renderer can rescan after an external MOVE that deleted a directory —
-        // otherwise a folder dragged out of an expanded parent lingers in the tree.
-        win?.webContents.send("nativeDropEnd", { outcome: result.outcome, deleted: result.deleted });
+        // Forward the OS outcome immediately so the renderer clears its drag UI
+        // right away (the app is responsive throughout an async transfer). For a
+        // `deferred` async external MOVE the source removal isn't known yet — the
+        // OS is still copying on its own thread — so the renderer holds its
+        // rescan until we observe the transfer settle and emit "nativeMoveSettled"
+        // (below). For every synchronous outcome the renderer rescans now.
+        win?.webContents.send("nativeDropEnd", { outcome: result.outcome, deleted: result.deleted, deferred: result.deferred });
+        if (result.deferred && nativeConfirmMove && win) {
+          const targetWin = win;
+          nativeConfirmMove(filePaths)
+            .then((info) => { try { targetWin.webContents.send("nativeMoveSettled", { deleted: info.deleted }); } catch { /* window gone */ } })
+            .catch(() => { try { targetWin.webContents.send("nativeMoveSettled", { deleted: [] }); } catch { /* window gone */ } });
+        }
       }
       return;
     } catch (e) {
@@ -888,7 +933,7 @@ ipcMain.handle("readFileBase64", async (_event, filePath: string) => {
 // modal Windows dialog is the UI while it runs; the renderer rescans after.
 ipcMain.handle("moveItemsNative", (event, paths: string[], destination: string) => {
   const sources = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
-  if (sources.length === 0 || !destination) return { aborted: false };
+  if (sources.length === 0 || !destination) return { aborted: false, moved: 0, skipped: 0, failed: 0 };
   if (!nativeMoveItems) throw new Error("native move addon unavailable");
   const win = BrowserWindow.fromWebContents(event.sender);
   try { win?.focus(); } catch { /* ignore */ }
@@ -902,6 +947,16 @@ ipcMain.handle("moveItemsNative", (event, paths: string[], destination: string) 
     else if (buf && buf.length >= 4) ownerHwnd = buf.readUInt32LE(0);
   } catch { /* 0 → addon falls back to the foreground window */ }
   return nativeMoveItems(sources, destination, ownerHwnd);
+});
+
+// Restore a recycled item to its original path (Phase 6 in-app undo). Runs the
+// Recycle Bin scan on a background thread in the addon, so this returns a
+// Promise<boolean> and the UI stays responsive. Returns false (the renderer then
+// tells the user to restore manually) when the native addon is unavailable, the
+// path is empty, or the item couldn't be located/put back.
+ipcMain.handle("restoreFromRecycleBin", (_event, originalPath: string) => {
+  if (!nativeRestore || typeof originalPath !== "string" || !originalPath) return false;
+  return nativeRestore(originalPath);
 });
 
 // Copy files as a file drop (CF_HDROP equivalent — paste in Explorer).

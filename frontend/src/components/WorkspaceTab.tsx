@@ -5,11 +5,13 @@ import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCa
 import {
   revealPath, openPath, shellContextMenu, createFolder, fetchScan,
   copyPath, renameItem, moveItems, deletePath, copyFiles,
-  hasNativeMove, moveItemsNative, fetchDupesV2, runCommand,
+  hasNativeMove, moveItemsNative, fetchDupesV2Bounded, runCommand,
 } from "../api/client";
 import type { ScanOptions } from "../api/client";
 import type { NodeRecord, SortKey } from "../api/types";
-import type { AgentApi } from "../lib/agent";
+import { isNoOpMove, type AgentApi } from "../lib/agent";
+import { confirmRisky, isCrossDrive } from "../lib/confirmRisky";
+import { pushUndo, parentDir } from "../lib/undo";
 import { TreeTable } from "./TreeTable";
 import { ConfigureColumnsMenu } from "./ConfigureColumnsMenu";
 import { Treemap } from "./Treemap";
@@ -57,6 +59,10 @@ export interface WorkspaceTabHandle {
   setShowFiles: (v: boolean) => void;
   setScanPath: (p: string) => void;
   setSortKeyDir: (key: string, dir: 1 | -1) => void;
+  /** Show a transient status toast in this pane (used for undo feedback). */
+  showNotice: (message: string) => void;
+  /** Force a fresh rescan of this pane (used after an undo changes the tree). */
+  refresh: () => void;
 }
 
 export interface RibbonState {
@@ -530,8 +536,12 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     const name = window.prompt("New folder name:");
     if (!name?.trim()) return;
     const sep = base.endsWith("\\") || base.endsWith("/") ? "" : "\\";
+    const full = base + sep + name.trim();
     try {
-      await createFolder(base + sep + name.trim());
+      await createFolder(full);
+      // Phase 6 undo: removing the folder on Ctrl+Z is safe only while it stays
+      // empty (the executor checks before deleting), so this never loses files.
+      pushUndo({ kind: "mkdir", path: full });
       doScan();
     } catch (e) {
       alert(`Could not create folder: ${e instanceof Error ? e.message : e}`);
@@ -614,21 +624,58 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     if (!newName || newName === node.name) return;
     const result = await renameItem(node.path, newName);
     if (!result.ok) { alert(`Rename failed: ${result.error ?? "unknown error"}`); return; }
+    // Phase 6: record the reverse (rename back to the original name) for Ctrl+Z.
+    pushUndo({ kind: "rename", parent: parentDir(node.path), from: node.name, to: newName });
     invalidateAllScanCache();
     doScan(undefined, undefined, true);
   }, [tree.nodeById, doScan]);
 
-  const runDeletePaths = useCallback(async (paths?: string[]) => {
+  const runDeletePaths = useCallback(async (paths?: string[], permanent = false) => {
     const targetPaths = paths && paths.length > 0 ? dedupeNestedPaths(paths, nodeByPath) : selectedPaths;
     if (targetPaths.length === 0) return;
-    const confirmed = targetPaths.length === 1
-      ? window.confirm(`Move "${nodeByPath.get(targetPaths[0])?.name ?? basenameFromPath(targetPaths[0])}" to Recycle Bin?`)
-      : window.confirm(`Move ${targetPaths.length} selected items to Recycle Bin?`);
-    if (!confirmed) return;
+    const nameOf = (p: string) => nodeByPath.get(p)?.name ?? basenameFromPath(p);
+    // Risk-scoped confirm (Phase 4): a permanent delete always prompts (it's
+    // irreversible); a recyclable delete prompts only for a large/many batch.
+    // A small recyclable delete is recoverable from the Recycle Bin (and now
+    // audited), so it stays frictionless — no prompt.
+    const totalBytes = targetPaths.reduce((sum, p) => sum + (nodeByPath.get(p)?.size ?? 0), 0);
+    const proceed = confirmRisky({
+      kind: "delete",
+      permanent,
+      itemCount: targetPaths.length,
+      totalBytes,
+      names: targetPaths.map(nameOf),
+    });
+    if (!proceed) return;
+    // Aggregate per-item results instead of swallowing them, so a delete that
+    // fails (locked file, permission denied) is surfaced rather than silently
+    // lost — the user otherwise thinks the item is gone when it isn't.
+    const failures: string[] = [];
+    const recycled: string[] = [];
+    let purged = 0;
     for (const path of targetPaths) {
-      await deletePath(path).catch(() => {});
+      try {
+        const res = await deletePath(path, permanent);
+        if (!res.ok) failures.push(`${nameOf(path)}: ${res.error ?? "unknown error"}`);
+        else if (permanent) purged++;
+        else recycled.push(path);
+      } catch (e) {
+        failures.push(`${nameOf(path)}: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
+    // Phase 6 undo: a recycle is reversible (restore from the Recycle Bin); a
+    // permanent delete is not — push a marker so Ctrl+Z says so plainly.
+    if (recycled.length > 0) pushUndo({ kind: "recycle", paths: recycled });
+    if (purged > 0) pushUndo({ kind: "permanentDelete", count: purged });
     doScan();
+    if (failures.length > 0) {
+      const verb = permanent ? "delete" : "move to the Recycle Bin";
+      const shown = failures.slice(0, 10).join("\n");
+      const more = failures.length > 10 ? `\n…and ${failures.length - 10} more` : "";
+      window.alert(
+        `Could not ${verb} ${failures.length} of ${targetPaths.length} item${targetPaths.length === 1 ? "" : "s"}:\n\n${shown}${more}`,
+      );
+    }
   }, [nodeByPath, selectedPaths, doScan]);
 
   const runDelete = useCallback(() => { void runDeletePaths(); }, [runDeletePaths]);
@@ -672,32 +719,78 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     [askConflict],
   );
 
-  const runMoveTo = useCallback(async () => {
-    if (selectedPaths.length === 0) return;
-    const dest = window.prompt("Move to folder:");
-    if (!dest?.trim()) return;
-    const outcome = await runMoveWithConflicts(selectedPaths, dest.trim());
-    if (!outcome.ok) { alert(`Move failed: ${outcome.error ?? "unknown error"}`); return; }
-    doScan();
-  }, [selectedPaths, doScan, runMoveWithConflicts]);
-
   const runCopyFiles = useCallback(() => {
     if (selectedPaths.length > 0) copyFiles(selectedPaths).catch(() => {});
   }, [selectedPaths]);
 
   const handleInternalMove = useCallback(async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string }> => {
     if (sources.length === 0 || !destination) return { ok: true };
-    if (sources.some(s => destination === s || destination.startsWith(s + "\\") || destination.startsWith(s + "/"))) {
-      return { ok: false, error: "Cannot move a folder into itself or one of its descendants." };
+    // Drop any source whose move would be a no-op or unsafe — dropped onto
+    // itself, into one of its own descendants, or into the folder it already
+    // lives in directly. The guard is normalized + case-insensitive (reliable on
+    // Windows), replacing the old case-sensitive self/descendant string check.
+    const realSources = sources.filter((s) => s && !isNoOpMove(s, destination));
+    if (realSources.length === 0) {
+      // Everything was already in place / self-targeted: nothing to move. Surface
+      // a brief, non-error notice (mirrors runMoveWithConflicts' alreadyThere
+      // path) rather than failing or silently doing nothing.
+      const n = sources.length;
+      setMoveNotice(n === 1 ? "Already in this folder." : `${n} items are already in this folder.`);
+      return { ok: true };
+    }
+    // Risk-scoped confirm (Phase 4): prompt only for a genuinely risky move —
+    // crossing drives (copy + delete originals), or a large/many batch. An
+    // ordinary same-drive move stays frictionless. (Overwrite/replace is still
+    // confirmed separately by the conflict / native collision dialog.)
+    const byPath = nodeByPathRef.current;
+    const moveBytes = realSources.reduce((sum, s) => sum + (byPath.get(s)?.size ?? 0), 0);
+    const proceedMove = confirmRisky({
+      kind: "move",
+      crossDrive: isCrossDrive(realSources, destination),
+      itemCount: realSources.length,
+      totalBytes: moveBytes,
+      names: realSources.map((s) => byPath.get(s)?.name ?? basenameFromPath(s)),
+    });
+    if (!proceedMove) {
+      setMoveNotice("Move canceled.");
+      return { ok: true };
     }
     try {
       suppressWatchRef.current = true;
       let outcome: { ok: boolean; error?: string };
+      let didMove = false;
       if (hasNativeMove()) {
-        await moveItemsNative(sources, destination);
-        outcome = { ok: true };
+        const res = await moveItemsNative(realSources, destination);
+        // Honor the native result instead of assuming success. A fully cancelled
+        // dialog (nothing moved, nothing failed) is just a no-op notice, while
+        // any item that didn't make it — a per-item failure or a "Skip" in the
+        // native collision dialog — is surfaced so the caller can report it.
+        if (res.aborted && res.moved === 0 && res.failed === 0) {
+          setMoveNotice("Move canceled.");
+          outcome = { ok: true };
+        } else if (res.failed > 0) {
+          didMove = res.moved > 0;
+          outcome = {
+            ok: false,
+            error: `${res.failed} item${res.failed === 1 ? "" : "s"} could not be moved${res.aborted ? " (move canceled)" : ""}.`,
+          };
+        } else {
+          didMove = res.moved > 0;
+          outcome = { ok: true };
+        }
       } else {
-        outcome = await runMoveWithConflicts(sources, destination);
+        outcome = await runMoveWithConflicts(realSources, destination);
+        didMove = outcome.ok;
+      }
+      // Phase 6 undo: record the reverse move (each item back to its original
+      // parent) when at least one item actually moved. The executor only moves
+      // back items still present at the destination, so partial moves are safe.
+      if (didMove) {
+        pushUndo({
+          kind: "move",
+          destination,
+          items: realSources.map((s) => ({ name: basenameFromPath(s), originalParent: parentDir(s) })),
+        });
       }
       invalidateAllScanCache();
       doScan(undefined, undefined, true);
@@ -707,6 +800,19 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   }, [doScan, runMoveWithConflicts]);
+
+  // "Move to..." (ribbon / context action). Route through handleInternalMove so
+  // that in Electron it uses the native shell move (IFileOperation) with the real
+  // Windows progress + conflict dialog — exactly like drag, treemap and the AI
+  // agent already do. The /api/move-items path stays only as the !hasNativeMove()
+  // (browser / dev) fallback, which handleInternalMove selects internally.
+  const runMoveTo = useCallback(async () => {
+    if (selectedPaths.length === 0) return;
+    const dest = window.prompt("Move to folder:");
+    if (!dest?.trim()) return;
+    const outcome = await handleInternalMove(selectedPaths, dest.trim());
+    if (!outcome.ok) { alert(`Move failed: ${outcome.error ?? "unknown error"}`); return; }
+  }, [selectedPaths, handleInternalMove]);
 
   // After a native drag moved item(s) OUT of this tree (a true move to Explorer
   // or another app), the source is gone from disk; drop our cached scan and
@@ -723,19 +829,23 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     getNodes: () => Array.from(tree.nodeById.values()),
     scanFolder: async (path: string) => { openLocation(path); },
     refresh: async () => { invalidateAllScanCache(); doScan(undefined, undefined, true); },
-    findDuplicates: async (minSizeBytes: number) => {
+    findDuplicates: async (minSizeBytes: number, signal?: AbortSignal) => {
       const root = data?.rootPath || scanPath;
-      const res = await fetchDupesV2({ paths: [root], mode: "exact", minSize: minSizeBytes });
+      const res = await fetchDupesV2Bounded({ paths: [root], mode: "exact", minSize: minSizeBytes }, signal);
       return { groups: res.groups.map((g) => ({ waste: g.waste, files: g.files.map((f) => ({ path: f.path, size: f.size })) })) };
     },
     moveItems: async (paths: string[], destination: string) => handleInternalMove(paths, destination),
     renameItem: async (path: string, newName: string) => {
       const r = await renameItem(path, newName);
-      if (r.ok) { invalidateAllScanCache(); doScan(undefined, undefined, true); }
+      if (r.ok) {
+        pushUndo({ kind: "rename", parent: parentDir(path), from: basenameFromPath(path), to: newName });
+        invalidateAllScanCache();
+        doScan(undefined, undefined, true);
+      }
       return r;
     },
     createFolder: async (path: string) => {
-      try { await createFolder(path); doScan(); return { ok: true }; }
+      try { await createFolder(path); pushUndo({ kind: "mkdir", path }); doScan(); return { ok: true }; }
       catch (e) { return { ok: false, error: (e as Error).message }; }
     },
     reveal: async (path: string) => { revealPath(path); },
@@ -838,6 +948,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       tree.setSortKey(key as SortKey);
       if (tree.sortDir !== dir) tree.setSortKey(key as SortKey);
     },
+    showNotice: (message) => setMoveNotice(message),
+    refresh: () => { invalidateAllScanCache(); doScan(undefined, undefined, true); },
   }), [status, data, progress, errorMessage, scanPath, tree, cancelScan, agentApi,
        doScan, handleNavigate, handleNavigateParent, handleExpand, handleNewFolder, selectedNode,
        openLocation, runOpen, runReveal, onScanPath,

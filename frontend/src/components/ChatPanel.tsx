@@ -17,7 +17,7 @@ import { ALWAYS_APPROVE_TOOLS } from "../lib/agents/runtime";
 import type { AgentKind, RunStatus, StepStatus, ToolCallView } from "../lib/agents/types";
 import { loadAiSettings, saveAiSettings, keyFor, type AiSettings } from "../lib/aiSettings";
 import { loadChatSession, saveChatSession, loadChatIndex, deleteChatSession, type ChatSessionBlob, type ChatSessionMeta } from "../lib/chatSessions";
-import { scanStreamUrl, fetchDupesV2 } from "../api/client";
+import { scanStreamUrl, fetchDupesV2Bounded } from "../api/client";
 import { getCached, setCached } from "../lib/scanCache";
 import { readNdjsonStream } from "../hooks/useScan";
 import type { NodeRecord, ScanResult, ExtensionStat } from "../api/types";
@@ -173,8 +173,8 @@ function buildScopedApi(base: AgentApi, dirs: string[], scans: ScanResult[]): Ag
     getScanPath: () => label,
     getScanResult: () => result,
     getNodes: () => nodes,
-    findDuplicates: async (minSizeBytes: number) => {
-      const res = await fetchDupesV2({ paths: dirs, mode: "exact", minSize: minSizeBytes });
+    findDuplicates: async (minSizeBytes: number, signal?: AbortSignal) => {
+      const res = await fetchDupesV2Bounded({ paths: dirs, mode: "exact", minSize: minSizeBytes }, signal);
       return { groups: res.groups.map((g) => ({ waste: g.waste, files: g.files.map((f) => ({ path: f.path, size: f.size })) })) };
     },
   };
@@ -1205,6 +1205,7 @@ function humanizeCommand(tool: ToolState): string {
   const items = `${n} item${n === 1 ? "" : "s"}`;
   switch (tool.tool) {
     case "run_command": return String(tool.args.command ?? "");
+    case "recycle_items": return `Send ${items} to Recycle Bin`;
     case "move_items": return `Move ${items} to ${basename(String(tool.args.destination ?? ""))}`;
     case "rename_item": return `Rename ${basename(String(tool.args.path ?? ""))} → ${String(tool.args.new_name ?? "")}`;
     case "create_folder": return `Create folder ${basename(String(tool.args.path ?? ""))}`;
@@ -1466,6 +1467,7 @@ function SettingsMenu({ ai, autoApprove, onChange, onToggleAuto, onRemoveAllow, 
 }) {
   const ALLOW_LABELS: Record<string, string> = {
     run_command: "Run command",
+    recycle_items: "Recycle items",
     move_items: "Move items",
     rename_item: "Rename item",
     create_folder: "Create folder",
