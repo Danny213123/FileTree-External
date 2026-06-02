@@ -194,6 +194,120 @@ pub fn confirm_external_move(sources: Vec<String>) -> AsyncTask<ConfirmMoveTask>
     AsyncTask::new(ConfirmMoveTask { sources })
 }
 
+// ── Windows clipboard CF_HDROP (roadmap item #9) ──────────────────────────────
+// Put real file references on the clipboard (CF_HDROP + "Preferred DropEffect")
+// so Paste works in Explorer and other apps, and read them back for
+// paste-into-folder. Copy keeps the sources; Cut tags them MOVE so the paste
+// target relocates them. The actual in-app paste mutation is performed by the
+// guarded move/copy engines (`move_items_native` / `copy_items_native`), never
+// here — this only moves the *reference list* on/off the clipboard.
+
+/// Files currently on the clipboard plus whether the originator tagged them as a
+/// Cut (move) rather than a Copy.
+#[napi(object)]
+pub struct ClipboardFiles {
+    pub paths: Vec<String>,
+    /// True when the clipboard's "Preferred DropEffect" is MOVE (a Cut).
+    pub prefer_move: bool,
+}
+
+/// Write `paths` to the clipboard as CF_HDROP with the matching drop effect
+/// (`cut` ⇒ MOVE, else COPY). Synchronous + fast; runs on the caller's thread.
+#[napi]
+pub fn clipboard_write_files(paths: Vec<String>, cut: bool, owner_hwnd: f64) -> napi::Result<()> {
+    #[cfg(windows)]
+    {
+        windows_impl::clipboard_write(paths, cut, owner_hwnd as i64 as isize)
+            .map_err(napi::Error::from_reason)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (paths, cut, owner_hwnd);
+        Err(napi::Error::from_reason(
+            "filetree-drag is only supported on Windows",
+        ))
+    }
+}
+
+/// Read CF_HDROP file paths (and the preferred drop effect) off the clipboard.
+/// Returns an empty list when the clipboard holds no files.
+#[napi]
+pub fn clipboard_read_files(owner_hwnd: f64) -> napi::Result<ClipboardFiles> {
+    #[cfg(windows)]
+    {
+        let (paths, prefer_move) = windows_impl::clipboard_read(owner_hwnd as i64 as isize)
+            .map_err(napi::Error::from_reason)?;
+        Ok(ClipboardFiles { paths, prefer_move })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = owner_hwnd;
+        Err(napi::Error::from_reason(
+            "filetree-drag is only supported on Windows",
+        ))
+    }
+}
+
+/// Copy `sources` into `dest` with the shell file-operation engine — the SAME
+/// guarded `IFileOperation` path as `move_items_native` (native progress /
+/// "Replace / Skip / Keep both" dialogs, `FOF_ALLOWUNDO` recycle-on-overwrite,
+/// per-item audit), but copying instead of moving. Used by paste-into-folder
+/// when the clipboard effect is Copy. Runs on a libuv worker thread.
+pub struct CopyTask {
+    sources: Vec<String>,
+    dest: String,
+    owner: isize,
+}
+
+impl Task for CopyTask {
+    type Output = MoveResult;
+    type JsValue = MoveResult;
+
+    fn compute(&mut self) -> napi::Result<MoveResult> {
+        #[cfg(windows)]
+        {
+            let sources = std::mem::take(&mut self.sources);
+            let dest = std::mem::take(&mut self.dest);
+            let o = windows_impl::copy_items(sources, dest, self.owner)
+                .map_err(napi::Error::from_reason)?;
+            Ok(MoveResult {
+                aborted: o.aborted,
+                moved: o.moved,
+                skipped: o.skipped,
+                failed: o.failed,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Err(napi::Error::from_reason(
+                "filetree-drag is only supported on Windows",
+            ))
+        }
+    }
+
+    fn resolve(&mut self, _env: Env, out: MoveResult) -> napi::Result<MoveResult> {
+        Ok(out)
+    }
+}
+
+/// Copy the given absolute source paths into `dest` (files AND folders) using the
+/// Windows shell engine, with the real native dialogs. `moved` in the result is
+/// the number of items copied. Returns a Promise; runs on a background thread.
+#[napi(
+    ts_return_type = "Promise<{ aborted: boolean; moved: number; skipped: number; failed: number }>"
+)]
+pub fn copy_items_native(
+    sources: Vec<String>,
+    dest: String,
+    owner_hwnd: f64,
+) -> AsyncTask<CopyTask> {
+    AsyncTask::new(CopyTask {
+        sources,
+        dest,
+        owner: owner_hwnd as i64 as isize,
+    })
+}
+
 // ── Recycle Bin restore (Phase 6: in-app undo of a recycle delete) ──────────────
 
 /// A restorable record discovered in the Recycle Bin: the `$R` payload to move
@@ -659,14 +773,19 @@ mod windows_impl {
 
     use windows::core::{implement, w, Interface, HRESULT, PCSTR, PCWSTR, PSTR};
     use windows::Win32::Foundation::{
-        BOOL, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HINSTANCE, HWND,
-        LPARAM, LRESULT, POINT, S_OK, WPARAM,
+        BOOL, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HANDLE, HGLOBAL,
+        HINSTANCE, HWND, LPARAM, LRESULT, POINT, S_OK, WPARAM,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IDataObject, CLSCTX_ALL,
         COINIT_APARTMENTTHREADED,
     };
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+        SetClipboardData,
+    };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::{
         IDropSource, IDropSource_Impl, OleInitialize, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE,
         DROPEFFECT_NONE,
@@ -676,9 +795,9 @@ mod windows_impl {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
-        FileOperation, IContextMenu, IContextMenu2, IDataObjectAsyncCapability, IFileOperation,
-        IShellFolder, IShellItem, SHBindToParent, SHCreateItemFromParsingName,
-        SHCreateShellItemArrayFromIDLists, SHDoDragDrop, SHParseDisplayName, BHID_DataObject,
+        DragQueryFileW, FileOperation, IContextMenu, IContextMenu2, IDataObjectAsyncCapability,
+        IFileOperation, IShellFolder, IShellItem, SHBindToParent, SHCreateItemFromParsingName,
+        SHCreateShellItemArrayFromIDLists, SHDoDragDrop, SHParseDisplayName, BHID_DataObject, DROPFILES, HDROP,
         CMF_CANRENAME, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO, FOF_ALLOWUNDO, FOF_NO_UI,
         FOF_WANTNUKEWARNING, FOFX_ADDUNDORECORD, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
         GCS_VERBA, IShellItemArray,
@@ -1176,6 +1295,276 @@ mod windows_impl {
             return false;
         }
         target_pid != GetCurrentProcessId()
+    }
+
+    // ── Clipboard CF_HDROP + copy engine (roadmap item #9) ────────────────────
+
+    /// Standard clipboard format for a file drop list (shlobj `CF_HDROP`).
+    const CF_HDROP_FORMAT: u32 = 15;
+
+    /// Open the clipboard, retrying briefly: another process may hold it for a
+    /// moment (Explorer, antivirus, clipboard managers). Returns false if it
+    /// never became available.
+    fn open_clipboard_retry(owner: HWND) -> bool {
+        for _ in 0..10 {
+            if unsafe { OpenClipboard(owner) }.is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// Put `paths` on the clipboard as CF_HDROP plus a "Preferred DropEffect"
+    /// (MOVE for a Cut, COPY otherwise) so Paste works in Explorer and any app.
+    pub fn clipboard_write(paths: Vec<String>, cut: bool, owner: isize) -> Result<(), String> {
+        let existing: Vec<String> = paths
+            .into_iter()
+            .filter(|p| !p.is_empty() && Path::new(p).exists())
+            .collect();
+        if existing.is_empty() {
+            return Err("no existing paths to put on the clipboard".to_string());
+        }
+
+        unsafe {
+            // DROPFILES expects a double-NUL-terminated list of wide paths
+            // immediately after the header.
+            let mut list: Vec<u16> = Vec::new();
+            for p in &existing {
+                list.extend(p.encode_utf16());
+                list.push(0);
+            }
+            list.push(0);
+
+            let header = std::mem::size_of::<DROPFILES>();
+            let bytes = header + list.len() * 2;
+            let hglobal = GlobalAlloc(GMEM_MOVEABLE, bytes)
+                .map_err(|e| format!("GlobalAlloc failed: {e}"))?;
+            let base = GlobalLock(hglobal) as *mut u8;
+            if base.is_null() {
+                // Tiny, one-off leak on a rare lock failure is preferable to the
+                // version-specific GlobalFree signature dance; freed at exit.
+                return Err("GlobalLock failed".to_string());
+            }
+            let df = base as *mut DROPFILES;
+            (*df).pFiles = header as u32;
+            (*df).pt = POINT { x: 0, y: 0 };
+            (*df).fNC = BOOL(0);
+            (*df).fWide = BOOL(1);
+            std::ptr::copy_nonoverlapping(list.as_ptr(), base.add(header) as *mut u16, list.len());
+            let _ = GlobalUnlock(hglobal);
+
+            let owner_hwnd = if owner != 0 { HWND(owner as *mut c_void) } else { HWND::default() };
+            if !open_clipboard_retry(owner_hwnd) {
+                return Err("could not open the clipboard".to_string());
+            }
+            let _ = EmptyClipboard();
+            if SetClipboardData(CF_HDROP_FORMAT, HANDLE(hglobal.0)).is_err() {
+                let _ = CloseClipboard();
+                return Err("SetClipboardData(CF_HDROP) failed".to_string());
+            }
+            // Preferred drop effect. Non-fatal on failure — the files are on the
+            // clipboard regardless, just defaulting to a copy on paste.
+            let fmt = RegisterClipboardFormatW(w!("Preferred DropEffect"));
+            if fmt != 0 {
+                let effect: u32 = if cut { DROPEFFECT_MOVE.0 } else { DROPEFFECT_COPY.0 };
+                if let Ok(eff) = GlobalAlloc(GMEM_MOVEABLE, 4) {
+                    let p = GlobalLock(eff) as *mut u32;
+                    if !p.is_null() {
+                        *p = effect;
+                        let _ = GlobalUnlock(eff);
+                        let _ = SetClipboardData(fmt, HANDLE(eff.0));
+                    }
+                }
+            }
+            let _ = CloseClipboard();
+            Ok(())
+        }
+    }
+
+    /// Read CF_HDROP file paths off the clipboard plus whether the source tagged
+    /// them MOVE (Cut). Returns an empty list when no file drop is present.
+    pub fn clipboard_read(owner: isize) -> Result<(Vec<String>, bool), String> {
+        unsafe {
+            let owner_hwnd = if owner != 0 { HWND(owner as *mut c_void) } else { HWND::default() };
+            if !open_clipboard_retry(owner_hwnd) {
+                return Err("could not open the clipboard".to_string());
+            }
+            let mut paths: Vec<String> = Vec::new();
+            let mut prefer_move = false;
+
+            if let Ok(handle) = GetClipboardData(CF_HDROP_FORMAT) {
+                if !handle.0.is_null() {
+                    let hdrop = HDROP(handle.0);
+                    let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
+                    for i in 0..count {
+                        let len = DragQueryFileW(hdrop, i, None);
+                        if len == 0 {
+                            continue;
+                        }
+                        let mut buf = vec![0u16; len as usize + 1];
+                        let got = DragQueryFileW(hdrop, i, Some(buf.as_mut_slice()));
+                        if got > 0 {
+                            paths.push(String::from_utf16_lossy(&buf[..got as usize]));
+                        }
+                    }
+                }
+            }
+
+            let fmt = RegisterClipboardFormatW(w!("Preferred DropEffect"));
+            if fmt != 0 {
+                if let Ok(handle) = GetClipboardData(fmt) {
+                    if !handle.0.is_null() {
+                        let p = GlobalLock(HGLOBAL(handle.0)) as *const u32;
+                        if !p.is_null() {
+                            prefer_move = (*p & DROPEFFECT_MOVE.0) != 0;
+                            let _ = GlobalUnlock(HGLOBAL(handle.0));
+                        }
+                    }
+                }
+            }
+
+            let _ = CloseClipboard();
+            Ok((paths, prefer_move))
+        }
+    }
+
+    /// Case-insensitive normalized Windows path key (shared by the copy guard);
+    /// mirrors the normalization used by `is_noop_move`.
+    fn norm_path(p: &Path) -> String {
+        let raw = std::fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| p.to_string_lossy().into_owned());
+        let stripped = raw
+            .strip_prefix(r"\\?\UNC\")
+            .map(|rest| format!(r"\\{rest}"))
+            .or_else(|| raw.strip_prefix(r"\\?\").map(|rest| rest.to_string()))
+            .unwrap_or(raw);
+        stripped.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+    }
+
+    /// True when copying `src` into `dest` would recurse forever — copying a
+    /// folder into itself or one of its own descendants. Files (and same-parent
+    /// copies, which the shell turns into "name - Copy") are always allowed, so
+    /// paste-into-the-same-folder still makes a duplicate.
+    fn is_unsafe_copy(src: &Path, dest: &Path) -> bool {
+        if !src.is_dir() {
+            return false;
+        }
+        let src_n = norm_path(src);
+        let dest_n = norm_path(dest);
+        dest_n == src_n || dest_n.starts_with(&format!("{src_n}\\"))
+    }
+
+    /// Copy `sources` into `dest` via the shell file-operation engine — the same
+    /// guarded `IFileOperation` path as `move_items`, but `CopyItem` instead of
+    /// `MoveItem`. Handles files AND folders, shows the native progress/collision
+    /// dialogs, recycles anything an overwrite displaces (`FOF_ALLOWUNDO`), and
+    /// audits each copied item. Runs on a libuv worker thread (see `CopyTask`).
+    pub fn copy_items(sources: Vec<String>, dest: String, owner: isize) -> Result<MoveOutcome, String> {
+        let existing: Vec<String> = sources
+            .into_iter()
+            .filter(|p| !p.is_empty() && Path::new(p).exists())
+            .collect();
+        if existing.is_empty() {
+            return Err("no existing paths to copy".to_string());
+        }
+        if dest.trim().is_empty() {
+            return Err("no destination".to_string());
+        }
+        unsafe {
+            let did_init = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+            let result = copy_items_inner(&existing, &dest, owner);
+            if did_init {
+                CoUninitialize();
+            }
+            result
+        }
+    }
+
+    unsafe fn copy_items_inner(existing: &[String], dest: &str, owner: isize) -> Result<MoveOutcome, String> {
+        let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)
+            .map_err(|e| format!("CoCreateInstance(FileOperation) failed: {e}"))?;
+        // Mirror move_items' flags: recoverable overwrites + stop-at-first-failure,
+        // and keep the native progress/collision UI visible.
+        op.SetOperationFlags(FOF_ALLOWUNDO | FOFX_EARLYFAILURE)
+            .map_err(|e| format!("SetOperationFlags failed: {e}"))?;
+
+        let owner_hwnd = if owner != 0 {
+            HWND(owner as *mut std::ffi::c_void)
+        } else {
+            GetForegroundWindow()
+        };
+        if owner_hwnd != HWND::default() {
+            let _ = op.SetOwnerWindow(owner_hwnd);
+        }
+
+        let dest_wide = to_wide(dest);
+        let dest_item: IShellItem = SHCreateItemFromParsingName(PCWSTR(dest_wide.as_ptr()), None)
+            .map_err(|e| format!("destination not found ({dest}): {e}"))?;
+        let dest_path = Path::new(dest);
+
+        let mut queued: Vec<(&String, String)> = Vec::new();
+        let mut skipped = 0u32;
+        for src in existing {
+            if is_unsafe_copy(Path::new(src), dest_path) {
+                skipped += 1;
+                continue;
+            }
+            let Some(name) = Path::new(src)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let src_wide = to_wide(src);
+            let src_item: IShellItem =
+                match SHCreateItemFromParsingName(PCWSTR(src_wide.as_ptr()), None) {
+                    Ok(item) => item,
+                    Err(_) => continue,
+                };
+            if op
+                .CopyItem(&src_item, &dest_item, PCWSTR::null(), None)
+                .is_ok()
+            {
+                queued.push((src, name));
+            }
+        }
+        if queued.is_empty() {
+            if skipped > 0 {
+                return Ok(MoveOutcome { aborted: false, moved: 0, skipped, failed: 0 });
+            }
+            return Err("no items could be queued for the copy".to_string());
+        }
+
+        let _ = op.PerformOperations();
+        let aborted = op
+            .GetAnyOperationsAborted()
+            .map(|b| b.as_bool())
+            .unwrap_or(false);
+
+        // Copy leaves the source in place, so success is detected by the target
+        // existing afterward (a paste into the SAME folder keeps both, so the
+        // original — which equals the target name — is present either way; the
+        // renderer rescans to show the true result regardless).
+        let mut copied = 0u32;
+        let mut failed = 0u32;
+        for (src, name) in &queued {
+            let target = dest_path.join(name);
+            if target.exists() {
+                copied += 1;
+                let dst = target.to_string_lossy().into_owned();
+                crate::audit::record(crate::audit::Entry {
+                    op: "copy",
+                    src: std::slice::from_ref(*src),
+                    dst: &dst,
+                    ..Default::default()
+                });
+            } else {
+                failed += 1;
+            }
+        }
+        Ok(MoveOutcome { aborted, moved: copied, skipped, failed })
     }
 
     // ── Native shell context menu ─────────────────────────────────────────────

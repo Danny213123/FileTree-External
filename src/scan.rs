@@ -67,6 +67,20 @@ where
     let root_hidden = is_hidden_entry(&options.root, &root_metadata);
     let root_name = display_name(&options.root);
     let root_path = options.root.display().to_string();
+    // Owner is opt-in (one security-descriptor open per entry); attributes are
+    // free here (already in the root metadata on Windows).
+    let root_owner = if options.collect_owners {
+        crate::owner::owner_of(&root_path)
+    } else {
+        String::new()
+    };
+    #[cfg(windows)]
+    let root_attributes = {
+        use std::os::windows::fs::MetadataExt;
+        root_metadata.file_attributes()
+    };
+    #[cfg(not(windows))]
+    let root_attributes = 0u32;
     let root_node = NodeRecord {
         id: 0,
         parent: None,
@@ -91,6 +105,8 @@ where
         errors: 0,
         children: Vec::new(),
         extension: String::new(),
+        owner: root_owner,
+        attributes: root_attributes,
     };
 
     let queue = if root_is_dir {
@@ -485,6 +501,15 @@ fn scan_directory_win32(
         let needs_queue = is_dir && should_recurse(depth, shared.options.max_depth);
         let at_depth_limit = is_dir && !needs_queue && shared.options.max_depth.is_some();
 
+        // Owner is opt-in: GetNamedSecurityInfo opens a security descriptor per
+        // entry, so resolving it unconditionally would slow large scans. The
+        // attribute bitmask is already in hand (`attrs`), so it's always carried.
+        let owner = if shared.options.collect_owners {
+            crate::owner::owner_of(&entry_path_str)
+        } else {
+            String::new()
+        };
+
         let local_idx = local_nodes.len();
         local_nodes.push(NodeRecord {
             id: 0, // assigned below
@@ -506,6 +531,8 @@ fn scan_directory_win32(
             errors: 0,
             children: Vec::new(),
             extension,
+            owner,
+            attributes: attrs,
         });
 
         if needs_queue {
@@ -660,6 +687,12 @@ fn scan_directory_portable(
         let needs_queue = is_dir && should_recurse(depth, shared.options.max_depth);
         let at_depth_limit = is_dir && !needs_queue && shared.options.max_depth.is_some();
 
+        let owner = if shared.options.collect_owners {
+            crate::owner::owner_of(&path_string)
+        } else {
+            String::new()
+        };
+
         let local_idx = local_nodes.len();
         local_nodes.push(NodeRecord {
             id: 0,
@@ -681,6 +714,10 @@ fn scan_directory_portable(
             errors: 0,
             children: Vec::new(),
             extension: if is_file_like { extension_from_name(&local_nodes.last().map(|_| "").unwrap_or("")).to_string() } else { String::new() },
+            owner,
+            // Raw Windows attribute bitmask is unavailable via std metadata on
+            // non-Windows; the existing hidden/readonly bools still carry over.
+            attributes: 0,
         });
 
         // Fix extension after push (borrow checker)
@@ -881,6 +918,8 @@ mod tests {
             errors: 0,
             children: Vec::new(),
             extension: String::new(),
+            owner: String::new(),
+            attributes: 0,
         }
     }
 
@@ -925,6 +964,7 @@ mod tests {
                 exclude_patterns: Vec::new(),
                 max_depth: None,
                 threads: 1,
+                collect_owners: false,
             },
             nodes: Mutex::new(vec![root, child_a, child_b]),
             errors: Mutex::new(Vec::new()),
@@ -965,6 +1005,7 @@ mod tests {
                 exclude_patterns: Vec::new(),
                 max_depth: None,
                 threads: 1,
+                collect_owners: false,
             },
             nodes: Mutex::new(vec![root, child]),
             errors: Mutex::new(Vec::new()),
@@ -995,6 +1036,7 @@ mod tests {
                 exclude_patterns: Vec::new(),
                 max_depth: None,
                 threads: 1,
+                collect_owners: false,
             },
             nodes: Mutex::new(Vec::new()),
             errors: Mutex::new(Vec::new()),
@@ -1034,6 +1076,7 @@ mod tests {
                 exclude_patterns: Vec::new(),
                 max_depth: None,
                 threads: 1,
+                collect_owners: false,
             },
             nodes: Mutex::new(Vec::new()),
             errors: Mutex::new(Vec::new()),
@@ -1074,6 +1117,7 @@ mod tests {
             exclude_patterns: Vec::new(),
             max_depth: None,
             threads: 1,
+            collect_owners: false,
         };
 
         let mut progress_called = false;

@@ -6,8 +6,10 @@ import {
   revealPath, openPath, shellContextMenu, createFolder, fetchScan,
   copyPath, renameItem, moveItems, deletePath, copyFiles,
   hasNativeMove, moveItemsNative, fetchDupesV2Bounded, runCommand,
+  exportUrl, printReportAsPdf,
+  clipboardWriteFiles, clipboardReadFiles, copyItemsNative, hasNativeCopy,
 } from "../api/client";
-import type { ScanOptions } from "../api/client";
+import type { ScanOptions, ExportFormat } from "../api/client";
 import type { NodeRecord, SortKey } from "../api/types";
 import { isNoOpMove, type AgentApi } from "../lib/agent";
 import { confirmRisky, isCrossDrive } from "../lib/confirmRisky";
@@ -18,6 +20,7 @@ import { Treemap } from "./Treemap";
 import type { ViewId } from "./ActivityBar";
 import { ConflictDialog, type ConflictChoice } from "./ConflictDialog";
 import { FilterDialog } from "./FilterDialog";
+import { Breadcrumb } from "./Breadcrumb";
 import { Icon } from "./Icon";
 import type { ScanStatus } from "../hooks/useScan";
 import type { ScanResult, Metric, Unit } from "../api/types";
@@ -40,11 +43,22 @@ export interface WorkspaceTabHandle {
   doCancel: () => void;
   doScanPath: (path: string) => void;
   doNavigateParent: () => void;
+  /** Navigate back/forward through this tab's per-tab scan history. */
+  doBack: () => void;
+  doForward: () => void;
+  /** Whether back/forward are currently possible (for menu enabled state). */
+  getNavState: () => { canBack: boolean; canForward: boolean };
   doExpand: (level: number) => void;
   doNewFolder: () => void;
   doOpenFilter: () => void;
   doReveal: () => void;
-  doExport: (format: "csv" | "json") => void;
+  doExport: (format: ExportFormat) => void;
+  /** Cut the selection to the clipboard as CF_HDROP (paste = move). #9 */
+  doCutFiles: () => void;
+  /** Paste CF_HDROP clipboard files into the focused folder (move or copy). #9 */
+  doPaste: () => void;
+  /** Drop Explorer files into a specific folder (drag-in): move same-drive, copy cross-drive. #9 */
+  dropExternalInto: (paths: string[], destination: string) => Promise<void>;
   doRename: () => void;
   doRenamePath: (path: string) => void;
   doDelete: () => void;
@@ -109,6 +123,27 @@ export interface SidebarModel {
   onScanPath: (p: string) => void;
 }
 
+// Cap on per-tab navigation history so a long browsing session can't grow the
+// stack without bound. Oldest entries are dropped first.
+const HISTORY_MAX = 50;
+
+// Case-insensitive, trailing-separator-insensitive path equality (Windows).
+function samePath(a: string, b: string): boolean {
+  return a.replace(/[/\\]+$/, "").toLowerCase() === b.replace(/[/\\]+$/, "").toLowerCase();
+}
+
+// Parent folder of a path, with drive roots normalized to include the trailing
+// backslash ("C:\\Users" → "C:\\"). Returns null at a volume/UNC root so "up"
+// becomes a no-op rather than scanning a malformed path.
+function parentDirOf(p: string): string | null {
+  const trimmed = p.replace(/[/\\]+$/, "");
+  const idx = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  if (idx <= 0) return null;
+  const parent = trimmed.slice(0, idx);
+  if (/^[a-zA-Z]:$/.test(parent)) return parent + "\\";
+  return parent || null;
+}
+
 function dedupeNestedPaths(paths: string[], nodeByPath: Map<string, NodeRecord>): string[] {
   // Sort shortest-first so an ancestor is always kept before its descendants.
   const sorted = [...paths].sort((a, b) => a.length - b.length);
@@ -163,6 +198,10 @@ interface WorkspaceTabProps {
   threads: number;
   includeHidden: boolean;
   followLinks: boolean;
+  /** Opt-in Windows owner resolution (off by default; slower scans). */
+  collectOwners: boolean;
+  /** Toggling this re-scans the current path so owners (de)populate. */
+  onCollectOwnersChange: (v: boolean) => void;
   exclude: string;
   treemapDetail: number;
   tmShowSingleFiles: boolean;
@@ -189,7 +228,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   {
     tabId, initialPath, active, activeView, toolbarVisible, darkMode,
     panelOpen, onPanelOpenChange, panelHeight, onPanelHeightChange,
-    bookmarkList, threads, includeHidden, followLinks, exclude,
+    bookmarkList, threads, includeHidden, followLinks, collectOwners, onCollectOwnersChange, exclude,
     treemapDetail,
     tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
@@ -216,6 +255,16 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const lastCompletedPathRef = useRef<string>("");
   const lastScanWasRefreshRef = useRef(false);
   const bookmarkSet = useMemo(() => new Set(bookmarkList), [bookmarkList]);
+
+  // Per-tab navigation history: the sequence of scanned root paths the user
+  // visited, with `index` pointing at the current entry. User navigations
+  // (drill-in, breadcrumb click, "up", sidebar location, scan) push onto the
+  // stack (truncating any forward entries); Back/Forward only move the index so
+  // they never create spurious entries. A live ref lets the stable Back/Forward
+  // callbacks read current state without being re-created each render.
+  const [navHistory, setNavHistory] = useState<{ stack: string[]; index: number }>({ stack: [], index: -1 });
+  const navHistoryRef = useRef(navHistory);
+  navHistoryRef.current = navHistory;
 
   // Debounced filter box: typing commits to tree state ~180ms after the last
   // keystroke so collectVisibleRows (O(n) over the whole tree) doesn't re-run on
@@ -246,6 +295,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       threads: t ?? threads,
       includeHidden,
       followLinks,
+      collectOwners,
       excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
       nocache: forceFresh || undefined,
     };
@@ -258,7 +308,19 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       startScan(opts);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scanPath, threads, includeHidden, followLinks, exclude, startScan, startRefresh, tree]);
+  }, [scanPath, threads, includeHidden, followLinks, collectOwners, exclude, startScan, startRefresh, tree]);
+
+  // Toggling owner collection only changes data on the next walk, so re-scan the
+  // current root (forced fresh) when it flips — but never on the initial mount /
+  // settings hydration before any scan has completed.
+  const ownersHydratedRef = useRef(false);
+  useEffect(() => {
+    if (!ownersHydratedRef.current) { ownersHydratedRef.current = true; return; }
+    if (status !== "scanning" && lastCompletedPathRef.current) {
+      doScan(lastCompletedPathRef.current, undefined, true);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [collectOwners]);
 
   const hasStartedRef = useRef(false);
   useEffect(() => {
@@ -360,6 +422,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               threads,
               includeHidden,
               followLinks,
+              collectOwners,
               excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
               maxDepth: 1,
               nocache: true,
@@ -384,12 +447,15 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [threads, includeHidden, followLinks, exclude]);
+  }, [threads, includeHidden, followLinks, collectOwners, exclude]);
 
   useEffect(() => {
     if (status === "done" && data) {
       lastCompletedPathRef.current = data.rootPath;
       if (active) startWatch(data.rootPath);
+      // Seed history with the very first completed root (initial/restored scan).
+      // Subsequent navigations push via openLocation; this only fires once.
+      setNavHistory((prev) => (prev.index === -1 ? { stack: [data.rootPath], index: 0 } : prev));
     }
     if (status === "scanning") {
       fsEventsRef.current?.close();
@@ -409,13 +475,58 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
-  // Scan a path inside THIS tab (no upward propagation/double-scan).
+  // Record a user navigation in the history stack. Drops any forward entries
+  // (classic browser semantics) and skips no-op pushes when re-navigating to
+  // the entry we're already on (e.g. a refresh of the current root).
+  const pushHistory = useCallback((path: string) => {
+    setNavHistory((prev) => {
+      const cur = prev.index >= 0 ? prev.stack[prev.index] : undefined;
+      if (cur != null && samePath(cur, path)) return prev;
+      const base = prev.stack.slice(0, prev.index + 1);
+      base.push(path);
+      const overflow = Math.max(0, base.length - HISTORY_MAX);
+      const stack = overflow ? base.slice(overflow) : base;
+      return { stack, index: stack.length - 1 };
+    });
+  }, []);
+
+  // Scan a path inside THIS tab (no upward propagation/double-scan). This is the
+  // single funnel for user-initiated root navigations (sidebar location, drill-
+  // in, breadcrumb, "up", scan button) so they all record history consistently.
+  // cancelScan() first so a navigation during an in-flight scan isn't dropped by
+  // startScan's "already scanning" guard.
   const openLocation = useCallback((path: string) => {
     if (!path.trim()) return;
+    cancelScan();
     setScanPathState(path);
     onScanPath(path); // record recent only
+    pushHistory(path.trim());
     doScan(path);
-  }, [doScan, onScanPath]);
+  }, [cancelScan, doScan, onScanPath, pushHistory]);
+
+  // Back/Forward replay a previously-visited root WITHOUT pushing new history;
+  // they only move the index. Guarded so they no-op at the ends of the stack.
+  const goBack = useCallback(() => {
+    const h = navHistoryRef.current;
+    if (h.index <= 0) return;
+    const target = h.stack[h.index - 1];
+    setNavHistory({ stack: h.stack, index: h.index - 1 });
+    cancelScan();
+    setScanPathState(target);
+    onScanPath(target);
+    doScan(target);
+  }, [cancelScan, doScan, onScanPath]);
+
+  const goForward = useCallback(() => {
+    const h = navHistoryRef.current;
+    if (h.index >= h.stack.length - 1) return;
+    const target = h.stack[h.index + 1];
+    setNavHistory({ stack: h.stack, index: h.index + 1 });
+    cancelScan();
+    setScanPathState(target);
+    onScanPath(target);
+    doScan(target);
+  }, [cancelScan, doScan, onScanPath]);
 
   // Stable identity (reads tree via ref) so TreeTable's React.memo holds across
   // unrelated parent re-renders.
@@ -483,19 +594,12 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     const node = treeRef.current.nodeById.get(id);
     if (!node) return;
     if (node.dir) {
-      setScanPathState(node.path);
-      cancelScan();
-      startScan({
-        path: node.path,
-        threads,
-        includeHidden,
-        followLinks,
-        excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
-      });
+      // Drill in = rescan this folder as the new root (records history).
+      openLocation(node.path);
     } else {
       openPath(node.path);
     }
-  }, [threads, includeHidden, followLinks, exclude, cancelScan, startScan]);
+  }, [openLocation]);
 
   const handleSortChange = useCallback((k: SortKey) => { treeRef.current.setSortKey(k); }, []);
 
@@ -511,18 +615,13 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     t.setSelectedId(id);
   }, []);
 
+  // "Up one level" navigates the scanned ROOT to its parent folder (Explorer
+  // parity) and records history. No-ops at a volume/UNC root.
   const handleNavigateParent = useCallback(() => {
-    const selected = tree.nodeById.get(tree.selectedId);
-    if (selected?.parent != null) {
-      tree.setSelectedId(selected.parent);
-    } else {
-      const parts = scanPath.replace(/[/\\]+$/, "").split(/[/\\]/);
-      if (parts.length > 1) {
-        const parent = parts.slice(0, -1).join("\\");
-        setScanPathState(parent);
-      }
-    }
-  }, [tree, scanPath]);
+    const root = lastCompletedPathRef.current || scanPath;
+    const parent = parentDirOf(root);
+    if (parent && !samePath(parent, root)) openLocation(parent);
+  }, [scanPath, openLocation]);
 
   const handleExpand = useCallback((level: number) => { tree.expandToLevel(level); }, [tree]);
 
@@ -723,6 +822,55 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     if (selectedPaths.length > 0) copyFiles(selectedPaths).catch(() => {});
   }, [selectedPaths]);
 
+  // Cut the selection: CF_HDROP with a MOVE drop effect so Explorer dims the
+  // items and a later Paste (here or in Explorer) relocates them (#9).
+  const runCutFiles = useCallback(() => {
+    if (selectedPaths.length > 0) clipboardWriteFiles(selectedPaths, true).catch(() => {});
+  }, [selectedPaths]);
+
+  // Where a Paste lands: a single selected folder, else the scanned root.
+  const pasteTargetFolder = useCallback((): string | null => {
+    if (!data) return null;
+    if (selectedPaths.length === 1) {
+      const node = nodeByPath.get(selectedPaths[0]);
+      if (node?.dir) return node.path;
+    }
+    return data.rootPath;
+  }, [data, selectedPaths, nodeByPath]);
+
+  // Copy clipboard/dropped files INTO `destination` via the guarded native shell
+  // COPY (IFileOperation): native progress/collision dialogs, recycle-on-
+  // overwrite, descendant/no-op skip, and per-item audit — never a raw copy that
+  // could clobber. Risk-scoped confirm for large/many batches mirrors moves (#9).
+  const runPasteCopy = useCallback(async (sources: string[], destination: string): Promise<void> => {
+    if (sources.length === 0 || !destination) return;
+    const byPath = nodeByPathRef.current;
+    const copyBytes = sources.reduce((sum, s) => sum + (byPath.get(s)?.size ?? 0), 0);
+    const proceed = confirmRisky({
+      kind: "copy",
+      crossDrive: isCrossDrive(sources, destination),
+      itemCount: sources.length,
+      totalBytes: copyBytes,
+      names: sources.map((s) => byPath.get(s)?.name ?? basenameFromPath(s)),
+    });
+    if (!proceed) { setMoveNotice("Paste canceled."); return; }
+    if (!hasNativeCopy()) { setMoveNotice("Paste-copy requires the FileTree desktop app."); return; }
+    try {
+      suppressWatchRef.current = true;
+      const res = await copyItemsNative(sources, destination);
+      if (res.failed > 0) {
+        setMoveNotice(`${res.failed} item${res.failed === 1 ? "" : "s"} could not be copied${res.aborted ? " (canceled)" : ""}.`);
+      } else if (res.moved === 0 && res.skipped > 0) {
+        setMoveNotice("Nothing to paste here.");
+      }
+      invalidateAllScanCache();
+      doScan(undefined, undefined, true);
+    } catch (e) {
+      suppressWatchRef.current = false;
+      setMoveNotice(`Paste failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, [doScan]);
+
   const handleInternalMove = useCallback(async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string }> => {
     if (sources.length === 0 || !destination) return { ok: true };
     // Drop any source whose move would be a no-op or unsafe — dropped onto
@@ -800,6 +948,38 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   }, [doScan, runMoveWithConflicts]);
+
+  // Paste CF_HDROP files into the focused folder. A Cut pastes as a MOVE through
+  // the existing guarded move flow (handleInternalMove: no-op/descendant guards,
+  // recycle-on-overwrite, risk confirm, audit, undo); a Copy pastes via the
+  // guarded native copy above (#9). Declared after handleInternalMove so the
+  // const is initialised before these closures capture it.
+  const runPaste = useCallback(async () => {
+    if (!data) return;
+    const clip = await clipboardReadFiles();
+    if (!clip.paths.length) { setMoveNotice("Clipboard has no files to paste."); return; }
+    const dest = pasteTargetFolder();
+    if (!dest) return;
+    if (clip.preferMove) {
+      const outcome = await handleInternalMove(clip.paths, dest);
+      if (!outcome.ok) setMoveNotice(`Paste failed: ${outcome.error ?? "unknown error"}`);
+    } else {
+      await runPasteCopy(clip.paths, dest);
+    }
+  }, [data, pasteTargetFolder, handleInternalMove, runPasteCopy]);
+
+  // Explorer drag-in dropped onto a folder row: Explorer-like effect — same-drive
+  // MOVE, cross-drive COPY (avoids the move=copy+delete hazard). Both route
+  // through the guarded engines, so the data-safety guards still fire (#9).
+  const dropExternalInto = useCallback(async (sources: string[], destination: string): Promise<void> => {
+    if (sources.length === 0 || !destination) return;
+    if (isCrossDrive(sources, destination)) {
+      await runPasteCopy(sources, destination);
+    } else {
+      const outcome = await handleInternalMove(sources, destination);
+      if (!outcome.ok) setMoveNotice(`Drop failed: ${outcome.error ?? "unknown error"}`);
+    }
+  }, [handleInternalMove, runPasteCopy]);
 
   // "Move to..." (ribbon / context action). Route through handleInternalMove so
   // that in Electron it uses the native shell move (IFileOperation) with the real
@@ -887,7 +1067,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         errorCount: data?.errorCount ?? 0,
         onNavigate: handleNavigate,
         onScanPathInput: setScanPathState,
-        onScan: () => { onScanPath(scanPath); doScan(); },
+        onScan: () => openLocation(scanPath),
         onCancel: cancelScan,
         onRefresh: () => doScan(undefined, undefined, true),
         onUp: handleNavigateParent,
@@ -904,8 +1084,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     },
     doScan: () => doScan(),
     doCancel: cancelScan,
-    doScanPath: (path) => { setScanPathState(path); doScan(path); },
+    doScanPath: (path) => openLocation(path),
     doNavigateParent: handleNavigateParent,
+    doBack: goBack,
+    doForward: goForward,
+    getNavState: () => ({
+      canBack: navHistory.index > 0,
+      canForward: navHistory.index < navHistory.stack.length - 1,
+    }),
     doExpand: handleExpand,
     doNewFolder: handleNewFolder,
     doOpenFilter: () => setFilterDialogOpen(true),
@@ -917,12 +1103,22 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     doMoveTo: runMoveTo,
     doCopyPath: runCopyPath,
     doCopyFiles: runCopyFiles,
+    doCutFiles: runCutFiles,
+    doPaste: () => { void runPaste(); },
+    dropExternalInto: (paths, destination) => dropExternalInto(paths, destination),
     doExport: (format) => {
       if (!data) return;
-      const path = encodeURIComponent(data.rootPath);
-      const url = format === "csv" ? `/api/export.csv?path=${path}` : `/api/export.json?path=${path}`;
+      // "pdf" isn't a server format: per roadmap #8, PDF = print the HTML
+      // report. We fetch the same server-rendered report and print it via a
+      // hidden iframe, so the user gets the OS "Save as PDF" target.
+      if (format === "pdf") {
+        printReportAsPdf(data.rootPath);
+        return;
+      }
+      // csv/json/html/xml/xlsx all download from the matching server endpoint,
+      // which reports on the current scan (last_scan) plus its analytics.
       const a = document.createElement("a");
-      a.href = url;
+      a.href = exportUrl(format, data.rootPath);
       a.download = "";
       document.body.appendChild(a);
       a.click();
@@ -952,8 +1148,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     refresh: () => { invalidateAllScanCache(); doScan(undefined, undefined, true); },
   }), [status, data, progress, errorMessage, scanPath, tree, cancelScan, agentApi,
        doScan, handleNavigate, handleNavigateParent, handleExpand, handleNewFolder, selectedNode,
-       openLocation, runOpen, runReveal, onScanPath,
-       runRename, runRenamePath, runDelete, runDeletePaths, runMoveTo, runCopyPath, runCopyFiles]);
+       openLocation, goBack, goForward, navHistory, runOpen, runReveal, onScanPath,
+       runRename, runRenamePath, runDelete, runDeletePaths, runMoveTo, runCopyPath, runCopyFiles,
+       runCutFiles, runPaste, dropExternalInto]);
 
   // Bottom-panel (treemap) vertical resize.
   const handlePanelResize = useCallback((e: React.MouseEvent) => {
@@ -978,10 +1175,23 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   }, [panelHeight, onPanelHeightChange]);
 
   const showTreemapView = activeView === "treemap";
+  const breadcrumbPath = data?.rootPath || scanPath;
+  const canBack = navHistory.index > 0;
+  const canForward = navHistory.index < navHistory.stack.length - 1;
 
   return (
     <div className="wb-tab" data-tab-id={tabId} style={active ? undefined : { display: "none" }}>
       <div className="editor-region">
+        <Breadcrumb
+          path={breadcrumbPath}
+          scanning={status === "scanning"}
+          canBack={canBack}
+          canForward={canForward}
+          onNavigate={openLocation}
+          onBack={goBack}
+          onForward={goForward}
+          onUp={handleNavigateParent}
+        />
         {showTreemapView ? (
           <>
             {toolbarVisible && (
@@ -1059,6 +1269,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               <label>
                 <input type="checkbox" checked={tree.showFiles} onChange={(e) => tree.setShowFiles(e.target.checked)} />
                 Files
+              </label>
+              <label title="Resolve each item's Windows owner during the scan (slower). Off by default; toggling re-scans this folder.">
+                <input type="checkbox" checked={collectOwners} onChange={(e) => onCollectOwnersChange(e.target.checked)} />
+                Owners
               </label>
               <button onClick={() => tree.expandToLevel(Infinity)}>Expand all</button>
               <button onClick={() => tree.expandToLevel(0)}>Collapse all</button>

@@ -19,8 +19,9 @@ use crate::dupes::{
     action_delete, action_move, action_copy,
 };
 use crate::export::{
-    app_config_json, drives_json, push_json_string, scan_result_to_csv, scan_result_to_json,
-    special_folders_json, write_scan_result_json, write_scan_result_ndjson,
+    app_config_json, drives_json, push_json_string, scan_result_to_csv, scan_result_to_html,
+    scan_result_to_json, scan_result_to_xlsx, scan_result_to_xml, special_folders_json,
+    write_scan_result_json, write_scan_result_ndjson,
 };
 use crate::io::{default_thread_count, open_path, parse_bool, reveal_path, split_patterns};
 use crate::model::{AppState, DupesProgress, HttpRequest, ScanOptions};
@@ -538,6 +539,29 @@ fn invalidate_scan_cache(cache: &mut HashMap<String, (Arc<crate::model::ScanResu
     });
 }
 
+/// Find the most recent full scan for `path` regardless of cache TTL. Used by
+/// the snapshot save / diff-vs-current routes, where the user explicitly wants
+/// the tree they're looking at right now (a freshly-scanned root is in the
+/// cache; `last_scan` is the fallback when the cache entry has been evicted).
+fn find_current_scan(
+    state: &AppState,
+    path: &std::path::Path,
+) -> Option<Arc<crate::model::ScanResult>> {
+    let cache_key = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    if let Some(result) = state
+        .scan_cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).map(|(result, _)| Arc::clone(result)))
+    {
+        return Some(result);
+    }
+    let last = state.last_scan.lock().ok()?;
+    last.as_ref()
+        .filter(|result| result.root_path.replace('\\', "/").to_lowercase() == cache_key)
+        .map(Arc::clone)
+}
+
 fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()> {
     let request = match read_http_request(&stream) {
         Ok(request) => request,
@@ -557,13 +581,18 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
     // to this process via the FILETREE_AUTH_TOKEN env var and to the renderer via
     // IPC (out of band — the token never travels over HTTP, so scraping `GET /`
     // can't reveal it). This is the lockdown for gaps #2/#18.
-    const DESTRUCTIVE_ROUTES: [&str; 6] = [
+    const DESTRUCTIVE_ROUTES: [&str; 8] = [
         "/api/delete",
         "/api/move",
         "/api/move-items",
         "/api/rename",
         "/api/dupes-action",
         "/api/run-command",
+        // Scheduled-task create/delete run system commands (schtasks via
+        // PowerShell), so they get the same POST-only + session-token lockdown
+        // as filesystem mutations (gap #10).
+        "/api/schedule-create",
+        "/api/schedule-delete",
     ];
     let is_destructive = DESTRUCTIVE_ROUTES.contains(&route.as_str());
 
@@ -575,7 +604,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         "/api/bookmarks", "/api/settings", "/api/ai-chat", "/api/watch", "/api/delete",
         "/api/copy-path", "/api/rename", "/api/move-items", "/api/copy-files", "/api/drag-out",
         "/api/dupes-hash", "/api/dupes-action", "/api/dupes-make-ref", "/api/dupes-cancel",
-        "/api/dupes-ignore", "/api/run-command",
+        "/api/dupes-ignore", "/api/run-command", "/api/snapshots", "/api/snapshot-delete",
     ];
     let method_allowed = if is_destructive {
         // No GET fall-through for destructive routes.
@@ -702,6 +731,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     .get("threads")
                     .and_then(|value| value.parse().ok())
                     .unwrap_or_else(default_thread_count),
+                collect_owners: query.get("owners").map(|value| parse_bool(value)).unwrap_or(false),
             };
 
             // A depth-limited (maxdepth) or nocache scan is only a PARTIAL view of
@@ -779,6 +809,112 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 )],
             )
         }
+        // Richer report exports (#8). All reuse the cached `last_scan` (the
+        // current view) and its precomputed analytics, mirroring csv/json above.
+        "/api/export.html" => {
+            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
+                return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
+            };
+            let body = scan_result_to_html(&result);
+            respond_bytes(
+                &mut stream,
+                200,
+                "OK",
+                "text/html; charset=utf-8",
+                body.as_bytes(),
+                &[(
+                    "Content-Disposition",
+                    "attachment; filename=\"filetree-report.html\"",
+                )],
+            )
+        }
+        "/api/export.xml" => {
+            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
+                return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
+            };
+            let body = scan_result_to_xml(&result);
+            respond_bytes(
+                &mut stream,
+                200,
+                "OK",
+                "application/xml; charset=utf-8",
+                body.as_bytes(),
+                &[(
+                    "Content-Disposition",
+                    "attachment; filename=\"filetree-scan.xml\"",
+                )],
+            )
+        }
+        "/api/export.xlsx" => {
+            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
+                return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
+            };
+            let body = scan_result_to_xlsx(&result);
+            respond_bytes(
+                &mut stream,
+                200,
+                "OK",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &body,
+                &[(
+                    "Content-Disposition",
+                    "attachment; filename=\"filetree-scan.xlsx\"",
+                )],
+            )
+        }
+        // Scheduled scans (#10). List is a read-only GET; create/delete are
+        // POST-only and token-gated above (they shell out to PowerShell).
+        "/api/schedules" => match crate::schedule::list_tasks() {
+            Ok(json) => respond_json(&mut stream, 200, "OK", &json),
+            Err(message) => {
+                let mut body = String::from("{\"error\":");
+                push_json_string(&mut body, &message);
+                body.push('}');
+                respond_json(&mut stream, 500, "Internal Server Error", &body)
+            }
+        },
+        "/api/schedule-create" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let req = crate::schedule::CreateRequest {
+                name: extract_json_str(&body_str, "name").unwrap_or_default(),
+                path: extract_json_str(&body_str, "path").unwrap_or_default(),
+                schedule: extract_json_str(&body_str, "schedule").unwrap_or_default(),
+                time: extract_json_str(&body_str, "time").unwrap_or_default(),
+                day: extract_json_str(&body_str, "day").unwrap_or_default(),
+                out_dir: extract_json_str(&body_str, "outDir").unwrap_or_default(),
+                format: extract_json_str(&body_str, "format").unwrap_or_default(),
+            };
+            match crate::schedule::create_task(&req) {
+                Ok(full_name) => {
+                    let mut body = String::from("{\"ok\":true,\"name\":");
+                    push_json_string(&mut body, &full_name);
+                    body.push('}');
+                    respond_json(&mut stream, 200, "OK", &body)
+                }
+                Err(message) => {
+                    let mut body = String::from("{\"error\":");
+                    push_json_string(&mut body, &message);
+                    body.push('}');
+                    respond_json(&mut stream, 400, "Bad request", &body)
+                }
+            }
+        }
+        "/api/schedule-delete" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let name = extract_json_str(&body_str, "name").unwrap_or_default();
+            if name.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing task name");
+            }
+            match crate::schedule::delete_task(&name) {
+                Ok(()) => respond_json(&mut stream, 200, "OK", "{\"ok\":true}"),
+                Err(message) => {
+                    let mut body = String::from("{\"error\":");
+                    push_json_string(&mut body, &message);
+                    body.push('}');
+                    respond_json(&mut stream, 400, "Bad request", &body)
+                }
+            }
+        }
         "/api/duplicates" => {
             let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
                 return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
@@ -836,6 +972,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     follow_links: false,
                     exclude_patterns: vec![],
                     max_depth: None,
+                    collect_owners: false,
                 };
                 let cancel = Arc::clone(&state.dupes_cancel);
                 let prog2 = Arc::clone(&prog);
@@ -985,6 +1122,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     follow_links: false,
                     exclude_patterns: vec![],
                     max_depth: None,
+                    collect_owners: false,
                 };
                 let cancel = Arc::clone(&state.dupes_cancel);
                 let prog2 = Arc::clone(&prog);
@@ -1262,6 +1400,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 return respond_text(&mut stream, 400, "Bad request", "Missing path");
             };
             serve_thumbnail(&mut stream, path)
+        }
+        "/api/file-text" => {
+            // Read-only, bounded UTF-8 text preview of a file (Details/Preview
+            // pane). Never mutates anything; caps the read so previewing a huge
+            // log can't blow up memory, and refuses anything that sniffs binary.
+            let Some(path) = query.get("path") else {
+                return respond_text(&mut stream, 400, "Bad request", "Missing path");
+            };
+            serve_file_text(&mut stream, path)
         }
         "/api/reveal" => {
             let Some(path) = query.get("path") else {
@@ -1800,6 +1947,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     .get("threads")
                     .and_then(|value| value.parse().ok())
                     .unwrap_or_else(default_thread_count),
+                collect_owners: query.get("owners").map(|value| parse_bool(value)).unwrap_or(false),
             };
 
             write!(
@@ -1845,6 +1993,95 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 }
             }
             write_final_chunk(&mut stream)
+        }
+        // ── Scan snapshots + growth diff (roadmap #5) ──────────────────────
+        "/api/snapshots" => {
+            if request.method == "POST" {
+                // Save the current scan of ?path= as a new snapshot.
+                let path = query
+                    .get("path")
+                    .filter(|value| !value.trim().is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| state.initial_path.clone());
+                let label = query.get("label").cloned().unwrap_or_default();
+                match find_current_scan(&state, &path) {
+                    Some(result) => match crate::diff::save_snapshot(&result, &label) {
+                        Ok(_) => respond_json(&mut stream, 200, "OK", &crate::diff::list_snapshots_json()),
+                        Err(error) => {
+                            let mut body = String::from("{\"error\":");
+                            push_json_string(&mut body, &error.to_string());
+                            body.push('}');
+                            respond_json(&mut stream, 500, "Internal Server Error", &body)
+                        }
+                    },
+                    None => respond_json(
+                        &mut stream,
+                        409,
+                        "Conflict",
+                        "{\"error\":\"No scan is loaded for this path — scan it first, then save a snapshot.\"}",
+                    ),
+                }
+            } else {
+                respond_json(&mut stream, 200, "OK", &crate::diff::list_snapshots_json())
+            }
+        }
+        "/api/snapshot-delete" => {
+            let id = query.get("id").cloned().unwrap_or_default();
+            match crate::diff::delete_snapshot(&id) {
+                Ok(_) => respond_json(&mut stream, 200, "OK", &crate::diff::list_snapshots_json()),
+                Err(error) => {
+                    let mut body = String::from("{\"error\":");
+                    push_json_string(&mut body, &error.to_string());
+                    body.push('}');
+                    respond_json(&mut stream, 400, "Bad Request", &body)
+                }
+            }
+        }
+        "/api/snapshot-diff" => {
+            let a_id = query.get("a").cloned().unwrap_or_default();
+            let b_id = query.get("b").cloned().unwrap_or_default();
+            // Resolve the live scan once if either side compares against "current".
+            let current = if a_id == "current" || b_id == "current" {
+                let path = query
+                    .get("path")
+                    .filter(|value| !value.trim().is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| state.initial_path.clone());
+                find_current_scan(&state, &path)
+            } else {
+                None
+            };
+            let resolve = |id: &str| -> Option<(crate::diff::SnapMeta, crate::diff::EntryMap)> {
+                if id == "current" {
+                    current
+                        .as_ref()
+                        .map(|result| (crate::diff::current_meta(result), crate::diff::scan_entry_map(result)))
+                } else {
+                    crate::diff::load_snapshot(id)
+                }
+            };
+            match (resolve(&a_id), resolve(&b_id)) {
+                (Some((a_meta, a_map)), Some((b_meta, b_map))) => {
+                    let body = crate::diff::diff_response_json(&a_meta, &b_meta, &a_map, &b_map);
+                    respond_json(&mut stream, 200, "OK", &body)
+                }
+                _ => respond_json(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    "{\"error\":\"Snapshot not found, or no current scan is loaded for this path.\"}",
+                ),
+            }
+        }
+        // On-demand owner resolution for a single path (Details pane fallback
+        // when owners weren't collected during the scan).
+        "/api/owner" => {
+            let path = query.get("path").cloned().unwrap_or_default();
+            let owner = crate::owner::owner_of(&path);
+            let mut body = String::from("{\"owner\":");
+            push_json_string(&mut body, &owner);
+            body.push('}');
+            respond_json(&mut stream, 200, "OK", &body)
         }
         "/api/exit" => {
             respond_json(&mut stream, 200, "OK", "{\"ok\":true}")?;
@@ -2356,6 +2593,52 @@ fn serve_thumbnail(stream: &mut TcpStream, path: &str) -> sio::Result<()> {
     }
 
     respond_text(stream, 404, "Not Found", "Unsupported type")
+}
+
+/// Serve a bounded UTF-8 text preview of a file (read-only). Returns JSON:
+///   {"text":"…","truncated":bool}  — decodable text head,
+///   {"binary":true}                — the head contains NUL bytes (looks binary),
+/// or 400/404/500 on bad input / missing file / IO error. Caps the read at
+/// MAX_PREVIEW bytes so previewing a multi-GB file stays cheap and never OOMs.
+fn serve_file_text(stream: &mut TcpStream, path: &str) -> sio::Result<()> {
+    use std::io::Read as _;
+    const MAX_PREVIEW: usize = 64 * 1024;
+
+    let p = std::path::Path::new(path);
+    let meta = match std::fs::metadata(p) {
+        Ok(m) => m,
+        Err(_) => return respond_text(stream, 404, "Not Found", "File not found"),
+    };
+    if meta.is_dir() {
+        return respond_text(stream, 400, "Bad request", "Not a file");
+    }
+    let total = meta.len();
+
+    let mut file = match std::fs::File::open(p) {
+        Ok(f) => f,
+        Err(e) => return respond_text(stream, 500, "Error", &e.to_string()),
+    };
+    let mut buf = vec![0u8; MAX_PREVIEW];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(e) => return respond_text(stream, 500, "Error", &e.to_string()),
+    };
+    buf.truncate(n);
+
+    // Binary sniff: a NUL byte in the head means "not text" — bail so the client
+    // falls back to an icon instead of rendering mojibake.
+    if buf.iter().take(8192).any(|&b| b == 0) {
+        return respond_json(stream, 200, "OK", "{\"binary\":true}");
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let truncated = (total as usize) > n;
+    let mut body = String::from("{\"text\":");
+    push_json_string(&mut body, text.as_ref());
+    body.push_str(",\"truncated\":");
+    body.push_str(if truncated { "true" } else { "false" });
+    body.push('}');
+    respond_json(stream, 200, "OK", &body)
 }
 
 /// Extract a thumbnail for any file using the Windows Shell thumbnail cache.

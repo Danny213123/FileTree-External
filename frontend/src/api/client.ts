@@ -4,6 +4,9 @@ import type {
   Config,
   ExactDuplicatesResult,
   SpecialFolderList,
+  SnapshotList,
+  SnapshotMeta,
+  DiffResult,
 } from "./types";
 
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -48,6 +51,8 @@ export interface ScanOptions {
   excludePatterns?: string[];
   maxDepth?: number;
   nocache?: boolean;
+  /** Opt-in owner resolution (slower scans). Off by default; see `crate::owner`. */
+  collectOwners?: boolean;
 }
 
 export function scanStreamUrl(opts: ScanOptions): string {
@@ -59,6 +64,7 @@ export function scanStreamUrl(opts: ScanOptions): string {
     params.set("exclude", opts.excludePatterns.join(","));
   if (opts.maxDepth != null) params.set("maxdepth", String(opts.maxDepth));
   if (opts.nocache) params.set("nocache", "1");
+  if (opts.collectOwners) params.set("owners", "1");
   return `/api/scan-stream?${params}`;
 }
 
@@ -71,6 +77,7 @@ export function scanUrl(opts: ScanOptions): string {
     params.set("exclude", opts.excludePatterns.join(","));
   if (opts.maxDepth != null) params.set("maxdepth", String(opts.maxDepth));
   if (opts.nocache) params.set("nocache", "1");
+  if (opts.collectOwners) params.set("owners", "1");
   return `/api/scan?${params}`;
 }
 
@@ -255,6 +262,8 @@ export interface AppSettings {
   threads?: number;
   includeHidden?: boolean;
   followLinks?: boolean;
+  /** Opt-in Windows owner resolution during scans (off by default; slower). */
+  collectOwners?: boolean;
   exclude?: string;
   lastPath?: string;
   metric?: string;
@@ -277,6 +286,10 @@ export interface AppSettings {
   panelHeight?: number;
   chatOpen?: boolean;
   chatWidth?: number;
+  // Inspector (right-side Details/Preview panes)
+  previewOpen?: boolean;
+  detailsOpen?: boolean;
+  inspectorWidth?: number;
 }
 
 export async function fetchSettings(): Promise<AppSettings> {
@@ -291,6 +304,79 @@ export async function saveSettings(settings: AppSettings): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(settings),
   });
+}
+
+// ── File text preview (read-only) ────────────────────────────
+
+export interface FileTextPreview {
+  /** Decoded text head (present only when the file looks like text). */
+  text?: string;
+  /** True when the file is larger than the preview cap (server reads ~64 KB). */
+  truncated?: boolean;
+  /** True when the head contained NUL bytes (treat as non-previewable). */
+  binary?: boolean;
+}
+
+// Fetch a bounded UTF-8 text preview of a file. Returns { binary: true } for
+// anything the server can't read as text so callers fall back to an icon.
+export async function fetchFileText(path: string, signal?: AbortSignal): Promise<FileTextPreview> {
+  const params = new URLSearchParams({ path });
+  const res = await fetch(`/api/file-text?${params.toString()}`, { signal });
+  if (!res.ok) return { binary: true };
+  try { return await res.json() as FileTextPreview; } catch { return { binary: true }; }
+}
+
+// ── Scan snapshots + growth diff (roadmap #5) ────────────────
+
+/** List saved snapshots (newest first). Never throws — returns [] on failure. */
+export async function fetchSnapshots(): Promise<SnapshotMeta[]> {
+  const res = await fetch("/api/snapshots");
+  if (!res.ok) return [];
+  try { return ((await res.json()) as SnapshotList).snapshots ?? []; } catch { return []; }
+}
+
+/**
+ * Save the server's current scan of `path` as a new snapshot. The server reads
+ * the freshly-scanned tree from its own cache (no large client upload) and
+ * returns the updated snapshot list (newest first).
+ */
+export async function saveSnapshot(path: string, label?: string): Promise<SnapshotMeta[]> {
+  const params = new URLSearchParams({ path });
+  if (label) params.set("label", label);
+  const res = await fetch(`/api/snapshots?${params}`, { method: "POST", headers: mutateHeaders() });
+  if (!res.ok) throw new Error(await responseErrorText(res));
+  try { return ((await res.json()) as SnapshotList).snapshots ?? []; } catch { return []; }
+}
+
+export async function deleteSnapshot(id: string): Promise<SnapshotMeta[]> {
+  const params = new URLSearchParams({ id });
+  const res = await fetch(`/api/snapshot-delete?${params}`, { method: "POST", headers: mutateHeaders() });
+  if (!res.ok) return fetchSnapshots();
+  try { return ((await res.json()) as SnapshotList).snapshots ?? []; } catch { return []; }
+}
+
+/**
+ * Diff two snapshots, or a snapshot vs the live scan. Pass the literal "current"
+ * for either side to compare against the server's current scan of `path`
+ * (required when a side is "current").
+ */
+export async function fetchSnapshotDiff(
+  a: string,
+  b: string,
+  path?: string,
+  signal?: AbortSignal,
+): Promise<DiffResult> {
+  const params = new URLSearchParams({ a, b });
+  if (path) params.set("path", path);
+  return getJson<DiffResult>(`/api/snapshot-diff?${params}`, signal);
+}
+
+/** On-demand owner resolution for a single path (Details pane fallback). */
+export async function fetchOwner(path: string, signal?: AbortSignal): Promise<string> {
+  const params = new URLSearchParams({ path });
+  const res = await fetch(`/api/owner?${params}`, { signal });
+  if (!res.ok) return "";
+  try { return ((await res.json()) as { owner?: string }).owner ?? ""; } catch { return ""; }
 }
 
 // ── Smart watch ──────────────────────────────────────────────
@@ -420,8 +506,11 @@ type ElectronAPI = {
   authToken?: string;
   copyText?: (text: string) => Promise<void>;
   copyFiles?: (paths: string[]) => Promise<void>;
+  clipboardWriteFiles?: (paths: string[], cut: boolean) => Promise<boolean>;
+  clipboardReadFiles?: () => Promise<ClipboardFiles>;
   shellContextMenu?: (paths: string | string[], x: number, y: number) => Promise<void>;
   moveItemsNative?: (paths: string[], destination: string) => Promise<NativeMoveResult>;
+  copyItemsNative?: (paths: string[], destination: string) => Promise<NativeMoveResult>;
   restoreFromRecycleBin?: (originalPath: string) => Promise<boolean>;
 };
 const eAPI = (): ElectronAPI =>
@@ -461,6 +550,63 @@ export async function moveItemsNative(
   const api = eAPI();
   if (!api.moveItemsNative) throw new Error("native move unavailable");
   return api.moveItemsNative(paths, destination);
+}
+
+/** CF_HDROP file list read off the clipboard (roadmap item #9). */
+export interface ClipboardFiles {
+  paths: string[];
+  /** True when the source tagged the items as a Cut (paste should MOVE them). */
+  preferMove: boolean;
+}
+
+/** True when the native shell COPY (for paste-copy / drag-in copy) is available. */
+export function hasNativeCopy(): boolean {
+  return typeof eAPI().copyItemsNative === "function";
+}
+
+/** True when native CF_HDROP clipboard read/write is available (Electron + addon). */
+export function hasClipboardFiles(): boolean {
+  const api = eAPI();
+  return typeof api.clipboardReadFiles === "function" && typeof api.clipboardWriteFiles === "function";
+}
+
+/**
+ * Copy items into a folder via the Windows shell (IFileOperation) — same guarded
+ * engine + native dialogs as {@link moveItemsNative}. Throws if unavailable.
+ */
+export async function copyItemsNative(
+  paths: string[],
+  destination: string,
+): Promise<NativeMoveResult> {
+  const api = eAPI();
+  if (!api.copyItemsNative) throw new Error("native copy unavailable");
+  return api.copyItemsNative(paths, destination);
+}
+
+/**
+ * Put files on the clipboard as CF_HDROP (`cut` ⇒ MOVE, else COPY). Resolves
+ * true when a real file drop was written; false when it degraded to text (no
+ * native addon) or there was nothing to write.
+ */
+export async function clipboardWriteFiles(paths: string[], cut: boolean): Promise<boolean> {
+  const api = eAPI();
+  if (!api.clipboardWriteFiles) {
+    // Best-effort text fallback so something lands on the clipboard.
+    if (api.copyFiles) await api.copyFiles(paths);
+    return false;
+  }
+  return api.clipboardWriteFiles(paths, cut);
+}
+
+/** Read CF_HDROP paths (+ cut/copy intent) off the clipboard for paste-into-folder. */
+export async function clipboardReadFiles(): Promise<ClipboardFiles> {
+  const api = eAPI();
+  if (!api.clipboardReadFiles) return { paths: [], preferMove: false };
+  try {
+    return await api.clipboardReadFiles();
+  } catch {
+    return { paths: [], preferMove: false };
+  }
 }
 
 /** True when the native Recycle Bin restore (Phase 6 undo) is available. */
@@ -602,12 +748,112 @@ export async function shellContextMenu(paths: string | string[], x: number, y: n
   }
 }
 
-export function exportCsvUrl(path: string): string {
-  return `/api/export.csv?path=${encodeURIComponent(path)}`;
+// Export formats wired into the File menu (#8). csv/json/html/xml/xlsx download
+// from the server; "pdf" is rendered by printing the HTML report (see
+// `printReportAsPdf`) since the report doubles as the print-to-PDF source.
+export type ExportFormat = "csv" | "json" | "html" | "xml" | "xlsx" | "pdf";
+
+/** URL of the server export endpoint for a downloadable format. */
+export function exportUrl(format: Exclude<ExportFormat, "pdf">, path: string): string {
+  return `/api/export.${format}?path=${encodeURIComponent(path)}`;
 }
 
-export function exportJsonUrl(path: string): string {
-  return `/api/export.json?path=${encodeURIComponent(path)}`;
+/**
+ * "Export as PDF" = print the HTML report (#8). We fetch the same self-contained
+ * report the HTML export produces, drop it into a hidden, sandboxed iframe and
+ * invoke print() — the user then picks "Save as PDF" (or Microsoft Print to PDF)
+ * in the OS print dialog. This avoids bundling a heavyweight PDF engine while
+ * still producing a real PDF from the exact report.
+ */
+export async function printReportAsPdf(path: string): Promise<void> {
+  const res = await fetch(exportUrl("html", path));
+  if (!res.ok) throw new Error(`export.html failed: ${res.status}`);
+  const html = await res.text();
+  const blob = new Blob([html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+
+  const iframe = document.createElement("iframe");
+  iframe.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden";
+  iframe.onload = () => {
+    try {
+      iframe.contentWindow?.focus();
+      iframe.contentWindow?.print();
+    } finally {
+      // Give the print dialog time to capture the document before teardown.
+      window.setTimeout(() => {
+        iframe.remove();
+        URL.revokeObjectURL(url);
+      }, 60_000);
+    }
+  };
+  iframe.src = url;
+  document.body.appendChild(iframe);
+}
+
+// ── Scheduled scans (#10) ─────────────────────────────────────────────────
+// A UI wizard registers a Windows Scheduled Task that runs the FileTree CLI
+// (`scan --path … --out … --format …`) on a daily/weekly cadence. Create/delete
+// are POST + token-gated (they shell out to PowerShell); list is a read-only GET.
+
+/** Export formats a scheduled task can emit (PDF is interactive-only, so omitted). */
+export type ScheduleFormat = "csv" | "json" | "html" | "xml" | "xlsx";
+
+export interface ScheduleCreateRequest {
+  name: string;
+  path: string;
+  schedule: "daily" | "weekly";
+  /** 24-hour HH:MM. */
+  time: string;
+  /** Weekday for weekly (e.g. "Mon"); ignored for daily. */
+  day?: string;
+  outDir: string;
+  format: ScheduleFormat;
+}
+
+/** One FileTree scheduled task as reported by the server (Windows task info). */
+export interface ScheduledTask {
+  name: string;
+  state: string;
+  execute: string;
+  arguments: string;
+  nextRun: string;
+  lastRun: string;
+}
+
+/** List FileTree-created scheduled tasks. Never throws — returns [] on failure. */
+export async function listSchedules(): Promise<ScheduledTask[]> {
+  const res = await fetch("/api/schedules");
+  if (!res.ok) return [];
+  try {
+    return (await res.json()) as ScheduledTask[];
+  } catch {
+    return [];
+  }
+}
+
+/** Register (or overwrite) a scheduled scan+export task. Returns the full task name. */
+export async function createSchedule(req: ScheduleCreateRequest): Promise<string> {
+  const res = await fetch("/api/schedule-create", {
+    method: "POST",
+    headers: mutateHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(req),
+  });
+  if (!res.ok) throw new Error(await responseErrorText(res));
+  try {
+    return ((await res.json()) as { name?: string }).name ?? req.name;
+  } catch {
+    return req.name;
+  }
+}
+
+/** Delete a FileTree scheduled task by its short name. */
+export async function deleteSchedule(name: string): Promise<void> {
+  const res = await fetch("/api/schedule-delete", {
+    method: "POST",
+    headers: mutateHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw new Error(await responseErrorText(res));
 }
 
 // ── dupeguru V2 API ───────────────────────────────────────────────────────

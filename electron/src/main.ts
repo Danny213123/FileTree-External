@@ -38,10 +38,18 @@ type NativeDragResult = { outcome: string; dropX: number; dropY: number; deleted
 type NativeMoveResult = { aborted: boolean; moved: number; skipped: number; failed: number };
 type NativeConfirmMoveResult = { deleted: string[] };
 type NativeContextMenuResult = { verb: string };
+type NativeClipboardFiles = { paths: string[]; preferMove: boolean };
 let nativeDragFiles: ((paths: string[]) => NativeDragResult) | null = null;
 let nativeMoveItems:
   | ((sources: string[], dest: string, ownerHwnd: number) => Promise<NativeMoveResult>)
   | null = null;
+// Real CF_HDROP clipboard + a guarded shell COPY (mirrors nativeMoveItems) for
+// the paste-into-folder / drag-in flows (roadmap item #9).
+let nativeCopyItems:
+  | ((sources: string[], dest: string, ownerHwnd: number) => Promise<NativeMoveResult>)
+  | null = null;
+let nativeClipboardWrite: ((paths: string[], cut: boolean, ownerHwnd: number) => void) | null = null;
+let nativeClipboardRead: ((ownerHwnd: number) => NativeClipboardFiles) | null = null;
 // Observes an async external move to completion (returns the removed sources) so
 // the renderer can rescan once the OS transfer actually finishes.
 let nativeConfirmMove: ((sources: string[]) => Promise<NativeConfirmMoveResult>) | null = null;
@@ -63,6 +71,9 @@ try {
   const addon = require(path.join(__dirname, "filetree_drag.node")) as {
     dragFiles?: (paths: string[]) => NativeDragResult;
     moveItemsNative?: (sources: string[], dest: string, ownerHwnd: number) => Promise<NativeMoveResult>;
+    copyItemsNative?: (sources: string[], dest: string, ownerHwnd: number) => Promise<NativeMoveResult>;
+    clipboardWriteFiles?: (paths: string[], cut: boolean, ownerHwnd: number) => void;
+    clipboardReadFiles?: (ownerHwnd: number) => NativeClipboardFiles;
     confirmExternalMove?: (sources: string[]) => Promise<NativeConfirmMoveResult>;
     showContextMenuNative?: (paths: string[], ownerHwnd: number) => NativeContextMenuResult;
     restoreFromRecycleBin?: (originalPath: string) => Promise<boolean>;
@@ -74,6 +85,9 @@ try {
   };
   nativeDragFiles = typeof addon.dragFiles === "function" ? addon.dragFiles : null;
   nativeMoveItems = typeof addon.moveItemsNative === "function" ? addon.moveItemsNative : null;
+  nativeCopyItems = typeof addon.copyItemsNative === "function" ? addon.copyItemsNative : null;
+  nativeClipboardWrite = typeof addon.clipboardWriteFiles === "function" ? addon.clipboardWriteFiles : null;
+  nativeClipboardRead = typeof addon.clipboardReadFiles === "function" ? addon.clipboardReadFiles : null;
   nativeConfirmMove = typeof addon.confirmExternalMove === "function" ? addon.confirmExternalMove : null;
   nativeContextMenu = typeof addon.showContextMenuNative === "function" ? addon.showContextMenuNative : null;
   nativeRestore = typeof addon.restoreFromRecycleBin === "function" ? addon.restoreFromRecycleBin : null;
@@ -959,12 +973,61 @@ ipcMain.handle("restoreFromRecycleBin", (_event, originalPath: string) => {
   return nativeRestore(originalPath);
 });
 
-// Copy files as a file drop (CF_HDROP equivalent — paste in Explorer).
-ipcMain.handle("copyFiles", (_event, paths: string[]) => {
-  // Electron clipboard doesn't expose CF_HDROP directly on Windows.
-  // Best available: write the path list as text so Ctrl+V in Explorer opens them.
-  // For true CF_HDROP in future, use a native node addon.
-  clipboard.writeText(paths.join("\n"));
+// FileTree's top-level window handle for `event`'s sender, so native shell
+// operations parent their dialogs to the app. 0 → addon uses the foreground window.
+function ownerHwndForEvent(event: Electron.IpcMainInvokeEvent): number {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  try { win?.focus(); } catch { /* ignore */ }
+  try {
+    const buf = win?.getNativeWindowHandle();
+    if (buf && buf.length >= 8) return Number(buf.readBigUInt64LE(0));
+    if (buf && buf.length >= 4) return buf.readUInt32LE(0);
+  } catch { /* fall through to 0 */ }
+  return 0;
+}
+
+// Copy files to the clipboard as a real Windows file drop (CF_HDROP) so Paste
+// works in Explorer and other apps (roadmap item #9). Falls back to the old
+// newline-separated text only if the native addon is unavailable.
+ipcMain.handle("copyFiles", (event, paths: string[]) => {
+  const list = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
+  if (list.length === 0) return;
+  if (nativeClipboardWrite) {
+    try { nativeClipboardWrite(list, false, ownerHwndForEvent(event)); return; }
+    catch (err) { console.warn("[electron] clipboardWriteFiles(copy) failed; text fallback", err); }
+  }
+  clipboard.writeText(list.join("\n"));
+});
+
+// Write the selection to the clipboard as CF_HDROP with the matching drop effect
+// — `cut` ⇒ MOVE (Explorer dims the items and Paste relocates them), else COPY.
+ipcMain.handle("clipboardWriteFiles", (event, paths: string[], cut: boolean) => {
+  const list = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
+  if (list.length === 0) return false;
+  if (!nativeClipboardWrite) {
+    clipboard.writeText(list.join("\n"));
+    return false; // signal: no real CF_HDROP / cut semantics available
+  }
+  nativeClipboardWrite(list, !!cut, ownerHwndForEvent(event));
+  return true;
+});
+
+// Read a CF_HDROP file list (+ whether it was a Cut) off the clipboard for
+// paste-into-folder. Returns { paths: [], preferMove: false } when none / no addon.
+ipcMain.handle("clipboardReadFiles", (event): NativeClipboardFiles => {
+  if (!nativeClipboardRead) return { paths: [], preferMove: false };
+  try { return nativeClipboardRead(ownerHwndForEvent(event)); }
+  catch (err) { console.warn("[electron] clipboardReadFiles failed", err); return { paths: [], preferMove: false }; }
+});
+
+// Guarded shell COPY into a folder (paste-copy / drag-in copy). Mirrors
+// moveItemsNative: runs IFileOperation on a background thread with the native
+// progress/collision dialogs, recycle-on-overwrite, and per-item audit.
+ipcMain.handle("copyItemsNative", (event, paths: string[], destination: string) => {
+  const sources = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
+  if (sources.length === 0 || !destination) return { aborted: false, moved: 0, skipped: 0, failed: 0 };
+  if (!nativeCopyItems) throw new Error("native copy addon unavailable");
+  return nativeCopyItems(sources, destination, ownerHwndForEvent(event));
 });
 
 // Shell context menu shown from the renderer. Prefer the native addon, which

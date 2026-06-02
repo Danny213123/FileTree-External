@@ -24,8 +24,11 @@ import { loadChatIndex, newChatSessionId } from "./lib/chatSessions";
 import { undoLast } from "./lib/undo";
 import { ActivityBar, type ViewId } from "./components/ActivityBar";
 import { SideBar } from "./components/SideBar";
+import { ReportsView } from "./components/ReportsView";
+import { InspectorPane } from "./components/InspectorPane";
 import { ChatPanel } from "./components/ChatPanel";
 import { TerminalPanel } from "./components/TerminalPanel";
+import { ScheduleWizard } from "./components/ScheduleWizard";
 
 const SETTINGS_DEBOUNCE_MS = 700;
 
@@ -100,6 +103,9 @@ export default function App() {
   const [exclude, setExclude] = useState("");
   const [includeHidden, setIncludeHidden] = useState(false);
   const [followLinks, setFollowLinks] = useState(false);
+  // Opt-in: resolve each node's Windows owner during scans. OFF by default
+  // because per-file owner lookups slow large scans (see crate::owner cache).
+  const [collectOwners, setCollectOwners] = useState(false);
   const [drives, setDrives] = useState<DriveEntry[]>([]);
   const [bookmarkList, setBookmarkList] = useState<string[]>([]);
   const [specialFolders, setSpecialFolders] = useState<SpecialFolder[]>([]);
@@ -126,6 +132,12 @@ export default function App() {
   const [chatOpen, setChatOpen] = useState(false);
   const [chatWidth, setChatWidth] = useState(360);
   const [chatSessionId, setChatSessionId] = useState<string>(() => newChatSessionId());
+  // Right-side inspector: Preview and Details panes (independently toggleable).
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [inspectorWidth, setInspectorWidth] = useState(320);
+  // Scheduled-scan wizard (#10) — a modal over the workbench.
+  const [scheduleOpen, setScheduleOpen] = useState(false);
 
   // Integrated terminal (global bottom panel). Mounted lazily on first open and
   // kept mounted thereafter so sessions survive hiding the panel.
@@ -211,7 +223,7 @@ export default function App() {
   const buildSettings = useCallback((): AppSettings => {
     const rs = getActiveRef()?.getRibbonState();
     return {
-      darkMode, threads, includeHidden, followLinks, exclude,
+      darkMode, threads, includeHidden, followLinks, collectOwners, exclude,
       lastPath: rs?.scanPath ?? "",
       metric: rs?.metric ?? "size",
       unit: rs?.unit ?? "auto",
@@ -229,10 +241,12 @@ export default function App() {
         toolbarHidden: g.toolbarHidden,
       })),
       activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth,
+      previewOpen, detailsOpen, inspectorWidth,
     };
-  }, [darkMode, threads, includeHidden, followLinks, exclude, getActiveRef, tabs, groups,
+  }, [darkMode, threads, includeHidden, followLinks, collectOwners, exclude, getActiveRef, tabs, groups,
       visibleColumns, decimals,
-      activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth]);
+      activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth,
+      previewOpen, detailsOpen, inspectorWidth]);
 
   const persist = useCallback(() => {
     if (!settingsLoaded) return;
@@ -242,9 +256,10 @@ export default function App() {
 
   useEffect(() => { persist(); },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [darkMode, threads, includeHidden, followLinks, exclude, tabs, groups, focusedGroupId,
+    [darkMode, threads, includeHidden, followLinks, collectOwners, exclude, tabs, groups, focusedGroupId,
      visibleColumns, decimals,
-     activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth]);
+     activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth,
+     previewOpen, detailsOpen, inspectorWidth]);
 
   const handleSaveSession = useCallback(() => {
     const paths = tabs.map((t) => t.ref.current?.getScanPath() ?? t.initialPath).filter(Boolean);
@@ -313,6 +328,7 @@ export default function App() {
       if (settings.threads !== undefined) setThreads(settings.threads);
       if (settings.includeHidden !== undefined) setIncludeHidden(settings.includeHidden);
       if (settings.followLinks !== undefined) setFollowLinks(settings.followLinks);
+      if (settings.collectOwners !== undefined) setCollectOwners(settings.collectOwners);
       if (settings.exclude !== undefined) setExclude(settings.exclude);
       if (settings.recentPaths?.length) setRecentPaths(settings.recentPaths);
       // Details-list prefs (global). Name is always kept on.
@@ -321,7 +337,7 @@ export default function App() {
       }
       if (settings.decimals !== undefined) setDecimals(settings.decimals);
       // Layout
-      if (settings.activeView && ["explorer", "search", "treemap", "duplicates", "bookmarks", "errors"].includes(settings.activeView)) {
+      if (settings.activeView && ["explorer", "search", "treemap", "reports", "duplicates", "bookmarks", "errors"].includes(settings.activeView)) {
         setActiveView(settings.activeView as ViewId);
       }
       if (settings.sidebarOpen !== undefined) setSidebarOpen(settings.sidebarOpen);
@@ -330,6 +346,9 @@ export default function App() {
       if (settings.panelHeight) setPanelHeight(settings.panelHeight);
       if (settings.chatOpen !== undefined) setChatOpen(settings.chatOpen);
       if (settings.chatWidth) setChatWidth(settings.chatWidth);
+      if (settings.previewOpen !== undefined) setPreviewOpen(settings.previewOpen);
+      if (settings.detailsOpen !== undefined) setDetailsOpen(settings.detailsOpen);
+      if (settings.inspectorWidth) setInspectorWidth(settings.inspectorWidth);
 
       setDrives(driveList.drives ?? []);
       setSpecialFolders(folderList.folders ?? []);
@@ -456,10 +475,19 @@ export default function App() {
     const onDrop = (e: DragEvent) => {
       if (!e.dataTransfer?.files?.length) return;
       e.preventDefault();
-      for (const f of Array.from(e.dataTransfer.files)) {
-        const p = pathForFile(f);
-        if (p) handleOpenInNewTab(p);
+      const paths = Array.from(e.dataTransfer.files).map(pathForFile).filter(Boolean);
+      if (paths.length === 0) return;
+      // Explorer drag-in (#9): if dropped onto a folder row, move/copy INTO it
+      // (Explorer-like) through the guarded engine; the row exposes its path +
+      // dir flag (see TreeTable). Dropping on empty/background opens new tabs.
+      const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+      const folderRow = el?.closest<HTMLElement>('.row[data-node-dir="1"]');
+      const destFolder = folderRow?.dataset.nodePath;
+      if (destFolder) {
+        void getActiveRef()?.dropExternalInto(paths, destFolder);
+        return;
       }
+      paths.forEach((p) => handleOpenInNewTab(p));
     };
     window.addEventListener("dragover", onDragOver);
     window.addEventListener("drop", onDrop);
@@ -467,7 +495,7 @@ export default function App() {
       window.removeEventListener("dragover", onDragOver);
       window.removeEventListener("drop", onDrop);
     };
-  }, [handleOpenInNewTab]);
+  }, [handleOpenInNewTab, getActiveRef]);
 
   useEffect(() => {
     type ElectronAPI = {
@@ -512,15 +540,40 @@ export default function App() {
       else if (e.ctrlKey && k === "j") { e.preventDefault(); setPanelOpen((v) => !v); }
       else if (e.ctrlKey && k === "t") { e.preventDefault(); handleOpenInNewTab(""); }
       else if (e.ctrlKey && (k === "`" || e.code === "Backquote")) { e.preventDefault(); handleToggleTerminal(); }
+      // Per-tab navigation history (acts on the focused pane).
+      else if (e.altKey && !e.ctrlKey && !e.shiftKey && k === "arrowleft") { e.preventDefault(); getActiveRef()?.doBack(); }
+      else if (e.altKey && !e.ctrlKey && !e.shiftKey && k === "arrowright") { e.preventDefault(); getActiveRef()?.doForward(); }
+      else if (e.altKey && !e.ctrlKey && !e.shiftKey && k === "arrowup") { e.preventDefault(); getActiveRef()?.doNavigateParent(); }
+      // Inspector pane toggles (mirror Explorer): Alt+P preview, Alt+Shift+P details.
+      else if (e.altKey && !e.ctrlKey && !e.shiftKey && k === "p") { e.preventDefault(); setPreviewOpen((v) => !v); }
+      else if (e.altKey && !e.ctrlKey && e.shiftKey && k === "p") { e.preventDefault(); setDetailsOpen((v) => !v); }
       else if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "z") {
         if (inEditable(e.target) || inEditable(document.activeElement)) return;
         e.preventDefault();
         void handleUndo();
       }
+      // Clipboard file ops (#9). Never hijack a text edit, and never steal Ctrl+C
+      // when the user has a real text selection (let the browser copy that text).
+      else if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "c") {
+        if (inEditable(e.target) || inEditable(document.activeElement)) return;
+        if ((window.getSelection()?.toString() ?? "") !== "") return;
+        e.preventDefault();
+        getActiveRef()?.doCopyFiles();
+      }
+      else if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "x") {
+        if (inEditable(e.target) || inEditable(document.activeElement)) return;
+        e.preventDefault();
+        getActiveRef()?.doCutFiles();
+      }
+      else if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "v") {
+        if (inEditable(e.target) || inEditable(document.activeElement)) return;
+        e.preventDefault();
+        getActiveRef()?.doPaste();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleOpenInNewTab, handleToggleTerminal, handleUndo]);
+  }, [handleOpenInNewTab, handleToggleTerminal, handleUndo, getActiveRef]);
 
   const handleScanPath = useCallback((path: string) => {
     if (path.trim()) { pushRecent(path.trim()); persist(); }
@@ -731,6 +784,27 @@ export default function App() {
     window.addEventListener("mouseup", onUp);
   }, [chatWidth]);
 
+  // Drag the divider on the left edge of the inspector pane (sits left of chat).
+  const handleInspectorResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = inspectorWidth;
+    const onMove = (ev: MouseEvent) => {
+      const delta = startX - ev.clientX; // drag left = wider inspector
+      setInspectorWidth(Math.max(240, Math.min(640, startW + delta)));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "ew-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [inspectorWidth]);
+
   // Open a terminal at `cwd` (called by the editor-toolbar Terminal button).
   const handleOpenTerminal = useCallback((cwd: string) => {
     setTerminalCwd(cwd || "");
@@ -779,6 +853,7 @@ export default function App() {
   const statusError = activeRef?.getErrorMessage() ?? "";
   const statusProgress = activeRef?.getProgress() ?? null;
   const statusVisible = activeRef?.getVisibleCount() ?? 0;
+  const navState = activeRef?.getNavState() ?? { canBack: false, canForward: false };
   const activeLabel = metaById.get(focusedTabId)?.label ?? "FileTree";
   const focusedTabIndex = focusedGroup ? focusedGroup.tabIds.indexOf(focusedTabId) : -1;
   const canPrevTab = focusedTabIndex > 0;
@@ -794,8 +869,14 @@ export default function App() {
         { label: "Save Session…", onClick: handleSaveSession },
         { label: "Load Session…", onClick: handleLoadSession },
         { separator: true },
-        { label: "Export as CSV", onClick: () => getActiveRef()?.doExport("csv"), disabled: !statusData },
-        { label: "Export as JSON", onClick: () => getActiveRef()?.doExport("json"), disabled: !statusData },
+        { label: "Export ▸ HTML Report", onClick: () => getActiveRef()?.doExport("html"), disabled: !statusData },
+        { label: "Export ▸ Excel (.xlsx)", onClick: () => getActiveRef()?.doExport("xlsx"), disabled: !statusData },
+        { label: "Export ▸ PDF (print report)", onClick: () => getActiveRef()?.doExport("pdf"), disabled: !statusData },
+        { label: "Export ▸ XML", onClick: () => getActiveRef()?.doExport("xml"), disabled: !statusData },
+        { label: "Export ▸ CSV", onClick: () => getActiveRef()?.doExport("csv"), disabled: !statusData },
+        { label: "Export ▸ JSON", onClick: () => getActiveRef()?.doExport("json"), disabled: !statusData },
+        { separator: true },
+        { label: "Scheduled Scans…", onClick: () => setScheduleOpen(true) },
         { separator: true },
         { label: "Exit", onClick: () => window.close() },
       ],
@@ -806,6 +887,10 @@ export default function App() {
         { label: "New Folder", onClick: () => getActiveRef()?.doNewFolder() },
         { label: "Rename", kbd: "F2", onClick: () => getActiveRef()?.doRename() },
         { label: "Delete", kbd: "Del", onClick: () => getActiveRef()?.doDelete() },
+        { separator: true },
+        { label: "Cut", kbd: "Ctrl+X", onClick: () => getActiveRef()?.doCutFiles() },
+        { label: "Copy", kbd: "Ctrl+C", onClick: () => getActiveRef()?.doCopyFiles() },
+        { label: "Paste", kbd: "Ctrl+V", onClick: () => getActiveRef()?.doPaste() },
         { label: "Move to…", onClick: () => getActiveRef()?.doMoveTo() },
         { label: "Copy Path", onClick: () => getActiveRef()?.doCopyPath() },
         { separator: true },
@@ -819,6 +904,9 @@ export default function App() {
         { label: "Toggle Panel", kbd: "Ctrl+J", checked: panelOpen, onClick: () => setPanelOpen((v) => !v) },
         { label: "Toggle Terminal", kbd: "Ctrl+`", checked: terminalOpen, onClick: handleToggleTerminal },
         { label: "Toggle AI Assistant", kbd: "Ctrl+Alt+B", checked: chatOpen, onClick: () => setChatOpen((v) => !v) },
+        { separator: true },
+        { label: "Preview Pane", kbd: "Alt+P", checked: previewOpen, onClick: () => setPreviewOpen((v) => !v) },
+        { label: "Details Pane", kbd: "Alt+Shift+P", checked: detailsOpen, onClick: () => setDetailsOpen((v) => !v) },
         { separator: true },
         { label: "Configure Columns…", opensColumns: true },
         { separator: true },
@@ -835,7 +923,10 @@ export default function App() {
     {
       label: "Go",
       items: [
-        { label: "Up One Level", onClick: () => getActiveRef()?.doNavigateParent() },
+        { label: "Back", kbd: "Alt+Left", onClick: () => getActiveRef()?.doBack(), disabled: !navState.canBack },
+        { label: "Forward", kbd: "Alt+Right", onClick: () => getActiveRef()?.doForward(), disabled: !navState.canForward },
+        { label: "Up One Level", kbd: "Alt+Up", onClick: () => getActiveRef()?.doNavigateParent() },
+        { separator: true },
         { label: "Reveal in Explorer", onClick: () => getActiveRef()?.doReveal() },
         { separator: true },
         { label: "Refresh", onClick: () => getActiveRef()?.doScan() },
@@ -859,8 +950,12 @@ export default function App() {
     { separator: true },
     { label: "Dark Theme", checked: darkMode, onClick: handleToggleDark },
     { separator: true },
-    { label: "Export as CSV", onClick: () => getActiveRef()?.doExport("csv"), disabled: !statusData },
-    { label: "Export as JSON", onClick: () => getActiveRef()?.doExport("json"), disabled: !statusData },
+    { label: "Export ▸ HTML Report", onClick: () => getActiveRef()?.doExport("html"), disabled: !statusData },
+    { label: "Export ▸ Excel (.xlsx)", onClick: () => getActiveRef()?.doExport("xlsx"), disabled: !statusData },
+    { label: "Export ▸ PDF (print report)", onClick: () => getActiveRef()?.doExport("pdf"), disabled: !statusData },
+    { label: "Export ▸ XML", onClick: () => getActiveRef()?.doExport("xml"), disabled: !statusData },
+    { label: "Export ▸ CSV", onClick: () => getActiveRef()?.doExport("csv"), disabled: !statusData },
+    { label: "Export ▸ JSON", onClick: () => getActiveRef()?.doExport("json"), disabled: !statusData },
     { label: "About FileTree", onClick: () => window.alert("FileTree — a fast disk-usage analyzer with a built-in local-AI assistant.") },
   ];
 
@@ -943,7 +1038,7 @@ export default function App() {
             <div className="resizer-x" onMouseDown={handleSidebarResize} />
           </>
         )}
-        <div className="workbench-tabs" style={activeView === "duplicates" ? { display: "none" } : undefined}>
+        <div className="workbench-tabs" style={activeView === "duplicates" || activeView === "reports" ? { display: "none" } : undefined}>
           {groups.map((group, gi) => {
             const isLast = gi === groups.length - 1;
             const isFocused = group.id === focusedGroupId;
@@ -1004,6 +1099,8 @@ export default function App() {
                         threads={threads}
                         includeHidden={includeHidden}
                         followLinks={followLinks}
+                        collectOwners={collectOwners}
+                        onCollectOwnersChange={setCollectOwners}
                         exclude={exclude}
                         treemapDetail={treemapDetail}
                         tmShowSingleFiles={tmShowSingleFiles}
@@ -1034,6 +1131,36 @@ export default function App() {
           <div className="dupes-editor">
             <DuplicatesResults ctrl={dupes} />
           </div>
+        )}
+
+        {activeView === "reports" && (
+          <div className="reports-editor">
+            <ReportsView
+              data={sidebarModel.data}
+              nodeById={sidebarModel.nodeById}
+              onNavigate={(id) => { sidebarModel.onNavigate(id); setActiveView("explorer"); }}
+            />
+          </div>
+        )}
+
+        {(previewOpen || detailsOpen) && (
+          <>
+            <div className="resizer-x" onMouseDown={handleInspectorResize} />
+            <InspectorPane
+              width={inspectorWidth}
+              node={sidebarModel.selectedNode}
+              data={sidebarModel.data}
+              nodeById={sidebarModel.nodeById}
+              unit={sidebarModel.unit}
+              showPreview={previewOpen}
+              showDetails={detailsOpen}
+              onClosePreview={() => setPreviewOpen(false)}
+              onCloseDetails={() => setDetailsOpen(false)}
+              onOpen={sidebarModel.onOpen}
+              onReveal={sidebarModel.onReveal}
+              onCopyPath={sidebarModel.onCopyPath}
+            />
+          </>
         )}
 
         {chatOpen && (
@@ -1067,6 +1194,13 @@ export default function App() {
           </>
         )}
       </div>
+
+      {scheduleOpen && (
+        <ScheduleWizard
+          initialPath={activeRef?.getScanPath() ?? ""}
+          onClose={() => setScheduleOpen(false)}
+        />
+      )}
 
       <StatusBar
         scanResult={statusData}

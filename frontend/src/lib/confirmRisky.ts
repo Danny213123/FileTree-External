@@ -24,7 +24,7 @@ export const RISK_THRESHOLDS = {
   LARGE_BYTES: 1024 * 1024 * 1024,
 } as const;
 
-export type RiskKind = "delete" | "move";
+export type RiskKind = "delete" | "move" | "copy";
 
 export interface RiskInput {
   kind: RiskKind;
@@ -57,6 +57,8 @@ export function isRisky(input: RiskInput): boolean {
   const large = (input.totalBytes ?? 0) > RISK_THRESHOLDS.LARGE_BYTES;
   if (input.kind === "delete" && input.permanent) return true;
   if (input.kind === "move" && input.crossDrive) return true;
+  // Copy is additive (never removes the source), so crossing drives isn't itself
+  // risky — only a large/many batch is worth confirming.
   return many || large;
 }
 
@@ -87,6 +89,9 @@ function buildMessage(input: RiskInput): string {
       return `Permanently delete ${subject}?\n\nThis CANNOT be undone — the items will NOT go to the Recycle Bin.`;
     }
     return `Move ${subject} to the Recycle Bin?`;
+  }
+  if (input.kind === "copy") {
+    return `Copy ${subject}?`;
   }
   // move
   if (input.crossDrive) {

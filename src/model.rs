@@ -14,6 +14,11 @@ pub(crate) struct ScanOptions {
     pub(crate) exclude_patterns: Vec<String>,
     pub(crate) max_depth: Option<usize>,
     pub(crate) threads: usize,
+    /// Opt-in (default false): resolve each entry's owner account during the
+    /// scan. OFF by default because `GetNamedSecurityInfo` adds one syscall per
+    /// file and would noticeably slow large scans; a cached SID→name map keeps
+    /// the translation cheap when it IS enabled. See `crate::owner`.
+    pub(crate) collect_owners: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +42,14 @@ pub(crate) struct NodeRecord {
     pub(crate) errors: u64,
     pub(crate) children: Vec<usize>,
     pub(crate) extension: String,
+    /// Owner account ("DOMAIN\\user"). Empty unless owner collection was
+    /// enabled for the scan (`ScanOptions::collect_owners`).
+    pub(crate) owner: String,
+    /// Raw Windows file-attribute bitmask (`FILE_ATTRIBUTE_*`). 0 on non-Windows
+    /// or when unavailable. Carries the full attribute set (System/Archive/
+    /// Compressed/Encrypted/Temporary/Offline/…) so the client can decode any
+    /// flag without the model growing a bool per attribute.
+    pub(crate) attributes: u32,
 }
 
 #[derive(Clone, Debug)]
