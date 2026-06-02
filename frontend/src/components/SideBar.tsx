@@ -6,6 +6,7 @@ import { ErrorsTab } from "./ErrorsTab";
 import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
 import { DuplicatesConfigPanel } from "./DuplicatesConfigPanel";
+import { DriveCapacityBar } from "./DriveCapacityBar";
 import type { DuplicatesController } from "../hooks/useDuplicates";
 
 const VIEW_TITLES: Record<ViewId, string> = {
@@ -99,34 +100,23 @@ function ExplorerView(props: SideBarProps) {
       </div>
       {locOpen && (
         <div className="loc-list">
-          {props.drives.map((d) => {
+          {props.drives.map((d) => (
             // Capacity/used bar (Explorer + TreeSize parity). total === 0 means
-            // the volume couldn't be queried (e.g. empty CD) → show name only.
-            const used = d.total > 0 ? Math.max(0, d.total - d.free) : 0;
-            const pct = d.total > 0 ? Math.min(100, (used / d.total) * 100) : 0;
-            const level = pct >= 90 ? " crit" : pct >= 75 ? " warn" : "";
-            return (
-              <div
-                key={d.root}
-                className="loc-item loc-drive"
-                title={d.total > 0 ? `${d.label || d.root} — ${fmtSize(d.free)} free of ${fmtSize(d.total)}` : d.root}
-                onClick={() => props.onOpenLocation(d.root)}
-              >
-                <div className="loc-drive-row">
-                  <span className="loc-ico"><Icon name="hdd" size={14} /></span>
-                  <span className="loc-name">{d.label || d.root}</span>
-                </div>
-                {d.total > 0 && (
-                  <div className="drive-cap">
-                    <div className="drive-cap-track">
-                      <div className={`drive-cap-fill${level}`} style={{ width: `${pct}%` }} />
-                    </div>
-                    <div className="drive-cap-label">{fmtSize(d.free)} free of {fmtSize(d.total)}</div>
-                  </div>
-                )}
+            // the volume couldn't be queried (e.g. empty CD) → DriveCapacityBar
+            // renders nothing and only the name shows.
+            <div
+              key={d.root}
+              className="loc-item loc-drive"
+              title={d.total > 0 ? `${d.label || d.root} — ${fmtSize(d.free)} free of ${fmtSize(d.total)}` : d.root}
+              onClick={() => props.onOpenLocation(d.root)}
+            >
+              <div className="loc-drive-row">
+                <span className="loc-ico"><Icon name="hdd" size={14} /></span>
+                <span className="loc-name">{d.label || d.root}</span>
               </div>
-            );
-          })}
+              <DriveCapacityBar total={d.total} free={d.free} />
+            </div>
+          ))}
           {props.specialFolders.map((f) => (
             <div key={f.path} className="loc-item" title={f.path} onClick={() => props.onOpenLocation(f.path)}>
               <span className="loc-ico"><Icon name="folder" size={14} /></span>

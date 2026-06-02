@@ -36,6 +36,10 @@
   --text-8: #999;
   --surface: #ffffff;
 
+  /* Single corner-radius token for buttons, inputs and dropdowns/menus, so the
+     whole shell shares one rounding (editor tabs stay square on their own). */
+  --radius: 4px;
+
   /* ── VS Code workbench (sizing, theme-agnostic) ── */
   --vsc-font: "Segoe UI", -apple-system, system-ui, sans-serif;
   /* Cursor / VS Code default monospace stack (editor.fontFamily on Windows) */
@@ -70,6 +74,15 @@
   --vsc-btn-fg: #ffffff;
   --vsc-list-selected: #e4e6f1;
   --vsc-indent-guide: rgba(0,0,0,0.12);
+
+  /* Treemap surface/chrome (theme-aware): a neutral light surface in light mode
+     so pastel cells read; the canvas fills are still computed in Treemap.tsx. */
+  --treemap-bg: #e9edf2;
+  --treemap-bg-2: #dfe4ea;
+  --treemap-fg: #33415a;
+  --treemap-line: rgba(0,0,0,0.10);
+  --treemap-btn-bg: rgba(0,0,0,0.06);
+  --treemap-btn-bg-hover: rgba(0,0,0,0.12);
 }
 
 * {
@@ -100,13 +113,41 @@ html, body {
 
 button, input, select {
   font: inherit;
-  outline: none;
+}
+
+/* Accessibility: show a focus ring ONLY for keyboard navigation, never for
+   mouse/touch. The blanket `outline: none` that used to live above removed all
+   keyboard focus indication; instead we suppress the ring for pointer focus and
+   draw one consistent token ring for :focus-visible on interactive controls. */
+:focus:not(:focus-visible) { outline: none; }
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+.activity-btn:focus-visible,
+.titlebar-btn:focus-visible,
+.bc-btn:focus-visible,
+.wtab:focus-visible,
+.explorer-btn:focus-visible,
+.vsc-menu-btn:focus-visible,
+.fd-icon-btn:focus-visible,
+.fd-ok:focus-visible,
+.fd-cancel:focus-visible,
+.fd-clear:focus-visible,
+.cd-keep:focus-visible {
+  outline: 2px solid var(--vsc-focus);
+  outline-offset: 2px;
+}
+/* Full-width menu rows: keep the ring inside the row so it isn't clipped. */
+.vsc-menu-item:focus-visible {
+  outline: 2px solid var(--vsc-focus);
+  outline-offset: -2px;
 }
 
 button {
-  height: 32px;
+  height: 28px;
   border: 1px solid rgba(0, 0, 0, 0.15);
-  border-radius: 0;
+  border-radius: var(--radius);
   background: var(--bg-4);
   color: var(--text);
   padding: 0 14px;
@@ -139,21 +180,24 @@ button:disabled {
   box-shadow: none;
 }
 
+/* Primary buttons share one accent identity (see also .fd-ok and
+   .agent-btn-approve, unified onto the same token + radius). */
 button.primary {
   background: var(--accent);
-  border-color: #005a9e;
+  border-color: var(--accent);
   color: #ffffff;
 }
 
 button.primary:hover {
-  background: #006cc1;
-  border-color: #005a9e;
+  background: var(--accent);
+  border-color: var(--accent);
+  filter: brightness(1.1);
 }
 
 input, select {
-  height: 32px;
+  height: 28px;
   border: 1px solid var(--line);
-  border-radius: 0;
+  border-radius: var(--radius);
   background: var(--surface);
   color: var(--text);
   padding: 0 10px;
@@ -891,7 +935,7 @@ input:focus, select:focus {
 }
 
 .table-head {
-  height: 22px;
+  height: 24px;
   flex-shrink: 0;
   position: sticky;
   top: 0;
@@ -963,7 +1007,7 @@ input:focus, select:focus {
 
 .row {
   position: relative;
-  min-height: 20px;
+  min-height: 23px;
   border-bottom: 1px solid rgba(0, 0, 0, 0.04);
   color: var(--text);
   cursor: pointer;
@@ -975,6 +1019,27 @@ input:focus, select:focus {
 .row.selected { background: var(--selected); border-bottom-color: rgba(0,120,212,0.12); }
 .row.selected.primary-selected { box-shadow: inset 0 0 0 1px rgba(0,120,212,0.22); }
 .row.drop-target { background: rgba(74,144,217,0.25); outline: 1px dashed var(--accent); outline-offset: -1px; }
+
+/* Floating drop-destination pill that tracks the cursor during a drag-over. */
+.drop-move-pill {
+  position: fixed;
+  z-index: 9999;
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  padding: 4px 9px;
+  font-size: 12px;
+  color: #fff;
+  background: var(--accent);
+  border-radius: var(--radius);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.30);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.drop-move-pill strong { font-weight: 600; }
 
 .row.selected::after {
   content: "";
@@ -990,7 +1055,7 @@ input:focus, select:focus {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  line-height: 20px;
+  line-height: 23px;
   font-size: 12px;
 }
 
@@ -1004,13 +1069,35 @@ input:focus, select:focus {
   padding-left: calc(6px + var(--depth, 0) * 12px);
 }
 
+/* Faint name-cell size bar: a theme-aware translucent fill (var(--bar)) with a
+   crisp accent cap at its leading edge so the relative size reads at a glance.
+   The inset box-shadow (not a border) means zero-width bars draw nothing. */
 .name-cell::before {
   content: "";
   position: absolute;
-  inset: 2px auto 2px 0;
+  inset: 1px auto 1px 0;
   width: var(--bar-width, 0%);
   max-width: 100%;
-  background: rgba(0, 120, 212, 0.08);
+  background: var(--bar);
+  box-shadow: inset -2px 0 0 0 var(--accent);
+  pointer-events: none;
+}
+
+/* Faint vertical indent guides, one per tree depth level (mirrors the side
+   bar's .indent-guide). 1px lines repeat every 12px across the indent gutter
+   (gutter width = depth * 12px), matching the name-cell's left padding step. */
+.name-cell::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 0;
+  bottom: 0;
+  width: calc(var(--depth, 0) * 12px);
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--vsc-indent-guide) 0, var(--vsc-indent-guide) 1px,
+    transparent 1px, transparent 12px
+  );
   pointer-events: none;
 }
 
@@ -1158,7 +1245,7 @@ input:focus, select:focus {
   position: relative;
   height: 14px;
   margin: 3px 6px;
-  border: 1px solid #ccc !important;
+  border: 1px solid var(--border-2);
   border-radius: 0;
   background: var(--bg-4);
   overflow: hidden;
@@ -1329,7 +1416,7 @@ input:focus, select:focus {
   flex-direction: column;
   width: 100%;
   height: 100%;
-  background: #0d2b45;
+  background: var(--treemap-bg);
   overflow: hidden;
 }
 
@@ -1339,7 +1426,7 @@ input:focus, select:focus {
   align-items: center;
   gap: 6px;
   padding: 0 6px;
-  background: #0d2b45;
+  background: var(--treemap-bg);
   /* no min-height — collapses to zero when empty (viewId === 0) */
 }
 
@@ -1347,14 +1434,14 @@ input:focus, select:focus {
   padding: 2px 10px;
   margin: 2px 0;
   font-size: 11px;
-  background: rgba(255,255,255,0.12);
-  color: #cde;
-  border: 1px solid rgba(255,255,255,0.2);
+  background: var(--treemap-btn-bg);
+  color: var(--treemap-fg);
+  border: 1px solid var(--treemap-line);
   border-radius: 3px;
   cursor: pointer;
   line-height: 16px;
 }
-.treemap-up-btn:hover { background: rgba(255,255,255,0.22); color: #fff; }
+.treemap-up-btn:hover { background: var(--treemap-btn-bg-hover); color: var(--text); }
 
 .treemap-body {
   flex: 1 1 0;
@@ -1366,7 +1453,7 @@ input:focus, select:focus {
   position: absolute;
   inset: 0;
   overflow: hidden;
-  background: #0d2b45;
+  background: var(--treemap-bg);
 }
 
 .treemap-canvas,
@@ -1392,15 +1479,15 @@ input:focus, select:focus {
   flex-wrap: wrap;
   gap: 4px 12px;
   padding: 4px 8px;
-  background: rgba(0,0,0,0.28);
-  border-top: 1px solid rgba(255,255,255,0.08);
+  background: var(--treemap-bg-2);
+  border-top: 1px solid var(--treemap-line);
 }
 .treemap-legend-item {
   display: flex;
   align-items: center;
   gap: 4px;
   font-size: 10px;
-  color: #c8daf0;
+  color: var(--treemap-fg);
   max-width: 120px;
 }
 .treemap-legend-swatch {
@@ -1420,8 +1507,8 @@ input:focus, select:focus {
   flex: 0 0 auto;
   display: flex;
   gap: 0;
-  background: #0b2035;
-  border-top: 1px solid rgba(255,255,255,0.08);
+  background: var(--treemap-bg-2);
+  border-top: 1px solid var(--treemap-line);
   overflow-x: auto;
   scrollbar-width: none;
 }
@@ -1432,19 +1519,19 @@ input:focus, select:focus {
   min-width: 60px;
   padding: 3px 8px;
   font-size: 11px;
-  color: #8ab;
+  color: var(--treemap-fg);
   background: transparent;
   border: none;
-  border-right: 1px solid rgba(255,255,255,0.08);
+  border-right: 1px solid var(--treemap-line);
   cursor: pointer;
   text-align: center;
   white-space: nowrap;
   line-height: 18px;
 }
-.tl-btn:hover { background: rgba(255,255,255,0.08); color: #cde; }
-.tl-btn-active { background: rgba(255,255,255,0.12); color: #e0eeff; font-weight: 600; }
+.tl-btn:hover { background: var(--treemap-btn-bg); color: var(--text); }
+.tl-btn-active { background: var(--treemap-btn-bg-hover); color: var(--text); font-weight: 600; }
 .tl-btn-inner { opacity: 0.5; cursor: default; }
-.tl-btn-inner:hover { background: transparent; color: #8ab; }
+.tl-btn-inner:hover { background: transparent; color: var(--treemap-fg); }
 
 /* Bar lists */
 .bar-list, .item-list { display: grid; gap: 6px; }
@@ -1476,9 +1563,18 @@ input:focus, select:focus {
 .bar-fill {
   height: 100%;
   width: var(--bar, 0%);
-  background: var(--accent);
+  /* Per-row semantic color (file-type hue / age ramp / owner hash) via
+     --bar-color; falls back to the accent when a row doesn't set one. */
+  background: var(--bar-color, var(--accent));
   border-radius: 0;
 }
+
+/* Ranked list rows (Top Files / Largest Folders): a leading type icon, the
+   name/meta column, and a proportional size bar under the row. */
+.item-row-ranked { display: flex; align-items: flex-start; gap: 8px; }
+.item-rank-icon { flex: 0 0 16px; display: flex; align-items: center; height: 18px; }
+.item-row-content { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.item-row-content .bar-track { margin-top: 6px; }
 
 .paths { display: grid; gap: 4px; margin-top: 8px; }
 
@@ -1950,20 +2046,24 @@ input:focus, select:focus {
   background: #222;
 }
 
+/* Dialog primary button — same accent identity as button.primary /
+   .agent-btn-approve, with the shared corner radius. */
 .fd-ok {
   height: 28px;
   padding: 0 20px;
-  background: #1a6cc4;
-  border: 1px solid #3a8ae0;
+  background: var(--accent);
+  border: 1px solid var(--accent);
   color: #fff;
   font-size: 12px;
   font-weight: 600;
-  border-radius: 0;
+  border-radius: var(--radius);
   cursor: pointer;
   min-height: 0;
 }
 
-.fd-ok:hover { background: #2278d4; transform: none; box-shadow: none; }
+.fd-ok:hover { filter: brightness(1.1); transform: none; box-shadow: none; }
+/* Destructive confirm (e.g. permanent delete) reads red, not accent-blue. */
+.fd-ok.fd-danger { background: var(--danger); border-color: var(--danger); }
 
 .fd-cancel {
   height: 28px;
@@ -1972,7 +2072,7 @@ input:focus, select:focus {
   border: 1px solid #666;
   color: #ccc;
   font-size: 12px;
-  border-radius: 0;
+  border-radius: var(--radius);
   cursor: pointer;
   min-height: 0;
 }
@@ -1986,7 +2086,7 @@ input:focus, select:focus {
   border: 1px solid #844;
   color: #e08080;
   font-size: 11.5px;
-  border-radius: 0;
+  border-radius: var(--radius);
   cursor: pointer;
   margin-right: auto;
   min-height: 0;
@@ -2145,7 +2245,7 @@ input:focus, select:focus {
   border: 1px solid #666;
   color: #e8e8e8;
   font-size: 12px;
-  border-radius: 0;
+  border-radius: var(--radius);
   cursor: pointer;
   min-height: 0;
 }
@@ -2165,6 +2265,123 @@ input:focus, select:focus {
   padding: 8px 16px;
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
   pointer-events: none;
+}
+
+/* ── Confirm & prompt modals (themed; match the filter/conflict dialogs) ── */
+
+.confirm-dialog, .prompt-dialog {
+  background: #2b2b2b;
+  border: 1px solid #555;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  min-width: 380px;
+  max-width: 520px;
+  width: 90vw;
+  display: flex;
+  flex-direction: column;
+  color: #e8e8e8;
+  font-size: 12px;
+}
+/* Risk prompts carry multi-line copy ("…This CANNOT be undone."). */
+.confirm-dialog .cd-msg, .prompt-dialog .cd-msg { white-space: pre-wrap; line-height: 1.5; }
+
+.prompt-field { display: flex; flex-direction: column; gap: 5px; }
+.prompt-label { font-size: 11.5px; color: #c4c4c4; }
+.prompt-input {
+  height: 28px;
+  padding: 0 9px;
+  background: var(--surface);
+  border: 1px solid var(--border-3);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 12.5px;
+}
+.prompt-input:focus { border-color: var(--accent); }
+.prompt-error { font-size: 11px; color: #ff9c9c; min-height: 14px; }
+
+/* ── Toast notifications (global stack, top-right) ──────────── */
+
+.toast-stack {
+  position: fixed;
+  top: calc(var(--titlebar-h) + 10px);
+  right: 14px;
+  z-index: 9600;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 340px;
+  max-width: calc(100vw - 28px);
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 9px 9px 11px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--vsc-border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.28);
+  font-size: 12px;
+  line-height: 1.45;
+  pointer-events: auto;
+  animation: toast-in 0.16s ease-out;
+}
+
+.toast-icon { flex: 0 0 auto; display: flex; align-items: center; margin-top: 1px; color: var(--accent); }
+.toast-msg { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; word-break: break-word; }
+
+.toast-action {
+  flex: 0 0 auto;
+  height: auto;
+  min-height: 0;
+  padding: 1px 6px;
+  margin: -1px 0 0;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius);
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.toast-action:hover { background: var(--vsc-list-hover); color: var(--accent); filter: brightness(1.05); }
+
+.toast-close {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  min-height: 0;
+  padding: 0;
+  margin: -1px -1px 0 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius);
+  color: var(--text-5);
+  cursor: pointer;
+  opacity: 0.75;
+}
+.toast-close:hover { background: var(--vsc-list-hover); color: var(--text); opacity: 1; }
+
+.toast-success { border-left-color: var(--accent-2); }
+.toast-success .toast-icon { color: var(--accent-2); }
+.toast-warn { border-left-color: var(--warn); }
+.toast-warn .toast-icon { color: var(--warn); }
+.toast-error { border-left-color: var(--danger); }
+.toast-error .toast-icon { color: var(--danger); }
+.toast-info { border-left-color: var(--accent); }
+.toast-info .toast-icon { color: var(--accent); }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(12px); }
+  to { opacity: 1; transform: translateX(0); }
 }
 
 /* ── Dark mode ─────────────────────────────────────────────── */
@@ -2229,6 +2446,14 @@ input:focus, select:focus {
   --vsc-btn-fg: #ffffff;
   --vsc-list-selected: #37373d;
   --vsc-indent-guide: rgba(255,255,255,0.10);
+
+  /* Treemap keeps its dark navy shell; chrome text/buttons stay light-on-dark. */
+  --treemap-bg: #0d2b45;
+  --treemap-bg-2: #0b2035;
+  --treemap-fg: #c8daf0;
+  --treemap-line: rgba(255,255,255,0.08);
+  --treemap-btn-bg: rgba(255,255,255,0.12);
+  --treemap-btn-bg-hover: rgba(255,255,255,0.22);
 }
 
 /* ── AI Chat Tab ─────────────────────────────────────────────── */
@@ -2653,6 +2878,11 @@ input:focus, select:focus {
 .df-target-icon { font-size: 12px; flex-shrink: 0; }
 .df-target-path { font-weight: 500; }
 .df-target-label { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+/* Drive target rows carry the shared capacity bar, so they stack the
+   checkbox/path row above the bar (matching the side bar's drive rows). */
+.df-target-drive { flex-direction: column; align-items: stretch; gap: 4px; padding: 5px 4px; }
+.df-target-main { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.df-target-main .df-target-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .df-target-add {
   display: flex;
   align-items: center;
@@ -3237,6 +3467,16 @@ input:focus, select:focus {
 .compare-snap-del:hover { color: var(--danger); background: var(--vsc-list-hover); }
 .compare-empty { color: var(--text-8); font-style: italic; padding: 24px 8px; text-align: center; }
 
+/* React.lazy Suspense / error-boundary fallback for code-split views. Centered,
+   muted, and fills its slot so the surrounding layout doesn't collapse while a
+   chunk loads (or if it fails to load). */
+.lazy-view-fallback {
+  display: flex; align-items: center; justify-content: center;
+  flex: 1 1 auto; min-height: 0; min-width: 0; padding: 24px;
+  color: var(--text-5); font-size: 13px;
+}
+.lazy-view-error { color: var(--warn); }
+
 .compare-results { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
 .compare-summary {
   display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; font-size: 12px;
@@ -3449,6 +3689,7 @@ input:focus, select:focus {
   position: absolute; top: 100%; left: 0; min-width: 240px; z-index: 1000;
   background: var(--vsc-sidebar-bg); border: 1px solid var(--vsc-border);
   box-shadow: 0 6px 18px rgba(0,0,0,0.4); padding: 4px 0;
+  border-radius: var(--radius);
 }
 .vsc-menu-item {
   display: flex; align-items: center; justify-content: space-between; gap: 24px;
@@ -3474,7 +3715,7 @@ input:focus, select:focus {
 .titlebar-actions.right { margin-left: 0; }
 .titlebar-btn {
   display: inline-flex; align-items: center; justify-content: center;
-  height: 26px; min-width: 28px; padding: 0 5px; border: 0; border-radius: 5px;
+  height: 28px; min-width: 28px; padding: 0 5px; border: 0; border-radius: var(--radius);
   background: transparent; color: var(--vsc-titlebar-fg); opacity: 0.72;
   cursor: pointer; -webkit-app-region: no-drag;
 }
@@ -3526,7 +3767,7 @@ input:focus, select:focus {
   position: relative; width: 24px; height: 26px; flex: 0 0 24px;
   border: 0; background: transparent; color: var(--vsc-sidebar-fg);
   opacity: 0.7; display: flex; align-items: center; justify-content: center;
-  cursor: pointer; border-radius: 5px; padding: 0;
+  cursor: pointer; border-radius: var(--radius); padding: 0;
 }
 .activity-btn svg { width: 16px; height: 16px; }
 .activity-btn:hover { opacity: 1; background: var(--vsc-list-hover); color: var(--text); box-shadow: none; }
@@ -3584,12 +3825,12 @@ input:focus, select:focus {
 .explorer-section-title.collapsed .chev { transform: rotate(-90deg); }
 .explorer-toolbar { display: flex; gap: 4px; padding: 6px 8px; }
 .explorer-path { display: flex; gap: 4px; padding: 0 8px 6px; }
-.explorer-path input { flex: 1; height: 26px; background: var(--vsc-input-bg); border: 1px solid var(--vsc-border); color: var(--text); font-size: 13px; padding: 0 6px; border-radius: 2px; }
+.explorer-path input { flex: 1; height: 28px; background: var(--vsc-input-bg); border: 1px solid var(--vsc-border); color: var(--text); font-size: 13px; padding: 0 6px; border-radius: var(--radius); }
 .explorer-path input:focus { border-color: var(--vsc-focus); outline: 1px solid var(--vsc-focus); outline-offset: -1px; }
 .explorer-path input::placeholder { color: var(--text-6); }
-.explorer-btn { height: 26px; padding: 0 8px; background: var(--vsc-btn-bg); border: 0; color: var(--vsc-btn-fg); font-size: 12px; }
+.explorer-btn { height: 28px; padding: 0 8px; background: var(--vsc-btn-bg); border: 0; color: var(--vsc-btn-fg); font-size: 12px; }
 .explorer-btn:hover { background: #1177bb; }
-.explorer-btn.icon { width: 26px; padding: 0; background: transparent; color: var(--text-4); }
+.explorer-btn.icon { width: 28px; padding: 0; background: transparent; color: var(--text-4); }
 .explorer-btn.icon:hover { background: var(--vsc-list-hover); color: var(--text); }
 .loc-list { display: flex; flex-direction: column; }
 .loc-item {
@@ -3608,18 +3849,22 @@ input:focus, select:focus {
 }
 .loc-drive .loc-drive-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .loc-drive .loc-drive-row .loc-name { overflow: hidden; text-overflow: ellipsis; }
-.drive-cap { display: flex; flex-direction: column; gap: 2px; padding-left: 22px; }
+.drive-cap { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .drive-cap-track {
-  height: 5px; background: var(--bg-5);
-  border: 1px solid var(--border-4); overflow: hidden;
+  height: 8px; background: var(--bg-5);
+  border: 1px solid var(--border-4); border-radius: 2px; overflow: hidden;
 }
 .drive-cap-fill { height: 100%; background: var(--accent); transition: width .2s ease; }
-.drive-cap-fill.warn { background: #d99030; }
-.drive-cap-fill.crit { background: #d9534f; }
+.drive-cap-fill.warn { background: var(--warn); }
+.drive-cap-fill.crit { background: var(--danger); }
 .drive-cap-label {
-  font-size: 10.5px; color: var(--muted-2);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-size: 10.5px; color: var(--muted-2); min-width: 0;
 }
+.drive-cap-usage { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drive-cap-pct { flex: 0 0 auto; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text-5); }
+.drive-cap-pct.warn { color: var(--warn); }
+.drive-cap-pct.crit { color: var(--danger); }
 .folder-tree { display: flex; flex-direction: column; padding-bottom: 8px; }
 .folder-row {
   display: flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px;
@@ -3647,8 +3892,21 @@ input:focus, select:focus {
 
 /* ── Editor group (one split pane: tab bar on top, editor below) ── */
 .editor-group {
+  position: relative;
   display: flex; flex-direction: column; min-width: 0; min-height: 0;
   background: var(--vsc-editor-bg); overflow: hidden;
+}
+
+/* When the editor is split, the focused pane gets a crisp 1px focus ring drawn
+   over its content (pointer-events:none) so the active group is obvious. App.tsx
+   only adds .focused when groups.length > 1, so a single pane stays ring-free. */
+.editor-group.focused::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 1px var(--vsc-focus);
+  z-index: 6;
 }
 
 /* ── Per-tab workbench region (side bar + editor) ─────────── */
@@ -3826,8 +4084,8 @@ input:focus, select:focus {
 .agent-card-paths li { font-family: var(--vsc-mono); font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .agent-card-actions { display: flex; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--vsc-border); }
 .agent-card-actions button { height: 26px; font-size: 12px; padding: 0 12px; }
-.agent-btn-approve { background: var(--vsc-btn-bg); color: #fff; border: 0; }
-.agent-btn-approve:hover { background: #1177bb; }
+.agent-btn-approve { background: var(--accent); color: #fff; border: 0; }
+.agent-btn-approve:hover { background: var(--accent); filter: brightness(1.1); }
 .agent-btn-reject { background: transparent; border: 1px solid var(--vsc-border); color: var(--text-3); }
 .agent-card.done .agent-card-head { color: var(--accent-2); }
 .agent-status { font-size: 11px; color: var(--muted-2); padding: 2px 0; }
@@ -4261,6 +4519,7 @@ input:focus, select:focus {
 }
 .bc-btn:hover:not(:disabled) { background: var(--vsc-list-hover); color: var(--text); }
 .bc-btn:disabled { opacity: 0.35; cursor: default; }
+.bc-edit { flex: 0 0 auto; margin-left: 2px; }
 .bc-track {
   flex: 1 1 0; min-width: 0; height: 24px; display: flex; align-items: center; flex-wrap: nowrap;
   overflow-x: auto; overflow-y: hidden; cursor: text; scrollbar-width: none;
@@ -4334,3 +4593,152 @@ input:focus, select:focus {
 .preview-meta { text-align: center; display: flex; flex-direction: column; gap: 3px; max-width: 100%; }
 .preview-meta-name { font-size: 13px; color: var(--text); font-weight: 600; word-break: break-word; }
 .preview-meta-sub { font-size: 11px; color: var(--muted); }
+
+/* ── Shared empty state (generalized from .df-empty) ─────────── */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 8px;
+  color: var(--muted);
+  padding: 32px;
+  text-align: center;
+}
+/* Tighter variant for narrow hosts (e.g. the inspector preview pane). */
+.empty-state-compact { height: auto; padding: 22px 16px; gap: 6px; }
+.empty-state-icon { display: flex; color: var(--text-7); opacity: 0.6; }
+.empty-state-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.empty-state-compact .empty-state-title { font-size: 13px; }
+.empty-state-hint { font-size: 12px; max-width: 320px; line-height: 1.5; color: var(--muted); }
+.empty-state-error .empty-state-title { color: var(--danger); }
+.empty-state-action { margin-top: 8px; height: 28px; padding: 0 16px; min-height: 0; }
+
+/* ── In-editor scan overlay (ITEM 4) ─────────────────────────── */
+/* Hosted by the position:relative .editor-main; covers the empty tree while a
+   scan streams in. Reuses .df-scanning-spinner / .df-progress-* from the
+   duplicates view for a consistent progress treatment. */
+.scan-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  animation: ft-fade-in 160ms ease;
+}
+.scan-skeleton {
+  position: absolute;
+  inset: 0;
+  padding: 32px 18px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  opacity: 0.55;
+  overflow: hidden;
+  pointer-events: none;
+}
+.skeleton-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.skeleton-bar {
+  display: block;
+  height: 9px;
+  border-radius: 3px;
+  background: linear-gradient(90deg,
+    rgba(128, 128, 128, 0.10) 25%,
+    rgba(128, 128, 128, 0.22) 37%,
+    rgba(128, 128, 128, 0.10) 63%);
+  background-size: 400% 100%;
+  animation: ft-shimmer 1.4s ease infinite;
+}
+.skeleton-size { width: 64px; flex: 0 0 auto; }
+.scan-overlay-card {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 22px 28px;
+  background: var(--surface);
+  border: 1px solid var(--vsc-border);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 26px rgba(0, 0, 0, 0.28);
+}
+.scan-overlay-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.scan-overlay-count { font-size: 12px; color: var(--muted); }
+.scan-overlay-cancel {
+  margin-top: 4px;
+  height: 26px;
+  padding: 0 16px;
+  min-height: 0;
+  background: var(--surface);
+  border: 1px solid var(--vsc-border);
+  color: var(--text);
+  border-radius: var(--radius);
+  font-size: 12px;
+  cursor: pointer;
+}
+.scan-overlay-cancel:hover { background: var(--vsc-list-hover); color: var(--text); transform: none; box-shadow: none; }
+
+/* ── Motion polish (ITEM 5) ──────────────────────────────────── */
+@keyframes ft-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ft-view-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ft-dialog-in { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: none; } }
+@keyframes ft-menu-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@keyframes ft-panel-left-in { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: none; } }
+@keyframes ft-panel-right-in { from { opacity: 0; transform: translateX(10px); } to { opacity: 1; transform: none; } }
+@keyframes ft-panel-up-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+@keyframes ft-shimmer { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
+
+/* Dialog open: overlay fade + panel scale(0.98 → 1)/opacity. */
+.filter-dialog-overlay { animation: ft-fade-in 150ms ease; }
+.filter-dialog,
+.conflict-dialog,
+.confirm-dialog,
+.prompt-dialog { animation: ft-dialog-in 170ms cubic-bezier(0.2, 0, 0, 1); }
+
+/* Popup menus (Configure Columns, duplicates columns) fade/slide in. */
+.rb-dropdown-menu { transform-origin: top; animation: ft-menu-in 130ms ease; }
+
+/* Side / bottom panels ease in on open. These run on mount (or the terminal's
+   display flip), so they never fight an active drag-resize of an open panel.
+   Scope the side bar to the .vsc-body host so the nested SideBar root (also
+   .sidebar) doesn't double-animate. */
+.vsc-body > .sidebar { animation: ft-panel-left-in 180ms ease; }
+.chatpanel,
+.inspector-pane { animation: ft-panel-right-in 180ms ease; }
+.bottom-panel,
+.terminal-panel { animation: ft-panel-up-in 180ms ease; }
+
+/* Cross-fade between the table / treemap / report / duplicates views. */
+.editor-main,
+.reports-editor,
+.dupes-editor { animation: ft-view-fade 150ms ease; }
+
+/* Honor a user's reduced-motion preference: drop the added motion (the live
+   scan count + progress text still convey state without movement). */
+@media (prefers-reduced-motion: reduce) {
+  .filter-dialog-overlay,
+  .filter-dialog,
+  .conflict-dialog,
+  .confirm-dialog,
+  .prompt-dialog,
+  .rb-dropdown-menu,
+  .toast,
+  .vsc-body > .sidebar,
+  .chatpanel,
+  .inspector-pane,
+  .bottom-panel,
+  .terminal-panel,
+  .editor-main,
+  .reports-editor,
+  .dupes-editor,
+  .scan-overlay,
+  .skeleton-bar,
+  .scan-overlay .df-scanning-spinner,
+  .scan-overlay .df-progress-bar-sweep {
+    animation: none !important;
+  }
+}

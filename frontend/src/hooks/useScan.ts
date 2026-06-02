@@ -52,11 +52,45 @@ export interface ScanProgress {
   elapsed: number;
 }
 
+// Live scan progress ticks many times per second. Holding it in React state
+// would re-render WorkspaceTab (and, via onStateChange, App) on every tick, only
+// to update a single counter — forcing React to reconcile the tree/table/treemap
+// each time. Instead progress lives in this tiny external store: setters notify
+// subscribers directly, and only the dedicated progress UIs (the in-pane scan
+// overlay + the status-bar counter) subscribe via useSyncExternalStore, so a
+// tick re-renders just those leaves, never the heavy subtrees.
+export interface ProgressStore {
+  /** Current value (also the useSyncExternalStore getSnapshot). */
+  get: () => ScanProgress | null;
+  /** Publish a new value (or null to clear) and notify subscribers. */
+  set: (p: ScanProgress | null) => void;
+  /** Subscribe to changes; returns an unsubscribe fn (useSyncExternalStore). */
+  subscribe: (listener: () => void) => () => void;
+}
+
+function createProgressStore(): ProgressStore {
+  let value: ScanProgress | null = null;
+  const listeners = new Set<() => void>();
+  return {
+    get: () => value,
+    set: (p) => {
+      value = p;
+      for (const l of listeners) l();
+    },
+    subscribe: (l) => {
+      listeners.add(l);
+      return () => listeners.delete(l);
+    },
+  };
+}
+
 export interface UseScanReturn {
   data: ScanResult | null;
   status: ScanStatus;
   errorMessage: string;
-  progress: ScanProgress | null;
+  /** Subscribe-able live progress (see ProgressStore) — NOT React state, so
+   *  ticks don't re-render this hook's consumer. */
+  progressStore: ProgressStore;
   startScan: (opts: ScanOptions) => void;
   // Refresh: runs a new scan but never clears existing data mid-flight.
   // The tree stays fully visible; only the final result triggers a merge.
@@ -139,7 +173,13 @@ export function useScan(): UseScanReturn {
   const [data, setData] = useState<ScanResult | null>(null);
   const [status, setStatus] = useState<ScanStatus>("idle");
   const [errorMessage, setErrorMessage] = useState("");
-  const [progress, setProgress] = useState<ScanProgress | null>(null);
+  // Progress lives in an external store (created once per hook instance) rather
+  // than React state, so its high-frequency ticks only re-render the leaf UIs
+  // that subscribe — see ProgressStore.
+  const progressStoreRef = useRef<ProgressStore>();
+  if (!progressStoreRef.current) progressStoreRef.current = createProgressStore();
+  const progressStore = progressStoreRef.current;
+  const setProgress = progressStore.set;
   const controllerRef = useRef<AbortController | null>(null);
 
   const cancelScan = useCallback(() => {
@@ -149,7 +189,7 @@ export function useScan(): UseScanReturn {
       setStatus("cancelled");
       setProgress(null);
     }
-  }, []);
+  }, [setProgress]);
 
   const startScan = useCallback((opts: ScanOptions) => {
     if (controllerRef.current) return;
@@ -197,7 +237,7 @@ export function useScan(): UseScanReturn {
       .finally(() => {
         controllerRef.current = null;
       });
-  }, []);
+  }, [setProgress]);
 
   // Refresh: runs a complete scan in background without ever clearing data.
   // Streams partial results but does NOT call setData on partials (tree stays stable).
@@ -242,7 +282,7 @@ export function useScan(): UseScanReturn {
       .finally(() => {
         controllerRef.current = null;
       });
-  }, []);
+  }, [setProgress]);
 
-  return { data, status, errorMessage, progress, startScan, startRefresh, cancelScan };
+  return { data, status, errorMessage, progressStore, startScan, startRefresh, cancelScan };
 }

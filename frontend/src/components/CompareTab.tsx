@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import type { DiffResult, DiffRow, NodeRecord, ScanResult, SnapshotMeta } from "../api/types";
 import {
   deleteSnapshot,
@@ -9,6 +10,7 @@ import {
 import { formatBytes } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
 import { Icon } from "./Icon";
+import { EmptyState } from "./EmptyState";
 
 interface CompareTabProps {
   /** The focused tab's current scan (the live "current" comparison side). */
@@ -19,6 +21,10 @@ interface CompareTabProps {
 }
 
 const CURRENT = "current";
+
+// Fixed row height for the virtualized diff list (matches the .compare-row box:
+// 12px vertical padding + ~17px line + 1px divider, box-sizing: border-box).
+const DIFF_ROW_HEIGHT = 32;
 
 function snapshotLabel(meta: SnapshotMeta): string {
   const when = meta.savedAt ? formatDate(meta.savedAt) : formatDate(meta.scannedAt);
@@ -193,11 +199,13 @@ export function CompareTab({ data, nodeById, onNavigate }: CompareTabProps) {
       {diff && <DiffView diff={diff} onRevealRow={revealRow} canReveal={(p) => pathToId.has(p.toLowerCase())} />}
 
       {!diff && !busy && (
-        <div className="compare-empty">
-          {options.length === 0
+        <EmptyState
+          icon="clock-history"
+          title="Compare disk usage over time"
+          hint={options.length === 0
             ? "Save a snapshot of the current scan, then come back later to see what grew."
             : "Pick a base and a comparison, then press Compare to see what grew or shrank."}
-        </div>
+        />
       )}
     </div>
   );
@@ -213,6 +221,20 @@ function DiffView({
   canReveal: (path: string) => boolean;
 }) {
   const { summary } = diff;
+  const rows = diff.rows;
+
+  // Virtualize the diff rows the same way TreeTable / DuplicatesResults do
+  // (@tanstack/react-virtual): the scroll element is the .compare-body, and only
+  // the visible window of rows is mounted. A capped diff can still hold thousands
+  // of rows, so this keeps the Compare report responsive instead of rendering all.
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => scrollEl,
+    estimateSize: () => DIFF_ROW_HEIGHT,
+    overscan: 20,
+  });
+
   return (
     <div className="compare-results">
       <div className="compare-summary">
@@ -225,8 +247,8 @@ function DiffView({
         <span className="compare-chip added">{summary.added} added</span>
         <span className="compare-chip removed">{summary.removed} removed</span>
         {summary.capped && (
-          <span className="compare-capped" title={`Showing the ${diff.rows.length} largest of ${summary.rowCount} changes`}>
-            top {diff.rows.length} of {summary.rowCount}
+          <span className="compare-capped" title={`Showing the ${rows.length} largest of ${summary.rowCount} changes`}>
+            top {rows.length} of {summary.rowCount}
           </span>
         )}
       </div>
@@ -240,30 +262,35 @@ function DiffView({
           <span className="c-num">Delta</span>
           <span className="c-num">%</span>
         </div>
-        <div className="compare-body">
-          {diff.rows.map((row, i) => {
-            const revealable = canReveal(row.path);
-            return (
-              <div
-                key={`${row.path}-${i}`}
-                className={`compare-row${revealable ? " revealable" : ""}`}
-                title={revealable ? `${row.path}\nClick to reveal in the tree` : row.path}
-                onClick={() => { if (revealable) onRevealRow(row); }}
-              >
-                <span className="c-name">
-                  <span className={`compare-kind ${row.dir ? "dir" : "file"}`} />
-                  {row.name}
-                </span>
-                <span className="c-status">
-                  <span className={`compare-badge ${row.status}`}>{row.status}</span>
-                </span>
-                <span className="c-num">{row.oldSize ? formatBytes(row.oldSize) : "—"}</span>
-                <span className="c-num">{row.newSize ? formatBytes(row.newSize) : "—"}</span>
-                <span className={`c-num ${row.delta >= 0 ? "pos" : "neg"}`}>{formatDelta(row.delta)}</span>
-                <span className={`c-num ${row.delta >= 0 ? "pos" : "neg"}`}>{formatPct(row)}</span>
-              </div>
-            );
-          })}
+        <div className="compare-body" ref={setScrollEl}>
+          <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
+            {virtualizer.getVirtualItems().map((vItem) => {
+              const row = rows[vItem.index];
+              if (!row) return null;
+              const revealable = canReveal(row.path);
+              return (
+                <div
+                  key={`${row.path}-${vItem.index}`}
+                  className={`compare-row${revealable ? " revealable" : ""}`}
+                  style={{ position: "absolute", top: vItem.start, left: 0, right: 0, height: DIFF_ROW_HEIGHT }}
+                  title={revealable ? `${row.path}\nClick to reveal in the tree` : row.path}
+                  onClick={() => { if (revealable) onRevealRow(row); }}
+                >
+                  <span className="c-name">
+                    <span className={`compare-kind ${row.dir ? "dir" : "file"}`} />
+                    {row.name}
+                  </span>
+                  <span className="c-status">
+                    <span className={`compare-badge ${row.status}`}>{row.status}</span>
+                  </span>
+                  <span className="c-num">{row.oldSize ? formatBytes(row.oldSize) : "—"}</span>
+                  <span className="c-num">{row.newSize ? formatBytes(row.newSize) : "—"}</span>
+                  <span className={`c-num ${row.delta >= 0 ? "pos" : "neg"}`}>{formatDelta(row.delta)}</span>
+                  <span className={`c-num ${row.delta >= 0 ? "pos" : "neg"}`}>{formatPct(row)}</span>
+                </div>
+              );
+            })}
+          </div>
         </div>
       </div>
     </div>

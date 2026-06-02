@@ -1,5 +1,6 @@
 import type { ExtensionStat } from "../api/types";
 import { formatBytes, formatCount } from "../utils/formatBytes";
+import { colorForExt } from "../lib/typeColors";
 
 interface ExtensionsTabProps {
   extensionStats: ExtensionStat[];
@@ -20,7 +21,7 @@ export function ExtensionsTab({ extensionStats }: ExtensionsTabProps) {
           <div className="bar-track">
             <div
               className="bar-fill"
-              style={{ "--bar": `${(item.bytes / max) * 100}%` } as React.CSSProperties}
+              style={{ "--bar": `${(item.bytes / max) * 100}%`, "--bar-color": colorForExt(item.ext) } as React.CSSProperties}
             />
           </div>
         </div>

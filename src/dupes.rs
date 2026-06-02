@@ -1,12 +1,17 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::export::push_json_string;
-use crate::model::{DupesProgress, HashCacheEntry, NodeRecord, ScanResult};
+use crate::model::{node_abs_path, DupesProgress, HashCacheEntry, NodeRecord};
+
+/// Upper bound on resident `(path)->hash` cache entries. A long session can
+/// otherwise grow the map without limit; surplus entries are evicted (a miss
+/// just re-hashes). Durable copies live in the on-disk cache regardless.
+pub(crate) const MAX_HASH_CACHE_ENTRIES: usize = 500_000;
 
 // ── Core types ─────────────────────────────────────────────────────────────
 
@@ -37,12 +42,6 @@ pub(crate) struct DupeGroupV2 {
 
 const SAMPLE_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Clone, Copy)]
-struct FileFingerprint {
-    hash: u64,
-    complete: bool,
-}
-
 fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
     for byte in bytes {
         *hash ^= u64::from(*byte);
@@ -68,7 +67,7 @@ pub(crate) fn fnv1a_file(path: &Path) -> io::Result<u64> {
     Ok(hash)
 }
 
-fn fnv1a_file_sample(path: &Path, size: u64) -> io::Result<FileFingerprint> {
+fn fnv1a_file_sample(path: &Path, size: u64) -> io::Result<u64> {
     let mut file = File::open(path)?;
     let mut buffer = [0u8; SAMPLE_BYTES];
     let mut hash = 0xcbf29ce484222325u64;
@@ -82,7 +81,7 @@ fn fnv1a_file_sample(path: &Path, size: u64) -> io::Result<FileFingerprint> {
             }
             fnv1a_update(&mut hash, &buffer[..read]);
         }
-        return Ok(FileFingerprint { hash, complete: true });
+        return Ok(hash);
     }
 
     let read = file.read(&mut buffer)?;
@@ -92,7 +91,7 @@ fn fnv1a_file_sample(path: &Path, size: u64) -> io::Result<FileFingerprint> {
     let read = file.read(&mut buffer)?;
     fnv1a_update(&mut hash, &buffer[..read]);
 
-    Ok(FileFingerprint { hash, complete: false })
+    Ok(hash)
 }
 
 // ── Candidate-list hash engine (POST /api/dupes-hash) ───────────────────────
@@ -205,17 +204,21 @@ where
     });
 }
 
-/// Group client-provided candidates into byte-identical sets. Returns the
-/// groups (as index lists into `files`), any per-file errors, and whether the
-/// persistent hash cache was modified (so the caller can persist it).
+/// The single parallel duplicate-detection pipeline shared by every endpoint:
+/// size-grouping -> head/tail sample fingerprint -> full FNV hash only for the
+/// sample-colliding groups, reusing the persistent `(path,size,mtime)->hash`
+/// cache. Returns one `(full_hash, indices_into_files)` entry per duplicate
+/// group plus any per-file errors. When `cache_path` is set, newly-computed
+/// hashes are appended to the on-disk cache incrementally (survives restarts).
 pub(crate) fn hash_candidate_groups(
     files: &[HashInput],
     confirm_bytes: bool,
     cache: &Mutex<HashMap<PathBuf, HashCacheEntry>>,
+    cache_path: Option<&Path>,
     progress: Option<&Arc<DupesProgress>>,
     cancel: Option<&Arc<AtomicBool>>,
     threads: usize,
-) -> (Vec<Vec<usize>>, Vec<String>, bool) {
+) -> (Vec<(u64, Vec<usize>)>, Vec<String>) {
     // 1. Bucket by size — only equal-size files can be byte-identical.
     let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
     for (idx, f) in files.iter().enumerate() {
@@ -248,7 +251,7 @@ pub(crate) fn hash_candidate_groups(
         .copied()
         .filter(|&i| full_hash[i].is_none())
         .collect();
-    let sample_fp: Vec<Mutex<Option<FileFingerprint>>> = (0..files.len()).map(|_| Mutex::new(None)).collect();
+    let sample_fp: Vec<Mutex<Option<u64>>> = (0..files.len()).map(|_| Mutex::new(None)).collect();
     parallel_for(uncached.len(), threads, cancel, |k| {
         let i = uncached[k];
         match fnv1a_file_sample(&files[i].path, files[i].size) {
@@ -260,7 +263,7 @@ pub(crate) fn hash_candidate_groups(
         }
     });
     if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
-        return (Vec::new(), Vec::new(), false);
+        return (Vec::new(), Vec::new());
     }
 
     // 4. Decide which uncached files still need a full hash: any uncached file
@@ -276,7 +279,7 @@ pub(crate) fn hash_candidate_groups(
             }
             let fp = *sample_fp[i].lock().expect("sample lock");
             if let Some(fp) = fp {
-                by_sample.entry(fp.hash).or_default().push(i);
+                by_sample.entry(fp).or_default().push(i);
             }
         }
         for (_, members) in by_sample {
@@ -307,26 +310,44 @@ pub(crate) fn hash_candidate_groups(
         }
     });
     if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
-        return (Vec::new(), Vec::new(), false);
+        return (Vec::new(), Vec::new());
     }
 
     let computed = computed.into_inner().expect("computed lock");
-    let mut cache_dirty = false;
     if !computed.is_empty() {
+        let mut new_entries: Vec<(PathBuf, HashCacheEntry)> = Vec::with_capacity(computed.len());
         let mut guard = cache.lock().expect("hash_cache lock");
         for &(i, h) in &computed {
             full_hash[i] = Some(h);
-            guard.insert(
-                files[i].path.clone(),
-                HashCacheEntry { size: files[i].size, mtime: files[i].mtime, hash: h },
-            );
+            let entry = HashCacheEntry { size: files[i].size, mtime: files[i].mtime, hash: h };
+            guard.insert(files[i].path.clone(), entry);
+            new_entries.push((files[i].path.clone(), entry));
         }
-        cache_dirty = true;
+        // Bound the resident cache so a long session can't grow it without limit.
+        // Evicting an entry only costs a future re-hash; the durable copy was just
+        // appended to disk below, so nothing persistent is lost.
+        if guard.len() > MAX_HASH_CACHE_ENTRIES {
+            let surplus = guard.len() - MAX_HASH_CACHE_ENTRIES;
+            let victims: Vec<PathBuf> = guard.keys().take(surplus).cloned().collect();
+            for key in victims {
+                guard.remove(&key);
+            }
+        }
+        // Incremental persistence: append only the new rows (not the whole map)
+        // while holding the cache lock, so concurrent appenders can't interleave
+        // partial lines. The on-disk format tolerates these trailing rows (see
+        // `load_hash_cache`), and a stale duplicate row is overridden on load by
+        // the later one for the same path.
+        if let Some(path) = cache_path {
+            let _ = append_hash_cache(path, &new_entries);
+        }
     }
 
     // 6. Group: within each size bucket, cluster by full hash, then optionally
     //    byte-confirm each cluster before emitting it as a duplicate group.
-    let mut groups: Vec<Vec<usize>> = Vec::new();
+    //    Each emitted group carries its full hash so callers that surface a
+    //    content hash (legacy `/api/dupes*`) don't need a second cache lookup.
+    let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
     for bucket in &buckets {
         let mut by_full: HashMap<u64, Vec<usize>> = HashMap::new();
         for &i in bucket {
@@ -334,44 +355,117 @@ pub(crate) fn hash_candidate_groups(
                 by_full.entry(h).or_default().push(i);
             }
         }
-        for (_, members) in by_full {
+        for (hash, members) in by_full {
             if members.len() < 2 {
                 continue;
             }
             if confirm_bytes {
                 for class in byte_confirm_partition(&members, files, &errors) {
                     if class.len() >= 2 {
-                        groups.push(class);
+                        groups.push((hash, class));
                     }
                 }
             } else {
-                groups.push(members);
+                groups.push((hash, members));
             }
         }
     }
 
-    (groups, errors.into_inner().expect("hash errors lock"), cache_dirty)
+    (groups, errors.into_inner().expect("hash errors lock"))
+}
+
+/// Adapt the unified pipeline to the legacy pairwise-match shape consumed by
+/// `matches_to_groups` (used by `/api/dupes-v2` exact mode). Emits every pair
+/// inside each content-identical group with a perfect score; ignore-list
+/// filtering and reference selection then happen in `matches_to_groups`.
+pub(crate) fn exact_matches_via_hash_cache(
+    files: &[DupeFileV2],
+    cache: &Mutex<HashMap<PathBuf, HashCacheEntry>>,
+    cache_path: Option<&Path>,
+    progress: Option<&Arc<DupesProgress>>,
+    cancel: Option<&Arc<AtomicBool>>,
+    threads: usize,
+) -> Vec<(usize, usize, u8)> {
+    let inputs: Vec<HashInput> = files
+        .iter()
+        .map(|f| HashInput { path: f.path.clone(), size: f.size, mtime: f.modified })
+        .collect();
+    let (groups, _errors) =
+        hash_candidate_groups(&inputs, false, cache, cache_path, progress, cancel, threads);
+    let mut matches = Vec::new();
+    for (_hash, indices) in &groups {
+        for i in 0..indices.len() {
+            for j in (i + 1)..indices.len() {
+                matches.push((indices[i], indices[j], 100u8));
+            }
+        }
+    }
+    matches
+}
+
+/// Append newly-computed hash rows to the on-disk cache (one JSON array per
+/// line: `["path",size,mtime,hash]`). `load_hash_cache` parses these trailing
+/// rows even when they follow a previously written bracketed array, so the file
+/// is grown in place rather than fully rewritten on every dedup.
+pub(crate) fn append_hash_cache(path: &Path, entries: &[(PathBuf, HashCacheEntry)]) -> io::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut out = String::with_capacity(entries.len() * 64);
+    for (p, e) in entries {
+        out.push('[');
+        push_json_string(&mut out, &p.to_string_lossy());
+        out.push(',');
+        out.push_str(&e.size.to_string());
+        out.push(',');
+        out.push_str(&e.mtime.to_string());
+        out.push(',');
+        out.push_str(&e.hash.to_string());
+        out.push_str("]\n");
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(out.as_bytes())
 }
 
 // ── Persistent content-hash cache (JSON) ────────────────────────────────────
 
-/// Load the hash cache from a JSON array of `["path", size, mtime, hash]` rows.
-pub(crate) fn load_hash_cache(path: &Path) -> HashMap<PathBuf, HashCacheEntry> {
+/// Load the hash cache from JSON `["path", size, mtime, hash]` rows. Returns the
+/// deduplicated map plus whether the file should be compacted: true when it held
+/// more rows than unique entries (incremental-append bloat from `append_hash_cache`)
+/// or had to be capped at `MAX_HASH_CACHE_ENTRIES`, so the caller can rewrite a
+/// tidy snapshot once at startup and keep the file bounded across restarts.
+pub(crate) fn load_hash_cache(path: &Path) -> (HashMap<PathBuf, HashCacheEntry>, bool) {
     let mut map = HashMap::new();
-    let Ok(raw) = fs::read_to_string(path) else { return map; };
+    let Ok(raw) = fs::read_to_string(path) else { return (map, false); };
+    let mut rows = 0usize;
+    let mut capped = false;
     for line in raw.lines() {
         let line = line.trim().trim_end_matches(',');
         if !line.starts_with('[') {
             continue;
         }
         if let Some((p, size, mtime, hash)) = parse_hash_row(line) {
-            map.insert(PathBuf::from(p), HashCacheEntry { size, mtime, hash });
+            rows += 1;
+            let key = PathBuf::from(p);
+            // A later row for the same path wins (newest append overrides), so
+            // duplicates from incremental appends collapse to the freshest hash.
+            if map.len() >= MAX_HASH_CACHE_ENTRIES && !map.contains_key(&key) {
+                capped = true;
+                continue;
+            }
+            map.insert(key, HashCacheEntry { size, mtime, hash });
         }
     }
-    map
+    let should_compact = capped || rows > map.len();
+    (map, should_compact)
 }
 
-/// Persist the hash cache as a JSON array of `["path", size, mtime, hash]` rows.
+/// Persist (compact) the whole hash cache as a JSON array of
+/// `["path", size, mtime, hash]` rows. This is the full-rewrite/compaction path;
+/// steady-state growth uses the cheaper incremental `append_hash_cache`.
 pub(crate) fn save_hash_cache(path: &Path, cache: &HashMap<PathBuf, HashCacheEntry>) -> io::Result<()> {
     let mut out = String::from("[\n");
     let mut first = true;
@@ -418,27 +512,6 @@ pub(crate) struct DupeFilter2 {
     pub(crate) extensions: Vec<String>,
 }
 
-#[allow(dead_code)]
-pub(crate) fn build_candidates(result: &ScanResult, filter: &DupeFilter2) -> Vec<DupeFileV2> {
-    result
-        .nodes
-        .iter()
-        .filter(|n| !n.is_dir && n.size >= filter.min_size.max(1))
-        .filter(|n| filter.max_size.map_or(true, |max| n.size <= max))
-        .filter(|n| {
-            filter.extensions.is_empty()
-                || filter.extensions.contains(&n.extension.to_lowercase())
-        })
-        .map(|n| DupeFileV2 {
-            path: PathBuf::from(&n.path),
-            name: n.name.clone(),
-            size: n.size,
-            modified: (n.modified_ms / 1000) as u64,
-            is_ref: false,
-        })
-        .collect()
-}
-
 pub(crate) fn build_candidates_from_nodes(nodes: &[NodeRecord], filter: &DupeFilter2) -> Vec<DupeFileV2> {
     nodes
         .iter()
@@ -449,7 +522,9 @@ pub(crate) fn build_candidates_from_nodes(nodes: &[NodeRecord], filter: &DupeFil
                 || filter.extensions.contains(&n.extension.to_lowercase())
         })
         .map(|n| DupeFileV2 {
-            path: PathBuf::from(&n.path),
+            // Files no longer store their absolute path (interned away to cut
+            // scan memory); reconstruct it from the parent directory + name.
+            path: PathBuf::from(node_abs_path(nodes, n.id)),
             name: n.name.clone(),
             size: n.size,
             modified: (n.modified_ms / 1000) as u64,
@@ -458,144 +533,13 @@ pub(crate) fn build_candidates_from_nodes(nodes: &[NodeRecord], filter: &DupeFil
         .collect()
 }
 
-// ── Algorithm 1: Exact (byte-identical via FNV-1a) ─────────────────────────
+// ── Exact duplicate detection now funnels through `hash_candidate_groups`
+//    (size-group -> sample fingerprint -> cached full hash). The old standalone
+//    `scan_exact` / `scan_exact_with_progress` walkers were removed; callers use
+//    `exact_matches_via_hash_cache` (above) so every path shares one engine and
+//    the persistent hash cache.
 
-#[allow(dead_code)]
-pub(crate) fn scan_exact(files: &[DupeFileV2]) -> Vec<(usize, usize, u8)> {
-    // Group by size first — only files with identical sizes can be identical
-    let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (idx, f) in files.iter().enumerate() {
-        by_size.entry(f.size).or_default().push(idx);
-    }
-
-    let mut matches = Vec::new();
-    for indices in by_size.values() {
-        if indices.len() < 2 {
-            continue;
-        }
-        // Hash each file in this size bucket
-        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
-        for &idx in indices {
-            if let Ok(h) = fnv1a_file(&files[idx].path) {
-                by_hash.entry(h).or_default().push(idx);
-            }
-        }
-        // Emit all pairs within each hash group
-        for hash_group in by_hash.values() {
-            if hash_group.len() < 2 {
-                continue;
-            }
-            for i in 0..hash_group.len() {
-                for j in (i + 1)..hash_group.len() {
-                    matches.push((hash_group[i], hash_group[j], 100u8));
-                }
-            }
-        }
-    }
-    matches
-}
-
-// ── Algorithm 2: Filename fuzzy (Sørensen-Dice) ────────────────────────────
-
-fn is_canceled(cancel: Option<&Arc<AtomicBool>>) -> bool {
-    cancel
-        .map(|flag| flag.load(Ordering::Relaxed))
-        .unwrap_or(false)
-}
-
-fn progress_add_hashed(progress: Option<&Arc<DupesProgress>>, count: u64) {
-    if let Some(progress) = progress {
-        progress.files_hashed.fetch_add(count, Ordering::Relaxed);
-    }
-}
-
-fn progress_add_hashing(progress: Option<&Arc<DupesProgress>>, count: u64) {
-    if let Some(progress) = progress {
-        progress.files_hashing.fetch_add(count, Ordering::Relaxed);
-    }
-}
-
-fn emit_all_pairs(indices: &[usize], matches: &mut Vec<(usize, usize, u8)>) {
-    for i in 0..indices.len() {
-        for j in (i + 1)..indices.len() {
-            matches.push((indices[i], indices[j], 100u8));
-        }
-    }
-}
-
-pub(crate) fn scan_exact_with_progress(
-    files: &[DupeFileV2],
-    progress: Option<&Arc<DupesProgress>>,
-    cancel: Option<&Arc<AtomicBool>>,
-) -> Vec<(usize, usize, u8)> {
-    // Group by size first. Only files with identical byte lengths can be exact duplicates.
-    let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (idx, file) in files.iter().enumerate() {
-        by_size.entry(file.size).or_default().push(idx);
-    }
-
-    let buckets: Vec<Vec<usize>> = by_size
-        .into_values()
-        .filter(|indices| indices.len() > 1)
-        .collect();
-
-    if let Some(progress) = progress {
-        let hash_candidates = buckets.iter().map(|indices| indices.len() as u64).sum::<u64>();
-        progress.files_hashing.store(hash_candidates, Ordering::Relaxed);
-        progress.files_hashed.store(0, Ordering::Relaxed);
-    }
-
-    let mut matches = Vec::new();
-    for indices in buckets {
-        if is_canceled(cancel) {
-            return Vec::new();
-        }
-
-        let mut by_sample_hash: HashMap<u64, Vec<(usize, bool)>> = HashMap::new();
-        for idx in indices {
-            if is_canceled(cancel) {
-                return Vec::new();
-            }
-            if let Ok(fingerprint) = fnv1a_file_sample(&files[idx].path, files[idx].size) {
-                by_sample_hash
-                    .entry(fingerprint.hash)
-                    .or_default()
-                    .push((idx, fingerprint.complete));
-            }
-            progress_add_hashed(progress, 1);
-        }
-
-        for sample_group in by_sample_hash.values().filter(|group| group.len() > 1) {
-            if is_canceled(cancel) {
-                return Vec::new();
-            }
-
-            if sample_group.iter().all(|(_, complete)| *complete) {
-                let exact_indices: Vec<usize> = sample_group.iter().map(|(idx, _)| *idx).collect();
-                emit_all_pairs(&exact_indices, &mut matches);
-                continue;
-            }
-
-            progress_add_hashing(progress, sample_group.len() as u64);
-            let mut by_full_hash: HashMap<u64, Vec<usize>> = HashMap::new();
-            for &(idx, _) in sample_group {
-                if is_canceled(cancel) {
-                    return Vec::new();
-                }
-                if let Ok(hash) = fnv1a_file(&files[idx].path) {
-                    by_full_hash.entry(hash).or_default().push(idx);
-                }
-                progress_add_hashed(progress, 1);
-            }
-
-            for hash_group in by_full_hash.values().filter(|group| group.len() > 1) {
-                emit_all_pairs(hash_group, &mut matches);
-            }
-        }
-    }
-
-    matches
-}
+// ── Filename fuzzy (Sørensen-Dice) ─────────────────────────────────────────
 
 fn get_words(name: &str) -> Vec<String> {
     // Strip file extension

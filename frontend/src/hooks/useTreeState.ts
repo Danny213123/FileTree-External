@@ -1,6 +1,6 @@
 import { useState, useCallback, useMemo } from "react";
 import type { NodeRecord, SortKey, Metric, Unit } from "../api/types";
-import { type FilterRule, applyRules } from "./useFilterRules";
+import { type FilterRule, type CompiledRule, compileRules, applyCompiledRules } from "./useFilterRules";
 import { attributeLetters } from "../lib/attributes";
 
 export interface TreeState {
@@ -209,7 +209,7 @@ function collectVisibleRows(
   collapsedOverrides: Set<number>,
   cache: DirCache,
   filter: string,
-  filterRules: FilterRule[],
+  compiledRules: CompiledRule[],
   showFiles: boolean,
 ): NodeRecord[] {
   const root = nodeById.get(0);
@@ -223,13 +223,14 @@ function collectVisibleRows(
     return expandedAll ? !collapsedOverrides.has(id) : expanded.has(id);
   };
 
-  // Determine which filtering mode is active.
-  // Rules take precedence when any rule has a non-empty value.
-  const hasActiveRules = filterRules.some((r) => r.value.trim() !== "");
+  // Determine which filtering mode is active. Rules take precedence when any
+  // rule is active; compiledRules already holds ONLY the active rules (their
+  // RegExps precompiled once), so a non-empty list means rule-mode is on.
+  const hasActiveRules = compiledRules.length > 0;
   const hasSimpleFilter = !hasActiveRules && filter.length > 0;
 
   const passesFilter = (node: NodeRecord): boolean => {
-    if (hasActiveRules) return applyRules(filterRules, node);
+    if (hasActiveRules) return applyCompiledRules(compiledRules, node);
     if (hasSimpleFilter) return node.name.toLowerCase().includes(filter.toLowerCase());
     return true;
   };
@@ -320,12 +321,16 @@ export function useTreeState(): UseTreeStateReturn {
     [nodeById, sortKey, sortDir],
   );
 
+  // Precompile filter rules (regex/glob → cached, ReDoS-guarded RegExp) ONCE per
+  // rule-set change, not per visible row. The row hot path reuses these.
+  const compiledRules = useMemo(() => compileRules(filterRules), [filterRules]);
+
   const visibleRows = useMemo(
     () => collectVisibleRows(
       nodeById, expanded, expandedAll, collapsedOverrides,
-      dirCache, filter, filterRules, showFiles,
+      dirCache, filter, compiledRules, showFiles,
     ),
-    [nodeById, expanded, expandedAll, collapsedOverrides, dirCache, filter, filterRules, showFiles],
+    [nodeById, expanded, expandedAll, collapsedOverrides, dirCache, filter, compiledRules, showFiles],
   );
 
   const toggleExpand = useCallback((id: number) => {

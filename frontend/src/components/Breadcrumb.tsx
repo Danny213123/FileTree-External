@@ -48,6 +48,9 @@ interface BreadcrumbProps {
   scanning: boolean;
   canBack: boolean;
   canForward: boolean;
+  /** False at a drive/volume root (no parent), so the Up button is disabled
+   *  like Back/Forward instead of being a silent no-op. */
+  canUp: boolean;
   /** Navigate to (rescan as root) an arbitrary path — segment click or typed path. */
   onNavigate: (path: string) => void;
   onBack: () => void;
@@ -58,7 +61,7 @@ interface BreadcrumbProps {
 // Explorer-style address bar: Back / Forward / Up controls plus the current
 // path as clickable segments. Clicking the empty track (or the "no folder"
 // hint) switches to an editable input so a path can be typed directly.
-export function Breadcrumb({ path, scanning, canBack, canForward, onNavigate, onBack, onForward, onUp }: BreadcrumbProps) {
+export function Breadcrumb({ path, scanning, canBack, canForward, canUp, onNavigate, onBack, onForward, onUp }: BreadcrumbProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(path);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -87,7 +90,7 @@ export function Breadcrumb({ path, scanning, canBack, canForward, onNavigate, on
         <button className="bc-btn" title="Forward (Alt+Right)" disabled={!canForward} onClick={onForward} aria-label="Forward">
           <Icon name="chevron-right" size={14} />
         </button>
-        <button className="bc-btn" title="Up one level (Alt+Up)" onClick={onUp} aria-label="Up one level">
+        <button className="bc-btn" title="Up one level (Alt+Up)" disabled={!canUp} onClick={onUp} aria-label="Up one level">
           <Icon name="arrow-up" size={14} />
         </button>
       </div>
@@ -107,30 +110,42 @@ export function Breadcrumb({ path, scanning, canBack, canForward, onNavigate, on
           onBlur={() => { setEditing(false); setDraft(path); }}
         />
       ) : (
-        <div
-          className="bc-track"
-          title="Click to edit path"
-          onDoubleClick={() => setEditing(true)}
-          onClick={(e) => { if (e.target === e.currentTarget) setEditing(true); }}
-        >
-          {segments.length === 0 ? (
-            <span className="bc-empty" onClick={() => setEditing(true)}>No folder scanned — click to enter a path</span>
-          ) : (
-            segments.map((seg, i) => (
-              <span className="bc-seg-wrap" key={seg.path}>
-                <button
-                  className="bc-seg"
-                  title={seg.path}
-                  disabled={scanning}
-                  onClick={() => onNavigate(seg.path)}
-                >
-                  {seg.label}
-                </button>
-                {i < segments.length - 1 && <Icon name="chevron-right" size={10} className="bc-sep" />}
-              </span>
-            ))
-          )}
-        </div>
+        <>
+          <div
+            className="bc-track"
+            title="Click to edit path"
+            onDoubleClick={() => setEditing(true)}
+            onClick={(e) => { if (e.target === e.currentTarget) setEditing(true); }}
+          >
+            {segments.length === 0 ? (
+              <span className="bc-empty" onClick={() => setEditing(true)}>No folder scanned — click to enter a path</span>
+            ) : (
+              segments.map((seg, i) => (
+                <span className="bc-seg-wrap" key={seg.path}>
+                  <button
+                    className="bc-seg"
+                    title={seg.path}
+                    disabled={scanning}
+                    onClick={() => onNavigate(seg.path)}
+                  >
+                    {seg.label}
+                  </button>
+                  {i < segments.length - 1 && <Icon name="chevron-right" size={10} className="bc-sep" />}
+                </span>
+              ))
+            )}
+          </div>
+          {/* Explicit edit affordance — editing otherwise needs a double-click on
+              the track. Focuses + selects the path input via the editing effect. */}
+          <button
+            className="bc-btn bc-edit"
+            title="Edit path"
+            aria-label="Edit path"
+            onClick={() => setEditing(true)}
+          >
+            <Icon name="pencil-square" size={13} />
+          </button>
+        </>
       )}
     </div>
   );

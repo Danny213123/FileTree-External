@@ -101,6 +101,20 @@ function renderInline(text: string): ReactNode[] {
   return out;
 }
 
+// Only these URL schemes may become real, clickable links in assistant output.
+// Everything else (javascript:, data:, file:, vbscript:, blob:, schemeless, …)
+// is rendered as inert text so a model can't smuggle a script/navigation payload.
+const SAFE_LINK_SCHEMES = new Set(["http", "https", "mailto"]);
+
+function safeLinkHref(raw: string): string | null {
+  // Strip whitespace + control chars first so obfuscated schemes like
+  // "java\tscript:" or "  javascript:" can't slip past the allowlist.
+  const cleaned = raw.trim().replace(/[\u0000-\u001F\u007F]/g, "");
+  const scheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(cleaned);
+  if (!scheme) return null; // schemeless/relative → don't navigate the app frame
+  return SAFE_LINK_SCHEMES.has(scheme[1].toLowerCase()) ? cleaned : null;
+}
+
 function formatRich(text: string, push: (n: ReactNode) => void): void {
   const re = /(\*\*|__)(.+?)\1|(\*|_)(.+?)\3|\[([^\]]+)\]\(([^)\s]+)\)/g;
   let last = 0;
@@ -109,7 +123,14 @@ function formatRich(text: string, push: (n: ReactNode) => void): void {
     if (m.index > last) pushText(text.slice(last, m.index), push);
     if (m[1]) push(<strong>{m[2]}</strong>);
     else if (m[3]) push(<em>{m[4]}</em>);
-    else if (m[5]) push(<a className="md-link" href={m[6]} target="_blank" rel="noreferrer">{m[5]}</a>);
+    else if (m[5]) {
+      const href = safeLinkHref(m[6]);
+      // Allowed schemes open in a new context (never the app frame), with
+      // noopener/noreferrer so the target can't reach back via window.opener.
+      // Disallowed schemes degrade to the plain link text.
+      if (href) push(<a className="md-link" href={href} target="_blank" rel="noopener noreferrer">{m[5]}</a>);
+      else pushText(m[5], push);
+    }
     last = re.lastIndex;
   }
   if (last < text.length) pushText(text.slice(last), push);

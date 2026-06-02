@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, createRef, Fragment } from "react";
+import { useState, useEffect, useCallback, useRef, createRef, Fragment, lazy } from "react";
 import {
   fetchConfig,
   fetchDrives,
@@ -11,7 +11,6 @@ import {
 import type { AppSettings } from "./api/client";
 import type { DriveEntry, SpecialFolder, SortKey, Unit, ScanResult } from "./api/types";
 import { useDuplicatesController } from "./hooks/useDuplicates";
-import { DuplicatesResults } from "./components/DuplicatesResults";
 import { DEFAULT_VISIBLE_COLUMNS } from "./components/TreeTable";
 import { pushRecent, loadRecentPaths, setRecentPaths } from "./components/RibbonBar";
 import { StatusBar } from "./components/StatusBar";
@@ -22,13 +21,23 @@ import type { WorkspaceTabHandle, SidebarModel } from "./components/WorkspaceTab
 import { TitleBar, type Menu, type MenuItem } from "./components/TitleBar";
 import { loadChatIndex, newChatSessionId } from "./lib/chatSessions";
 import { undoLast } from "./lib/undo";
+import { ToastProvider, toast } from "./lib/toast";
+import { DialogProvider } from "./lib/dialogs";
 import { ActivityBar, type ViewId } from "./components/ActivityBar";
 import { SideBar } from "./components/SideBar";
-import { ReportsView } from "./components/ReportsView";
 import { InspectorPane } from "./components/InspectorPane";
-import { ChatPanel } from "./components/ChatPanel";
-import { TerminalPanel } from "./components/TerminalPanel";
 import { ScheduleWizard } from "./components/ScheduleWizard";
+import { LazyView } from "./components/LazyView";
+
+// Heavy, not-always-visible views are code-split via React.lazy so they leave
+// the main bundle and load on first use (xterm rides along with TerminalPanel;
+// the AI chat, reports and duplicates panels likewise). Each render site is
+// wrapped in <LazyView> (Suspense + error boundary). Named exports are mapped to
+// the default export shape React.lazy expects.
+const ChatPanel = lazy(() => import("./components/ChatPanel").then((m) => ({ default: m.ChatPanel })));
+const TerminalPanel = lazy(() => import("./components/TerminalPanel").then((m) => ({ default: m.TerminalPanel })));
+const ReportsView = lazy(() => import("./components/ReportsView").then((m) => ({ default: m.ReportsView })));
+const DuplicatesResults = lazy(() => import("./components/DuplicatesResults").then((m) => ({ default: m.DuplicatesResults })));
 
 const SETTINGS_DEBOUNCE_MS = 700;
 
@@ -506,7 +515,7 @@ export default function App() {
       if (action === "rename") getActiveRef()?.doRenamePath(message);
       else if (action === "delete") getActiveRef()?.doDeletePaths([message]);
       else if (action === "refresh") getActiveRef()?.doScan();
-      else if (action === "error") window.alert(message);
+      else if (action === "error") toast.error(message);
     });
     return typeof cleanup === "function" ? cleanup : undefined;
   }, [getActiveRef]);
@@ -517,9 +526,13 @@ export default function App() {
   const handleUndo = useCallback(async () => {
     const active = getActiveRef();
     const res = await undoLast();
-    if (!res) { active?.showNotice("Nothing to undo."); return; }
-    active?.showNotice(res.message);
-    if (res.ok) active?.refresh();
+    if (!res) { toast.info("Nothing to undo."); return; }
+    if (res.ok) {
+      toast.success(res.message);
+      active?.refresh();
+    } else {
+      toast.warn(res.message);
+    }
   }, [getActiveRef]);
 
   // ── VS Code keybindings ──
@@ -851,7 +864,10 @@ export default function App() {
   const statusData = activeRef?.getData() ?? null;
   const statusStatus = activeRef?.getStatus() ?? "idle";
   const statusError = activeRef?.getErrorMessage() ?? "";
-  const statusProgress = activeRef?.getProgress() ?? null;
+  // Pass the focused pane's progress STORE (stable per tab) to the status bar so
+  // its counter subscribes and re-renders alone on scan ticks — App itself no
+  // longer re-renders per tick (progress was removed from the notify path).
+  const statusProgressStore = activeRef?.getProgressStore() ?? null;
   const statusVisible = activeRef?.getVisibleCount() ?? 0;
   const navState = activeRef?.getNavState() ?? { canBack: false, canForward: false };
   const activeLabel = metaById.get(focusedTabId)?.label ?? "FileTree";
@@ -1118,6 +1134,7 @@ export default function App() {
                         onScanPath={handleScanPath}
                         onStateChange={notifyState}
                         onOpenFolderInTab={handleOpenFolderInTab}
+                        onUndo={handleUndo}
                       />
                     );
                   })}
@@ -1129,17 +1146,21 @@ export default function App() {
 
         {activeView === "duplicates" && (
           <div className="dupes-editor">
-            <DuplicatesResults ctrl={dupes} />
+            <LazyView>
+              <DuplicatesResults ctrl={dupes} />
+            </LazyView>
           </div>
         )}
 
         {activeView === "reports" && (
           <div className="reports-editor">
-            <ReportsView
-              data={sidebarModel.data}
-              nodeById={sidebarModel.nodeById}
-              onNavigate={(id) => { sidebarModel.onNavigate(id); setActiveView("explorer"); }}
-            />
+            <LazyView>
+              <ReportsView
+                data={sidebarModel.data}
+                nodeById={sidebarModel.nodeById}
+                onNavigate={(id) => { sidebarModel.onNavigate(id); setActiveView("explorer"); }}
+              />
+            </LazyView>
           </div>
         )}
 
@@ -1166,16 +1187,21 @@ export default function App() {
         {chatOpen && (
           <>
             <div className="resizer-x" onMouseDown={handleChatResize} />
-            <ChatPanel
-              width={chatWidth}
-              sessionId={chatSessionId}
-              getAgentApi={() => getActiveRef()?.getAgentApi() ?? null}
-              includeHidden={includeHidden}
-              threads={threads}
-              onClose={() => setChatOpen(false)}
-              onNewSession={handleNewAgentSession}
-              onRestoreSession={handleRestoreSession}
-            />
+            <LazyView
+              loading={<div className="lazy-view-fallback" style={{ width: chatWidth, flex: `0 0 ${chatWidth}px` }}>Loading…</div>}
+              error={<div className="lazy-view-fallback lazy-view-error" style={{ width: chatWidth, flex: `0 0 ${chatWidth}px` }}>Assistant failed to load.</div>}
+            >
+              <ChatPanel
+                width={chatWidth}
+                sessionId={chatSessionId}
+                getAgentApi={() => getActiveRef()?.getAgentApi() ?? null}
+                includeHidden={includeHidden}
+                threads={threads}
+                onClose={() => setChatOpen(false)}
+                onNewSession={handleNewAgentSession}
+                onRestoreSession={handleRestoreSession}
+              />
+            </LazyView>
           </>
         )}
       </div>
@@ -1183,14 +1209,19 @@ export default function App() {
         {terminalMounted && (
           <>
             {terminalOpen && <div className="resizer-y" onMouseDown={handleTerminalResize} />}
-            <TerminalPanel
-              open={terminalOpen}
-              height={terminalHeight}
-              requestCwd={terminalCwd}
-              requestNonce={terminalReq}
-              darkMode={darkMode}
-              onClose={() => setTerminalOpen(false)}
-            />
+            <LazyView
+              loading={terminalOpen ? <div className="lazy-view-fallback" style={{ height: terminalHeight }}>Loading…</div> : null}
+              error={terminalOpen ? <div className="lazy-view-fallback lazy-view-error" style={{ height: terminalHeight }}>Terminal failed to load.</div> : null}
+            >
+              <TerminalPanel
+                open={terminalOpen}
+                height={terminalHeight}
+                requestCwd={terminalCwd}
+                requestNonce={terminalReq}
+                darkMode={darkMode}
+                onClose={() => setTerminalOpen(false)}
+              />
+            </LazyView>
           </>
         )}
       </div>
@@ -1206,10 +1237,14 @@ export default function App() {
         scanResult={statusData}
         status={statusStatus}
         errorMessage={statusError}
-        progress={statusProgress}
+        progressStore={statusProgressStore}
         visibleCount={statusVisible}
         scanPath={activeRef?.getScanPath() ?? ""}
       />
+
+      {/* App-wide overlays: themed confirm/prompt modals + the toast stack. */}
+      <DialogProvider />
+      <ToastProvider />
     </div>
   );
 }

@@ -15,7 +15,7 @@ import { runOrchestrator } from "../lib/agents";
 import type { AgentEvent } from "../lib/agents";
 import { ALWAYS_APPROVE_TOOLS } from "../lib/agents/runtime";
 import type { AgentKind, RunStatus, StepStatus, ToolCallView } from "../lib/agents/types";
-import { loadAiSettings, saveAiSettings, keyFor, type AiSettings } from "../lib/aiSettings";
+import { loadAiSettings, saveAiSettings, loadAiKeys, saveAiKey, keyFor, type AiSettings } from "../lib/aiSettings";
 import { loadChatSession, saveChatSession, loadChatIndex, deleteChatSession, type ChatSessionBlob, type ChatSessionMeta } from "../lib/chatSessions";
 import { scanStreamUrl, fetchDupesV2Bounded } from "../api/client";
 import { getCached, setCached } from "../lib/scanCache";
@@ -231,6 +231,16 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     });
   }, []);
 
+  // Cloud API keys are stored in Electron safeStorage (with a localStorage
+  // fallback for plain-browser dev). Reflect each edit in state immediately and
+  // persist it to the secret store — never to localStorage.
+  const setKeys = useCallback((keys: Partial<AiSettings["keys"]>) => {
+    updateAi({ keys });
+    for (const [provider, value] of Object.entries(keys)) {
+      void saveAiKey(provider as keyof AiSettings["keys"], value ?? "");
+    }
+  }, [updateAi]);
+
   // Build one grouped model list (Ollama local + cloud) for the composer's
   // single model picker. Ollama is probed live; cloud lists are curated.
   const loadModels = useCallback(() => {
@@ -261,6 +271,15 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
   }, []);
 
   useEffect(() => { loadModels(); }, [loadModels]);
+
+  // Load cloud keys from safeStorage on mount, migrating any legacy localStorage
+  // keys into the secret store, then merge the resolved keys into settings state.
+  useEffect(() => {
+    let cancelled = false;
+    void loadAiKeys().then((keys) => { if (!cancelled) setAi((prev) => ({ ...prev, keys })); });
+    return () => { cancelled = true; };
+  }, []);
+
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [items, runs]);
 
   // Auto-grow the composer textarea up to a cap.
@@ -834,7 +853,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
           <SettingsMenu
             ai={ai}
             autoApprove={autoApprove}
-            onChange={(keys) => updateAi({ keys })}
+            onChange={setKeys}
             onToggleAuto={setAutoApprove}
             onRemoveAllow={removeAllow}
             onClose={() => setShowKeys(false)}

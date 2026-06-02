@@ -9,7 +9,7 @@ import { Icon } from "./Icon";
 import { eqPath, isNoOpMove } from "../lib/agent";
 import { attributeLetters, attributeList } from "../lib/attributes";
 
-const ROW_HEIGHT = 20;
+const ROW_HEIGHT = 23;
 // Smallest a column may be dragged to, so a header never collapses to nothing.
 const MIN_COLUMN_WIDTH = 56;
 
@@ -218,6 +218,14 @@ function TreeTableInner({
   onRenameCancel,
 }: TreeTableProps) {
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
+  // Viewport position of the floating "Move to <folder>" pill, tracked from the
+  // last drag-over so the pill follows the cursor over the highlighted folder.
+  const [dropPillPos, setDropPillPos] = useState<{ x: number; y: number } | null>(null);
+  // Debounce timer for clearing the drop highlight: a dragleave from one child
+  // element to another WITHIN the same row would otherwise clear-then-reset the
+  // highlight and make it flicker. We schedule the clear and cancel it if a
+  // dragover re-fires almost immediately.
+  const dropClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragPathsRef = useRef<string[]>([]);
   // True only on the TreeTable instance that started the current native drag.
   // Gates the nativeDropInternal IPC so hidden/other-tab instances ignore it.
@@ -287,7 +295,33 @@ function TreeTableInner({
     // Those must survive any dragend/drop/dragleave that fire during the native
     // drag so the nativeDropInternal IPC (which arrives afterwards) can use them.
     dragPathsRef.current = [];
+    if (dropClearTimerRef.current) { clearTimeout(dropClearTimerRef.current); dropClearTimerRef.current = null; }
     setDropTargetId(null);
+    setDropPillPos(null);
+  }, []);
+
+  // Mark `id` as the live drop target and move the pill to the cursor. Cancels
+  // any pending debounced clear so crossing between a row's children is stable.
+  const markDropTarget = useCallback((id: number, x: number, y: number) => {
+    if (dropClearTimerRef.current) { clearTimeout(dropClearTimerRef.current); dropClearTimerRef.current = null; }
+    setDropTargetId((prev) => (prev === id ? prev : id));
+    setDropPillPos({ x, y });
+  }, []);
+
+  // Debounced clear: scheduled on dragleave, cancelled if a dragover re-fires
+  // within the window (i.e. the cursor merely crossed a child boundary).
+  const scheduleClearDropTarget = useCallback(() => {
+    if (dropClearTimerRef.current) clearTimeout(dropClearTimerRef.current);
+    dropClearTimerRef.current = setTimeout(() => {
+      dropClearTimerRef.current = null;
+      setDropTargetId(null);
+      setDropPillPos(null);
+    }, 60);
+  }, []);
+
+  // Clear the debounce timer if the component unmounts mid-drag.
+  useEffect(() => () => {
+    if (dropClearTimerRef.current) clearTimeout(dropClearTimerRef.current);
   }, []);
   // Name is always shown (it is the special tree cell); other columns are opt-in
   // via `visibleColumns`. Header and rows render from this single list in
@@ -729,10 +763,12 @@ function TreeTableInner({
                   // Remember the highlighted folder as the live drop target so a
                   // native drag-out that returns here can move into it directly.
                   lastFolderTargetRef.current = node.path;
-                  if (dropTargetId !== node.id) setDropTargetId(node.id);
+                  markDropTarget(node.id, e.clientX, e.clientY);
                 }}
                 onDragLeave={() => {
-                  if (dropTargetId === node.id) setDropTargetId(null);
+                  // Debounced so brushing across this row's child elements doesn't
+                  // flicker the highlight; a re-entering dragover cancels the clear.
+                  if (dropTargetId === node.id) scheduleClearDropTarget();
                 }}
                 onDrop={(e) => {
                   if (!node.dir || !node.path || isBundle) return;
@@ -829,6 +865,18 @@ function TreeTableInner({
           anchorY={tooltip.y}
         />
       )}
+      {/* Persistent "Move to <folder>" pill that follows the cursor while a drag
+          hovers a folder row, making the drop destination explicit. */}
+      {dropTargetId != null && dropPillPos && (() => {
+        const target = nodeById.get(dropTargetId);
+        if (!target || !target.dir) return null;
+        return (
+          <div className="drop-move-pill" style={{ left: dropPillPos.x + 14, top: dropPillPos.y + 18 }}>
+            <Icon name="folder" size={12} />
+            <span>Move to <strong>{target.name}</strong></span>
+          </div>
+        );
+      })()}
     </div>
   );
 }

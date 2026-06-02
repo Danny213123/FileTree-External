@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import type { ScanResult } from "../api/types";
 import { formatBytes, formatCount } from "../utils/formatBytes";
+import { ownerColor } from "../lib/typeColors";
 
 interface ByOwnerTabProps {
   data: ScanResult;
@@ -54,7 +55,7 @@ export function ByOwnerTab({ data }: ByOwnerTabProps) {
           <div className="bar-track">
             <div
               className="bar-fill"
-              style={{ "--bar": `${(item.bytes / max) * 100}%` } as React.CSSProperties}
+              style={{ "--bar": `${(item.bytes / max) * 100}%`, "--bar-color": ownerColor(item.owner) } as React.CSSProperties}
             />
           </div>
         </div>

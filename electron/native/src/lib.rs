@@ -1574,6 +1574,7 @@ mod windows_impl {
     const SHELL_ID_FIRST: u32 = 1;
     const FT_NEW_FOLDER: u32 = 0x9001;
     const FT_OPEN_NEW_TAB: u32 = 0x9002;
+    const FT_REVEAL: u32 = 0x9003;
 
     static MENU_CLASS_ONCE: std::sync::Once = std::sync::Once::new();
     const MENU_CLASS: PCWSTR = w!("FileTreeShellMenuHost");
@@ -1736,6 +1737,15 @@ mod windows_impl {
                     AppendMenuW(hmenu, MF_STRING, FT_OPEN_NEW_TAB as usize, w!("Open in new tab"));
                 index += 1;
             }
+            // Reveal works for any single selection — file or folder — so it is
+            // not gated on `single_dir` like "Open in new tab".
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                FT_REVEAL as usize,
+                w!("Open containing folder"),
+            );
+            index += 1;
             let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
             index += 1;
 
@@ -1801,6 +1811,9 @@ mod windows_impl {
         }
         if cmd == FT_OPEN_NEW_TAB {
             return "open-new-tab".to_string();
+        }
+        if cmd == FT_REVEAL {
+            return "show-in-explorer".to_string();
         }
 
         let offset = cmd - SHELL_ID_FIRST;

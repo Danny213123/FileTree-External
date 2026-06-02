@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,22 +14,92 @@ use crate::cli::APP_NAME;
 use crate::dupes::{
     DupeFilter2, DupeGroupV2, HashInput, ReprioritizeCriterion, ScanMode, IgnoreList,
     build_candidates_from_nodes, matches_to_groups, groups_to_json,
-    hash_candidate_groups, load_hash_cache, save_hash_cache,
-    scan_exact_with_progress, scan_filename, scan_audio, reprioritize,
+    hash_candidate_groups, exact_matches_via_hash_cache, load_hash_cache, save_hash_cache,
+    scan_filename, scan_audio, reprioritize,
     action_delete, action_move, action_copy,
 };
 use crate::export::{
-    app_config_json, drives_json, push_json_string, scan_result_to_csv, scan_result_to_html,
-    scan_result_to_json, scan_result_to_xlsx, scan_result_to_xml, special_folders_json,
-    write_scan_result_json, write_scan_result_ndjson,
+    app_config_json, drives_json, push_json_string, scan_result_to_html, scan_result_to_xlsx,
+    special_folders_json, write_scan_result_csv, write_scan_result_json, write_scan_result_ndjson,
+    write_scan_result_xml,
 };
 use crate::io::{default_thread_count, open_path, parse_bool, reveal_path, split_patterns};
 use crate::model::{AppState, DupesProgress, HttpRequest, ScanOptions};
 use crate::scan::{scan_path, scan_path_with_progress};
 
-const INDEX_HTML: &str = include_str!("../frontend/dist/index.html");
-const APP_CSS: &[u8] = include_bytes!("../frontend/dist/assets/index.css");
-const APP_JS: &[u8] = include_bytes!("../frontend/dist/assets/index.js");
+/// The built renderer (`frontend/dist`) is compiled into the binary so the
+/// single executable serves the SPA with no external files. Embedding the whole
+/// directory — instead of one `include_bytes!` const per file — means every
+/// Vite-emitted chunk (content-hashed entrypoints and lazily-loaded panels
+/// alike) is available without editing this file on each rebuild.
+static DIST: include_dir::Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
+
+/// Map a renderer asset's file extension to its `Content-Type`. Covers the
+/// types Vite emits (JS/CSS/source maps/fonts/images); anything unrecognised
+/// falls back to a safe binary type.
+fn content_type_for(name: &str) -> &'static str {
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Serve a Vite-emitted renderer asset from the compiled-in `frontend/dist`.
+///
+/// `route` is the request path with the query already stripped, e.g.
+/// `/assets/index-1a2b3c.js`. Vite content-hashes these names and adds new lazy
+/// chunks on every build, so we resolve each one against the embedded dir by
+/// file name rather than hardcoding routes. These are the app's own static
+/// files, fetched (GET, unauthenticated) before any session token exists, so
+/// this path deliberately stays outside the `/api/*` + token machinery.
+///
+/// Only the flat `assets/` directory is exposed; empty names, nested paths, and
+/// `..` traversal are rejected, and an unknown file yields a genuine 404.
+fn serve_renderer_asset(stream: &mut TcpStream, route: &str) -> sio::Result<()> {
+    let name = match route.strip_prefix("/assets/") {
+        Some(name)
+            if !name.is_empty()
+                && !name.contains('/')
+                && !name.contains('\\')
+                && !name.contains("..") =>
+        {
+            name
+        }
+        _ => return respond_text(stream, 404, "Not found", "Not found"),
+    };
+
+    if let Some(assets) = DIST.get_dir("assets") {
+        for file in assets.files() {
+            if file.path().file_name().and_then(|n| n.to_str()) == Some(name) {
+                return respond_bytes(
+                    stream,
+                    200,
+                    "OK",
+                    content_type_for(name),
+                    file.contents(),
+                    &[],
+                );
+            }
+        }
+    }
+    respond_text(stream, 404, "Not found", "Not found")
+}
 
 pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
@@ -50,21 +120,46 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
             .unwrap_or_else(|_| PathBuf::from("."));
         base.join("FileTree").join("hash_cache.json")
     };
-    let hash_cache = load_hash_cache(&hash_cache_path);
+    // Load the persistent hash cache. `should_compact` is set when the on-disk
+    // file accumulated incremental-append duplicate rows (or was capped); rewrite
+    // a tidy snapshot once at startup so the file stays bounded across restarts.
+    let (hash_cache, should_compact) = load_hash_cache(&hash_cache_path);
+    if should_compact {
+        let _ = save_hash_cache(&hash_cache_path, &hash_cache);
+    }
 
     // Per-session local auth token: Electron mints a random token at startup and
     // passes it to this process via FILETREE_AUTH_TOKEN (out of band — never over
     // HTTP), and to the renderer via IPC, so only the app can drive the
-    // destructive mutation routes. A blank/absent value means "no token" (e.g. a
-    // standalone dev launch), and those routes then fall back to POST-only.
-    let auth_token = std::env::var("FILETREE_AUTH_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
+    // destructive mutation routes.
+    let auth_token = match std::env::var("FILETREE_AUTH_TOKEN").ok().filter(|t| !t.is_empty()) {
+        // An explicitly-provided token (always the case under Electron) is used
+        // verbatim so it matches the value handed to the renderer.
+        Some(token) => Some(token),
+        None => {
+            if cfg!(debug_assertions) {
+                // Debug/standalone dev launch: keep the "no token = open"
+                // convenience (mutation routes stay POST-only with no token check).
+                None
+            } else {
+                // Release build with no token supplied: FAIL CLOSED. Mint a random
+                // session token so the mutation routes can never run token-less.
+                // A packaged build always receives a token from Electron, so this
+                // only affects a standalone release-mode server run.
+                let token = generate_session_token();
+                eprintln!(
+                    "{APP_NAME}: FILETREE_AUTH_TOKEN was not set; generated a random session token \
+                     for this run (mutation routes require X-FileTree-Token): {token}"
+                );
+                Some(token)
+            }
+        }
+    };
 
     let state = Arc::new(AppState {
         initial_path,
         last_scan: Mutex::new(None),
-        scan_cache: Mutex::new(std::collections::HashMap::new()),
+        scan_cache: Mutex::new(crate::model::ScanCache::new()),
         icon_cache: Mutex::new(std::collections::HashMap::new()),
         dupes_progress: Arc::new(DupesProgress::default()),
         dupes_cancel: Arc::new(AtomicBool::new(false)),
@@ -73,16 +168,28 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
         hash_cache: Mutex::new(hash_cache),
         hash_cache_path,
         auth_token,
+        scan_roots: Mutex::new(Vec::new()),
     });
+
+    // Seed the allowed-read roots with the launch directory so previews of files
+    // under it work before the first explicit scan; scans add more roots.
+    register_scan_root(&state, &state.initial_path);
 
     println!("{} is running at http://127.0.0.1:{port}", APP_NAME);
     println!("Press Ctrl+C to stop.");
 
+    // Bound the number of in-flight connections so a flood can't exhaust threads
+    // or memory. The accept loop blocks (backpressure) once the cap is reached.
+    let limiter = Arc::new(ConnLimiter::new(MAX_CONNECTIONS));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let permit = limiter.acquire();
                 let state = Arc::clone(&state);
                 thread::spawn(move || {
+                    // Held for the connection's lifetime; the slot is released on
+                    // drop, even if the handler panics.
+                    let _permit = permit;
                     if let Err(error) = handle_client(stream, state) {
                         eprintln!("request failed: {error}");
                     }
@@ -93,6 +200,98 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
     }
 
     Ok(())
+}
+
+/// Conservative ceiling on simultaneously-handled connections (DoS hardening).
+/// High enough for the app's bursty thumbnail/icon fetches plus a couple of
+/// long-lived SSE streams, low enough to bound thread/memory use under a flood.
+const MAX_CONNECTIONS: usize = 128;
+
+/// A counting semaphore for live connections. `acquire` blocks the accept loop
+/// while `active == max`, providing backpressure instead of unbounded spawning.
+struct ConnLimiter {
+    active: Mutex<usize>,
+    available: Condvar,
+    max: usize,
+}
+
+impl ConnLimiter {
+    fn new(max: usize) -> Self {
+        Self { active: Mutex::new(0), available: Condvar::new(), max }
+    }
+
+    fn acquire(self: &Arc<Self>) -> ConnPermit {
+        let mut active = self.active.lock().expect("conn limiter poisoned");
+        while *active >= self.max {
+            active = self.available.wait(active).expect("conn limiter poisoned");
+        }
+        *active += 1;
+        ConnPermit { limiter: Arc::clone(self) }
+    }
+}
+
+/// RAII permit: releases its connection slot (and wakes a waiter) on drop.
+struct ConnPermit {
+    limiter: Arc<ConnLimiter>,
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        let mut active = self.limiter.active.lock().expect("conn limiter poisoned");
+        *active = active.saturating_sub(1);
+        self.limiter.available.notify_one();
+    }
+}
+
+/// Generate a random hex session token without any external RNG crate (this
+/// crate ships zero dependencies). `RandomState` is seeded by the OS with random
+/// SipHash keys (HashMap collision-DoS defense), so a fresh hasher's digest over
+/// mixed entropy (time, pid, counter) is unpredictable. Four rounds → 256 bits.
+fn generate_session_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let pid = std::process::id() as u64;
+    let mut token = String::with_capacity(64);
+    for round in 0..4u64 {
+        let mut hasher = RandomState::new().build_hasher();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        hasher.write_u64(nanos);
+        hasher.write_u64(pid);
+        hasher.write_u64(round);
+        token.push_str(&format!("{:016x}", hasher.finish()));
+    }
+    token
+}
+
+/// Record a directory the user has scanned as an allowed root for later
+/// file-content reads. Stored canonicalized (symlinks/`..` resolved) so the
+/// read-time containment check compares like-for-like. Bounded to avoid growth.
+fn register_scan_root(state: &AppState, path: &Path) {
+    let Ok(canon) = fs::canonicalize(path) else { return };
+    let mut roots = state.scan_roots.lock().expect("scan_roots lock poisoned");
+    if roots.iter().any(|existing| existing == &canon) {
+        return;
+    }
+    const MAX_ROOTS: usize = 64;
+    if roots.len() >= MAX_ROOTS {
+        roots.remove(0);
+    }
+    roots.push(canon);
+}
+
+/// True only when `requested` canonicalizes to a path located under at least one
+/// recorded scan root. Resolving symlinks/`..` first means path traversal and
+/// symlink escapes outside every scan root are rejected. A path that can't be
+/// canonicalized (missing, or no root recorded yet) is rejected.
+fn path_within_scan_root(state: &AppState, requested: &Path) -> bool {
+    let Ok(canon) = fs::canonicalize(requested) else { return false };
+    let roots = state.scan_roots.lock().expect("scan_roots lock poisoned");
+    roots.iter().any(|root| canon.starts_with(root))
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
@@ -509,35 +708,6 @@ fn parse_extension_filter(value: Option<&String>) -> Vec<String> {
 }
 
 const SCAN_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
-/// Max distinct scan roots kept in the in-memory cache. Raised above 1 so a
-/// multi-root duplicate scan (several drives/folders) can reuse every root's
-/// already-walked tree instead of re-walking. Oldest entries evict first.
-const SCAN_CACHE_CAPACITY: usize = 8;
-
-/// Evict oldest entries (by insertion timestamp) until the cache holds at most
-/// `SCAN_CACHE_CAPACITY - 1`, leaving room for the entry about to be inserted.
-/// `keep` is never evicted (it is the entry being refreshed/inserted).
-fn evict_scan_cache(cache: &mut HashMap<String, (Arc<crate::model::ScanResult>, Instant)>, keep: &str) {
-    while cache.len() >= SCAN_CACHE_CAPACITY {
-        let Some(oldest) = cache
-            .iter()
-            .filter(|(k, _)| k.as_str() != keep)
-            .min_by_key(|(_, (_, ts))| *ts)
-            .map(|(k, _)| k.clone())
-        else { break; };
-        cache.remove(&oldest);
-    }
-}
-
-/// Evict cache entries that are descendants of `path` OR ancestors of `path`.
-/// A move/rename affects both the subtree and all parent aggregates up to the root.
-fn invalidate_scan_cache(cache: &mut HashMap<String, (Arc<crate::model::ScanResult>, Instant)>, path: &str) {
-    let norm = path.replace('\\', "/").to_lowercase();
-    cache.retain(|k, _| {
-        // Keep only entries that are neither descendants nor ancestors of `norm`.
-        !k.starts_with(&norm) && !norm.starts_with(k.as_str())
-    });
-}
 
 /// Find the most recent full scan for `path` regardless of cache TTL. Used by
 /// the snapshot save / diff-vs-current routes, where the user explicitly wants
@@ -552,7 +722,7 @@ fn find_current_scan(
         .scan_cache
         .lock()
         .ok()
-        .and_then(|cache| cache.get(&cache_key).map(|(result, _)| Arc::clone(result)))
+        .and_then(|mut cache| cache.get_any(&cache_key))
     {
         return Some(result);
     }
@@ -562,9 +732,28 @@ fn find_current_scan(
         .map(Arc::clone)
 }
 
+/// Read a string parameter from the query string, falling back to the JSON
+/// request body (`{"key":"..."}`). Lets a route that was switched from GET to
+/// POST accept the value either way (`?key=...` or in the body).
+fn query_or_body_str(query: &HashMap<String, String>, body: &[u8], key: &str) -> Option<String> {
+    match query.get(key) {
+        Some(value) if !value.is_empty() => Some(value.clone()),
+        _ => extract_json_str(&String::from_utf8_lossy(body), key),
+    }
+}
+
 fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()> {
     let request = match read_http_request(&stream) {
-        Ok(request) => request,
+        Ok(RequestOutcome::Parsed(request)) => request,
+        Ok(RequestOutcome::TooLarge) => {
+            respond_text(
+                &mut stream,
+                413,
+                "Payload Too Large",
+                "Request body exceeds the allowed size",
+            )?;
+            return Ok(());
+        }
         Err(error) => {
             respond_text(&mut stream, 400, "Bad request", &error.to_string())?;
             return Ok(());
@@ -573,15 +762,16 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
 
     let (route, query) = split_target(&request.target);
 
-    // Destructive routes mutate the filesystem or run shell commands. They are
-    // POST-only — a bare `GET /api/delete?path=...` from any local process (or a
-    // drive-by localhost navigation/<img> request) must never trigger them — AND,
-    // when the server was started with a session token, they require a matching
+    // Destructive routes mutate the filesystem, run shell commands, launch
+    // programs, or stop the server. They are POST-only — a bare
+    // `GET /api/delete?path=...` from any local process (or a drive-by localhost
+    // navigation/<img> request) must never trigger them — AND, when the server
+    // was started with a session token, they require a matching
     // `X-FileTree-Token` header. Electron mints that token at startup, hands it
     // to this process via the FILETREE_AUTH_TOKEN env var and to the renderer via
     // IPC (out of band — the token never travels over HTTP, so scraping `GET /`
     // can't reveal it). This is the lockdown for gaps #2/#18.
-    const DESTRUCTIVE_ROUTES: [&str; 8] = [
+    const DESTRUCTIVE_ROUTES: &[&str] = &[
         "/api/delete",
         "/api/move",
         "/api/move-items",
@@ -593,6 +783,16 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         // as filesystem mutations (gap #10).
         "/api/schedule-create",
         "/api/schedule-delete",
+        // Newly locked down: directory creation, launching the default handler /
+        // Explorer / the Properties dialog for an arbitrary path, deleting a
+        // saved snapshot, and stopping the server — all side-effecting, so all
+        // POST-only + token-gated.
+        "/api/mkdir",
+        "/api/open",
+        "/api/reveal",
+        "/api/properties",
+        "/api/snapshot-delete",
+        "/api/exit",
     ];
     let is_destructive = DESTRUCTIVE_ROUTES.contains(&route.as_str());
 
@@ -604,7 +804,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         "/api/bookmarks", "/api/settings", "/api/ai-chat", "/api/watch", "/api/delete",
         "/api/copy-path", "/api/rename", "/api/move-items", "/api/copy-files", "/api/drag-out",
         "/api/dupes-hash", "/api/dupes-action", "/api/dupes-make-ref", "/api/dupes-cancel",
-        "/api/dupes-ignore", "/api/run-command", "/api/snapshots", "/api/snapshot-delete",
+        "/api/dupes-ignore", "/api/run-command", "/api/snapshots",
     ];
     let method_allowed = if is_destructive {
         // No GET fall-through for destructive routes.
@@ -624,13 +824,21 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         return Ok(());
     }
 
-    // Token gate: enforced on destructive routes whenever a session token was
-    // configured (always true under Electron). A standalone/dev launch with no
-    // token configured keeps the POST-only protection above but skips this check.
-    if is_destructive {
-        if let Some(expected) = state.auth_token.as_deref() {
-            let provided = request.auth_token.as_deref().unwrap_or("");
-            if !tokens_match(provided, expected) {
+    // settings / bookmarks / snapshots are dual-mode: a GET reads (open) and a
+    // POST writes/persists (mutating). The write side is token-gated like a
+    // destructive route; the read side stays open.
+    let writes_on_post = request.method == "POST"
+        && matches!(route.as_str(), "/api/settings" | "/api/bookmarks" | "/api/snapshots");
+
+    // Token gate: enforced on every destructive route and on the write (POST)
+    // side of the dual-mode routes, whenever a session token is configured.
+    // Release builds always configure one (fail-closed startup), and Electron
+    // always provides one. A debug/standalone launch with no token keeps the
+    // POST-only protection above but skips this check (dev convenience).
+    if is_destructive || writes_on_post {
+        let provided = request.auth_token.as_deref().unwrap_or("");
+        match state.auth_token.as_deref() {
+            Some(expected) if !tokens_match(provided, expected) => {
                 respond_text(
                     &mut stream,
                     403,
@@ -639,33 +847,27 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 )?;
                 return Ok(());
             }
+            _ => {}
         }
     }
     match route.as_str() {
-        "/" | "/index.html" => respond_bytes(
-            &mut stream,
-            200,
-            "OK",
-            "text/html; charset=utf-8",
-            INDEX_HTML.as_bytes(),
-            &[],
-        ),
-        "/assets/index.css" => respond_bytes(
-            &mut stream,
-            200,
-            "OK",
-            "text/css; charset=utf-8",
-            APP_CSS,
-            &[],
-        ),
-        "/assets/index.js" => respond_bytes(
-            &mut stream,
-            200,
-            "OK",
-            "application/javascript; charset=utf-8",
-            APP_JS,
-            &[],
-        ),
+        "/" | "/index.html" => match DIST.get_file("index.html") {
+            Some(file) => respond_bytes(
+                &mut stream,
+                200,
+                "OK",
+                "text/html; charset=utf-8",
+                file.contents(),
+                &[],
+            ),
+            None => respond_text(&mut stream, 404, "Not found", "Not found"),
+        },
+        // Every renderer chunk Vite emits lives under `/assets/`. Serve them all
+        // from the embedded dist dir so content-hashed entrypoints and the
+        // lazily-loaded panels resolve in the packaged app instead of 404ing.
+        asset_route if asset_route.starts_with("/assets/") => {
+            serve_renderer_asset(&mut stream, asset_route)
+        }
         "/api/config" => {
             let body = app_config_json(&state);
             respond_json(&mut stream, 200, "OK", &body)
@@ -685,6 +887,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 .map(PathBuf::from)
                 .unwrap_or_else(|| state.initial_path.clone());
             let cache_key = path.to_string_lossy().replace('\\', "/").to_lowercase();
+            // Remember this root so previews/thumbnails of files under it are allowed.
+            register_scan_root(&state, &path);
 
             // Return cached result if still fresh (skip when nocache=1)
             let skip_cache = query.get("nocache").map(|v| v == "1").unwrap_or(false);
@@ -694,12 +898,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 // materialise the whole JSON body as a String — stream it instead.
                 let cached = {
                     let mut cache = state.scan_cache.lock().expect("scan_cache lock");
-                    let fresh = match cache.get(&cache_key) {
-                        Some((result, ts)) if ts.elapsed() < SCAN_CACHE_TTL => Some(Arc::clone(result)),
-                        _ => None,
-                    };
-                    if fresh.is_none() { cache.remove(&cache_key); }
-                    fresh
+                    cache.get_fresh(&cache_key, SCAN_CACHE_TTL)
                 };
                 if let Some(result) = cached {
                     write!(
@@ -750,10 +949,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         *state.last_scan.lock().expect("scan lock poisoned") =
                             Some(Arc::clone(&result));
                         let mut cache = state.scan_cache.lock().expect("scan_cache lock");
-                        // Cap peak memory but keep several roots so multi-root
-                        // duplicate scans can reuse each already-walked tree.
-                        evict_scan_cache(&mut cache, &cache_key);
-                        cache.insert(cache_key.clone(), (Arc::clone(&result), Instant::now()));
+                        // LRU insert; eviction by total estimated bytes is handled
+                        // inside ScanCache so peak memory stays bounded.
+                        cache.insert(cache_key.clone(), Arc::clone(&result));
                         eprintln!("[mem] scan done: path={cache_key:?} nodes={node_count} cache_entries={}", cache.len());
                     } else {
                         eprintln!("[mem] partial scan (not cached): path={cache_key:?} nodes={node_count}");
@@ -779,38 +977,53 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
                 return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
             };
-            let body = scan_result_to_csv(&result);
-            respond_bytes(
-                &mut stream,
-                200,
-                "OK",
-                "text/csv; charset=utf-8",
-                body.as_bytes(),
-                &[(
-                    "Content-Disposition",
-                    "attachment; filename=\"filetree-scan.csv\"",
-                )],
-            )
+            // Stream the CSV chunked (one row per node, capped at EXPORT_ROW_CAP)
+            // instead of materialising the whole body, so a multi-million-row
+            // export no longer builds a huge String in memory first. Formula
+            // guarding is applied to every text cell inside the writer.
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/csv; charset=utf-8\r\nContent-Disposition: attachment; filename=\"filetree-scan.csv\"\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut cw = ChunkedWriter::new(&mut stream);
+            write_scan_result_csv(&mut cw, &result, crate::export::EXPORT_ROW_CAP)?;
+            cw.finish()
         }
         "/api/export.json" => {
             let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
                 return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
             };
-            let body = scan_result_to_json(&result);
-            respond_bytes(
-                &mut stream,
-                200,
-                "OK",
-                "application/json; charset=utf-8",
-                body.as_bytes(),
-                &[(
-                    "Content-Disposition",
-                    "attachment; filename=\"filetree-scan.json\"",
-                )],
-            )
+            // Stream JSON chunked via the same writer the live /api/scan uses, so
+            // the export never materialises a 300-400 MB String. It is NOT row-
+            // capped: the analytics arrays reference node ids by index, so a
+            // partial node list would dangle those references and break re-import;
+            // chunked streaming already bounds peak memory to the 64 KB buffer.
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Disposition: attachment; filename=\"filetree-scan.json\"\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut cw = ChunkedWriter::new(&mut stream);
+            write_scan_result_json(&mut cw, &result)?;
+            cw.finish()
         }
-        // Richer report exports (#8). All reuse the cached `last_scan` (the
-        // current view) and its precomputed analytics, mirroring csv/json above.
+        "/api/export.xml" => {
+            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
+                return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
+            };
+            // Stream XML chunked, node list capped at EXPORT_ROW_CAP (constant
+            // peak memory; truncation marked with a comment in the body).
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Disposition: attachment; filename=\"filetree-scan.xml\"\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut cw = ChunkedWriter::new(&mut stream);
+            write_scan_result_xml(&mut cw, &result, crate::export::EXPORT_ROW_CAP)?;
+            cw.finish()
+        }
+        // Richer report exports (#8). HTML and XLSX reuse the cached `last_scan`
+        // and its precomputed analytics; both are already size-bounded (HTML by
+        // its table caps + capped summary, XLSX at 100k rows), so they build a
+        // bounded body and use the shared byte responder.
         "/api/export.html" => {
             let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
                 return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
@@ -825,23 +1038,6 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 &[(
                     "Content-Disposition",
                     "attachment; filename=\"filetree-report.html\"",
-                )],
-            )
-        }
-        "/api/export.xml" => {
-            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
-                return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
-            };
-            let body = scan_result_to_xml(&result);
-            respond_bytes(
-                &mut stream,
-                200,
-                "OK",
-                "application/xml; charset=utf-8",
-                body.as_bytes(),
-                &[(
-                    "Content-Disposition",
-                    "attachment; filename=\"filetree-scan.xml\"",
                 )],
             )
         }
@@ -927,7 +1123,18 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 .get("limit")
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(100);
-            let body = exact_duplicates_json(&result, min_size, limit);
+            let threads = query
+                .get("threads")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_else(default_thread_count);
+            let body = exact_duplicates_json(
+                &result,
+                min_size,
+                limit,
+                &state.hash_cache,
+                Some(&state.hash_cache_path),
+                threads,
+            );
             respond_json(&mut stream, 200, "OK", &body)
         }
         "/api/dupes" => {
@@ -937,7 +1144,18 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             };
             let filter = build_dupe_filter(&query);
             let limit = query.get("limit").and_then(|v| v.parse().ok()).unwrap_or(500);
-            let body = duplicates_full_json(&result, filter, limit);
+            let threads = query
+                .get("threads")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_else(default_thread_count);
+            let body = duplicates_full_json(
+                &result,
+                filter,
+                limit,
+                &state.hash_cache,
+                Some(&state.hash_cache_path),
+                threads,
+            );
             respond_json(&mut stream, 200, "OK", &body)
         }
         "/api/dupes-scan" => {
@@ -965,6 +1183,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let mut merged_errors: Vec<crate::model::ScanError> = Vec::new();
 
             for raw_path in paths_raw.split(',').filter(|s| !s.is_empty()) {
+                register_scan_root(&state, std::path::Path::new(raw_path));
                 let options = crate::model::ScanOptions {
                     root: std::path::PathBuf::from(raw_path),
                     threads: thread_count,
@@ -1021,7 +1240,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             };
             let filter = build_dupe_filter(&query);
             let limit = query.get("limit").and_then(|v| v.parse().ok()).unwrap_or(1000);
-            let body = duplicates_full_json(&merged, filter, limit);
+            let body = duplicates_full_json(
+                &merged,
+                filter,
+                limit,
+                &state.hash_cache,
+                Some(&state.hash_cache_path),
+                thread_count,
+            );
             prog.phase.store(3, Ordering::Relaxed);
             respond_json(&mut stream, 200, "OK", &body)
         }
@@ -1088,61 +1314,58 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             prog.files_hashing.store(0, Ordering::Relaxed);
             prog.files_hashed.store(0, Ordering::Relaxed);
 
-            let mut all_nodes: Vec<crate::model::NodeRecord> = Vec::new();
+            // Build the candidate file list directly, per source. A cached tree is
+            // shared via `Arc` (NO deep clone of the node buffer); each source's
+            // candidates are reconstructed from its own nodes (absolute paths via
+            // `node_abs_path`, inside `build_candidates_from_nodes`) and appended.
+            // Because a `DupeFileV2` owns its absolute path, the candidate list is
+            // self-contained — there is no id-offset remap of the node buffer at
+            // all, eliminating both the clone and the per-node rewrite.
+            let mut candidates: Vec<crate::dupes::DupeFileV2> = Vec::new();
             let mut scan_errors: Vec<String> = Vec::new();
 
             for raw_path in paths_raw.split(',').filter(|s| !s.is_empty()) {
+                register_scan_root(&state, std::path::Path::new(raw_path));
                 // Reuse an already-walked tree when one is cached and still fresh
                 // for this exact root, so a fresh server-side scan is avoided.
                 let cache_key = PathBuf::from(raw_path).to_string_lossy().replace('\\', "/").to_lowercase();
                 let cached = {
-                    let cache = state.scan_cache.lock().expect("scan_cache lock");
-                    match cache.get(&cache_key) {
-                        Some((result, ts)) if ts.elapsed() < SCAN_CACHE_TTL => Some(Arc::clone(result)),
-                        _ => None,
-                    }
+                    let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                    cache.get_fresh(&cache_key, SCAN_CACHE_TTL)
                 };
-                if let Some(result) = cached {
+                let result: Arc<crate::model::ScanResult> = if let Some(result) = cached {
                     prog.files_scanned.fetch_add(result.nodes.len() as u64, Ordering::Relaxed);
-                    let offset = all_nodes.len();
-                    for node in result.nodes.iter() {
-                        let mut node = node.clone();
-                        node.id += offset;
-                        if let Some(p) = node.parent { node.parent = Some(p + offset); }
-                        node.children = node.children.into_iter().map(|c| c + offset).collect();
-                        all_nodes.push(node);
+                    result
+                } else {
+                    let options = ScanOptions {
+                        root: PathBuf::from(raw_path),
+                        threads: thread_count,
+                        include_hidden,
+                        follow_links: false,
+                        exclude_patterns: vec![],
+                        max_depth: None,
+                        collect_owners: false,
+                    };
+                    let cancel = Arc::clone(&state.dupes_cancel);
+                    let prog2 = Arc::clone(&prog);
+                    match scan_path_with_progress(options, cancel, move |node_count, _elapsed_ms| {
+                        prog2.files_scanned.store(node_count as u64, Ordering::Relaxed);
+                    }) {
+                        Ok(result) => {
+                            for e in &result.errors {
+                                scan_errors.push(format!("{}: {}", e.path, e.message));
+                            }
+                            Arc::new(result)
+                        }
+                        Err(e) => {
+                            scan_errors.push(format!("{raw_path}: {e}"));
+                            continue;
+                        }
                     }
-                    continue;
-                }
-
-                let options = ScanOptions {
-                    root: PathBuf::from(raw_path),
-                    threads: thread_count,
-                    include_hidden,
-                    follow_links: false,
-                    exclude_patterns: vec![],
-                    max_depth: None,
-                    collect_owners: false,
                 };
-                let cancel = Arc::clone(&state.dupes_cancel);
-                let prog2 = Arc::clone(&prog);
-                match scan_path_with_progress(options, cancel, move |node_count, _elapsed_ms| {
-                    prog2.files_scanned.store(node_count as u64, Ordering::Relaxed);
-                }) {
-                    Ok(result) => {
-                        let offset = all_nodes.len();
-                        for mut node in result.nodes {
-                            node.id += offset;
-                            if let Some(p) = node.parent { node.parent = Some(p + offset); }
-                            node.children = node.children.into_iter().map(|c| c + offset).collect();
-                            all_nodes.push(node);
-                        }
-                        for e in result.errors {
-                            scan_errors.push(format!("{}: {}", e.path, e.message));
-                        }
-                    }
-                    Err(e) => scan_errors.push(format!("{raw_path}: {e}")),
-                }
+                // Candidates from this source's shared, immutable node buffer.
+                let mut part = build_candidates_from_nodes(&result.nodes, &filter);
+                candidates.append(&mut part);
                 if state.dupes_cancel.load(Ordering::Relaxed) {
                     prog.phase.store(0, Ordering::Relaxed);
                     return respond_json(&mut stream, 499, "Client Closed Request", "{\"groups\":[],\"errors\":[\"Scan canceled\"],\"ignoredCount\":0}");
@@ -1151,17 +1374,21 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
 
             prog.phase.store(2, Ordering::Relaxed);
 
-            let candidates = build_candidates_from_nodes(&all_nodes, &filter);
             prog.files_scanned.store(candidates.len() as u64, Ordering::Relaxed);
             prog.files_hashing.store(0, Ordering::Relaxed);
             prog.files_hashed.store(0, Ordering::Relaxed);
 
             let ignore = state.ignore_list.lock().expect("ignore lock poisoned");
             let raw_matches = match mode {
-                ScanMode::Exact    => scan_exact_with_progress(
+                // Exact mode now funnels through the SAME hash pipeline as the
+                // other dupe endpoints (size-group -> sample -> cached full hash).
+                ScanMode::Exact    => exact_matches_via_hash_cache(
                     &candidates,
+                    &state.hash_cache,
+                    Some(&state.hash_cache_path),
                     Some(&prog),
                     Some(&state.dupes_cancel),
+                    thread_count,
                 ),
                 ScanMode::Filename => scan_filename(&candidates, min_score, weighted, mix_kinds),
                 ScanMode::Audio    => {
@@ -1194,6 +1421,18 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             // Returns content-identical groups: { "groups": [{ "paths": [...] }], "errors": [...] }
             let body_str = String::from_utf8_lossy(&request.body);
             let files = parse_hash_files(&body_str);
+            // Anti-oracle confinement: this route hashes the CONTENT of every
+            // candidate path, so an ungated caller could otherwise learn whether
+            // two ARBITRARY files are byte-identical. Drop any candidate that does
+            // not resolve under a recorded scan root — skip, don't fail, so a batch
+            // with a stray path still returns groups for the rest. Legitimate
+            // candidates always come from a scanned tree, so this is transparent.
+            let candidate_count = files.len();
+            let files: Vec<HashInput> = files
+                .into_iter()
+                .filter(|f| path_within_scan_root(&state, &f.path))
+                .collect();
+            let skipped_out_of_root = candidate_count - files.len();
             // Content-verified by default: only an explicit confirmBytes:false skips it.
             let confirm_bytes = !body_str.contains("\"confirmBytes\":false");
             let thread_count = query
@@ -1208,18 +1447,22 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             prog.files_hashing.store(0, Ordering::Relaxed);
             prog.files_hashed.store(0, Ordering::Relaxed);
 
-            let (groups, errors, cache_dirty) = hash_candidate_groups(
+            // Hashes computed here are persisted incrementally inside the pipeline
+            // (appended to the on-disk cache), so this route no longer rewrites the
+            // whole cache file on every call.
+            let (groups, mut errors) = hash_candidate_groups(
                 &files,
                 confirm_bytes,
                 &state.hash_cache,
+                Some(&state.hash_cache_path),
                 Some(&prog),
                 Some(&state.dupes_cancel),
                 thread_count,
             );
-
-            if cache_dirty {
-                let cache = state.hash_cache.lock().expect("hash_cache lock");
-                let _ = save_hash_cache(&state.hash_cache_path, &cache);
+            if skipped_out_of_root > 0 {
+                errors.push(format!(
+                    "Skipped {skipped_out_of_root} candidate(s) outside the scanned directories"
+                ));
             }
 
             prog.phase.store(3, Ordering::Relaxed);
@@ -1230,7 +1473,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             }
 
             let mut body = String::from("{\"groups\":[");
-            for (gi, group) in groups.iter().enumerate() {
+            for (gi, (_hash, group)) in groups.iter().enumerate() {
                 if gi > 0 { body.push(','); }
                 body.push_str("{\"paths\":[");
                 for (pi, &idx) in group.iter().enumerate() {
@@ -1295,7 +1538,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     affected.push(dest_str.clone());
                 }
                 for a in &affected {
-                    invalidate_scan_cache(&mut scan_cache, a);
+                    scan_cache.invalidate(a);
                 }
             }
             {
@@ -1378,6 +1621,20 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 if a.is_empty() || b.is_empty() {
                     return respond_text(&mut stream, 400, "Bad request", "Missing a or b");
                 }
+                // Anti-oracle confinement: only persist a pair whose BOTH members
+                // resolve under a recorded scan root. A legitimate "ignore this
+                // pair" always comes from a scan, so reject anything else rather
+                // than letting an ungated caller write arbitrary paths to disk.
+                if !path_within_scan_root(&state, std::path::Path::new(&a))
+                    || !path_within_scan_root(&state, std::path::Path::new(&b))
+                {
+                    return respond_text(
+                        &mut stream,
+                        403,
+                        "Forbidden",
+                        "Paths are outside the scanned directories",
+                    );
+                }
                 let mut list = state.ignore_list.lock().expect("ignore lock poisoned");
                 list.add(std::path::Path::new(&a), std::path::Path::new(&b));
                 let count = list.pair_count();
@@ -1399,6 +1656,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let Some(path) = query.get("path") else {
                 return respond_text(&mut stream, 400, "Bad request", "Missing path");
             };
+            // Confine reads to files under a scanned root (resolves symlinks/`..`).
+            if !path_within_scan_root(&state, Path::new(path)) {
+                return respond_text(&mut stream, 403, "Forbidden", "Path is outside the scanned directories");
+            }
             serve_thumbnail(&mut stream, path)
         }
         "/api/file-text" => {
@@ -1408,37 +1669,44 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let Some(path) = query.get("path") else {
                 return respond_text(&mut stream, 400, "Bad request", "Missing path");
             };
+            // Confine reads to files under a scanned root (resolves symlinks/`..`).
+            if !path_within_scan_root(&state, Path::new(path)) {
+                return respond_text(&mut stream, 403, "Forbidden", "Path is outside the scanned directories");
+            }
             serve_file_text(&mut stream, path)
         }
         "/api/reveal" => {
-            let Some(path) = query.get("path") else {
+            let Some(path) = query_or_body_str(&query, &request.body, "path") else {
                 return respond_text(&mut stream, 400, "Bad request", "Missing path");
             };
-            reveal_path(path)?;
+            reveal_path(&path)?;
             respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
         }
         "/api/open" => {
-            let Some(path) = query.get("path") else {
+            let Some(path) = query_or_body_str(&query, &request.body, "path") else {
                 return respond_text(&mut stream, 400, "Bad request", "Missing path");
             };
-            open_path(path)?;
+            open_path(&path)?;
             respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
         }
         "/api/delete" => {
-            let Some(path) = query.get("path") else {
+            // Params now arrive in the JSON body (`{ "path", "permanent" }`) since
+            // the renderer routes deletes through the token-authed POST proxy, so
+            // read from query OR body. Legacy `?path=&permanent=` callers still work.
+            let Some(path) = query_or_body_str(&query, &request.body, "path") else {
                 return respond_text(&mut stream, 400, "Bad request", "Missing path");
             };
-            let path_buf = PathBuf::from(path);
+            let path_buf = PathBuf::from(&path);
             // Recoverable by default: route deletes through the Recycle Bin
             // (shared `recycle_path`, which recurses directories) unless the
-            // caller explicitly opted into a permanent delete (?permanent=1|true).
-            // The client already sends this param; the server previously ignored
-            // it and ALWAYS did a permanent `fs::remove_*` — the data-loss path
-            // this closes.
-            let permanent = query
-                .get("permanent")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+            // caller explicitly opted into a permanent delete. The flag may come
+            // from the query (`?permanent=1|true`) or the JSON body
+            // (`{"permanent":true}`); anything else — `false`, or absent — keeps
+            // the safe recycle default, the data-loss path this closes.
+            let permanent = match query.get("permanent") {
+                Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+                None => String::from_utf8_lossy(&request.body).contains("\"permanent\":true"),
+            };
             let delete_result = if permanent {
                 crate::recycle::delete_path_permanent(&path_buf)
             } else {
@@ -1452,7 +1720,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             crate::audit::record(crate::audit::Entry {
                 op: if permanent { "permanent-delete" } else { "delete" },
                 disposition: if permanent { "permanent" } else { "recycle" },
-                src: std::slice::from_ref(path),
+                src: std::slice::from_ref(&path),
                 error: err_text.as_deref(),
                 by: "server",
                 ..Default::default()
@@ -1461,10 +1729,11 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 Ok(_) => {
                     // Invalidate cache for the parent directory
                     if let Some(parent) = path_buf.parent() {
-                        invalidate_scan_cache(
-                            &mut state.scan_cache.lock().expect("scan_cache lock"),
-                            &parent.to_string_lossy(),
-                        );
+                        state
+                            .scan_cache
+                            .lock()
+                            .expect("scan_cache lock")
+                            .invalidate(&parent.to_string_lossy());
                     }
                     respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
                 }
@@ -1500,10 +1769,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             respond_json(&mut stream, 200, "OK", &body)
         }
         "/api/mkdir" => {
-            let Some(path) = query.get("path") else {
+            let Some(path) = query_or_body_str(&query, &request.body, "path") else {
                 return respond_text(&mut stream, 400, "Bad request", "Missing path");
             };
-            let path_buf = PathBuf::from(path);
+            let path_buf = PathBuf::from(&path);
             // Path hygiene: reject reserved names / invalid chars / over-long
             // paths up front with a clear message (Phase 3).
             if let Some(name) = path_buf.file_name().and_then(|n| n.to_str()) {
@@ -1523,7 +1792,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 .map(|e| crate::preflight::describe_fs_error(e, &path_buf));
             crate::audit::record(crate::audit::Entry {
                 op: "mkdir",
-                dst: path,
+                dst: &path,
                 error: err_text.as_deref(),
                 by: "server",
                 ..Default::default()
@@ -1531,10 +1800,11 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             match mkdir_result {
                 Ok(_) => {
                     if let Some(parent) = path_buf.parent() {
-                        invalidate_scan_cache(
-                            &mut state.scan_cache.lock().expect("scan_cache lock"),
-                            &parent.to_string_lossy(),
-                        );
+                        state
+                            .scan_cache
+                            .lock()
+                            .expect("scan_cache lock")
+                            .invalidate(&parent.to_string_lossy());
                     }
                     respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
                 }
@@ -1550,11 +1820,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             }
         }
         "/api/move" => {
-            let (Some(src), Some(dst)) = (query.get("src"), query.get("dst")) else {
+            // Renderer posts `{ "src", "dst" }` in the body; accept query or body.
+            let (Some(src), Some(dst)) = (
+                query_or_body_str(&query, &request.body, "src"),
+                query_or_body_str(&query, &request.body, "dst"),
+            ) else {
                 return respond_text(&mut stream, 400, "Bad request", "Missing src or dst");
             };
-            let src_path = Path::new(src);
-            let dst_path = Path::new(dst);
+            let src_path = Path::new(&src);
+            let dst_path = Path::new(&dst);
             // Honor the cross-volume free-space pre-flight + copy fallback.
             let move_result = rename_or_copy_remove(src_path, dst_path);
             let err_text = move_result
@@ -1563,8 +1837,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 .map(|e| crate::preflight::describe_fs_error(e, src_path));
             crate::audit::record(crate::audit::Entry {
                 op: "move",
-                src: std::slice::from_ref(src),
-                dst,
+                src: std::slice::from_ref(&src),
+                dst: &dst,
                 error: err_text.as_deref(),
                 by: "server",
                 ..Default::default()
@@ -1574,10 +1848,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     // Invalidate cache for both source and destination parents
                     let mut cache = state.scan_cache.lock().expect("scan_cache lock");
                     if let Some(p) = src_path.parent() {
-                        invalidate_scan_cache(&mut cache, &p.to_string_lossy());
+                        cache.invalidate(&p.to_string_lossy());
                     }
                     if let Some(p) = dst_path.parent() {
-                        invalidate_scan_cache(&mut cache, &p.to_string_lossy());
+                        cache.invalidate(&p.to_string_lossy());
                     }
                     respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
                 }
@@ -1656,10 +1930,11 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             });
             match rename_result {
                 Ok(_) => {
-                    invalidate_scan_cache(
-                        &mut state.scan_cache.lock().expect("scan_cache lock"),
-                        &parent.to_string_lossy(),
-                    );
+                    state
+                        .scan_cache
+                        .lock()
+                        .expect("scan_cache lock")
+                        .invalidate(&parent.to_string_lossy());
                     respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
                 }
                 Err(error) => {
@@ -1816,7 +2091,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             {
                 let mut cache = state.scan_cache.lock().expect("scan_cache lock");
                 for p in &touched_parents {
-                    invalidate_scan_cache(&mut cache, &p.to_string_lossy());
+                    cache.invalidate(&p.to_string_lossy());
                 }
             }
 
@@ -1875,10 +2150,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
         }
         "/api/properties" => {
-            let Some(path) = query.get("path") else {
+            let Some(path) = query_or_body_str(&query, &request.body, "path") else {
                 return respond_text(&mut stream, 400, "Bad request", "Missing path");
             };
-            let p = path.clone();
+            let p = path;
             thread::spawn(move || {
                 use std::os::windows::process::CommandExt;
                 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -1901,6 +2176,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 .map(PathBuf::from)
                 .unwrap_or_else(|| state.initial_path.clone());
             let cache_key = path.to_string_lossy().replace('\\', "/").to_lowercase();
+            // Remember this root so previews/thumbnails of files under it are allowed.
+            register_scan_root(&state, &path);
             // nocache=1 forces a fresh scan and bypasses the server-side cache.
             // The rescan right after a native (IFileOperation) move sets this: that
             // move never touches the server, so the cached tree is stale and would
@@ -1909,22 +2186,20 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
 
             // If result is cached and fresh, return it as a single NDJSON chunk
             if !skip_cache {
-                let mut cache = state.scan_cache.lock().expect("scan_cache lock");
-                if let Some((result, ts)) = cache.get(&cache_key) {
-                    if ts.elapsed() < SCAN_CACHE_TTL {
-                        let result = Arc::clone(result);
-                        drop(cache);
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
-                        )?;
-                        // Stream as per-node NDJSON so the browser never parses a giant string.
-                        let mut cw = ChunkedWriter::new(&mut stream);
-                        write_scan_result_ndjson(&mut cw, &result)?;
-                        cw.finish()?;
-                        return Ok(());
-                    }
-                    cache.remove(&cache_key);
+                let cached = {
+                    let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                    cache.get_fresh(&cache_key, SCAN_CACHE_TTL)
+                };
+                if let Some(result) = cached {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                    )?;
+                    // Stream as per-node NDJSON so the browser never parses a giant string.
+                    let mut cw = ChunkedWriter::new(&mut stream);
+                    write_scan_result_ndjson(&mut cw, &result)?;
+                    cw.finish()?;
+                    return Ok(());
                 }
             }
 
@@ -1973,11 +2248,13 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     if !is_partial {
                         *state.last_scan.lock().expect("scan lock poisoned") =
                             Some(Arc::clone(&result));
-                        let mut cache = state.scan_cache.lock().expect("scan_cache lock");
-                        // Cap peak memory but keep several roots so multi-root
-                        // duplicate scans can reuse each already-walked tree.
-                        evict_scan_cache(&mut cache, &cache_key);
-                        cache.insert(cache_key, (Arc::clone(&result), Instant::now()));
+                        // LRU insert; eviction by total estimated bytes is handled
+                        // inside ScanCache so peak memory stays bounded.
+                        state
+                            .scan_cache
+                            .lock()
+                            .expect("scan_cache lock")
+                            .insert(cache_key, Arc::clone(&result));
                     }
                     // Stream as per-node NDJSON so the browser never parses a giant string.
                     let mut cw = ChunkedWriter::new(&mut stream);
@@ -1997,13 +2274,13 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         // ── Scan snapshots + growth diff (roadmap #5) ──────────────────────
         "/api/snapshots" => {
             if request.method == "POST" {
-                // Save the current scan of ?path= as a new snapshot.
-                let path = query
-                    .get("path")
+                // Save the current scan as a new snapshot. The renderer posts
+                // `{ "path", "label"? }` in the body; accept query or body.
+                let path = query_or_body_str(&query, &request.body, "path")
                     .filter(|value| !value.trim().is_empty())
                     .map(PathBuf::from)
                     .unwrap_or_else(|| state.initial_path.clone());
-                let label = query.get("label").cloned().unwrap_or_default();
+                let label = query_or_body_str(&query, &request.body, "label").unwrap_or_default();
                 match find_current_scan(&state, &path) {
                     Some(result) => match crate::diff::save_snapshot(&result, &label) {
                         Ok(_) => respond_json(&mut stream, 200, "OK", &crate::diff::list_snapshots_json()),
@@ -2026,7 +2303,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             }
         }
         "/api/snapshot-delete" => {
-            let id = query.get("id").cloned().unwrap_or_default();
+            let id = query_or_body_str(&query, &request.body, "id").unwrap_or_default();
             match crate::diff::delete_snapshot(&id) {
                 Ok(_) => respond_json(&mut stream, 200, "OK", &crate::diff::list_snapshots_json()),
                 Err(error) => {
@@ -2077,6 +2354,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         // when owners weren't collected during the scan).
         "/api/owner" => {
             let path = query.get("path").cloned().unwrap_or_default();
+            // Confine to files under a scanned root, like the other path reads.
+            if !path_within_scan_root(&state, Path::new(&path)) {
+                return respond_json(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "{\"error\":\"Path is outside the scanned directories\"}",
+                );
+            }
             let owner = crate::owner::owner_of(&path);
             let mut body = String::from("{\"owner\":");
             push_json_string(&mut body, &owner);
@@ -2121,18 +2407,29 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             respond_json(&mut stream, 200, "OK", &body)
         }
         "/api/ai-chat" => {
-            // Proxy POST to Ollama with streaming response.
+            // Proxy POST to the local Ollama instance with a streaming response.
             // Request body: {"model":"...", "messages":[...]}
-            // Response: NDJSON stream (Transfer-Encoding: chunked)
-            let ollama_port: u16 = query
+            // SSRF / open-proxy guard: the upstream host is always 127.0.0.1 and
+            // the port is restricted to the allowlisted Ollama default. A request
+            // for any other port is refused rather than reaching an arbitrary
+            // local service.
+            let requested_port: u16 = query
                 .get("port")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(11434);
+                .unwrap_or(OLLAMA_PORT);
+            if requested_port != OLLAMA_PORT {
+                return respond_json(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "{\"error\":\"AI proxy is restricted to the local Ollama port (11434)\"}",
+                );
+            }
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
             )?;
-            ollama_stream_chat(&mut stream, &request.body, ollama_port)?;
+            ollama_stream_chat(&mut stream, &request.body, OLLAMA_PORT)?;
             write_final_chunk(&mut stream)
         }
         _ => respond_text(&mut stream, 404, "Not found", "Not found"),
@@ -2239,59 +2536,106 @@ fn save_bookmarks(body: &[u8]) -> sio::Result<()> {
     fs::rename(&tmp, &path)
 }
 
-fn read_http_request(stream: &TcpStream) -> sio::Result<HttpRequest> {
-    use std::io::Read;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut first_line = String::new();
-    reader.read_line(&mut first_line)?;
-    let mut parts = first_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| sio::Error::new(sio::ErrorKind::InvalidData, "missing method"))?
-        .to_string();
-    let target = parts
-        .next()
-        .ok_or_else(|| sio::Error::new(sio::ErrorKind::InvalidData, "missing target"))?
-        .to_string();
+/// Result of parsing an incoming request: a fully parsed request, or a signal
+/// that the declared body is larger than allowed (answered with 413 without
+/// reading the oversized payload).
+enum RequestOutcome {
+    Parsed(HttpRequest),
+    TooLarge,
+}
 
+fn read_http_request(stream: &TcpStream) -> sio::Result<RequestOutcome> {
+    // DoS hardening: bound both the header section and the body so a single
+    // connection can't exhaust memory.
+    const MAX_HEADER_BYTES: u64 = 64 * 1024;
+    const MAX_BODY_DEFAULT: usize = 32 * 1024 * 1024;
+    // /api/dupes-hash legitimately posts a large candidate list (one
+    // {path,size,mtime} row per size-collision file); give it more headroom so a
+    // big dedup isn't truncated, while every other route stays tightly capped.
+    const MAX_BODY_DUPES_HASH: usize = 256 * 1024 * 1024;
+
+    let mut reader = BufReader::new(stream.try_clone()?);
+
+    let method;
+    let target;
     let mut content_length: usize = 0;
     let mut auth_token: Option<String> = None;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
+    let mut header_complete = false;
+    {
+        // Read the request line + headers through a byte-limited reader so an
+        // endless header stream (or one gigantic unterminated header line) can't
+        // grow memory without bound.
+        let mut limited = (&mut reader).take(MAX_HEADER_BYTES);
+
+        let mut first_line = String::new();
+        if limited.read_line(&mut first_line)? == 0 {
+            return Err(sio::Error::new(sio::ErrorKind::InvalidData, "missing request line"));
         }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        let lower = line.to_ascii_lowercase();
-        if let Some(val) = lower.strip_prefix("content-length:") {
-            content_length = val.trim().parse().unwrap_or(0);
-        } else if lower.starts_with("x-filetree-token:") {
-            // Preserve the original (case-sensitive) value; only the header NAME
-            // is matched case-insensitively. Split on the raw line so the token
-            // bytes aren't lowercased.
-            if let Some(val) = line.splitn(2, ':').nth(1) {
-                auth_token = Some(val.trim().to_string());
+        let mut parts = first_line.split_whitespace();
+        method = parts
+            .next()
+            .ok_or_else(|| sio::Error::new(sio::ErrorKind::InvalidData, "missing method"))?
+            .to_string();
+        target = parts
+            .next()
+            .ok_or_else(|| sio::Error::new(sio::ErrorKind::InvalidData, "missing target"))?
+            .to_string();
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if limited.read_line(&mut line)? == 0 {
+                break;
+            }
+            if line == "\r\n" || line == "\n" {
+                header_complete = true;
+                break;
+            }
+            let lower = line.to_ascii_lowercase();
+            if let Some(val) = lower.strip_prefix("content-length:") {
+                content_length = val.trim().parse().unwrap_or(0);
+            } else if lower.starts_with("x-filetree-token:") {
+                // Preserve the original (case-sensitive) value; only the header
+                // NAME is matched case-insensitively. Split on the raw line so the
+                // token bytes aren't lowercased.
+                if let Some(val) = line.splitn(2, ':').nth(1) {
+                    auth_token = Some(val.trim().to_string());
+                }
             }
         }
     }
+    if !header_complete {
+        // Reached the header-byte cap (or the peer hung up) before the blank
+        // line that terminates the header section — refuse rather than guess.
+        return Err(sio::Error::new(
+            sio::ErrorKind::InvalidData,
+            "request header section too large or incomplete",
+        ));
+    }
 
-    // Cap the body allocation. Raised well above the old 4 MB so a large
-    // /api/dupes-hash candidate list (one {path,size,mtime} row per size-collision
-    // file) is never truncated, which would corrupt the JSON and drop candidates.
-    let mut body = vec![0u8; content_length.min(256 * 1024 * 1024)];
+    // Per-route body cap. Reject an oversized declared body up front with 413 and
+    // stop reading (the connection is then closed) instead of allocating it.
+    let route = target.split('?').next().unwrap_or("");
+    let max_body = if route == "/api/dupes-hash" {
+        MAX_BODY_DUPES_HASH
+    } else {
+        MAX_BODY_DEFAULT
+    };
+    if content_length > max_body {
+        return Ok(RequestOutcome::TooLarge);
+    }
+
+    let mut body = vec![0u8; content_length];
     if !body.is_empty() {
         reader.read_exact(&mut body)?;
     }
 
-    Ok(HttpRequest {
+    Ok(RequestOutcome::Parsed(HttpRequest {
         method,
         target,
         body,
         auth_token,
-    })
+    }))
 }
 
 fn respond_text(stream: &mut TcpStream, status: u16, reason: &str, body: &str) -> sio::Result<()> {
@@ -3205,9 +3549,14 @@ fn stream_fs_events_poll(mut stream: TcpStream, root: &str) -> sio::Result<()> {
 
 // ── Ollama proxy ────────────────────────────────────────────
 
+/// The only upstream the AI proxy may forward to: localhost on Ollama's default
+/// port. Both proxy paths hardcode the 127.0.0.1 host, and the chat route
+/// refuses any other port — no SSRF / open-proxy to arbitrary local ports.
+const OLLAMA_PORT: u16 = 11434;
+
 fn ollama_list_models() -> String {
     use std::net::TcpStream;
-    let Ok(mut conn) = TcpStream::connect("127.0.0.1:11434") else {
+    let Ok(mut conn) = TcpStream::connect(("127.0.0.1", OLLAMA_PORT)) else {
         return "{\"models\":[]}".to_string();
     };
     let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(4)));
@@ -3352,6 +3701,43 @@ mod ollama_proxy_tests {
             read_chunked_body_to_string(&mut reader).unwrap(),
             "{\"models\":[]}"
         );
+    }
+}
+
+#[cfg(test)]
+mod static_assets_tests {
+    use super::{content_type_for, DIST};
+
+    #[test]
+    fn embedded_dist_has_index_and_js_chunk() {
+        assert!(
+            DIST.get_file("index.html").is_some(),
+            "index.html must be embedded as the renderer entrypoint"
+        );
+        let assets = DIST
+            .get_dir("assets")
+            .expect("frontend/dist/assets must be embedded");
+        let js_chunks = assets
+            .files()
+            .filter(|file| file.path().extension().and_then(|ext| ext.to_str()) == Some("js"))
+            .count();
+        assert!(
+            js_chunks > 0,
+            "at least one *.js chunk must be embedded under assets/"
+        );
+    }
+
+    #[test]
+    fn content_type_mapping_covers_vite_assets() {
+        assert_eq!(
+            content_type_for("index-1a2b3c.js"),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(content_type_for("index.css"), "text/css; charset=utf-8");
+        assert_eq!(content_type_for("source.js.map"), "application/json; charset=utf-8");
+        assert_eq!(content_type_for("logo.svg"), "image/svg+xml");
+        assert_eq!(content_type_for("font.woff2"), "font/woff2");
+        assert_eq!(content_type_for("noextension"), "application/octet-stream");
     }
 }
 

@@ -15,32 +15,69 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-async function responseErrorText(res: Response): Promise<string> {
-  const text = await res.text();
-  if (!text) return `HTTP ${res.status}`;
-  try {
-    const parsed = JSON.parse(text) as { error?: string };
-    return parsed.error ?? text;
-  } catch {
-    return text;
-  }
+/** Result shape returned by the Electron `mutate` IPC (token-authed POST). */
+type MutateResponse = { ok: boolean; status: number; data: any };
+
+/** safeStorage-backed secret store exposed by the Electron preload. */
+interface SecretStore {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+  delete(key: string): Promise<void>;
 }
+
+type ElectronAPI = {
+  /**
+   * Token-authenticated POST performed from the Electron MAIN process. Every
+   * mutating/destructive API call routes through this so the per-session server
+   * token (formerly `X-FileTree-Token`) never has to be exposed to the renderer.
+   */
+  mutate?: (route: string, body?: unknown) => Promise<MutateResponse>;
+  /** safeStorage-backed secret storage for cloud AI provider keys. */
+  secrets?: SecretStore;
+  copyText?: (text: string) => Promise<void>;
+  copyFiles?: (paths: string[]) => Promise<void>;
+  clipboardWriteFiles?: (paths: string[], cut: boolean) => Promise<boolean>;
+  clipboardReadFiles?: () => Promise<ClipboardFiles>;
+  shellContextMenu?: (paths: string | string[], x: number, y: number) => Promise<void>;
+  moveItemsNative?: (paths: string[], destination: string) => Promise<NativeMoveResult>;
+  copyItemsNative?: (paths: string[], destination: string) => Promise<NativeMoveResult>;
+  restoreFromRecycleBin?: (originalPath: string) => Promise<boolean>;
+};
+
+const eAPI = (): ElectronAPI =>
+  (window as unknown as { electronAPI?: ElectronAPI }).electronAPI ?? {};
 
 /**
- * Per-session local auth token exposed by the Electron preload. The Rust server
- * requires it as the `X-FileTree-Token` header on destructive routes (delete /
- * move / move-items / rename / dupes-action / run-command). Empty outside
- * Electron (dev/browser), where the server runs token-less and POST-only.
+ * Perform a mutating request. Prefers the Electron `mutate` IPC, which attaches
+ * the per-session token in the MAIN process; when it's unavailable (plain
+ * browser dev) it falls back to the same POST + JSON body issued directly from
+ * the renderer, without a token, so dev keeps working. Never reads a raw token.
  */
-function authToken(): string {
-  return (window as unknown as { electronAPI?: { authToken?: string } })
-    .electronAPI?.authToken ?? "";
+async function postMutation(route: string, body?: unknown): Promise<MutateResponse> {
+  const mutate = eAPI().mutate;
+  if (typeof mutate === "function") return mutate(route, body);
+  const res = await fetch(route, {
+    method: "POST",
+    ...(body !== undefined
+      ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+      : {}),
+  });
+  let data: unknown = null;
+  const text = await res.text().catch(() => "");
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = text; }
+  }
+  return { ok: res.ok, status: res.status, data };
 }
 
-/** Build headers for a mutating request: the session token plus any extras. */
-function mutateHeaders(extra?: Record<string, string>): Record<string, string> {
-  const token = authToken();
-  return { ...(token ? { "X-FileTree-Token": token } : {}), ...(extra ?? {}) };
+/** Best-effort human-readable error message from a {@link MutateResponse}. */
+function mutateErrorText(r: MutateResponse): string {
+  const d = r.data;
+  if (typeof d === "string" && d) return d;
+  if (d && typeof d === "object" && typeof (d as { error?: unknown }).error === "string") {
+    return (d as { error: string }).error;
+  }
+  return `HTTP ${r.status}`;
 }
 
 export interface ScanOptions {
@@ -160,25 +197,25 @@ export async function fetchExactDuplicates(
 }
 
 export async function revealPath(path: string): Promise<void> {
-  const params = new URLSearchParams({ path });
-  await fetch(`/api/reveal?${params}`);
+  await postMutation("/api/reveal", { path });
 }
 
 export async function openPath(path: string): Promise<void> {
-  const params = new URLSearchParams({ path });
-  await fetch(`/api/open?${params}`);
+  await postMutation("/api/open", { path });
+}
+
+/** Ask the backend to terminate the app (routed through the token-authed IPC). */
+export async function exitApp(): Promise<void> {
+  await postMutation("/api/exit");
 }
 
 export async function deletePath(
   path: string,
   permanent = false,
 ): Promise<{ ok: boolean; error?: string }> {
-  const params = new URLSearchParams({ path });
-  if (permanent) params.set("permanent", "1");
-  const res = await fetch(`/api/delete?${params}`, { method: "POST", headers: mutateHeaders() });
-  if (res.ok) return { ok: true };
-  const text = await res.text();
-  return { ok: false, error: text };
+  const r = await postMutation("/api/delete", { path, permanent });
+  if (r.ok) return { ok: true };
+  return { ok: false, error: mutateErrorText(r) };
 }
 
 export interface RunCommandResult {
@@ -201,44 +238,30 @@ export async function runCommand(
   cwd?: string,
   opts?: { shell?: "powershell" | "cmd"; timeoutMs?: number },
 ): Promise<RunCommandResult> {
-  const res = await fetch("/api/run-command", {
-    method: "POST",
-    headers: mutateHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({
-      command,
-      ...(cwd ? { cwd } : {}),
-      ...(opts?.shell ? { shell: opts.shell } : {}),
-      ...(opts?.timeoutMs != null ? { timeout_ms: opts.timeoutMs } : {}),
-    }),
+  const r = await postMutation("/api/run-command", {
+    command,
+    ...(cwd ? { cwd } : {}),
+    ...(opts?.shell ? { shell: opts.shell } : {}),
+    ...(opts?.timeoutMs != null ? { timeout_ms: opts.timeoutMs } : {}),
   });
-  if (!res.ok) return { ok: false, error: await responseErrorText(res) };
-  try {
-    return (await res.json()) as RunCommandResult;
-  } catch {
-    return { ok: false, error: "Invalid response from run-command" };
-  }
+  if (!r.ok) return { ok: false, error: mutateErrorText(r) };
+  if (r.data && typeof r.data === "object") return r.data as RunCommandResult;
+  return { ok: false, error: "Invalid response from run-command" };
 }
 
 export async function moveItem(src: string, dst: string): Promise<{ ok: boolean; error?: string }> {
-  const params = new URLSearchParams({ src, dst });
-  const res = await fetch(`/api/move?${params}`, { method: "POST", headers: mutateHeaders() });
-  if (res.ok) return { ok: true };
-  const text = await res.text();
-  return { ok: false, error: text };
+  const r = await postMutation("/api/move", { src, dst });
+  if (r.ok) return { ok: true };
+  return { ok: false, error: mutateErrorText(r) };
 }
 
 export async function openProperties(path: string): Promise<void> {
-  const params = new URLSearchParams({ path });
-  await fetch(`/api/properties?${params}`);
+  await postMutation("/api/properties", { path });
 }
 
 export async function createFolder(path: string): Promise<void> {
-  const params = new URLSearchParams({ path });
-  const res = await fetch(`/api/mkdir?${params}`);
-  if (!res.ok) {
-    const body = await res.json() as { error?: string };
-    throw new Error(body.error ?? `HTTP ${res.status}`);
-  }
+  const r = await postMutation("/api/mkdir", { path });
+  if (!r.ok) throw new Error(mutateErrorText(r));
 }
 
 export async function fetchBookmarks(): Promise<string[]> {
@@ -248,11 +271,7 @@ export async function fetchBookmarks(): Promise<string[]> {
 }
 
 export async function saveBookmarks(paths: string[]): Promise<void> {
-  await fetch("/api/bookmarks", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(paths),
-  });
+  await postMutation("/api/bookmarks", paths);
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -299,11 +318,7 @@ export async function fetchSettings(): Promise<AppSettings> {
 }
 
 export async function saveSettings(settings: AppSettings): Promise<void> {
-  await fetch("/api/settings", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(settings),
-  });
+  await postMutation("/api/settings", settings);
 }
 
 // ── File text preview (read-only) ────────────────────────────
@@ -341,18 +356,15 @@ export async function fetchSnapshots(): Promise<SnapshotMeta[]> {
  * returns the updated snapshot list (newest first).
  */
 export async function saveSnapshot(path: string, label?: string): Promise<SnapshotMeta[]> {
-  const params = new URLSearchParams({ path });
-  if (label) params.set("label", label);
-  const res = await fetch(`/api/snapshots?${params}`, { method: "POST", headers: mutateHeaders() });
-  if (!res.ok) throw new Error(await responseErrorText(res));
-  try { return ((await res.json()) as SnapshotList).snapshots ?? []; } catch { return []; }
+  const r = await postMutation("/api/snapshots", { path, ...(label ? { label } : {}) });
+  if (!r.ok) throw new Error(mutateErrorText(r));
+  return (r.data as SnapshotList | null)?.snapshots ?? [];
 }
 
 export async function deleteSnapshot(id: string): Promise<SnapshotMeta[]> {
-  const params = new URLSearchParams({ id });
-  const res = await fetch(`/api/snapshot-delete?${params}`, { method: "POST", headers: mutateHeaders() });
-  if (!res.ok) return fetchSnapshots();
-  try { return ((await res.json()) as SnapshotList).snapshots ?? []; } catch { return []; }
+  const r = await postMutation("/api/snapshot-delete", { id });
+  if (!r.ok) return fetchSnapshots();
+  return (r.data as SnapshotList | null)?.snapshots ?? [];
 }
 
 /**
@@ -502,20 +514,6 @@ export async function* streamAgentChat(
   }
 }
 
-type ElectronAPI = {
-  authToken?: string;
-  copyText?: (text: string) => Promise<void>;
-  copyFiles?: (paths: string[]) => Promise<void>;
-  clipboardWriteFiles?: (paths: string[], cut: boolean) => Promise<boolean>;
-  clipboardReadFiles?: () => Promise<ClipboardFiles>;
-  shellContextMenu?: (paths: string | string[], x: number, y: number) => Promise<void>;
-  moveItemsNative?: (paths: string[], destination: string) => Promise<NativeMoveResult>;
-  copyItemsNative?: (paths: string[], destination: string) => Promise<NativeMoveResult>;
-  restoreFromRecycleBin?: (originalPath: string) => Promise<boolean>;
-};
-const eAPI = (): ElectronAPI =>
-  (window as unknown as { electronAPI?: ElectronAPI }).electronAPI ?? {};
-
 /**
  * Result of a native shell move (`IFileOperation`). `aborted` is true when the
  * user cancelled in the native progress/conflict dialog; the counts are
@@ -643,13 +641,9 @@ export async function copyPath(path: string): Promise<void> {
 }
 
 export async function renameItem(path: string, newName: string): Promise<{ ok: boolean; error?: string }> {
-  const res = await fetch("/api/rename", {
-    method: "POST",
-    headers: mutateHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ path, newName }),
-  });
-  if (res.ok) return { ok: true };
-  return { ok: false, error: await responseErrorText(res) };
+  const r = await postMutation("/api/rename", { path, newName });
+  if (r.ok) return { ok: true };
+  return { ok: false, error: mutateErrorText(r) };
 }
 
 export type MoveConflictChoice = "replace" | "keep-both" | "skip";
@@ -692,29 +686,24 @@ export async function moveItems(
   const empty: MoveItemsResult = {
     ok: false, moved: [], alreadyThere: [], conflicts: [], skipped: [], errors: [],
   };
-  const res = await fetch("/api/move-items", {
-    method: "POST",
-    headers: mutateHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify(conflict ? { paths, destination, conflict } : { paths, destination }),
-  });
-  if (!res.ok) {
-    return { ...empty, error: await responseErrorText(res) };
+  const r = await postMutation(
+    "/api/move-items",
+    conflict ? { paths, destination, conflict } : { paths, destination },
+  );
+  if (!r.ok) {
+    return { ...empty, error: mutateErrorText(r) };
   }
-  try {
-    const j = (await res.json()) as Partial<MoveItemsResult>;
-    const errors = j.errors ?? [];
-    return {
-      ok: j.ok ?? errors.length === 0,
-      moved: j.moved ?? [],
-      alreadyThere: j.alreadyThere ?? [],
-      conflicts: j.conflicts ?? [],
-      skipped: j.skipped ?? [],
-      errors,
-      error: errors.length > 0 ? errors.join("; ") : undefined,
-    };
-  } catch {
-    return { ...empty, ok: true };
-  }
+  const j = (r.data ?? {}) as Partial<MoveItemsResult>;
+  const errors = j.errors ?? [];
+  return {
+    ok: j.ok ?? errors.length === 0,
+    moved: j.moved ?? [],
+    alreadyThere: j.alreadyThere ?? [],
+    conflicts: j.conflicts ?? [],
+    skipped: j.skipped ?? [],
+    errors,
+    error: errors.length > 0 ? errors.join("; ") : undefined,
+  };
 }
 
 export async function copyFiles(paths: string[]): Promise<void> {
@@ -773,6 +762,13 @@ export async function printReportAsPdf(path: string): Promise<void> {
   const url = URL.createObjectURL(blob);
 
   const iframe = document.createElement("iframe");
+  // Sandbox the server-rendered report so a crafted file name embedded in it can
+  // never execute script or navigate the top frame. We grant only the two tokens
+  // this hidden frame actually needs: `allow-same-origin` (so the parent can read
+  // `contentWindow` to drive printing — a blob URL is same-origin) and
+  // `allow-modals` (so the `print()` call below isn't suppressed). Notably absent:
+  // `allow-scripts`, `allow-top-navigation`, `allow-forms`, `allow-popups`.
+  iframe.setAttribute("sandbox", "allow-same-origin allow-modals");
   iframe.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden";
   iframe.onload = () => {
     try {
@@ -833,27 +829,15 @@ export async function listSchedules(): Promise<ScheduledTask[]> {
 
 /** Register (or overwrite) a scheduled scan+export task. Returns the full task name. */
 export async function createSchedule(req: ScheduleCreateRequest): Promise<string> {
-  const res = await fetch("/api/schedule-create", {
-    method: "POST",
-    headers: mutateHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify(req),
-  });
-  if (!res.ok) throw new Error(await responseErrorText(res));
-  try {
-    return ((await res.json()) as { name?: string }).name ?? req.name;
-  } catch {
-    return req.name;
-  }
+  const r = await postMutation("/api/schedule-create", req);
+  if (!r.ok) throw new Error(mutateErrorText(r));
+  return (r.data as { name?: string } | null)?.name ?? req.name;
 }
 
 /** Delete a FileTree scheduled task by its short name. */
 export async function deleteSchedule(name: string): Promise<void> {
-  const res = await fetch("/api/schedule-delete", {
-    method: "POST",
-    headers: mutateHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ name }),
-  });
-  if (!res.ok) throw new Error(await responseErrorText(res));
+  const r = await postMutation("/api/schedule-delete", { name });
+  if (!r.ok) throw new Error(mutateErrorText(r));
 }
 
 // ── dupeguru V2 API ───────────────────────────────────────────────────────
@@ -965,10 +949,11 @@ export async function dupeAction(
   paths: string[],
   opts: { permanent?: boolean; dest?: string },
 ): Promise<{ ok: boolean; errors: string[] }> {
-  const body = JSON.stringify({ action, paths, permanent: opts.permanent ?? false, dest: opts.dest ?? "" });
-  const res = await fetch("/api/dupes-action", { method: "POST", headers: mutateHeaders({ "Content-Type": "application/json" }), body });
-  if (!res.ok) return { ok: false, errors: [`HTTP ${res.status}`] };
-  return res.json() as Promise<{ ok: boolean; errors: string[] }>;
+  const r = await postMutation("/api/dupes-action", {
+    action, paths, permanent: opts.permanent ?? false, dest: opts.dest ?? "",
+  });
+  if (!r.ok) return { ok: false, errors: [mutateErrorText(r)] };
+  return (r.data as { ok: boolean; errors: string[] } | null) ?? { ok: false, errors: ["Invalid response"] };
 }
 
 export async function dupeMakeRef(
