@@ -23,6 +23,23 @@ async function responseErrorText(res: Response): Promise<string> {
   }
 }
 
+/**
+ * Per-session local auth token exposed by the Electron preload. The Rust server
+ * requires it as the `X-FileTree-Token` header on destructive routes (delete /
+ * move / move-items / rename / dupes-action / run-command). Empty outside
+ * Electron (dev/browser), where the server runs token-less and POST-only.
+ */
+function authToken(): string {
+  return (window as unknown as { electronAPI?: { authToken?: string } })
+    .electronAPI?.authToken ?? "";
+}
+
+/** Build headers for a mutating request: the session token plus any extras. */
+function mutateHeaders(extra?: Record<string, string>): Record<string, string> {
+  const token = authToken();
+  return { ...(token ? { "X-FileTree-Token": token } : {}), ...(extra ?? {}) };
+}
+
 export interface ScanOptions {
   path: string;
   threads?: number;
@@ -151,7 +168,7 @@ export async function deletePath(
 ): Promise<{ ok: boolean; error?: string }> {
   const params = new URLSearchParams({ path });
   if (permanent) params.set("permanent", "1");
-  const res = await fetch(`/api/delete?${params}`, { method: "POST" });
+  const res = await fetch(`/api/delete?${params}`, { method: "POST", headers: mutateHeaders() });
   if (res.ok) return { ok: true };
   const text = await res.text();
   return { ok: false, error: text };
@@ -179,7 +196,7 @@ export async function runCommand(
 ): Promise<RunCommandResult> {
   const res = await fetch("/api/run-command", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: mutateHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
       command,
       ...(cwd ? { cwd } : {}),
@@ -197,7 +214,7 @@ export async function runCommand(
 
 export async function moveItem(src: string, dst: string): Promise<{ ok: boolean; error?: string }> {
   const params = new URLSearchParams({ src, dst });
-  const res = await fetch(`/api/move?${params}`, { method: "POST" });
+  const res = await fetch(`/api/move?${params}`, { method: "POST", headers: mutateHeaders() });
   if (res.ok) return { ok: true };
   const text = await res.text();
   return { ok: false, error: text };
@@ -400,13 +417,32 @@ export async function* streamAgentChat(
 }
 
 type ElectronAPI = {
+  authToken?: string;
   copyText?: (text: string) => Promise<void>;
   copyFiles?: (paths: string[]) => Promise<void>;
   shellContextMenu?: (paths: string | string[], x: number, y: number) => Promise<void>;
-  moveItemsNative?: (paths: string[], destination: string) => Promise<{ aborted: boolean }>;
+  moveItemsNative?: (paths: string[], destination: string) => Promise<NativeMoveResult>;
+  restoreFromRecycleBin?: (originalPath: string) => Promise<boolean>;
 };
 const eAPI = (): ElectronAPI =>
   (window as unknown as { electronAPI?: ElectronAPI }).electronAPI ?? {};
+
+/**
+ * Result of a native shell move (`IFileOperation`). `aborted` is true when the
+ * user cancelled in the native progress/conflict dialog; the counts are
+ * post-hoc per-item outcomes so the caller can react to a partial move:
+ *   - `moved`   — sources gone from their origin afterward (true moves),
+ *   - `skipped` — sources skipped before the op as no-ops/unsafe (already in
+ *                 place, or moving a folder into itself/its descendant),
+ *   - `failed`  — sources queued but still present afterward (a per-item error,
+ *                 or the user chose "Skip" in the native collision dialog).
+ */
+export interface NativeMoveResult {
+  aborted: boolean;
+  moved: number;
+  skipped: number;
+  failed: number;
+}
 
 /** True when running in Electron with the native shell move-operation available. */
 export function hasNativeMove(): boolean {
@@ -421,10 +457,31 @@ export function hasNativeMove(): boolean {
 export async function moveItemsNative(
   paths: string[],
   destination: string,
-): Promise<{ aborted: boolean }> {
+): Promise<NativeMoveResult> {
   const api = eAPI();
   if (!api.moveItemsNative) throw new Error("native move unavailable");
   return api.moveItemsNative(paths, destination);
+}
+
+/** True when the native Recycle Bin restore (Phase 6 undo) is available. */
+export function hasRecycleRestore(): boolean {
+  return typeof eAPI().restoreFromRecycleBin === "function";
+}
+
+/**
+ * Best-effort restore of a recycled item back to `originalPath` via the native
+ * addon (it locates the item in the Recycle Bin and moves it back). Resolves
+ * true on success, false when it couldn't be found / put back (caller tells the
+ * user to restore manually) or when running outside Electron. Never throws.
+ */
+export async function restoreFromRecycleBin(originalPath: string): Promise<boolean> {
+  const api = eAPI();
+  if (!api.restoreFromRecycleBin) return false;
+  try {
+    return await api.restoreFromRecycleBin(originalPath);
+  } catch {
+    return false;
+  }
 }
 
 export async function copyPath(path: string): Promise<void> {
@@ -442,7 +499,7 @@ export async function copyPath(path: string): Promise<void> {
 export async function renameItem(path: string, newName: string): Promise<{ ok: boolean; error?: string }> {
   const res = await fetch("/api/rename", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: mutateHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ path, newName }),
   });
   if (res.ok) return { ok: true };
@@ -491,7 +548,7 @@ export async function moveItems(
   };
   const res = await fetch("/api/move-items", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: mutateHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(conflict ? { paths, destination, conflict } : { paths, destination }),
   });
   if (!res.ok) {
@@ -584,6 +641,40 @@ export async function fetchDupesV2(
   return getJson<import("./types").DupesV2Result>(`/api/dupes-v2?${params}`, signal);
 }
 
+/**
+ * Cancellable, time-bounded wrapper over fetchDupesV2. The underlying
+ * /api/dupes-v2 walk + hash can be expensive, so this aborts it when the
+ * external signal aborts (e.g. the chat Stop button) OR after `timeoutMs`, and
+ * also tells the server to stop (/api/dupes-cancel) so a scan can never hang.
+ * On cancel/timeout it resolves with an empty result carrying an explanatory
+ * error rather than throwing; any other error is rethrown.
+ */
+export async function fetchDupesV2Bounded(
+  opts: DupesV2Opts,
+  external?: AbortSignal,
+  timeoutMs = 90000,
+): Promise<import("./types").DupesV2Result> {
+  const inner = new AbortController();
+  const onExternalAbort = () => inner.abort();
+  const timer = setTimeout(() => inner.abort(), timeoutMs);
+  if (external) {
+    if (external.aborted) inner.abort();
+    else external.addEventListener("abort", onExternalAbort);
+  }
+  try {
+    return await fetchDupesV2(opts, inner.signal);
+  } catch (e) {
+    if (inner.signal.aborted) {
+      await cancelDupesScan();
+      return { mode: opts.mode, groups: [], errors: ["Duplicate scan canceled or timed out"], ignoredCount: 0 };
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    if (external) external.removeEventListener("abort", onExternalAbort);
+  }
+}
+
 export interface DupeHashFile {
   path: string;
   size: number;
@@ -629,7 +720,7 @@ export async function dupeAction(
   opts: { permanent?: boolean; dest?: string },
 ): Promise<{ ok: boolean; errors: string[] }> {
   const body = JSON.stringify({ action, paths, permanent: opts.permanent ?? false, dest: opts.dest ?? "" });
-  const res = await fetch("/api/dupes-action", { method: "POST", headers: { "Content-Type": "application/json" }, body });
+  const res = await fetch("/api/dupes-action", { method: "POST", headers: mutateHeaders({ "Content-Type": "application/json" }), body });
   if (!res.ok) return { ok: false, errors: [`HTTP ${res.status}`] };
   return res.json() as Promise<{ ok: boolean; errors: string[] }>;
 }

@@ -1,7 +1,20 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 
+// Per-session local auth token, fetched synchronously from main at preload time
+// (over IPC, never HTTP). The renderer sends it as the `X-FileTree-Token` header
+// on destructive API calls; the Rust server rejects those routes without it.
+let authToken = "";
+try {
+  authToken = (ipcRenderer.sendSync("getAuthToken") as string) ?? "";
+} catch {
+  authToken = "";
+}
+
 // Expose a safe API to the renderer that replaces window.chrome.webview.
 contextBridge.exposeInMainWorld("electronAPI", {
+  // Per-session token the renderer must attach to destructive API requests.
+  authToken,
+
   // Fire-and-forget: starting the drag must NOT block the renderer. Main calls
   // Electron's webContents.startDrag, which hands the drag to Chromium so the
   // renderer stays responsive — auto-scroll and internal drop-to-move
@@ -31,8 +44,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Move files into a folder via the Windows shell (IFileOperation). Shows the
   // real native dialogs — progress, Replace/Skip/Keep both, "source and
   // destination file names are the same", elevation — exactly like Explorer.
-  moveItemsNative: (paths: string[], destination: string): Promise<{ aborted: boolean }> =>
+  moveItemsNative: (
+    paths: string[],
+    destination: string,
+  ): Promise<{ aborted: boolean; moved: number; skipped: number; failed: number }> =>
     ipcRenderer.invoke("moveItemsNative", paths, destination),
+
+  // Best-effort restore of a recycled item to its original path (Phase 6 undo).
+  // Resolves true when the item was found in the Recycle Bin and put back; false
+  // when it couldn't be located (the renderer then tells the user to restore it
+  // manually from the Recycle Bin). Never overwrites/deletes on failure.
+  restoreFromRecycleBin: (originalPath: string): Promise<boolean> =>
+    ipcRenderer.invoke("restoreFromRecycleBin", originalPath),
 
   // Electron 32+ no longer exposes file.path directly in the renderer.
   getPathForFile: (file: File): string =>
@@ -67,13 +90,25 @@ contextBridge.exposeInMainWorld("electronAPI", {
   },
 
   // A native drag-out ended without an internal drop (external move/copy or
-  // cancel). The renderer clears its drag UI state and, when `info.outcome` is
-  // an external move, may rescan (a moved-out folder is gone from disk). `info`
+  // cancel). The renderer clears its drag UI state immediately. When `info.outcome`
+  // is an external move it may rescan (a moved-out folder is gone from disk) —
+  // unless `info.deferred` is true, meaning the OS is still transferring on its
+  // own thread; in that case the rescan waits for `onNativeMoveSettled`. `info`
   // is omitted on the error-fallback path.
-  onNativeDropEnd: (cb: (info?: { outcome: string; deleted: string[] }) => void) => {
-    const listener = (_evt: Electron.IpcRendererEvent, info?: { outcome: string; deleted: string[] }) => cb(info);
+  onNativeDropEnd: (cb: (info?: { outcome: string; deleted: string[]; deferred?: boolean }) => void) => {
+    const listener = (_evt: Electron.IpcRendererEvent, info?: { outcome: string; deleted: string[]; deferred?: boolean }) => cb(info);
     ipcRenderer.on("nativeDropEnd", listener);
     return () => ipcRenderer.removeListener("nativeDropEnd", listener);
+  },
+
+  // An async external MOVE finished transferring: the OS performed the copy on
+  // its own thread and removed the sources reported in `info.deleted`. Fired once
+  // after a `deferred` onNativeDropEnd so the initiating renderer can rescan now
+  // that the move is actually complete on disk.
+  onNativeMoveSettled: (cb: (info: { deleted: string[] }) => void) => {
+    const listener = (_evt: Electron.IpcRendererEvent, info: { deleted: string[] }) => cb(info);
+    ipcRenderer.on("nativeMoveSettled", listener);
+    return () => ipcRenderer.removeListener("nativeMoveSettled", listener);
   },
 
   // ── Cloud LLM gateway ──────────────────────────────────────────────────────

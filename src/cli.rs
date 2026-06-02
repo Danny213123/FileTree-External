@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::{self as sio};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::export::{scan_result_to_csv, scan_result_to_json};
 use crate::io::{
@@ -103,10 +103,49 @@ fn run_scan_command(args: &[String]) -> sio::Result<()> {
     };
 
     if let Some(out) = out {
-        fs::write(out, body)?;
+        // Atomic write: stream to a sibling temp file, then rename over the
+        // destination. A crash/error mid-write can't leave a half-written or
+        // truncated export in place — the user either gets the old file or the
+        // complete new one (Phase 3).
+        write_atomic(Path::new(&out), body.as_bytes())?;
     } else {
         println!("{body}");
     }
 
     Ok(())
+}
+
+/// Write `bytes` to `path` atomically: write a temp file in the same directory,
+/// flush+sync it, then rename it onto `path` (an atomic replace on Windows and
+/// POSIX). On any error the temp file is cleaned up and the original is left
+/// untouched.
+fn write_atomic(path: &Path, bytes: &[u8]) -> sio::Result<()> {
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("output");
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        // Best-effort durability; ignore platforms/filesystems that reject it.
+        let _ = file.sync_all();
+    }
+
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&tmp);
+            Err(error)
+        }
+    }
 }

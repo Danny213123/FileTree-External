@@ -21,6 +21,7 @@ import { WorkspaceTab } from "./components/WorkspaceTab";
 import type { WorkspaceTabHandle, SidebarModel } from "./components/WorkspaceTab";
 import { TitleBar, type Menu, type MenuItem } from "./components/TitleBar";
 import { loadChatIndex, newChatSessionId } from "./lib/chatSessions";
+import { undoLast } from "./lib/undo";
 import { ActivityBar, type ViewId } from "./components/ActivityBar";
 import { SideBar } from "./components/SideBar";
 import { ChatPanel } from "./components/ChatPanel";
@@ -482,8 +483,28 @@ export default function App() {
     return typeof cleanup === "function" ? cleanup : undefined;
   }, [getActiveRef]);
 
+  // Phase 6 in-app undo: reverse the most recent reversible file op (move back,
+  // rename back, restore from the Recycle Bin) and toast the outcome in the
+  // active pane. The fs change then refreshes the tree (we also force a rescan).
+  const handleUndo = useCallback(async () => {
+    const active = getActiveRef();
+    const res = await undoLast();
+    if (!res) { active?.showNotice("Nothing to undo."); return; }
+    active?.showNotice(res.message);
+    if (res.ok) active?.refresh();
+  }, [getActiveRef]);
+
   // ── VS Code keybindings ──
   useEffect(() => {
+    // Ctrl+Z must never hijack text-editing undo: bail when focus is in an
+    // input/textarea/select or any contentEditable (rename box, chat composer,
+    // path bar, terminal) — those get the browser's native edit undo instead.
+    const inEditable = (el: EventTarget | null): boolean => {
+      const node = el as HTMLElement | null;
+      if (!node || typeof node.tagName !== "string") return false;
+      const tag = node.tagName;
+      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || node.isContentEditable === true;
+    };
     const onKey = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
       if (e.ctrlKey && e.altKey && k === "b") { e.preventDefault(); setChatOpen((v) => !v); }
@@ -491,10 +512,15 @@ export default function App() {
       else if (e.ctrlKey && k === "j") { e.preventDefault(); setPanelOpen((v) => !v); }
       else if (e.ctrlKey && k === "t") { e.preventDefault(); handleOpenInNewTab(""); }
       else if (e.ctrlKey && (k === "`" || e.code === "Backquote")) { e.preventDefault(); handleToggleTerminal(); }
+      else if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "z") {
+        if (inEditable(e.target) || inEditable(document.activeElement)) return;
+        e.preventDefault();
+        void handleUndo();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleOpenInNewTab, handleToggleTerminal]);
+  }, [handleOpenInNewTab, handleToggleTerminal, handleUndo]);
 
   const handleScanPath = useCallback((path: string) => {
     if (path.trim()) { pushRecent(path.trim()); persist(); }

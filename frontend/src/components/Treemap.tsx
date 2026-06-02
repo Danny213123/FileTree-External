@@ -4,6 +4,7 @@ import { layoutTreemap } from "../utils/treeLayout";
 import { formatBytes, formatCount } from "../utils/formatBytes";
 import { Treemap3DModal } from "./Treemap3DModal";
 import { NodeTooltip } from "./NodeTooltip";
+import { isNoOpMove } from "../lib/agent";
 
 // detail 1–5 → rendering limits
 function detailLimits(detail: number) {
@@ -564,6 +565,12 @@ export const Treemap = memo(function Treemap({
     const src = nodeById.get(srcId);
     const dst = nodeById.get(dstId);
     if (!src || !dst || !dst.dir) return;
+    // Refuse no-op / unsafe drops: onto itself, into a descendant, or into the
+    // folder it already lives in (parent-drop). `srcId === dstId` above only
+    // catches the exact-same-cell case; this also blocks dropping a child back
+    // onto its own parent, matching the tree's guard so the treemap can't
+    // quietly "move" a folder to where it already is.
+    if (isNoOpMove(src.path, dst.path)) return;
     // Move the dragged item INTO the destination folder using the same path the
     // tree uses (shell IFileOperation move via /api/move-items, with the
     // self/descendant guard and conflict handling). The old direct moveItem()

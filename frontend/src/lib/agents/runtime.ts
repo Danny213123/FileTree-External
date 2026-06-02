@@ -15,9 +15,18 @@ import { llmStream, type LlmImage, type LlmMessage, type LlmToolCall } from "../
 import type { AgentSpec, RunContext, RunResult } from "./types";
 
 // Tools that ALWAYS surface an approval card, no matter the user's auto-approve
-// setting or allowlist. run_command runs arbitrary shell, so the user must see
-// and confirm the exact command every single time — it can never be bypassed.
-export const ALWAYS_APPROVE_TOOLS = new Set(["run_command"]);
+// setting or per-tool allowlist. These are the destructive ones: they move,
+// rename, recycle, create, or run arbitrary shell, so the user must see and
+// confirm each one every single time — auto-approve / "always allow" can never
+// silently run them. Read-only tools (scan, search, reveal, find duplicates)
+// stay auto-approvable. Keep this in sync with the mutating tools in agent.ts.
+export const ALWAYS_APPROVE_TOOLS = new Set([
+  "run_command",
+  "move_items",
+  "recycle_items",
+  "rename_item",
+  "create_folder",
+]);
 
 export async function runAgent(
   spec: AgentSpec,

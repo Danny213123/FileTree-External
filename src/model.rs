@@ -125,6 +125,11 @@ pub(crate) struct AppState {
     /// `%APPDATA%\FileTree\hash_cache.json`.
     pub(crate) hash_cache: Mutex<HashMap<PathBuf, HashCacheEntry>>,
     pub(crate) hash_cache_path: PathBuf,
+    /// Per-session local auth token minted by Electron (passed in via the
+    /// `FILETREE_AUTH_TOKEN` env var) and required on the destructive mutation
+    /// routes. `None` when the server is launched standalone without a token
+    /// (dev), in which case those routes fall back to POST-only with no token.
+    pub(crate) auth_token: Option<String>,
 }
 
 #[derive(Debug)]
@@ -132,6 +137,9 @@ pub(crate) struct HttpRequest {
     pub(crate) method: String,
     pub(crate) target: String,
     pub(crate) body: Vec<u8>,
+    /// Value of the `X-FileTree-Token` request header, if present. Compared
+    /// against `AppState::auth_token` to authorize destructive routes.
+    pub(crate) auth_token: Option<String>,
 }
 
 #[derive(Clone, Debug)]
