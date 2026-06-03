@@ -20,16 +20,13 @@ interface CompareTabProps {
   onNavigate: (id: number) => void;
 }
 
-const CURRENT = "current";
-
 // Fixed row height for the virtualized diff list (matches the .compare-row box:
 // 12px vertical padding + ~17px line + 1px divider, box-sizing: border-box).
 const DIFF_ROW_HEIGHT = 32;
 
 function snapshotLabel(meta: SnapshotMeta): string {
-  const when = meta.savedAt ? formatDate(meta.savedAt) : formatDate(meta.scannedAt);
-  const tag = meta.label ? `${meta.label} — ` : "";
-  return `${tag}${meta.rootPath} · ${formatBytes(meta.totalSize)} · ${when}`;
+  // createdAt is unix SECONDS; formatDate wants ms.
+  return `${meta.path} · ${formatBytes(meta.total)} · ${formatDate(meta.createdAt * 1000)}`;
 }
 
 /** Signed byte delta, e.g. "+1.2 GB" / "−340 MB". */
@@ -51,7 +48,6 @@ export function CompareTab({ data, nodeById, onNavigate }: CompareTabProps) {
   const [snapshots, setSnapshots] = useState<SnapshotMeta[]>([]);
   const [aId, setAId] = useState<string>("");
   const [bId, setBId] = useState<string>("");
-  const [label, setLabel] = useState<string>("");
   const [diff, setDiff] = useState<DiffResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>("");
@@ -74,83 +70,72 @@ export function CompareTab({ data, nodeById, onNavigate }: CompareTabProps) {
 
   useEffect(() => { void refreshSnapshots(); }, [refreshSnapshots]);
 
-  // Sensible defaults: compare the newest snapshot (base) against the current
-  // scan (target) — i.e. "what changed since I last saved a snapshot".
+  // Sensible defaults: diff the previous snapshot (base) → the newest (target),
+  // i.e. "what changed between my last two saved snapshots".
   useEffect(() => {
-    if (!aId && snapshots.length) setAId(snapshots[0].id);
-    if (!bId) setBId(data ? CURRENT : (snapshots[0]?.id ?? ""));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [snapshots, data]);
+    if (snapshots.length === 0) return;
+    setAId((prev) => prev || (snapshots[1]?.id ?? snapshots[0].id));
+    setBId((prev) => prev || snapshots[0].id);
+  }, [snapshots]);
 
   const handleSave = useCallback(async () => {
     if (!rootPath) return;
     setBusy(true);
     setError("");
     try {
-      const list = await saveSnapshot(rootPath, label.trim() || undefined);
+      const list = await saveSnapshot(rootPath);
       setSnapshots(list);
-      setLabel("");
-      // Default the base to the PREVIOUS snapshot (if any) so an immediate
-      // Compare-vs-current shows real growth instead of an empty (self) diff.
+      // Default to PREVIOUS snapshot (base) → the one just saved (target) so an
+      // immediate Compare shows real growth instead of an empty (self) diff.
+      setBId(list[0]?.id ?? "");
       setAId(list[1]?.id ?? list[0]?.id ?? "");
-      if (data) setBId(CURRENT);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
-  }, [rootPath, label, data]);
+  }, [rootPath]);
 
   const handleDelete = useCallback(async (id: string) => {
     const list = await deleteSnapshot(id);
     setSnapshots(list);
-    if (aId === id) setAId(list[0]?.id ?? "");
-    if (bId === id) setBId(data ? CURRENT : (list[0]?.id ?? ""));
-  }, [aId, bId, data]);
+    if (aId === id) setAId(list[1]?.id ?? list[0]?.id ?? "");
+    if (bId === id) setBId(list[0]?.id ?? "");
+  }, [aId, bId]);
 
   const handleCompare = useCallback(async () => {
     if (!aId || !bId) return;
-    if (aId === bId) { setError("Pick two different sides to compare."); return; }
-    if ((aId === CURRENT || bId === CURRENT) && !rootPath) {
-      setError("No current scan is loaded to compare against.");
-      return;
-    }
+    if (aId === bId) { setError("Pick two different snapshots to compare."); return; }
+    const a = snapshots.find((s) => s.id === aId);
+    const b = snapshots.find((s) => s.id === bId);
+    if (!a || !b) { setError("Pick two saved snapshots to compare."); return; }
     setBusy(true);
     setError("");
     setDiff(null);
     try {
-      const result = await fetchSnapshotDiff(aId, bId, rootPath || undefined);
+      const result = await fetchSnapshotDiff(a, b);
       setDiff(result);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
-  }, [aId, bId, rootPath]);
+  }, [aId, bId, snapshots]);
 
   const revealRow = useCallback((row: DiffRow) => {
     const id = pathToId.get(row.path.toLowerCase());
     if (id != null) onNavigate(id);
   }, [pathToId, onNavigate]);
 
-  const options = useMemo(() => {
-    const opts: { value: string; label: string }[] = [];
-    if (data) opts.push({ value: CURRENT, label: `Current scan · ${rootPath}` });
-    for (const s of snapshots) opts.push({ value: s.id, label: snapshotLabel(s) });
-    return opts;
-  }, [data, rootPath, snapshots]);
+  const options = useMemo(
+    () => snapshots.map((s) => ({ value: s.id, label: snapshotLabel(s) })),
+    [snapshots],
+  );
 
   return (
     <div className="compare-tab">
       <div className="compare-controls">
         <div className="compare-save">
-          <input
-            className="compare-label-input"
-            placeholder="Optional label (e.g. before cleanup)"
-            value={label}
-            onChange={(e) => setLabel(e.target.value)}
-            disabled={!rootPath || busy}
-          />
           <button className="compare-btn" onClick={() => void handleSave()} disabled={!rootPath || busy} title={rootPath ? "Save the current scan as a snapshot" : "Run a scan first"}>
             <Icon name="clock-history" size={13} /> Save current as snapshot
           </button>
@@ -186,7 +171,7 @@ export function CompareTab({ data, nodeById, onNavigate }: CompareTabProps) {
           <ul className="compare-snap-list">
             {snapshots.map((s) => (
               <li key={s.id}>
-                <span className="compare-snap-meta" title={s.rootPath}>{snapshotLabel(s)}</span>
+                <span className="compare-snap-meta" title={s.path}>{snapshotLabel(s)}</span>
                 <button className="compare-snap-del" title="Delete snapshot" onClick={() => void handleDelete(s.id)}>
                   <Icon name="trash" size={12} />
                 </button>

@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect, useRef, useLayoutEffect } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { ViewId } from "./ActivityBar";
-import type { DriveEntry, NodeRecord, ScanResult, SpecialFolder, Unit } from "../api/types";
+import type { DriveEntry, NodeRecord, ScanResult, SpecialFolder, Unit, TagEntry, SmartFolder } from "../api/types";
 import { BookmarksTab } from "./BookmarksTab";
 import { ErrorsTab } from "./ErrorsTab";
 import { FileIcon } from "./FileIcon";
@@ -17,6 +17,9 @@ const VIEW_TITLES: Record<ViewId, string> = {
   treemap: "Treemap",
   reports: "Reports",
   duplicates: "Duplicates",
+  cleanup: "Cleanup",
+  snapshots: "Snapshots",
+  gallery: "Gallery",
   bookmarks: "Bookmarks",
   errors: "Problems",
 };
@@ -69,11 +72,127 @@ export interface SideBarProps {
   // bookmarks
   onScanPath: (p: string) => void;
   onRemoveBookmark: (p: string) => void;
+  // tags (F4): the full tag list (to aggregate the sidebar Tags list), the active
+  // tag filter, and a setter that filters the focused tree to a tag (null clears).
+  tagEntries: TagEntry[];
+  activeTagFilter: string | null;
+  onSelectTag: (tag: string | null) => void;
+  // smart folders (F7): saved searches/filters + apply/save/delete actions.
+  smartFolders: SmartFolder[];
+  onApplySmartFolder: (sf: SmartFolder) => void;
+  onSaveSmartFolder: () => void;
+  onDeleteSmartFolder: (id: string) => void;
   // duplicates page controller (shared with the app-level results view)
   dupes?: DuplicatesController;
 }
 
 const SIDEBAR_FOLDER_ROW_H = 22; // keep in sync with .folder-row height in global.css
+
+// ── Tags list (F4) ───────────────────────────────────────────────────────────
+// Aggregates every tag across the persisted tag entries into a name → {count,
+// color} list. Clicking a tag filters the focused tree to its tagged paths
+// (toggling it off when already active). The active tag is highlighted.
+function TagsSection({
+  tagEntries, activeTagFilter, onSelectTag,
+}: {
+  tagEntries: TagEntry[];
+  activeTagFilter: string | null;
+  onSelectTag: (tag: string | null) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  const tags = useMemo(() => {
+    const m = new Map<string, { count: number; color?: string }>();
+    for (const e of tagEntries) {
+      for (const t of e.tags) {
+        const cur = m.get(t) ?? { count: 0, color: undefined as string | undefined };
+        cur.count += 1;
+        if (!cur.color && e.color) cur.color = e.color;
+        m.set(t, cur);
+      }
+    }
+    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [tagEntries]);
+
+  if (tags.length === 0) return null;
+
+  return (
+    <>
+      <div className={`explorer-section-title${open ? "" : " collapsed"}`} onClick={() => setOpen((v) => !v)}>
+        <span className="chev"><Icon name="chevron-down" size={11} /></span> Tags
+      </div>
+      {open && (
+        <div className="tag-list">
+          {activeTagFilter && (
+            <button className="tag-list-clear" onClick={() => onSelectTag(null)}>
+              <Icon name="x" size={11} /> Clear tag filter
+            </button>
+          )}
+          {tags.map(([tag, info]) => (
+            <button
+              key={tag}
+              className={`tag-list-item${activeTagFilter === tag ? " active" : ""}`}
+              title={`${info.count} item${info.count === 1 ? "" : "s"} tagged \u201C${tag}\u201D`}
+              onClick={() => onSelectTag(activeTagFilter === tag ? null : tag)}
+            >
+              <span className="tag-list-dot" style={{ background: info.color || "var(--accent, #61afef)" }} />
+              <span className="tag-list-name">{tag}</span>
+              <span className="tag-list-count">{info.count}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+// ── Smart folders list (F7) ──────────────────────────────────────────────────
+// Lists saved searches/filters; the first row saves the CURRENT search query +
+// active filter rules as a new smart folder, and each entry re-applies its query.
+function describeSmartFolder(sf: SmartFolder): string {
+  const parts: string[] = [];
+  if (sf.query.text) parts.push(`search “${sf.query.text}”`);
+  if (sf.query.rules?.length) parts.push(`${sf.query.rules.length} filter rule${sf.query.rules.length === 1 ? "" : "s"}`);
+  return parts.length ? `Apply ${parts.join(" + ")}` : "Apply smart folder";
+}
+
+function SmartFoldersSection({
+  smartFolders, onApply, onSave, onDelete,
+}: {
+  smartFolders: SmartFolder[];
+  onApply: (sf: SmartFolder) => void;
+  onSave: () => void;
+  onDelete: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  return (
+    <>
+      <div className={`explorer-section-title${open ? "" : " collapsed"}`} onClick={() => setOpen((v) => !v)}>
+        <span className="chev"><Icon name="chevron-down" size={11} /></span> Smart Folders
+      </div>
+      {open && (
+        <div className="smartfolder-list">
+          <button className="smartfolder-save" title="Save the current search and filter rules as a smart folder" onClick={onSave}>
+            <Icon name="plus" size={11} /> Save current search…
+          </button>
+          {smartFolders.length === 0 && (
+            <div className="smartfolder-empty">No smart folders yet.</div>
+          )}
+          {smartFolders.map((sf) => (
+            <div key={sf.id} className="smartfolder-item">
+              <button className="smartfolder-open" title={describeSmartFolder(sf)} onClick={() => onApply(sf)}>
+                <Icon name="funnel" size={12} />
+                <span className="smartfolder-name">{sf.name}</span>
+              </button>
+              <button className="smartfolder-del" title="Delete smart folder" onClick={() => onDelete(sf.id)}>
+                <Icon name="x" size={10} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
 
 function ExplorerView(props: SideBarProps) {
   const [locOpen, setLocOpen] = useState(true);
@@ -217,6 +336,18 @@ function ExplorerView(props: SideBarProps) {
           )}
         </>
       )}
+
+      <TagsSection
+        tagEntries={props.tagEntries}
+        activeTagFilter={props.activeTagFilter}
+        onSelectTag={props.onSelectTag}
+      />
+      <SmartFoldersSection
+        smartFolders={props.smartFolders}
+        onApply={props.onApplySmartFolder}
+        onSave={props.onSaveSmartFolder}
+        onDelete={props.onDeleteSmartFolder}
+      />
     </div>
   );
 }
@@ -249,6 +380,11 @@ function SearchView(props: SideBarProps) {
           placeholder={hasScan ? "Search files and folders…" : "Run a scan first…"}
           onChange={(e) => props.onSearchQueryChange(e.target.value)}
         />
+        {props.searchQuery && (
+          <button className="search-save" title="Save this search as a smart folder" onClick={props.onSaveSmartFolder}>
+            <Icon name="funnel" size={12} />
+          </button>
+        )}
         {props.searchQuery && (
           <button className="search-clear" title="Clear" onClick={() => props.onSearchQueryChange("")}>
             <Icon name="x" size={12} />
@@ -289,10 +425,12 @@ function SearchView(props: SideBarProps) {
 
 export function SideBar(props: SideBarProps) {
   const { view } = props;
-  // Reports/Treemap reuse the Explorer body so the scan controls, drive list
-  // (with capacity bars) and folder tree stay available while their main panel
-  // (treemap / analytics reports) shows in the editor area.
-  const showExplorerBody = view === "explorer" || view === "treemap" || view === "reports";
+  // Reports/Treemap (and the Cleanup/Snapshots/Gallery editor views) reuse the
+  // Explorer body so the scan controls, drive list (with capacity bars) and
+  // folder tree stay available while their main panel shows in the editor area.
+  const showExplorerBody =
+    view === "explorer" || view === "treemap" || view === "reports" ||
+    view === "cleanup" || view === "snapshots" || view === "gallery";
   const showFolderActions = showExplorerBody;
 
   return (

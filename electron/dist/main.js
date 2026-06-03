@@ -622,6 +622,35 @@ if ($action) { [Console]::Out.WriteLine("FILETREE_ACTION:" + $action) }
 electron_1.ipcMain.on("diag", (_event, message) => {
     console.log("[renderer]", message);
 });
+// ── Native desktop notifications (F9 low-space alerts) ────────────────────────
+// The renderer asks MAIN to raise a real OS notification (Windows Action Center
+// toast) so a low-space warning is seen even when the window is unfocused. The
+// renderer de-dupes upstream; this just shows what it's given. Resolves true
+// when a notification was actually shown.
+electron_1.ipcMain.handle("notify", (_event, title, body) => {
+    try {
+        if (!electron_1.Notification.isSupported())
+            return false;
+        const n = new electron_1.Notification({
+            title: typeof title === "string" ? title : "FileTree",
+            body: typeof body === "string" ? body : "",
+        });
+        // Focus the app window when the user clicks the toast.
+        n.on("click", () => {
+            const win = electron_1.BrowserWindow.getAllWindows()[0];
+            if (win) {
+                if (win.isMinimized())
+                    win.restore();
+                win.focus();
+            }
+        });
+        n.show();
+        return true;
+    }
+    catch {
+        return false;
+    }
+});
 // ── Mutating-request proxy ────────────────────────────────────────────────────
 // The session token is NEVER handed to the renderer. Instead the renderer asks
 // main to perform a mutating (POST) request to the local Rust server; main

@@ -7,9 +7,17 @@ import {
   saveBookmarks,
   fetchSettings,
   saveSettings,
+  fetchTags,
+  saveTags,
+  fetchSmartFolders,
+  saveSmartFolders,
+  fetchDriveSpace,
+  notify,
+  saveSnapshot,
 } from "./api/client";
 import type { AppSettings } from "./api/client";
-import type { DriveEntry, SpecialFolder, SortKey, Unit, ScanResult } from "./api/types";
+import type { DriveEntry, SpecialFolder, SortKey, Unit, ScanResult, TagEntry, SmartFolder, NodeRecord } from "./api/types";
+import { isActiveRule } from "./hooks/useFilterRules";
 import { useDuplicatesController, type DuplicatesController } from "./hooks/useDuplicates";
 import { createWorkbenchStore, useWorkbench, type WorkbenchStore, type WorkbenchSnapshot } from "./hooks/useWorkbench";
 import { DEFAULT_VISIBLE_COLUMNS } from "./components/TreeTable";
@@ -23,9 +31,11 @@ import { TitleBar, type Menu, type MenuItem } from "./components/TitleBar";
 import { loadChatIndex, newChatSessionId } from "./lib/chatSessions";
 import { undoLast } from "./lib/undo";
 import { ToastProvider, toast } from "./lib/toast";
-import { DialogProvider } from "./lib/dialogs";
+import { DialogProvider, promptDialog } from "./lib/dialogs";
 import { ActivityBar, type ViewId } from "./components/ActivityBar";
 import { SideBar } from "./components/SideBar";
+import { CommandPalette, type PaletteCommand } from "./components/CommandPalette";
+import { TransfersPanel } from "./components/TransfersPanel";
 import { InspectorPane } from "./components/InspectorPane";
 import { ScheduleWizard } from "./components/ScheduleWizard";
 import { LazyView } from "./components/LazyView";
@@ -39,8 +49,17 @@ const ChatPanel = lazy(() => import("./components/ChatPanel").then((m) => ({ def
 const TerminalPanel = lazy(() => import("./components/TerminalPanel").then((m) => ({ default: m.TerminalPanel })));
 const ReportsView = lazy(() => import("./components/ReportsView").then((m) => ({ default: m.ReportsView })));
 const DuplicatesResults = lazy(() => import("./components/DuplicatesResults").then((m) => ({ default: m.DuplicatesResults })));
+const CleanupView = lazy(() => import("./components/CleanupView").then((m) => ({ default: m.CleanupView })));
+const SnapshotsView = lazy(() => import("./components/SnapshotsView").then((m) => ({ default: m.SnapshotsView })));
+const GalleryView = lazy(() => import("./components/GalleryView").then((m) => ({ default: m.GalleryView })));
 
 const SETTINGS_DEBOUNCE_MS = 700;
+
+// Views that take over the whole editor area (replacing the workspace tabs),
+// each rendered from its own dedicated editor block below.
+const FULL_EDITOR_VIEWS = new Set<ViewId>([
+  "duplicates", "reports", "cleanup", "snapshots", "gallery",
+]);
 
 let nextTabId = 1;
 function newTabId() { return String(nextTabId++); }
@@ -65,6 +84,10 @@ interface EditorGroup {
   // tabs). Per-editor-group, toggled from the tab bar; defaults to shown.
   toolbarHidden?: boolean;
 }
+
+// Stable empty node map handed to the command palette while no pane is focused
+// (a fresh Map() each render would needlessly re-run the palette's matcher memo).
+const EMPTY_NODE_MAP: Map<number, NodeRecord> = new Map();
 
 const MAX_GROUPS = 4;
 // Floor a single split pane can shrink to. Kept modest so two panes comfortably
@@ -141,6 +164,17 @@ export default function App() {
   const [collectOwners, setCollectOwners] = useState(false);
   const [drives, setDrives] = useState<DriveEntry[]>([]);
   const [bookmarkList, setBookmarkList] = useState<string[]>([]);
+  // Tags & color labels (F4): the persisted full list (mirrors bookmarks) plus
+  // the active tag filter applied to the focused tree.
+  const [tagEntries, setTagEntries] = useState<TagEntry[]>([]);
+  const [activeTagFilter, setActiveTagFilter] = useState<string | null>(null);
+  // Smart folders (F7): persisted saved searches/filters.
+  const [smartFolders, setSmartFolders] = useState<SmartFolder[]>([]);
+  // Low-space monitor (F9): toggle + threshold (% free) persisted in settings.
+  const [lowSpaceAlerts, setLowSpaceAlerts] = useState(false);
+  const [lowSpaceThreshold, setLowSpaceThreshold] = useState(10);
+  // Command palette (F6): null = closed; otherwise the mode it opened in.
+  const [paletteMode, setPaletteMode] = useState<"files" | "commands" | null>(null);
   const [specialFolders, setSpecialFolders] = useState<SpecialFolder[]>([]);
   const [darkMode, setDarkModeState] = useState(true);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
@@ -285,6 +319,14 @@ export default function App() {
   // Bookmarked paths as a Set (for the inspector's folder-thumbnail picker).
   const bookmarkSet = useMemo(() => new Set(bookmarkList), [bookmarkList]);
 
+  // Tags keyed by path for the TreeTable badges + popover (F4). Rebuilt only
+  // when the persisted tag list changes.
+  const tagsByPath = useMemo(() => {
+    const m = new Map<string, TagEntry>();
+    for (const e of tagEntries) m.set(e.path, e);
+    return m;
+  }, [tagEntries]);
+
   // Ctrl+` toggle: open the terminal at the active tab's root, or hide it.
   const handleToggleTerminal = useCallback(() => {
     if (terminalOpenRef.current) { setTerminalOpen(false); return; }
@@ -319,11 +361,12 @@ export default function App() {
       })),
       activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth,
       previewOpen, detailsOpen, inspectorWidth,
+      lowSpaceAlerts, lowSpaceThreshold,
     };
   }, [darkMode, threads, includeHidden, followLinks, collectOwners, exclude, getActiveRef, tabs, groups,
       visibleColumns, decimals,
       activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth,
-      previewOpen, detailsOpen, inspectorWidth]);
+      previewOpen, detailsOpen, inspectorWidth, lowSpaceAlerts, lowSpaceThreshold]);
 
   const persist = useCallback(() => {
     if (!settingsLoaded) return;
@@ -336,7 +379,7 @@ export default function App() {
     [darkMode, threads, includeHidden, followLinks, collectOwners, exclude, tabs, groups, focusedGroupId,
      visibleColumns, decimals,
      activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth,
-     previewOpen, detailsOpen, inspectorWidth]);
+     previewOpen, detailsOpen, inspectorWidth, lowSpaceAlerts, lowSpaceThreshold]);
 
   const handleSaveSession = useCallback(() => {
     const paths = tabs.map((t) => t.ref.current?.getScanPath() ?? t.initialPath).filter(Boolean);
@@ -430,7 +473,7 @@ export default function App() {
       }
       if (settings.decimals !== undefined) setDecimals(settings.decimals);
       // Layout
-      if (settings.activeView && ["explorer", "search", "treemap", "reports", "duplicates", "bookmarks", "errors"].includes(settings.activeView)) {
+      if (settings.activeView && ["explorer", "search", "treemap", "reports", "duplicates", "cleanup", "snapshots", "gallery", "bookmarks", "errors"].includes(settings.activeView)) {
         setActiveView(settings.activeView as ViewId);
       }
       if (settings.sidebarOpen !== undefined) setSidebarOpen(settings.sidebarOpen);
@@ -442,6 +485,11 @@ export default function App() {
       if (settings.previewOpen !== undefined) setPreviewOpen(settings.previewOpen);
       if (settings.detailsOpen !== undefined) setDetailsOpen(settings.detailsOpen);
       if (settings.inspectorWidth) setInspectorWidth(settings.inspectorWidth);
+      // Low-space monitor (F9)
+      if (settings.lowSpaceAlerts !== undefined) setLowSpaceAlerts(settings.lowSpaceAlerts);
+      if (settings.lowSpaceThreshold !== undefined && settings.lowSpaceThreshold > 0) {
+        setLowSpaceThreshold(settings.lowSpaceThreshold);
+      }
 
       setDrives(driveList.drives ?? []);
       setSpecialFolders(folderList.folders ?? []);
@@ -493,12 +541,140 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Tags + smart folders load independently (mirrors bookmarks; both degrade to
+  // an empty list when the backend endpoint isn't present yet).
+  useEffect(() => {
+    fetchTags().then(setTagEntries).catch(() => {});
+    fetchSmartFolders().then(setSmartFolders).catch(() => {});
+  }, []);
+
   const handleToggleBookmark = useCallback((path: string) => {
     setBookmarkList((prev) => {
       const next = prev.includes(path) ? prev.filter((p) => p !== path) : [...prev, path];
       saveBookmarks(next).catch(() => {});
       return next;
     });
+  }, []);
+
+  // ── Tags & color labels (F4) ──────────────────────────────────────────────
+  // Persist a path's tag set + color (full-list replace, mirroring bookmarks).
+  // Empty tags + no color removes the entry entirely so the row badge clears.
+  const handleSetTags = useCallback((path: string, tags: string[], color?: string) => {
+    setTagEntries((prev) => {
+      const hasContent = tags.length > 0 || !!color;
+      const idx = prev.findIndex((e) => e.path === path);
+      let next: TagEntry[];
+      if (!hasContent) {
+        if (idx < 0) return prev;
+        next = prev.filter((e) => e.path !== path);
+      } else if (idx >= 0) {
+        next = prev.slice();
+        next[idx] = { path, tags, color };
+      } else {
+        next = [...prev, { path, tags, color }];
+      }
+      saveTags(next).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  // Filter the focused tree to a tag (null clears). Switching to a tag jumps to
+  // the Explorer view so the (flattened) tagged rows are visible.
+  const handleSelectTag = useCallback((tag: string | null) => {
+    setActiveTagFilter(tag);
+    if (tag) setActiveView("explorer");
+  }, []);
+  const handleClearTagFilter = useCallback(() => setActiveTagFilter(null), []);
+
+  // ── Smart folders (F7) ────────────────────────────────────────────────────
+  const handleApplySmartFolder = useCallback((sf: SmartFolder) => {
+    const ref = getActiveRef();
+    ref?.setFilterRules(sf.query.rules ?? []);
+    if (sf.query.text) {
+      setSearchQuery(sf.query.text);
+      setActiveView("search");
+    } else {
+      setActiveView("explorer");
+    }
+  }, [getActiveRef]);
+
+  const handleSaveSmartFolder = useCallback(async () => {
+    const ref = getActiveRef();
+    const rules = (ref?.getFilterRules() ?? []).filter(isActiveRule);
+    const text = searchQuery.trim();
+    if (!text && rules.length === 0) {
+      toast.info("Type a search query or set filter rules first, then save.");
+      return;
+    }
+    const name = await promptDialog({
+      title: "Save smart folder",
+      label: "Name",
+      placeholder: text || "My smart folder",
+      confirmLabel: "Save",
+    });
+    if (name == null) return; // canceled
+    const trimmed = name.trim() || text || "Smart folder";
+    const sf: SmartFolder = {
+      id: `sf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+      name: trimmed,
+      query: { text: text || undefined, rules: rules.length ? rules : undefined },
+    };
+    setSmartFolders((prev) => {
+      const next = [...prev, sf];
+      saveSmartFolders(next).catch(() => {});
+      return next;
+    });
+    toast.success(`Saved smart folder \u201C${trimmed}\u201D.`);
+  }, [getActiveRef, searchQuery]);
+
+  const handleDeleteSmartFolder = useCallback((id: string) => {
+    setSmartFolders((prev) => {
+      const next = prev.filter((s) => s.id !== id);
+      saveSmartFolders(next).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  // ── Low-space monitor + alerts (F9) ───────────────────────────────────────
+  // Poll drive free space on an interval while enabled and raise ONE native
+  // notification when a drive first crosses below the threshold. De-dupes via a
+  // per-drive "already alerted" set, re-arming only once the drive climbs a
+  // couple points back above the line (hysteresis) so it can't notify each tick.
+  const lowSpaceAlertedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!lowSpaceAlerts) { lowSpaceAlertedRef.current.clear(); return; }
+    let cancelled = false;
+    const gb = (n: number) => `${(n / 1e9).toFixed(1)} GB`;
+    const check = async () => {
+      const list = await fetchDriveSpace();
+      if (cancelled) return;
+      const alerted = lowSpaceAlertedRef.current;
+      for (const d of list) {
+        if (!d.total || d.total <= 0) continue;
+        const pctFree = (d.free / d.total) * 100;
+        const key = d.root.toLowerCase();
+        if (pctFree < lowSpaceThreshold) {
+          if (!alerted.has(key)) {
+            alerted.add(key);
+            void notify(
+              `Low disk space on ${d.label || d.root}`,
+              `${pctFree.toFixed(1)}% free — ${gb(d.free)} of ${gb(d.total)} remaining (below your ${lowSpaceThreshold}% threshold).`,
+            );
+          }
+        } else if (pctFree > lowSpaceThreshold + 2) {
+          alerted.delete(key); // re-arm once it recovers past the hysteresis band
+        }
+      }
+    };
+    void check();
+    const timer = window.setInterval(() => void check(), 60_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [lowSpaceAlerts, lowSpaceThreshold]);
+
+  // Cycle the low-space threshold through a few sensible presets (View menu).
+  const cycleLowSpaceThreshold = useCallback(() => {
+    const presets = [5, 10, 15, 20];
+    setLowSpaceThreshold((cur) => presets[(presets.indexOf(cur) + 1) % presets.length] ?? 10);
   }, []);
 
   // Open a new tab inside a specific group (before `beforeId`, else appended),
@@ -632,6 +808,10 @@ export default function App() {
     };
     const onKey = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
+      // Command palette (F6): Ctrl+Shift+P → commands, Ctrl+P → file jump. Checked
+      // first (and shift before non-shift) so they win over other Ctrl bindings.
+      if (e.ctrlKey && !e.altKey && e.shiftKey && k === "p") { e.preventDefault(); setPaletteMode("commands"); return; }
+      if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "p") { e.preventDefault(); setPaletteMode("files"); return; }
       if (e.ctrlKey && e.altKey && k === "b") { e.preventDefault(); setChatOpen((v) => !v); }
       else if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "b") { e.preventDefault(); setSidebarOpen((v) => !v); }
       else if (e.ctrlKey && k === "j") { e.preventDefault(); setPanelOpen((v) => !v); }
@@ -994,6 +1174,7 @@ export default function App() {
       items: [
         { label: "New Folder", onClick: () => getActiveRef()?.doNewFolder() },
         { label: "Rename", kbd: "F2", onClick: () => getActiveRef()?.doRename() },
+        { label: "Bulk Rename…", onClick: () => getActiveRef()?.doBulkRename() },
         { label: "Delete", kbd: "Del", onClick: () => getActiveRef()?.doDelete() },
         { separator: true },
         { label: "Cut", kbd: "Ctrl+X", onClick: () => getActiveRef()?.doCutFiles() },
@@ -1001,6 +1182,10 @@ export default function App() {
         { label: "Paste", kbd: "Ctrl+V", onClick: () => getActiveRef()?.doPaste() },
         { label: "Move to…", onClick: () => getActiveRef()?.doMoveTo() },
         { label: "Copy Path", onClick: () => getActiveRef()?.doCopyPath() },
+        { separator: true },
+        { label: "Compress to .zip…", onClick: () => getActiveRef()?.doCompress() },
+        { label: "Extract here", onClick: () => getActiveRef()?.doExtract() },
+        { label: "Copy checksum (SHA-256)", onClick: () => getActiveRef()?.doChecksum() },
         { separator: true },
         { label: "Filter…", onClick: () => getActiveRef()?.doOpenFilter() },
       ],
@@ -1019,6 +1204,9 @@ export default function App() {
         { label: "Configure Columns…", opensColumns: true },
         { separator: true },
         { label: "Dark Theme", checked: darkMode, onClick: handleToggleDark },
+        { separator: true },
+        { label: "Low-space Alerts", checked: lowSpaceAlerts, onClick: () => setLowSpaceAlerts((v) => !v) },
+        { label: `Low-space Threshold: ${lowSpaceThreshold}% free`, onClick: cycleLowSpaceThreshold },
         { separator: true },
         { label: "Treemap: Labels", checked: tmShowLabels, onClick: handleToggleTmLabels },
         { label: "Treemap: Hierarchy", checked: tmShowHierarchy, onClick: handleToggleTmHierarchy },
@@ -1053,6 +1241,7 @@ export default function App() {
     sidebarOpen, panelOpen, terminalOpen, chatOpen, previewOpen, detailsOpen, darkMode,
     tmShowLabels, tmShowHierarchy, tmShowLegend, navState.canBack, navState.canForward,
     statusData, tabs.length, focusedGroupId, focusedTabId,
+    lowSpaceAlerts, lowSpaceThreshold, cycleLowSpaceThreshold,
     handleOpenInNewTab, handleCloseTab, handleSaveSession, handleLoadSession,
     handleToggleTerminal, handleToggleChat, handleToggleDark, handleToggleSidebar,
     handleTogglePanel, handleTogglePreview, handleToggleDetails, handleToggleTmLabels,
@@ -1082,6 +1271,57 @@ export default function App() {
     handleNewAgentSession, handleToggleChat, handleToggleSidebar, handleTogglePanel,
     handleToggleDark, handleAbout, getActiveRef,
   ]);
+
+  // Curated command list for the palette's command mode (F6). Each `run` reads
+  // the focused pane live via getActiveRef so it acts on whatever tab is active
+  // when the command fires (the palette defers run() until after it closes).
+  const paletteCommands: PaletteCommand[] = useMemo(() => {
+    const views: { id: ViewId; label: string }[] = [
+      { id: "explorer", label: "Explorer" },
+      { id: "search", label: "Search" },
+      { id: "treemap", label: "Treemap" },
+      { id: "reports", label: "Reports" },
+      { id: "duplicates", label: "Duplicates" },
+      { id: "cleanup", label: "Cleanup" },
+      { id: "snapshots", label: "Snapshots" },
+      { id: "gallery", label: "Gallery" },
+      { id: "bookmarks", label: "Bookmarks" },
+      { id: "errors", label: "Problems" },
+    ];
+    return [
+      { id: "scan", title: "Scan", hint: "Tree", keywords: "rescan run", run: () => getActiveRef()?.doScan() },
+      { id: "refresh", title: "Refresh", hint: "Tree", keywords: "reload", run: () => getActiveRef()?.refresh() },
+      { id: "stop", title: "Stop Scan", hint: "Tree", keywords: "cancel", run: () => getActiveRef()?.doCancel() },
+      { id: "expand", title: "Expand All", keywords: "tree open", run: () => getActiveRef()?.doExpand(Infinity) },
+      { id: "collapse", title: "Collapse All", keywords: "tree close", run: () => getActiveRef()?.doExpand(0) },
+      { id: "new-folder", title: "New Folder", keywords: "create mkdir", run: () => getActiveRef()?.doNewFolder() },
+      { id: "bulk-rename", title: "Bulk Rename\u2026", keywords: "batch", run: () => getActiveRef()?.doBulkRename() },
+      { id: "compress", title: "Compress to .zip\u2026", keywords: "zip archive", run: () => getActiveRef()?.doCompress() },
+      { id: "extract", title: "Extract here", keywords: "unzip archive", run: () => getActiveRef()?.doExtract() },
+      { id: "checksum", title: "Copy checksum (SHA-256)", keywords: "hash sha md5 verify", run: () => getActiveRef()?.doChecksum() },
+      { id: "hidden", title: "Toggle Hidden Files", keywords: "dotfiles include", run: () => setIncludeHidden((v) => !v) },
+      { id: "terminal", title: "Open Terminal", hint: "Ctrl+`", keywords: "shell console", run: () => handleToggleTerminal() },
+      { id: "undo", title: "Undo Last Action", hint: "Ctrl+Z", keywords: "revert", run: () => { void handleUndo(); } },
+      {
+        id: "snapshot", title: "Save Snapshot", keywords: "capture baseline",
+        run: () => {
+          const p = getActiveRef()?.getScanPath();
+          if (!p) { toast.info("Scan a folder first, then save a snapshot."); return; }
+          saveSnapshot(p)
+            .then(() => toast.success("Snapshot saved."))
+            .catch((e) => toast.error(`Snapshot failed: ${e instanceof Error ? e.message : String(e)}`));
+        },
+      },
+      { id: "save-smart-folder", title: "Save Smart Folder\u2026", keywords: "search filter", run: () => { void handleSaveSmartFolder(); } },
+      { id: "sidebar", title: "Toggle Side Bar", hint: "Ctrl+B", keywords: "panel", run: () => handleToggleSidebar() },
+      { id: "assistant", title: "Toggle AI Assistant", hint: "Ctrl+Alt+B", keywords: "chat", run: () => handleToggleChat() },
+      { id: "low-space", title: "Toggle Low-space Alerts", keywords: "disk monitor", run: () => setLowSpaceAlerts((v) => !v) },
+      ...views.map((v) => ({
+        id: `view:${v.id}`, title: `Go to ${v.label}`, hint: "View", keywords: "switch open",
+        run: () => handleSelectView(v.id),
+      })),
+    ];
+  }, [getActiveRef, handleToggleTerminal, handleUndo, handleSaveSmartFolder, handleToggleSidebar, handleToggleChat, handleSelectView]);
 
   return (
     <div className="vscode">
@@ -1136,12 +1376,19 @@ export default function App() {
                 dupes={dupes}
                 searchQuery={searchQuery}
                 onSearchQueryChange={setSearchQuery}
+                tagEntries={tagEntries}
+                activeTagFilter={activeTagFilter}
+                onSelectTag={handleSelectTag}
+                smartFolders={smartFolders}
+                onApplySmartFolder={handleApplySmartFolder}
+                onSaveSmartFolder={handleSaveSmartFolder}
+                onDeleteSmartFolder={handleDeleteSmartFolder}
               />
             </div>
             <div className="resizer-x" onMouseDown={handleSidebarResize} />
           </>
         )}
-        <div className="workbench-tabs" style={activeView === "duplicates" || activeView === "reports" ? { display: "none" } : undefined}>
+        <div className="workbench-tabs" style={FULL_EDITOR_VIEWS.has(activeView) ? { display: "none" } : undefined}>
           {groups.map((group, gi) => {
             const isLast = gi === groups.length - 1;
             const isFocused = group.id === focusedGroupId;
@@ -1224,6 +1471,10 @@ export default function App() {
                         onWorkbenchChange={publishWorkbench}
                         onOpenFolderInTab={handleOpenFolderInTab}
                         onUndo={handleUndo}
+                        tagsByPath={tagsByPath}
+                        activeTagFilter={activeTagFilter}
+                        onSetTags={handleSetTags}
+                        onClearTagFilter={handleClearTagFilter}
                       />
                     );
                   })}
@@ -1245,6 +1496,30 @@ export default function App() {
           <div className="reports-editor">
             <LazyView>
               <WorkbenchReports store={workbenchStore} onAfterNavigate={handleReportsNavigate} />
+            </LazyView>
+          </div>
+        )}
+
+        {activeView === "cleanup" && (
+          <div className="cleanup-editor">
+            <LazyView>
+              <WorkbenchCleanup store={workbenchStore} />
+            </LazyView>
+          </div>
+        )}
+
+        {activeView === "snapshots" && (
+          <div className="snapshots-editor">
+            <LazyView>
+              <WorkbenchSnapshots store={workbenchStore} onAfterNavigate={handleReportsNavigate} />
+            </LazyView>
+          </div>
+        )}
+
+        {activeView === "gallery" && (
+          <div className="gallery-editor">
+            <LazyView>
+              <WorkbenchGallery store={workbenchStore} />
             </LazyView>
           </div>
         )}
@@ -1313,7 +1588,22 @@ export default function App() {
         />
       )}
 
-      <WorkbenchStatusBar store={workbenchStore} />
+      {/* Transfer manager (F10): floats just above the status bar; hides itself
+          when the move/copy queue is empty. */}
+      <TransfersPanel />
+
+      <WorkbenchStatusBar store={workbenchStore} onUndo={handleUndo} />
+
+      {/* Command palette (F6): a single overlay serving file-jump + commands. */}
+      {paletteMode && (
+        <CommandPalette
+          initialMode={paletteMode}
+          commands={paletteCommands}
+          nodeById={activeRef?.getNodeById() ?? EMPTY_NODE_MAP}
+          onNavigateFile={(id) => { setActiveView("explorer"); getActiveRef()?.doNavigateId(id); }}
+          onClose={() => setPaletteMode(null)}
+        />
+      )}
 
       {/* App-wide overlays: themed confirm/prompt modals + the toast stack. */}
       <DialogProvider />
@@ -1333,6 +1623,8 @@ export default function App() {
 function WorkbenchSideBar({
   store, view, drives, specialFolders, bookmarkList, onRemoveBookmark, dupes,
   searchQuery, onSearchQueryChange,
+  tagEntries, activeTagFilter, onSelectTag,
+  smartFolders, onApplySmartFolder, onSaveSmartFolder, onDeleteSmartFolder,
 }: {
   store: WorkbenchStore;
   view: ViewId;
@@ -1343,6 +1635,13 @@ function WorkbenchSideBar({
   dupes: DuplicatesController;
   searchQuery: string;
   onSearchQueryChange: (q: string) => void;
+  tagEntries: TagEntry[];
+  activeTagFilter: string | null;
+  onSelectTag: (tag: string | null) => void;
+  smartFolders: SmartFolder[];
+  onApplySmartFolder: (sf: SmartFolder) => void;
+  onSaveSmartFolder: () => void;
+  onDeleteSmartFolder: (id: string) => void;
 }) {
   const { sidebar: m } = useWorkbench(store);
   return (
@@ -1353,6 +1652,13 @@ function WorkbenchSideBar({
       unit={m.unit}
       searchQuery={searchQuery}
       onSearchQueryChange={onSearchQueryChange}
+      tagEntries={tagEntries}
+      activeTagFilter={activeTagFilter}
+      onSelectTag={onSelectTag}
+      smartFolders={smartFolders}
+      onApplySmartFolder={onApplySmartFolder}
+      onSaveSmartFolder={onSaveSmartFolder}
+      onDeleteSmartFolder={onDeleteSmartFolder}
       onNavigate={m.onNavigate}
       scanPath={m.scanPath}
       scanning={m.scanning}
@@ -1383,7 +1689,7 @@ function WorkbenchSideBar({
   );
 }
 
-function WorkbenchStatusBar({ store }: { store: WorkbenchStore }) {
+function WorkbenchStatusBar({ store, onUndo }: { store: WorkbenchStore; onUndo: () => void }) {
   const snap = useWorkbench(store);
   return (
     <StatusBar
@@ -1393,6 +1699,7 @@ function WorkbenchStatusBar({ store }: { store: WorkbenchStore }) {
       progressStore={snap.progressStore}
       visibleCount={snap.visibleCount}
       scanPath={snap.sidebar.scanPath}
+      onUndo={onUndo}
     />
   );
 }
@@ -1437,4 +1744,31 @@ function WorkbenchReports({ store, onAfterNavigate }: { store: WorkbenchStore; o
       onNavigate={(id) => { m.onNavigate(id); onAfterNavigate(); }}
     />
   );
+}
+
+// Disk Cleanup (roadmap #1): scans the focused pane's current scan root for
+// reclaimable space. Reads only scanPath from the workbench snapshot.
+function WorkbenchCleanup({ store }: { store: WorkbenchStore }) {
+  const { sidebar: m } = useWorkbench(store);
+  return <CleanupView scanPath={m.scanPath} />;
+}
+
+// Scan Snapshots + diff (roadmap #2): compares snapshots/the live scan. Reveal
+// jumps to the tree and flips back to the Explorer (like Reports).
+function WorkbenchSnapshots({ store, onAfterNavigate }: { store: WorkbenchStore; onAfterNavigate: () => void }) {
+  const { sidebar: m } = useWorkbench(store);
+  return (
+    <SnapshotsView
+      data={m.data}
+      nodeById={m.nodeById}
+      onNavigate={(id) => { m.onNavigate(id); onAfterNavigate(); }}
+    />
+  );
+}
+
+// Media gallery (roadmap #8): thumbnail grid over the focused pane's scan tree.
+// Selecting a cell reveals it in the tree but keeps the gallery open.
+function WorkbenchGallery({ store }: { store: WorkbenchStore }) {
+  const { sidebar: m } = useWorkbench(store);
+  return <GalleryView nodeById={m.nodeById} onNavigate={m.onNavigate} />;
 }
