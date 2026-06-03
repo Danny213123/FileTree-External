@@ -155,6 +155,10 @@ cd frontend && npm run dev
 
 Then open the URL printed by Vite (the Rust server must also be running on port 7878).
 
+## License
+
+FileTree is licensed under the PolyForm Noncommercial License 1.0.0. See [LICENSE](LICENSE).
+
 ## Notes
 
 Not affiliated with JAM Software or TreeSize. Independent Rust implementation.
