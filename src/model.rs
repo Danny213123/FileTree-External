@@ -350,6 +350,13 @@ pub(crate) struct AppState {
     pub(crate) scan_cache: Mutex<ScanCache>,
     /// Cached shell icon BMPs, keyed by lowercase extension (no dot).
     pub(crate) icon_cache: Mutex<HashMap<String, Vec<u8>>>,
+    /// Cached shell-generated thumbnail PNGs, keyed by
+    /// `"<normalized_lower_path>|<mtime_nanos>|<size>"`. The mtime+size token
+    /// means a file that is edited or replaced misses and regenerates instead of
+    /// serving a stale image. Bounded to ~512 entries with arbitrary-entry
+    /// eviction in `serve_thumbnail`, so repeated hovers skip the slow Windows
+    /// Shell thumbnail API. Mirrors `icon_cache`'s `Mutex<HashMap<…>>` style.
+    pub(crate) thumbnail_cache: Mutex<HashMap<String, Vec<u8>>>,
     pub(crate) dupes_progress: Arc<DupesProgress>,
     pub(crate) dupes_cancel: Arc<AtomicBool>,
     /// Read-dominated: consulted (read) on every duplicate scan to filter ignored

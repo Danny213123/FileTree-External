@@ -158,6 +158,16 @@ export default function App() {
 
   // VS Code workbench layout
   const [activeView, setActiveView] = useState<ViewId>("explorer");
+  // Activity-bar Search query, lifted to App so the sidebar Search input and the
+  // main-area results table (rendered inside each WorkspaceTab) share one source
+  // of truth. `searchQuery` updates per keystroke (controls the input);
+  // `debouncedSearchQuery` is what the heavy table matcher consumes.
+  const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearchQuery(searchQuery), 180);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(260);
   const [panelOpen, setPanelOpen] = useState(false);
@@ -271,6 +281,9 @@ export default function App() {
   }, []);
 
   const dupes = useDuplicatesController({ getScanResults, threads, defaultIncludeHidden: includeHidden });
+
+  // Bookmarked paths as a Set (for the inspector's folder-thumbnail picker).
+  const bookmarkSet = useMemo(() => new Set(bookmarkList), [bookmarkList]);
 
   // Ctrl+` toggle: open the terminal at the active tab's root, or hide it.
   const handleToggleTerminal = useCallback(() => {
@@ -1121,6 +1134,8 @@ export default function App() {
                 bookmarkList={bookmarkList}
                 onRemoveBookmark={handleToggleBookmark}
                 dupes={dupes}
+                searchQuery={searchQuery}
+                onSearchQueryChange={setSearchQuery}
               />
             </div>
             <div className="resizer-x" onMouseDown={handleSidebarResize} />
@@ -1177,6 +1192,7 @@ export default function App() {
                         active={visible}
                         onOpenTerminal={handleOpenTerminal}
                         activeView={activeView}
+                        searchQuery={debouncedSearchQuery}
                         toolbarVisible={!group.toolbarHidden}
                         darkMode={darkMode}
                         panelOpen={panelOpen}
@@ -1239,6 +1255,7 @@ export default function App() {
             <WorkbenchInspector
               store={workbenchStore}
               width={inspectorWidth}
+              bookmarks={bookmarkSet}
               showPreview={previewOpen}
               showDetails={detailsOpen}
               onClosePreview={() => setPreviewOpen(false)}
@@ -1315,6 +1332,7 @@ export default function App() {
 
 function WorkbenchSideBar({
   store, view, drives, specialFolders, bookmarkList, onRemoveBookmark, dupes,
+  searchQuery, onSearchQueryChange,
 }: {
   store: WorkbenchStore;
   view: ViewId;
@@ -1323,6 +1341,8 @@ function WorkbenchSideBar({
   bookmarkList: string[];
   onRemoveBookmark: (path: string) => void;
   dupes: DuplicatesController;
+  searchQuery: string;
+  onSearchQueryChange: (q: string) => void;
 }) {
   const { sidebar: m } = useWorkbench(store);
   return (
@@ -1331,6 +1351,8 @@ function WorkbenchSideBar({
       data={m.data}
       nodeById={m.nodeById}
       unit={m.unit}
+      searchQuery={searchQuery}
+      onSearchQueryChange={onSearchQueryChange}
       onNavigate={m.onNavigate}
       scanPath={m.scanPath}
       scanning={m.scanning}
@@ -1376,10 +1398,11 @@ function WorkbenchStatusBar({ store }: { store: WorkbenchStore }) {
 }
 
 function WorkbenchInspector({
-  store, width, showPreview, showDetails, onClosePreview, onCloseDetails,
+  store, width, bookmarks, showPreview, showDetails, onClosePreview, onCloseDetails,
 }: {
   store: WorkbenchStore;
   width: number;
+  bookmarks: Set<string>;
   showPreview: boolean;
   showDetails: boolean;
   onClosePreview: () => void;
@@ -1392,6 +1415,7 @@ function WorkbenchInspector({
       node={m.selectedNode}
       data={m.data}
       nodeById={m.nodeById}
+      bookmarks={bookmarks}
       unit={m.unit}
       showPreview={showPreview}
       showDetails={showDetails}

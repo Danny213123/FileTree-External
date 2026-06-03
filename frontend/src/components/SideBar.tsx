@@ -9,6 +9,7 @@ import { Icon } from "./Icon";
 import { DuplicatesConfigPanel } from "./DuplicatesConfigPanel";
 import { DriveCapacityBar } from "./DriveCapacityBar";
 import type { DuplicatesController } from "../hooks/useDuplicates";
+import { searchNodes } from "../lib/search";
 
 const VIEW_TITLES: Record<ViewId, string> = {
   explorer: "Explorer",
@@ -34,6 +35,10 @@ export interface SideBarProps {
   data: ScanResult | null;
   nodeById: Map<number, NodeRecord>;
   unit: Unit;
+  // search (activity-bar Search view): the input is controlled by App's lifted
+  // searchQuery so the sidebar list and the main-area results table stay in sync.
+  searchQuery: string;
+  onSearchQueryChange: (q: string) => void;
   onNavigate: (id: number) => void;
   // explorer: scan controls
   scanPath: string;
@@ -217,29 +222,21 @@ function ExplorerView(props: SideBarProps) {
 }
 
 function SearchView(props: SideBarProps) {
-  const [input, setInput] = useState("");
   const [query, setQuery] = useState("");
   const hasScan = props.data !== null;
 
-  // Debounce so we don't re-scan the node map on every keystroke.
+  // Input is controlled by App's lifted searchQuery; debounce a local copy so
+  // the shared matcher doesn't re-walk the node map on every keystroke.
   useEffect(() => {
-    const t = setTimeout(() => setQuery(input.trim().toLowerCase()), 180);
+    const t = setTimeout(() => setQuery(props.searchQuery.trim().toLowerCase()), 180);
     return () => clearTimeout(t);
-  }, [input]);
+  }, [props.searchQuery]);
 
-  const results = useMemo(() => {
-    if (query.length < 2) return [];
-    const out: NodeRecord[] = [];
-    for (const node of props.nodeById.values()) {
-      if (node.id < 0) continue; // skip aggregated bundles
-      if (node.name.toLowerCase().includes(query)) {
-        out.push(node);
-        if (out.length >= 1500) break;
-      }
-    }
-    out.sort((a, b) => b.size - a.size);
-    return out.slice(0, 300);
-  }, [query, props.nodeById]);
+  // Shared name+path matcher, sorted largest-first to mirror the main table.
+  const results = useMemo(
+    () => searchNodes(props.nodeById, query, "size", -1, 300),
+    [query, props.nodeById],
+  );
 
   return (
     <div className="sidebar-content search-view">
@@ -247,13 +244,13 @@ function SearchView(props: SideBarProps) {
         <span className="search-box-ico"><Icon name="search" size={13} /></span>
         <input
           autoFocus
-          value={input}
+          value={props.searchQuery}
           spellCheck={false}
           placeholder={hasScan ? "Search files and folders…" : "Run a scan first…"}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={(e) => props.onSearchQueryChange(e.target.value)}
         />
-        {input && (
-          <button className="search-clear" title="Clear" onClick={() => setInput("")}>
+        {props.searchQuery && (
+          <button className="search-clear" title="Clear" onClick={() => props.onSearchQueryChange("")}>
             <Icon name="x" size={12} />
           </button>
         )}

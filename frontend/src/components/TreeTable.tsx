@@ -8,6 +8,7 @@ import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
 import { eqPath, isNoOpMove } from "../lib/agent";
 import { attributeLetters, attributeList } from "../lib/attributes";
+import { pickFolderThumb, isImage, isVideo } from "../lib/thumbs";
 
 const ROW_HEIGHT = 23;
 // Smallest a column may be dragged to, so a header never collapses to nothing.
@@ -59,6 +60,10 @@ type MoveItemsResult = { ok: boolean; error?: string };
 
 interface TreeTableProps {
   rows: NodeRecord[];
+  /** Render rows as a FLAT list (used for search results): every row sits at
+   *  depth 0 with no expand twisty. All other behavior — sort, hover, context
+   *  menu, selection, drag, bookmark, rename — is identical to the tree. */
+  flat?: boolean;
   nodeById: Map<number, NodeRecord>;
   expanded: Set<number>;
   selectedId: number;
@@ -190,6 +195,7 @@ function RenameInput({
 
 function TreeTableInner({
   rows,
+  flat,
   nodeById,
   expanded,
   selectedId,
@@ -456,15 +462,33 @@ function TreeTableInner({
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [tooltip, setTooltip] = useState<{ node: NodeRecord; x: number; y: number } | null>(null);
+  const [tooltip, setTooltip] = useState<{ node: NodeRecord; x: number; y: number; thumbPath?: string } | null>(null);
+  // Memoized folder→representative-thumbnail cache so repeated hovers over the
+  // same folder don't re-walk its subtree. Cleared whenever the node map changes
+  // (new scan / merge / patch) so a stale path is never served.
+  const folderThumbCacheRef = useRef(new Map<number, string | null>());
+  useEffect(() => { folderThumbCacheRef.current.clear(); }, [nodeById]);
 
   const handleKindEnter = useCallback((node: NodeRecord, e: React.MouseEvent) => {
     if (node.id < 0) return; // skip bundles
     const x = e.clientX;
     const y = e.clientY;
+    // Resolve the thumbnail this row will show: a folder uses the largest
+    // bookmarked/any media beneath it; a media file uses its own path.
+    let thumbPath: string | undefined;
+    if (node.dir) {
+      thumbPath = pickFolderThumb(node.id, nodeById, bookmarks, folderThumbCacheRef.current) ?? undefined;
+    } else if (node.path && (isImage(node.extension ?? "") || isVideo(node.extension ?? ""))) {
+      thumbPath = node.path;
+    }
+    // Warm the image so its bytes are ready (decoded) by the time the card opens.
+    if (thumbPath) {
+      const img = new Image();
+      img.src = `/api/thumbnail?path=${encodeURIComponent(thumbPath)}`;
+    }
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
-    hoverTimerRef.current = setTimeout(() => setTooltip({ node, x, y }), 400);
-  }, []);
+    hoverTimerRef.current = setTimeout(() => setTooltip({ node, x, y, thumbPath }), 150);
+  }, [nodeById, bookmarks]);
 
   const handleKindLeave = useCallback(() => {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
@@ -679,9 +703,9 @@ function TreeTableInner({
             const barWidth  = rootVal > 0 ? (val / rootVal) * 100 : 0;
             const parentNode = node.parent != null ? nodeById.get(node.parent) : null;
             const parentSize = parentNode ? parentNode.size : node.size;
-            const hasKids   = node.children.length > 0;
+            const hasKids   = !flat && node.children.length > 0;
             const isOpen    = expanded.has(node.id);
-            const isDraggable = !isBundle && !!node.path;
+            const isDraggable = !isBundle && !!node.path && node.id !== renamingId;
             const isSelected = !isBundle && selectedIds.has(node.id);
             const isDropTarget = dropTargetId === node.id;
             return (
@@ -810,7 +834,9 @@ function TreeTableInner({
               >
                 <div
                   className="cell name-cell"
-                  style={{ "--depth": node.depth, "--bar-width": `${barWidth}%` } as React.CSSProperties}
+                  style={{ "--depth": flat ? 0 : node.depth, "--bar-width": `${barWidth}%` } as React.CSSProperties}
+                  onMouseEnter={(e) => handleKindEnter(node, e)}
+                  onMouseLeave={handleKindLeave}
                 >
                   {hasKids ? (
                     <button
@@ -826,8 +852,6 @@ function TreeTableInner({
                     ext={node.extension ?? ""}
                     isDir={node.dir}
                     isBundle={isBundle}
-                    onMouseEnter={(e) => handleKindEnter(node, e)}
-                    onMouseLeave={handleKindLeave}
                   />
                   {node.id === renamingId ? (
                     <RenameInput
@@ -863,6 +887,7 @@ function TreeTableInner({
           unit={unit}
           anchorX={tooltip.x}
           anchorY={tooltip.y}
+          thumbPath={tooltip.thumbPath}
         />
       )}
       {/* Persistent "Move to <folder>" pill that follows the cursor while a drag

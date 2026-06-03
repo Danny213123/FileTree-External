@@ -4,6 +4,26 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.5.0] - 2026-06-03
+
+### Added
+
+- **Search results as a real file table**: the activity-bar Search now renders matches in the main area using the same table as the tree (sortable columns, hover thumbnails, right-click shell context menu, multi-select, double-click to open, drag-to-move) via a new flat table mode, in addition to the existing sidebar results list.
+- **Folder thumbnails**: folders now show a representative thumbnail -- the largest bookmarked image/video inside the folder, or the largest image/video if none are bookmarked -- in the hover info card and the Inspector preview (folder rows keep their folder icon).
+
+### Changed
+
+- **Search matches name and path**: file/folder search now does a case-insensitive substring match against both the name and the full path (previously name-only), so path- and extension-oriented queries return the files you expect; the matcher is shared between the sidebar list and the main-area table.
+- **Toolbar filter surfaces files**: an active Filter (or advanced rules) now lists matching files, not just folders, and is expansion-independent (it descends into every directory, capped to keep very large trees responsive), so searching for a known file no longer returns zero results.
+- **Hover info on the whole name**: the thumbnail / file-info card now appears when hovering anywhere over the file/folder title, not only the icon, and no longer dismisses when the cursor moves between the icon and the name.
+- **Faster hover thumbnails**: the hover delay dropped from 400 ms to 150 ms, the thumbnail is prefetched on row hover, and the backend caches generated thumbnails in memory (keyed by path + modified-time + size, bounded to 512 entries) so repeat hovers skip the Windows Shell thumbnail API.
+
+### Fixed
+
+- **Rename text selection vs drag**: dragging the mouse to highlight text while renaming a file or folder no longer starts the file/folder move drag, so text can be selected normally in the rename field.
+
+---
+
 ## [1.4.0] - 2026-06-02
 
 ### Added

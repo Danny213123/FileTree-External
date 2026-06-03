@@ -178,6 +178,7 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
         last_scan: RwLock::new(None),
         scan_cache: Mutex::new(crate::model::ScanCache::new()),
         icon_cache: Mutex::new(std::collections::HashMap::new()),
+        thumbnail_cache: Mutex::new(std::collections::HashMap::new()),
         dupes_progress: Arc::new(DupesProgress::default()),
         dupes_cancel: Arc::new(AtomicBool::new(false)),
         ignore_list: RwLock::new(ignore_list),
@@ -1719,7 +1720,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             if !path_within_scan_root(&state, Path::new(path)) {
                 return respond_text(&mut stream, 403, "Forbidden", "Path is outside the scanned directories");
             }
-            serve_thumbnail(&mut stream, path)
+            serve_thumbnail(&mut stream, path, &state)
         }
         "/api/file-text" => {
             // Read-only, bounded UTF-8 text preview of a file (Details/Preview
@@ -2962,7 +2963,13 @@ fn deflate_store_zlib(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn serve_thumbnail(stream: &mut TcpStream, path: &str) -> sio::Result<()> {
+fn serve_thumbnail(stream: &mut TcpStream, path: &str, state: &AppState) -> sio::Result<()> {
+    // Server-side thumbnail cache cap. Generating a thumbnail round-trips through
+    // the (slow) Windows Shell API on a dedicated COM/STA thread, so we keep the
+    // results in `AppState.thumbnail_cache` to make repeated hovers instant. The
+    // cap bounds memory; eviction drops one arbitrary entry when full.
+    const THUMBNAIL_CACHE_CAP: usize = 512;
+
     let p = std::path::Path::new(path);
     let ext = p.extension()
         .and_then(|e| e.to_str())
@@ -2979,10 +2986,39 @@ fn serve_thumbnail(stream: &mut TcpStream, path: &str) -> sio::Result<()> {
     }
 
     if is_video || is_image {
-        // Use the Windows Shell thumbnail cache.
+        // Freshness-aware cache key: normalized lowercase path plus an mtime+size
+        // token so an edited/replaced file (which changes either) misses and is
+        // regenerated rather than served stale. If metadata can't be read we fall
+        // back to generating without caching (`cache_key` stays `None`).
+        let cache_key = std::fs::metadata(p).ok().map(|m| {
+            let size = m.len();
+            let mtime = m.modified().ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let norm = path.replace('\\', "/").to_ascii_lowercase();
+            format!("{norm}|{mtime}|{size}")
+        });
+
+        // Cache HIT: serve the stored PNG without touching the Shell API. The lock
+        // is held only long enough to clone the bytes out, then released.
+        if let Some(key) = &cache_key {
+            let hit = {
+                let cache = state.thumbnail_cache.lock().expect("thumbnail_cache poisoned");
+                cache.get(key).cloned()
+            };
+            if let Some(data) = hit {
+                eprintln!("[thumb-route] cache hit");
+                return respond_bytes(stream, 200, "OK", "image/png", &data,
+                    &[("Cache-Control", "private, max-age=300")]);
+            }
+        }
+
+        // MISS: generate via the Windows Shell thumbnail cache.
         // IShellItemImageFactory::GetImage requires a COM STA with a message pump.
         // Server connection threads are plain OS threads with no pump, so we
         // spawn a dedicated thread, join it, and return the PNG bytes (or 404).
+        // The cache lock is NOT held across this slow call.
         let path_owned = path.to_string();
         let png = std::thread::spawn(move || {
             #[cfg(windows)]
@@ -2992,8 +3028,23 @@ fn serve_thumbnail(stream: &mut TcpStream, path: &str) -> sio::Result<()> {
         }).join().ok().flatten();
 
         return match png {
-            Some(data) => respond_bytes(stream, 200, "OK", "image/png", &data,
-                &[("Cache-Control", "private, max-age=300")]),
+            Some(data) => {
+                // Cache the freshly generated PNG before responding. Briefly lock,
+                // evict one arbitrary entry if at capacity (unless we're refreshing
+                // an existing key), insert, then unlock. Only successes are cached;
+                // 404s are never cached so a transient failure can recover.
+                if let Some(key) = cache_key {
+                    let mut cache = state.thumbnail_cache.lock().expect("thumbnail_cache poisoned");
+                    if cache.len() >= THUMBNAIL_CACHE_CAP && !cache.contains_key(&key) {
+                        if let Some(victim) = cache.keys().next().cloned() {
+                            cache.remove(&victim);
+                        }
+                    }
+                    cache.insert(key, data.clone());
+                }
+                respond_bytes(stream, 200, "OK", "image/png", &data,
+                    &[("Cache-Control", "private, max-age=300")])
+            }
             None => respond_text(stream, 404, "Not Found", "Thumbnail unavailable"),
         };
     }

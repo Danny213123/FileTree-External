@@ -45,7 +45,7 @@ export interface UseTreeStateReturn extends TreeState {
   setNodes: (nodes: NodeRecord[]) => void;
 }
 
-function compareNodes(
+export function compareNodes(
   a: NodeRecord,
   b: NodeRecord,
   key: SortKey,
@@ -202,6 +202,12 @@ function buildDirCache(
   return { sortedDirs, bundles, sortedFiles };
 }
 
+// Cap on rows surfaced while a filter/rule set is active. Filtering descends
+// into every directory (ignoring expand state) and lists matching files inline,
+// so without a bound a huge tree could materialise hundreds of thousands of rows
+// — the very freeze the bundle system avoids in the normal (unfiltered) view.
+const FILTER_ROW_CAP = 5000;
+
 function collectVisibleRows(
   nodeById: Map<number, NodeRecord>,
   expanded: Set<number>,
@@ -228,6 +234,10 @@ function collectVisibleRows(
   // RegExps precompiled once), so a non-empty list means rule-mode is on.
   const hasActiveRules = compiledRules.length > 0;
   const hasSimpleFilter = !hasActiveRules && filter.length > 0;
+  // A filter or rule set is active. When so, the walk surfaces matching FILES
+  // inline (the bundle system is bypassed) and treats every directory as open,
+  // so deep matches show like a real filter rather than only matching folders.
+  const filtering = hasSimpleFilter || hasActiveRules;
   // Normalize the simple-filter needle ONCE per recompute instead of calling
   // filter.toLowerCase() for every node in passesFilter (the per-row hot path).
   const filterLower = hasSimpleFilter ? filter.toLowerCase() : "";
@@ -242,18 +252,24 @@ function collectVisibleRows(
   const stack: NodeRecord[] = [root];
 
   while (stack.length) {
+    // Filtering descends into every directory (below), so bound the total rows
+    // to avoid the large-tree freeze the bundle system normally guards against.
+    if (filtering && result.length >= FILTER_ROW_CAP) break;
+
     const node = stack.pop()!;
     const isBundle = node.id < 0;
 
     if (node.id !== 0 && !isBundle) {
       if (!showFiles && !node.dir) continue;
-      if ((hasActiveRules || hasSimpleFilter) && !passesFilter(node)) {
+      if (filtering && !passesFilter(node)) {
         if (!node.dir) continue;
       }
     }
     result.push(node);
 
-    if (!isOpen(node.id)) continue;
+    // While filtering, treat real directories as open so matches inside
+    // collapsed folders still surface; otherwise honor the expand/collapse state.
+    if (!(filtering && !isBundle && node.dir) && !isOpen(node.id)) continue;
 
     if (isBundle) {
       // Expanded bundle: look up pre-sorted file list from parent dir's cache
@@ -267,25 +283,41 @@ function collectVisibleRows(
       }
     } else {
       const dirs = cache.sortedDirs.get(node.id) ?? [];
-      const bundle = (!filter && showFiles) ? cache.bundles.get(node.id) : undefined;
-
-      // Push in reverse so first item ends up on top of stack
-      if (bundle) {
-        // Interleave bundle with dirs using cached sort order
-        // Build display list: dirs + optional bundle, already sorted dirs
-        // Bundle participates in sort — find its insertion point
-        let bundleInserted = false;
-        for (let i = dirs.length - 1; i >= 0; i--) {
-          if (!bundleInserted && compareNodes(bundle, dirs[i], "size", -1) > 0) {
-            stack.push(bundle);
-            bundleInserted = true;
+      if (filtering) {
+        // Surface this directory's matching files inline (depth+1) — the bundle
+        // system is bypassed so individual matches are visible — then queue every
+        // subdirectory so the walk keeps descending the whole subtree.
+        const files = cache.sortedFiles.get(node.id);
+        if (files) {
+          for (const f of files) {
+            if (result.length >= FILTER_ROW_CAP) break;
+            if (passesFilter(f)) result.push({ ...f, depth: node.depth + 1 });
           }
+        }
+        for (let i = dirs.length - 1; i >= 0; i--) {
           stack.push(dirs[i]);
         }
-        if (!bundleInserted) stack.push(bundle);
       } else {
-        for (let i = dirs.length - 1; i >= 0; i--) {
-          stack.push(dirs[i]);
+        const bundle = (!filter && showFiles) ? cache.bundles.get(node.id) : undefined;
+
+        // Push in reverse so first item ends up on top of stack
+        if (bundle) {
+          // Interleave bundle with dirs using cached sort order
+          // Build display list: dirs + optional bundle, already sorted dirs
+          // Bundle participates in sort — find its insertion point
+          let bundleInserted = false;
+          for (let i = dirs.length - 1; i >= 0; i--) {
+            if (!bundleInserted && compareNodes(bundle, dirs[i], "size", -1) > 0) {
+              stack.push(bundle);
+              bundleInserted = true;
+            }
+            stack.push(dirs[i]);
+          }
+          if (!bundleInserted) stack.push(bundle);
+        } else {
+          for (let i = dirs.length - 1; i >= 0; i--) {
+            stack.push(dirs[i]);
+          }
         }
       }
     }
