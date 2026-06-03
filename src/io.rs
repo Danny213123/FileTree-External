@@ -3,6 +3,7 @@ use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -100,6 +101,80 @@ pub(crate) fn default_thread_count() -> usize {
         .map(|count| count.get())
         .unwrap_or(4)
         .clamp(2, 32)
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Global scan-thread budget
+//
+// Each full-tree scan spawns ~`default_thread_count()` workers. Without a gate,
+// K simultaneous scans (e.g. several tabs refreshing, or a tree scan racing a
+// duplicate scan) would spawn K×threads and oversubscribe the CPU, so every scan
+// runs slower. This counting gate caps the TOTAL number of live scan workers at
+// the logical-core count: a lone scan still gets all of its requested threads,
+// but concurrent scans share the pool and briefly queue for permits instead of
+// thrashing. It is a soft pool (no threads are pre-spawned) — just an admission
+// budget acquired up front and released (RAII) once a scan's workers have joined.
+// ──────────────────────────────────────────────────────────────────
+
+fn scan_thread_budget() -> usize {
+    thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+        .clamp(2, 64)
+}
+
+struct ScanGate {
+    available: Mutex<usize>,
+    ready: Condvar,
+}
+
+fn scan_gate() -> &'static ScanGate {
+    static GATE: OnceLock<ScanGate> = OnceLock::new();
+    GATE.get_or_init(|| ScanGate {
+        available: Mutex::new(scan_thread_budget()),
+        ready: Condvar::new(),
+    })
+}
+
+/// RAII permit that returns its reserved thread slots to the global scan budget
+/// when dropped. Hold it for the lifetime of a scan's worker threads.
+pub(crate) struct ScanThreadPermit {
+    count: usize,
+}
+
+impl ScanThreadPermit {
+    /// Worker-thread count this scan is cleared to spawn (its clamped request —
+    /// never more than the whole budget).
+    pub(crate) fn threads(&self) -> usize {
+        self.count
+    }
+}
+
+impl Drop for ScanThreadPermit {
+    fn drop(&mut self) {
+        let gate = scan_gate();
+        let mut available = gate.available.lock().expect("scan gate poisoned");
+        *available += self.count;
+        // A waiting scan may now have enough slots, so wake all and let each
+        // re-check its own `want` under the lock.
+        gate.ready.notify_all();
+    }
+}
+
+/// Reserve up to `requested` worker-thread slots from the global scan budget,
+/// blocking until that many are free. A single scan never needs more than the
+/// whole budget (the request is clamped to it), so the all-or-nothing reservation
+/// cannot deadlock: every scan acquires exactly once, up front, and releases on
+/// drop, so the budget is always eventually replenished.
+pub(crate) fn acquire_scan_threads(requested: usize) -> ScanThreadPermit {
+    let want = requested.clamp(1, scan_thread_budget());
+    let gate = scan_gate();
+    let mut available = gate.available.lock().expect("scan gate poisoned");
+    while *available < want {
+        available = gate.ready.wait(available).expect("scan gate poisoned");
+    }
+    *available -= want;
+    ScanThreadPermit { count: want }
 }
 
 pub(crate) fn option_value(args: &[String], name: &str) -> Option<String> {

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, createRef, Fragment, lazy } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef, createRef, Fragment, lazy } from "react";
 import {
   fetchConfig,
   fetchDrives,
@@ -10,7 +10,8 @@ import {
 } from "./api/client";
 import type { AppSettings } from "./api/client";
 import type { DriveEntry, SpecialFolder, SortKey, Unit, ScanResult } from "./api/types";
-import { useDuplicatesController } from "./hooks/useDuplicates";
+import { useDuplicatesController, type DuplicatesController } from "./hooks/useDuplicates";
+import { createWorkbenchStore, useWorkbench, type WorkbenchStore, type WorkbenchSnapshot } from "./hooks/useWorkbench";
 import { DEFAULT_VISIBLE_COLUMNS } from "./components/TreeTable";
 import { pushRecent, loadRecentPaths, setRecentPaths } from "./components/RibbonBar";
 import { StatusBar } from "./components/StatusBar";
@@ -107,6 +108,29 @@ const EMPTY_SIDEBAR_MODEL: SidebarModel = {
   onScanPath: NOOP,
 };
 
+// Snapshot used before any pane has published (and as the focused-pane fallback).
+const EMPTY_WORKBENCH_SNAPSHOT: WorkbenchSnapshot = {
+  sidebar: EMPTY_SIDEBAR_MODEL,
+  status: "idle",
+  errorMessage: "",
+  visibleCount: 0,
+  progressStore: null,
+};
+
+// Pulls the focused pane's current sidebar/status into a fresh snapshot object.
+// A new object every call is intentional: useSyncExternalStore compares by
+// reference, so each publish (a real state change) re-renders the subscribers.
+function buildWorkbenchSnapshot(ref: WorkspaceTabHandle | null): WorkbenchSnapshot {
+  if (!ref) return EMPTY_WORKBENCH_SNAPSHOT;
+  return {
+    sidebar: ref.getSidebarModel(),
+    status: ref.getStatus(),
+    errorMessage: ref.getErrorMessage(),
+    visibleCount: ref.getVisibleCount(),
+    progressStore: ref.getProgressStore(),
+  };
+}
+
 export default function App() {
   const [threads, setThreads] = useState(8);
   const [exclude, setExclude] = useState("");
@@ -174,15 +198,37 @@ export default function App() {
   useEffect(() => { groupsRef.current = groups; }, [groups]);
   useEffect(() => { focusedGroupIdRef.current = focusedGroupId; }, [focusedGroupId]);
 
-  // Re-render trigger when the active tab's state changes (status bar / labels).
-  // Throttled (leading + trailing, ~120ms): scan-progress storms from every tab
-  // would otherwise fire ~30x/sec each and re-render App constantly. The leading
-  // edge keeps single user actions instant; the guaranteed trailing call lets
-  // end-of-scan counts settle.
-  const [, setTick] = useState(0);
+  // Shared workbench store (mirrors useScan's ProgressStore): the focused pane
+  // publishes its sidebar + status snapshot here on every tree / selection /
+  // scan change, and only the subscribing leaves (side bar, status bar,
+  // inspector, reports) re-render. App itself no longer re-renders on
+  // expand / collapse / filter / select — just on scan + layout changes.
+  const workbenchStoreRef = useRef<WorkbenchStore>();
+  if (!workbenchStoreRef.current) workbenchStoreRef.current = createWorkbenchStore(EMPTY_WORKBENCH_SNAPSHOT);
+  const workbenchStore = workbenchStoreRef.current;
+
+  // Stable publisher: reads the CURRENT focused pane via the live refs synced
+  // above and writes its snapshot to the store. Stable identity so it can be
+  // handed to every pane without churning their memoized props.
+  const publishWorkbench = useCallback(() => {
+    const gs = groupsRef.current;
+    const group = gs.find((g) => g.id === focusedGroupIdRef.current) ?? gs[0];
+    const tab = group ? tabsRef.current.find((t) => t.id === group.activeTabId) : undefined;
+    workbenchStore.set(buildWorkbenchSnapshot(tab?.ref.current ?? null));
+  }, [workbenchStore]);
+
+  // Re-render trigger when the active tab's SHELL state changes (tab labels /
+  // scan status / menus). Now only the data/status/path effects call this, so
+  // it fires at scan frequency — not on every expand/filter. Throttled (leading
+  // + trailing, ~120ms): the leading edge keeps single user actions instant;
+  // the guaranteed trailing call lets end-of-scan counts settle. Always
+  // publishes the focused-pane snapshot too, so the side bar / status bar stay
+  // current the instant a scan lands.
+  const [tick, setTick] = useState(0);
   const notifyLastRef = useRef(0);
   const notifyTimerRef = useRef<number | null>(null);
   const notifyState = useCallback(() => {
+    publishWorkbench();
     const now = Date.now();
     const elapsed = now - notifyLastRef.current;
     if (elapsed >= 120) {
@@ -195,7 +241,7 @@ export default function App() {
         setTick((n) => n + 1);
       }, 120 - elapsed);
     }
-  }, []);
+  }, [publishWorkbench]);
 
   // The "active tab" is the active tab of the FOCUSED group, so the status bar,
   // chat, title-bar menus and keybindings all follow the pane the user last
@@ -205,6 +251,15 @@ export default function App() {
     const tab = group ? tabs.find((t) => t.id === group.activeTabId) : undefined;
     return tab?.ref.current ?? null;
   }, [tabs, groups, focusedGroupId]);
+
+  // Keep the workbench store pointed at the focused pane: republish synchronously
+  // (before paint) whenever the focused-tab identity changes (focus switch, tab
+  // open / close / move), so the shared side bar / status bar reflect the new
+  // pane with no stale frame. getActiveRef changes identity exactly on those
+  // edits; reading it here sees the freshly-committed tab refs.
+  useLayoutEffect(() => {
+    workbenchStore.set(buildWorkbenchSnapshot(getActiveRef()));
+  }, [getActiveRef, workbenchStore]);
 
   // Every open tab's in-memory scan — the Duplicates page aggregates these (plus
   // the client scanCache) before walking any uncached target, so already-scanned
@@ -315,6 +370,22 @@ export default function App() {
       return next;
     });
   }, []);
+
+  // Stable menu/title-bar toggle handlers — extracted so the memoized `menus`/
+  // `optionsMenu` arrays (and the TitleBar props) keep stable callback identities
+  // instead of allocating fresh closures on every render.
+  const handleToggleSidebar = useCallback(() => setSidebarOpen((v) => !v), []);
+  const handleTogglePanel = useCallback(() => setPanelOpen((v) => !v), []);
+  const handleTogglePreview = useCallback(() => setPreviewOpen((v) => !v), []);
+  const handleToggleDetails = useCallback(() => setDetailsOpen((v) => !v), []);
+  const handleToggleTmLabels = useCallback(() => setTmShowLabels((v) => !v), []);
+  const handleToggleTmHierarchy = useCallback(() => setTmShowHierarchy((v) => !v), []);
+  const handleToggleTmLegend = useCallback(() => setTmShowLegend((v) => !v), []);
+  const handleOpenSchedule = useCallback(() => setScheduleOpen(true), []);
+  const handleAbout = useCallback(
+    () => window.alert("FileTree — a fast disk-usage analyzer with a built-in local-AI assistant."),
+    [],
+  );
 
   useEffect(() => {
     document.documentElement.dataset.theme = darkMode ? "dark" : "light";
@@ -754,6 +825,11 @@ export default function App() {
     setSidebarOpen(true);
   }, []);
 
+  // Reports → "open in Explorer": the WorkbenchReports wrapper performs the
+  // actual tree navigation off the focused pane's snapshot; App just flips back
+  // to the Explorer view afterward. Stable so the wrapper's props don't churn.
+  const handleReportsNavigate = useCallback(() => setActiveView("explorer"), []);
+
   // Drag the divider on the right edge of the shared Explorer side bar. The
   // side bar is a single left panel (hoisted out of the editor groups), so this
   // lives in App alongside sidebarWidth.
@@ -846,36 +922,39 @@ export default function App() {
     window.addEventListener("mouseup", onUp);
   }, [terminalHeight]);
 
-  // Editor-tab metadata (label/path/scanning) per tab, rebuilt from live refs
-  // each render and looked up per group in the split layout below.
-  const metaById = new Map<string, WorkspaceTabMeta>(tabs.map((t) => {
+  // Editor-tab metadata (label/path/scanning) per tab, derived from the live
+  // refs and looked up per group in the split layout below. Memoized on `tabs`
+  // plus the throttled `tick` (bumped by notifyState whenever a pane's scan
+  // path/scanning/tree changes), so it's rebuilt only when those real inputs
+  // move rather than on every unrelated App render.
+  const metaById = useMemo(() => new Map<string, WorkspaceTabMeta>(tabs.map((t) => {
     const handle = t.ref.current;
     const path = handle?.getScanPath() ?? t.initialPath;
     const label = path ? path.split(/[/\\]/).filter(Boolean).pop() ?? path : "New tab";
     return [t.id, { id: t.id, label, path, scanning: handle?.getScanning() ?? false }];
-  }));
+  })),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [tabs, tick]);
 
   const focusedGroup = groups.find((g) => g.id === focusedGroupId) ?? groups[0];
   const focusedTabId = focusedGroup?.activeTabId ?? "";
 
   const activeRef = getActiveRef();
-  // The shared Explorer side bar is driven by the focused group's active tab.
-  const sidebarModel = activeRef?.getSidebarModel() ?? EMPTY_SIDEBAR_MODEL;
+  // The shared Explorer side bar, status bar, inspector and reports view are
+  // driven by the focused pane's WORKBENCH STORE (subscribed inside the
+  // Workbench* wrappers below) rather than read here — so they re-render on
+  // tree/selection changes without re-rendering App. App still reads the few
+  // SHELL-level bits it needs (export menu enablement, nav arrows, error badge),
+  // which only move at scan frequency.
   const statusData = activeRef?.getData() ?? null;
-  const statusStatus = activeRef?.getStatus() ?? "idle";
-  const statusError = activeRef?.getErrorMessage() ?? "";
-  // Pass the focused pane's progress STORE (stable per tab) to the status bar so
-  // its counter subscribes and re-renders alone on scan ticks — App itself no
-  // longer re-renders per tick (progress was removed from the notify path).
-  const statusProgressStore = activeRef?.getProgressStore() ?? null;
-  const statusVisible = activeRef?.getVisibleCount() ?? 0;
+  const shellErrorCount = statusData?.errorCount ?? 0;
   const navState = activeRef?.getNavState() ?? { canBack: false, canForward: false };
   const activeLabel = metaById.get(focusedTabId)?.label ?? "FileTree";
   const focusedTabIndex = focusedGroup ? focusedGroup.tabIds.indexOf(focusedTabId) : -1;
   const canPrevTab = focusedTabIndex > 0;
   const canNextTab = !!focusedGroup && focusedTabIndex >= 0 && focusedTabIndex < focusedGroup.tabIds.length - 1;
 
-  const menus: Menu[] = [
+  const menus: Menu[] = useMemo(() => [
     {
       label: "File",
       items: [
@@ -892,7 +971,7 @@ export default function App() {
         { label: "Export ▸ CSV", onClick: () => getActiveRef()?.doExport("csv"), disabled: !statusData },
         { label: "Export ▸ JSON", onClick: () => getActiveRef()?.doExport("json"), disabled: !statusData },
         { separator: true },
-        { label: "Scheduled Scans…", onClick: () => setScheduleOpen(true) },
+        { label: "Scheduled Scans…", onClick: handleOpenSchedule },
         { separator: true },
         { label: "Exit", onClick: () => window.close() },
       ],
@@ -916,21 +995,21 @@ export default function App() {
     {
       label: "View",
       items: [
-        { label: "Toggle Side Bar", kbd: "Ctrl+B", checked: sidebarOpen, onClick: () => setSidebarOpen((v) => !v) },
-        { label: "Toggle Panel", kbd: "Ctrl+J", checked: panelOpen, onClick: () => setPanelOpen((v) => !v) },
+        { label: "Toggle Side Bar", kbd: "Ctrl+B", checked: sidebarOpen, onClick: handleToggleSidebar },
+        { label: "Toggle Panel", kbd: "Ctrl+J", checked: panelOpen, onClick: handleTogglePanel },
         { label: "Toggle Terminal", kbd: "Ctrl+`", checked: terminalOpen, onClick: handleToggleTerminal },
-        { label: "Toggle AI Assistant", kbd: "Ctrl+Alt+B", checked: chatOpen, onClick: () => setChatOpen((v) => !v) },
+        { label: "Toggle AI Assistant", kbd: "Ctrl+Alt+B", checked: chatOpen, onClick: handleToggleChat },
         { separator: true },
-        { label: "Preview Pane", kbd: "Alt+P", checked: previewOpen, onClick: () => setPreviewOpen((v) => !v) },
-        { label: "Details Pane", kbd: "Alt+Shift+P", checked: detailsOpen, onClick: () => setDetailsOpen((v) => !v) },
+        { label: "Preview Pane", kbd: "Alt+P", checked: previewOpen, onClick: handleTogglePreview },
+        { label: "Details Pane", kbd: "Alt+Shift+P", checked: detailsOpen, onClick: handleToggleDetails },
         { separator: true },
         { label: "Configure Columns…", opensColumns: true },
         { separator: true },
         { label: "Dark Theme", checked: darkMode, onClick: handleToggleDark },
         { separator: true },
-        { label: "Treemap: Labels", checked: tmShowLabels, onClick: () => setTmShowLabels((v) => !v) },
-        { label: "Treemap: Hierarchy", checked: tmShowHierarchy, onClick: () => setTmShowHierarchy((v) => !v) },
-        { label: "Treemap: Legend", checked: tmShowLegend, onClick: () => setTmShowLegend((v) => !v) },
+        { label: "Treemap: Labels", checked: tmShowLabels, onClick: handleToggleTmLabels },
+        { label: "Treemap: Hierarchy", checked: tmShowHierarchy, onClick: handleToggleTmHierarchy },
+        { label: "Treemap: Legend", checked: tmShowLegend, onClick: handleToggleTmLegend },
         { separator: true },
         { label: "Expand All", onClick: () => getActiveRef()?.doExpand(Infinity) },
         { label: "Collapse All", onClick: () => getActiveRef()?.doExpand(0) },
@@ -951,18 +1030,29 @@ export default function App() {
     {
       label: "Help",
       items: [
-        { label: "About FileTree", onClick: () => window.alert("FileTree — a fast disk-usage analyzer with a built-in local-AI assistant.") },
+        { label: "About FileTree", onClick: handleAbout },
       ],
     },
-  ];
+  ],
+  // getActiveRef / the extracted toggle handlers are stable; the array rebuilds
+  // only when a checked/disabled input or the focused tab changes.
+  [
+    sidebarOpen, panelOpen, terminalOpen, chatOpen, previewOpen, detailsOpen, darkMode,
+    tmShowLabels, tmShowHierarchy, tmShowLegend, navState.canBack, navState.canForward,
+    statusData, tabs.length, focusedGroupId, focusedTabId,
+    handleOpenInNewTab, handleCloseTab, handleSaveSession, handleLoadSession,
+    handleToggleTerminal, handleToggleChat, handleToggleDark, handleToggleSidebar,
+    handleTogglePanel, handleTogglePreview, handleToggleDetails, handleToggleTmLabels,
+    handleToggleTmHierarchy, handleToggleTmLegend, handleOpenSchedule, handleAbout, getActiveRef,
+  ]);
 
   // Overflow menu for the right-hand "⋯" control in the title bar.
-  const optionsMenu: MenuItem[] = [
+  const optionsMenu: MenuItem[] = useMemo(() => [
     { label: "New Agent Session", onClick: handleNewAgentSession },
     { label: chatOpen ? "Hide AI Assistant" : "Open AI Assistant", onClick: handleToggleChat },
     { separator: true },
-    { label: "Toggle Side Bar", kbd: "Ctrl+B", checked: sidebarOpen, onClick: () => setSidebarOpen((v) => !v) },
-    { label: "Toggle Treemap Panel", kbd: "Ctrl+J", checked: panelOpen, onClick: () => setPanelOpen((v) => !v) },
+    { label: "Toggle Side Bar", kbd: "Ctrl+B", checked: sidebarOpen, onClick: handleToggleSidebar },
+    { label: "Toggle Treemap Panel", kbd: "Ctrl+J", checked: panelOpen, onClick: handleTogglePanel },
     { separator: true },
     { label: "Dark Theme", checked: darkMode, onClick: handleToggleDark },
     { separator: true },
@@ -972,8 +1062,13 @@ export default function App() {
     { label: "Export ▸ XML", onClick: () => getActiveRef()?.doExport("xml"), disabled: !statusData },
     { label: "Export ▸ CSV", onClick: () => getActiveRef()?.doExport("csv"), disabled: !statusData },
     { label: "Export ▸ JSON", onClick: () => getActiveRef()?.doExport("json"), disabled: !statusData },
-    { label: "About FileTree", onClick: () => window.alert("FileTree — a fast disk-usage analyzer with a built-in local-AI assistant.") },
-  ];
+    { label: "About FileTree", onClick: handleAbout },
+  ],
+  [
+    chatOpen, sidebarOpen, panelOpen, darkMode, statusData,
+    handleNewAgentSession, handleToggleChat, handleToggleSidebar, handleTogglePanel,
+    handleToggleDark, handleAbout, getActiveRef,
+  ]);
 
   return (
     <div className="vscode">
@@ -1014,39 +1109,16 @@ export default function App() {
                 sidebarOpen={sidebarOpen}
                 onSelect={handleSelectView}
                 bookmarkCount={bookmarkList.length}
-                errorCount={sidebarModel.errorCount}
+                errorCount={shellErrorCount}
                 darkMode={darkMode}
                 onToggleTheme={handleToggleDark}
               />
-              <SideBar
+              <WorkbenchSideBar
+                store={workbenchStore}
                 view={activeView}
-                data={sidebarModel.data}
-                nodeById={sidebarModel.nodeById}
-                unit={sidebarModel.unit}
-                onNavigate={sidebarModel.onNavigate}
-                scanPath={sidebarModel.scanPath}
-                scanning={sidebarModel.scanning}
-                onScanPathInput={sidebarModel.onScanPathInput}
-                onScan={sidebarModel.onScan}
-                onCancel={sidebarModel.onCancel}
-                onRefresh={sidebarModel.onRefresh}
-                onUp={sidebarModel.onUp}
-                onNewFolder={sidebarModel.onNewFolder}
-                onCollapseAll={sidebarModel.onCollapseAll}
                 drives={drives}
                 specialFolders={specialFolders}
                 bookmarkList={bookmarkList}
-                onOpenLocation={sidebarModel.onOpenLocation}
-                treeRows={sidebarModel.treeRows}
-                expanded={sidebarModel.expanded}
-                selectedId={sidebarModel.selectedId}
-                onToggleExpand={sidebarModel.onToggleExpand}
-                onSelectFolder={sidebarModel.onSelectFolder}
-                selectedNode={sidebarModel.selectedNode}
-                onOpen={sidebarModel.onOpen}
-                onReveal={sidebarModel.onReveal}
-                onCopyPath={sidebarModel.onCopyPath}
-                onScanPath={sidebarModel.onScanPath}
                 onRemoveBookmark={handleToggleBookmark}
                 dupes={dupes}
               />
@@ -1133,6 +1205,7 @@ export default function App() {
                         onToggleBookmark={handleToggleBookmark}
                         onScanPath={handleScanPath}
                         onStateChange={notifyState}
+                        onWorkbenchChange={publishWorkbench}
                         onOpenFolderInTab={handleOpenFolderInTab}
                         onUndo={handleUndo}
                       />
@@ -1155,11 +1228,7 @@ export default function App() {
         {activeView === "reports" && (
           <div className="reports-editor">
             <LazyView>
-              <ReportsView
-                data={sidebarModel.data}
-                nodeById={sidebarModel.nodeById}
-                onNavigate={(id) => { sidebarModel.onNavigate(id); setActiveView("explorer"); }}
-              />
+              <WorkbenchReports store={workbenchStore} onAfterNavigate={handleReportsNavigate} />
             </LazyView>
           </div>
         )}
@@ -1167,19 +1236,13 @@ export default function App() {
         {(previewOpen || detailsOpen) && (
           <>
             <div className="resizer-x" onMouseDown={handleInspectorResize} />
-            <InspectorPane
+            <WorkbenchInspector
+              store={workbenchStore}
               width={inspectorWidth}
-              node={sidebarModel.selectedNode}
-              data={sidebarModel.data}
-              nodeById={sidebarModel.nodeById}
-              unit={sidebarModel.unit}
               showPreview={previewOpen}
               showDetails={detailsOpen}
               onClosePreview={() => setPreviewOpen(false)}
               onCloseDetails={() => setDetailsOpen(false)}
-              onOpen={sidebarModel.onOpen}
-              onReveal={sidebarModel.onReveal}
-              onCopyPath={sidebarModel.onCopyPath}
             />
           </>
         )}
@@ -1233,18 +1296,121 @@ export default function App() {
         />
       )}
 
-      <StatusBar
-        scanResult={statusData}
-        status={statusStatus}
-        errorMessage={statusError}
-        progressStore={statusProgressStore}
-        visibleCount={statusVisible}
-        scanPath={activeRef?.getScanPath() ?? ""}
-      />
+      <WorkbenchStatusBar store={workbenchStore} />
 
       {/* App-wide overlays: themed confirm/prompt modals + the toast stack. */}
       <DialogProvider />
       <ToastProvider />
     </div>
+  );
+}
+
+// ── Workbench store consumers ────────────────────────────────────────────────
+// Thin wrappers that subscribe to the focused pane's snapshot and feed the
+// shared, tree-driven UI. They re-render on tree / selection / scan changes
+// (the only thing the store publishes) WITHOUT re-rendering App, so expand /
+// collapse / filter / select no longer cascade through the title bar, menus and
+// tab bar. The non-tree props (view, drives, widths, toggles) still flow from
+// App and only change when App itself re-renders.
+
+function WorkbenchSideBar({
+  store, view, drives, specialFolders, bookmarkList, onRemoveBookmark, dupes,
+}: {
+  store: WorkbenchStore;
+  view: ViewId;
+  drives: DriveEntry[];
+  specialFolders: SpecialFolder[];
+  bookmarkList: string[];
+  onRemoveBookmark: (path: string) => void;
+  dupes: DuplicatesController;
+}) {
+  const { sidebar: m } = useWorkbench(store);
+  return (
+    <SideBar
+      view={view}
+      data={m.data}
+      nodeById={m.nodeById}
+      unit={m.unit}
+      onNavigate={m.onNavigate}
+      scanPath={m.scanPath}
+      scanning={m.scanning}
+      onScanPathInput={m.onScanPathInput}
+      onScan={m.onScan}
+      onCancel={m.onCancel}
+      onRefresh={m.onRefresh}
+      onUp={m.onUp}
+      onNewFolder={m.onNewFolder}
+      onCollapseAll={m.onCollapseAll}
+      drives={drives}
+      specialFolders={specialFolders}
+      bookmarkList={bookmarkList}
+      onOpenLocation={m.onOpenLocation}
+      treeRows={m.treeRows}
+      expanded={m.expanded}
+      selectedId={m.selectedId}
+      onToggleExpand={m.onToggleExpand}
+      onSelectFolder={m.onSelectFolder}
+      selectedNode={m.selectedNode}
+      onOpen={m.onOpen}
+      onReveal={m.onReveal}
+      onCopyPath={m.onCopyPath}
+      onScanPath={m.onScanPath}
+      onRemoveBookmark={onRemoveBookmark}
+      dupes={dupes}
+    />
+  );
+}
+
+function WorkbenchStatusBar({ store }: { store: WorkbenchStore }) {
+  const snap = useWorkbench(store);
+  return (
+    <StatusBar
+      scanResult={snap.sidebar.data}
+      status={snap.status}
+      errorMessage={snap.errorMessage}
+      progressStore={snap.progressStore}
+      visibleCount={snap.visibleCount}
+      scanPath={snap.sidebar.scanPath}
+    />
+  );
+}
+
+function WorkbenchInspector({
+  store, width, showPreview, showDetails, onClosePreview, onCloseDetails,
+}: {
+  store: WorkbenchStore;
+  width: number;
+  showPreview: boolean;
+  showDetails: boolean;
+  onClosePreview: () => void;
+  onCloseDetails: () => void;
+}) {
+  const { sidebar: m } = useWorkbench(store);
+  return (
+    <InspectorPane
+      width={width}
+      node={m.selectedNode}
+      data={m.data}
+      nodeById={m.nodeById}
+      unit={m.unit}
+      showPreview={showPreview}
+      showDetails={showDetails}
+      onClosePreview={onClosePreview}
+      onCloseDetails={onCloseDetails}
+      onOpen={m.onOpen}
+      onReveal={m.onReveal}
+      onCopyPath={m.onCopyPath}
+    />
+  );
+}
+
+function WorkbenchReports({ store, onAfterNavigate }: { store: WorkbenchStore; onAfterNavigate: () => void }) {
+  const { sidebar: m } = useWorkbench(store);
+  return (
+    <ReportsView
+      data={m.data}
+      nodeById={m.nodeById}
+      onNavigate={(id) => { m.onNavigate(id); onAfterNavigate(); }}
+    />
   );
 }

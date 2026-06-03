@@ -5,23 +5,23 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::analytics::{exact_duplicates_json, duplicates_full_json, DupeFilter};
+use crate::analytics::{exact_duplicates_json, write_duplicates_full_json, DupeFilter};
 use crate::cli::APP_NAME;
 use crate::dupes::{
     DupeFilter2, DupeGroupV2, HashInput, ReprioritizeCriterion, ScanMode, IgnoreList,
-    build_candidates_from_nodes, matches_to_groups, groups_to_json,
+    build_candidates_from_nodes, matches_to_groups, groups_to_json, write_groups_to_json,
     hash_candidate_groups, exact_matches_via_hash_cache, load_hash_cache, save_hash_cache,
     scan_filename, scan_audio, reprioritize,
     action_delete, action_move, action_copy,
 };
 use crate::export::{
-    app_config_json, drives_json, push_json_string, scan_result_to_html, scan_result_to_xlsx,
-    special_folders_json, write_scan_result_csv, write_scan_result_json, write_scan_result_ndjson,
-    write_scan_result_xml,
+    app_config_json, drives_json, push_json_string, scan_progress_ndjson_line,
+    scan_result_to_html, scan_result_to_xlsx, special_folders_json, write_scan_result_csv,
+    write_scan_result_json, write_scan_result_ndjson, write_scan_result_xml,
 };
 use crate::io::{default_thread_count, open_path, parse_bool, reveal_path, split_patterns};
 use crate::model::{AppState, DupesProgress, HttpRequest, ScanOptions};
@@ -60,6 +60,27 @@ fn content_type_for(name: &str) -> &'static str {
     }
 }
 
+/// File-name → embedded-file lookup for the flat `assets/` directory, built once
+/// on first use. Vite emits dozens-to-hundreds of content-hashed chunks, so the
+/// previous per-request linear scan over `assets.files()` was O(assets) on every
+/// static GET; this `HashMap` makes each lookup O(1). The map borrows the
+/// compiled-in `DIST`, which is `'static`, so the references live as long as the
+/// process.
+fn renderer_asset_index() -> &'static HashMap<String, &'static include_dir::File<'static>> {
+    static INDEX: OnceLock<HashMap<String, &'static include_dir::File<'static>>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut map = HashMap::new();
+        if let Some(assets) = DIST.get_dir("assets") {
+            for file in assets.files() {
+                if let Some(name) = file.path().file_name().and_then(|n| n.to_str()) {
+                    map.insert(name.to_string(), file);
+                }
+            }
+        }
+        map
+    })
+}
+
 /// Serve a Vite-emitted renderer asset from the compiled-in `frontend/dist`.
 ///
 /// `route` is the request path with the query already stripped, e.g.
@@ -84,19 +105,15 @@ fn serve_renderer_asset(stream: &mut TcpStream, route: &str) -> sio::Result<()> 
         _ => return respond_text(stream, 404, "Not found", "Not found"),
     };
 
-    if let Some(assets) = DIST.get_dir("assets") {
-        for file in assets.files() {
-            if file.path().file_name().and_then(|n| n.to_str()) == Some(name) {
-                return respond_bytes(
-                    stream,
-                    200,
-                    "OK",
-                    content_type_for(name),
-                    file.contents(),
-                    &[],
-                );
-            }
-        }
+    if let Some(file) = renderer_asset_index().get(name) {
+        return respond_bytes(
+            stream,
+            200,
+            "OK",
+            content_type_for(name),
+            file.contents(),
+            &[],
+        );
     }
     respond_text(stream, 404, "Not found", "Not found")
 }
@@ -158,17 +175,17 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
 
     let state = Arc::new(AppState {
         initial_path,
-        last_scan: Mutex::new(None),
+        last_scan: RwLock::new(None),
         scan_cache: Mutex::new(crate::model::ScanCache::new()),
         icon_cache: Mutex::new(std::collections::HashMap::new()),
         dupes_progress: Arc::new(DupesProgress::default()),
         dupes_cancel: Arc::new(AtomicBool::new(false)),
-        ignore_list: Mutex::new(ignore_list),
+        ignore_list: RwLock::new(ignore_list),
         ignore_list_path,
         hash_cache: Mutex::new(hash_cache),
         hash_cache_path,
         auth_token,
-        scan_roots: Mutex::new(Vec::new()),
+        scan_roots: RwLock::new(Vec::new()),
     });
 
     // Seed the allowed-read roots with the launch directory so previews of files
@@ -273,7 +290,7 @@ fn generate_session_token() -> String {
 /// read-time containment check compares like-for-like. Bounded to avoid growth.
 fn register_scan_root(state: &AppState, path: &Path) {
     let Ok(canon) = fs::canonicalize(path) else { return };
-    let mut roots = state.scan_roots.lock().expect("scan_roots lock poisoned");
+    let mut roots = state.scan_roots.write().expect("scan_roots lock poisoned");
     if roots.iter().any(|existing| existing == &canon) {
         return;
     }
@@ -290,7 +307,7 @@ fn register_scan_root(state: &AppState, path: &Path) {
 /// canonicalized (missing, or no root recorded yet) is rejected.
 fn path_within_scan_root(state: &AppState, requested: &Path) -> bool {
     let Ok(canon) = fs::canonicalize(requested) else { return false };
-    let roots = state.scan_roots.lock().expect("scan_roots lock poisoned");
+    let roots = state.scan_roots.read().expect("scan_roots lock poisoned");
     roots.iter().any(|root| canon.starts_with(root))
 }
 
@@ -726,7 +743,7 @@ fn find_current_scan(
     {
         return Some(result);
     }
-    let last = state.last_scan.lock().ok()?;
+    let last = state.last_scan.read().ok()?;
     last.as_ref()
         .filter(|result| result.root_path.replace('\\', "/").to_lowercase() == cache_key)
         .map(Arc::clone)
@@ -946,7 +963,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     let node_count = result.nodes.len();
                     let result = Arc::new(result);
                     if !is_partial {
-                        *state.last_scan.lock().expect("scan lock poisoned") =
+                        *state.last_scan.write().expect("scan lock poisoned") =
                             Some(Arc::clone(&result));
                         let mut cache = state.scan_cache.lock().expect("scan_cache lock");
                         // LRU insert; eviction by total estimated bytes is handled
@@ -974,7 +991,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             }
         }
         "/api/export.csv" => {
-            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
+            let Some(result) = state.last_scan.read().expect("scan lock poisoned").clone() else {
                 return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
             };
             // Stream the CSV chunked (one row per node, capped at EXPORT_ROW_CAP)
@@ -990,7 +1007,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             cw.finish()
         }
         "/api/export.json" => {
-            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
+            let Some(result) = state.last_scan.read().expect("scan lock poisoned").clone() else {
                 return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
             };
             // Stream JSON chunked via the same writer the live /api/scan uses, so
@@ -1007,7 +1024,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             cw.finish()
         }
         "/api/export.xml" => {
-            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
+            let Some(result) = state.last_scan.read().expect("scan lock poisoned").clone() else {
                 return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
             };
             // Stream XML chunked, node list capped at EXPORT_ROW_CAP (constant
@@ -1025,7 +1042,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         // its table caps + capped summary, XLSX at 100k rows), so they build a
         // bounded body and use the shared byte responder.
         "/api/export.html" => {
-            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
+            let Some(result) = state.last_scan.read().expect("scan lock poisoned").clone() else {
                 return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
             };
             let body = scan_result_to_html(&result);
@@ -1042,7 +1059,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             )
         }
         "/api/export.xlsx" => {
-            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
+            let Some(result) = state.last_scan.read().expect("scan lock poisoned").clone() else {
                 return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
             };
             let body = scan_result_to_xlsx(&result);
@@ -1112,7 +1129,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             }
         }
         "/api/duplicates" => {
-            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
+            let Some(result) = state.last_scan.read().expect("scan lock poisoned").clone() else {
                 return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
             };
             let min_size = query
@@ -1139,7 +1156,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         }
         "/api/dupes" => {
             // Full-detail duplicate scan with rich filters. Requires a prior /api/scan.
-            let Some(result) = state.last_scan.lock().expect("scan lock poisoned").clone() else {
+            let Some(result) = state.last_scan.read().expect("scan lock poisoned").clone() else {
                 return respond_text(&mut stream, 404, "Not found", "No scan has been run yet");
             };
             let filter = build_dupe_filter(&query);
@@ -1148,15 +1165,27 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 .get("threads")
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or_else(default_thread_count);
-            let body = duplicates_full_json(
-                &result,
+            // Stream the (potentially large) duplicate JSON instead of building a
+            // full in-memory String. Same schema, chunked delivery.
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut cw = ChunkedWriter::new(&mut stream);
+            // Project the (immutable, Arc-shared) scan into the serializer's
+            // candidate view — no node-buffer copy, no id rewrite.
+            let mut candidates = Vec::new();
+            crate::analytics::collect_dupe_nodes(&result.nodes, 0, &mut candidates);
+            write_duplicates_full_json(
+                &mut cw,
+                &candidates,
                 filter,
                 limit,
                 &state.hash_cache,
                 Some(&state.hash_cache_path),
                 threads,
-            );
-            respond_json(&mut stream, 200, "OK", &body)
+            )?;
+            cw.finish()
         }
         "/api/dupes-scan" => {
             // Standalone duplicate scan across one or more paths — no prior scan required.
@@ -1178,9 +1207,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             prog.files_hashing.store(0, Ordering::Relaxed);
             prog.files_hashed.store(0, Ordering::Relaxed);
 
-            // Scan each path, then merge all nodes with re-indexed IDs.
-            let mut merged_nodes: Vec<crate::model::NodeRecord> = Vec::new();
+            // Scan each path and collect its files as duplicate candidates. Each
+            // scan is shared immutably via `Arc` (the `dupes-v2` pattern) and
+            // projected with `collect_dupe_nodes`; the running `id_offset`
+            // reproduces the exact global ids the old merge-and-re-index path
+            // emitted, so the streamed JSON is byte-for-byte identical — without
+            // copying every node into a combined buffer or rewriting its indices.
+            let mut candidates: Vec<crate::analytics::DupeNode> = Vec::new();
             let mut merged_errors: Vec<crate::model::ScanError> = Vec::new();
+            let mut id_offset = 0usize;
 
             for raw_path in paths_raw.split(',').filter(|s| !s.is_empty()) {
                 register_scan_root(&state, std::path::Path::new(raw_path));
@@ -1199,15 +1234,13 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     prog2.files_scanned.store(node_count as u64, Ordering::Relaxed);
                 }) {
                     Ok(result) => {
+                        let result = Arc::new(result);
                         prog.files_scanned.fetch_add(result.nodes.len() as u64, Ordering::Relaxed);
-                        let offset = merged_nodes.len();
-                        for mut node in result.nodes {
-                            node.id += offset;
-                            if let Some(p) = node.parent { node.parent = Some(p + offset); }
-                            node.children = node.children.into_iter().map(|c| c + offset).collect();
-                            merged_nodes.push(node);
-                        }
-                        merged_errors.extend(result.errors);
+                        crate::analytics::collect_dupe_nodes(&result.nodes, id_offset, &mut candidates);
+                        // Advance by the full node count (directories included) so
+                        // ids stay aligned with the legacy merged-buffer indices.
+                        id_offset += result.nodes.len();
+                        merged_errors.extend(result.errors.iter().cloned());
                     }
                     Err(e) => {
                         merged_errors.push(crate::model::ScanError {
@@ -1222,34 +1255,41 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 }
             }
 
-            // Count candidate files for hashing (files with duplicate sizes).
-            let total_files = merged_nodes.iter().filter(|n| !n.is_dir).count() as u64;
+            // Count candidate files for hashing (candidates are already files only).
+            let total_files = candidates.len() as u64;
             prog.phase.store(2, Ordering::Relaxed);
             prog.files_scanned.store(total_files, Ordering::Relaxed);
             prog.files_hashing.store(total_files, Ordering::Relaxed);
             prog.files_hashed.store(0, Ordering::Relaxed);
 
-            let merged = crate::model::ScanResult {
-                root_path: paths_raw.replace(',', "; "),
-                scanned_at_ms: 0,
-                elapsed_ms: 0,
-                thread_count,
-                nodes: merged_nodes,
-                errors: merged_errors,
-                summary: crate::model::ScanSummary::default(),
-            };
+            // NOTE: like the previous implementation, per-path scan errors are not
+            // surfaced in this endpoint's body — the v1 dupes JSON reports only
+            // hashing errors (filled inside the writer). `merged_errors` is kept so
+            // the collection point is preserved, but it is intentionally not
+            // emitted, keeping the response schema unchanged.
+            let _ = merged_errors;
             let filter = build_dupe_filter(&query);
             let limit = query.get("limit").and_then(|v| v.parse().ok()).unwrap_or(1000);
-            let body = duplicates_full_json(
-                &merged,
+            // Stream the duplicate JSON (same schema) instead of building a full
+            // in-memory String. Hashing happens inside the writer, so phase is
+            // advanced to "done" only once the body has been fully streamed.
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut cw = ChunkedWriter::new(&mut stream);
+            write_duplicates_full_json(
+                &mut cw,
+                &candidates,
                 filter,
                 limit,
                 &state.hash_cache,
                 Some(&state.hash_cache_path),
                 thread_count,
-            );
+            )?;
+            cw.finish()?;
             prog.phase.store(3, Ordering::Relaxed);
-            respond_json(&mut stream, 200, "OK", &body)
+            Ok(())
         }
         "/api/dupes-progress" => {
             let prog = &state.dupes_progress;
@@ -1378,7 +1418,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             prog.files_hashing.store(0, Ordering::Relaxed);
             prog.files_hashed.store(0, Ordering::Relaxed);
 
-            let ignore = state.ignore_list.lock().expect("ignore lock poisoned");
+            let ignore = state.ignore_list.read().expect("ignore lock poisoned");
             let raw_matches = match mode {
                 // Exact mode now funnels through the SAME hash pipeline as the
                 // other dupe endpoints (size-group -> sample -> cached full hash).
@@ -1411,8 +1451,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             }
 
             prog.phase.store(3, Ordering::Relaxed);
-            let body = groups_to_json(&groups, mode, &scan_errors, ignored_count);
-            respond_json(&mut stream, 200, "OK", &body)
+            // Groups are already fully computed; stream their JSON (same schema)
+            // instead of building one large in-memory String.
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut cw = ChunkedWriter::new(&mut stream);
+            write_groups_to_json(&mut cw, &groups, mode, &scan_errors, ignored_count)?;
+            cw.finish()
         }
 
         // ── Content-hash duplicate detection (candidate-list driven, no walk) ──
@@ -1472,6 +1519,13 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 return respond_json(&mut stream, 499, "Client Closed Request", "{\"groups\":[],\"errors\":[\"Hashing canceled\"]}");
             }
 
+            // Stream the duplicate JSON (same schema) instead of building one
+            // large in-memory String — a big candidate batch can yield many groups.
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut cw = ChunkedWriter::new(&mut stream);
             let mut body = String::from("{\"groups\":[");
             for (gi, (_hash, group)) in groups.iter().enumerate() {
                 if gi > 0 { body.push(','); }
@@ -1481,6 +1535,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     push_json_string(&mut body, &files[idx].path.to_string_lossy());
                 }
                 body.push_str("]}");
+                if body.len() >= 65536 {
+                    cw.write_all(body.as_bytes())?;
+                    body.clear();
+                }
             }
             body.push_str("],\"errors\":[");
             for (i, e) in errors.iter().enumerate() {
@@ -1488,7 +1546,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 push_json_string(&mut body, e);
             }
             body.push_str("]}");
-            respond_json(&mut stream, 200, "OK", &body)
+            cw.write_all(body.as_bytes())?;
+            cw.finish()
         }
 
         "/api/dupes-action" => {
@@ -1608,7 +1667,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
 
         "/api/dupes-ignore" => {
             if request.method == "DELETE" {
-                let mut list = state.ignore_list.lock().expect("ignore lock poisoned");
+                let mut list = state.ignore_list.write().expect("ignore lock poisoned");
                 list.clear();
                 let _ = list.save(&state.ignore_list_path);
                 drop(list);
@@ -1635,7 +1694,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         "Paths are outside the scanned directories",
                     );
                 }
-                let mut list = state.ignore_list.lock().expect("ignore lock poisoned");
+                let mut list = state.ignore_list.write().expect("ignore lock poisoned");
                 list.add(std::path::Path::new(&a), std::path::Path::new(&b));
                 let count = list.pair_count();
                 let _ = list.save(&state.ignore_list_path);
@@ -2239,14 +2298,17 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let scan_result = scan_path_with_progress(options, cancel, |node_count, elapsed_ms| {
                 // Send a lightweight progress line instead of a full snapshot.
                 // For 1.5M nodes a full snapshot would clone ~450 MB and serialize another ~450 MB.
-                let line = format!("{{\"scanning\":true,\"nodeCount\":{node_count},\"elapsedMs\":{elapsed_ms}}}\n");
+                // The line carries the same `"type"` discriminator the client's NDJSON
+                // parser switches on (see `scan_progress_ndjson_line`); without it the
+                // ping is dropped and the live counter stays at 0.
+                let line = scan_progress_ndjson_line(node_count, elapsed_ms);
                 let _ = write_chunk(s, line.as_bytes());
             });
             match scan_result {
                 Ok(result) => {
                     let result = Arc::new(result);
                     if !is_partial {
-                        *state.last_scan.lock().expect("scan lock poisoned") =
+                        *state.last_scan.write().expect("scan lock poisoned") =
                             Some(Arc::clone(&result));
                         // LRU insert; eviction by total estimated bytes is handled
                         // inside ScanCache so peak memory stays bounded.

@@ -1,0 +1,68 @@
+/* Styles for the lazy-loaded 3D treemap modal. Co-located + imported by
+   Treemap3DModal.tsx so Vite bundles them into the modal's own code-split
+   chunk (Treemap3DModal.css) instead of the initial global stylesheet — they
+   load only when the modal is first opened. Theme tokens (var(--…)) stay in
+   global.css, so dark/light theming is unaffected. */
+
+.modal3d-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modal3d {
+  background: var(--bg-elevated, #1e1e2e);
+  border: 1px solid var(--border, #3a3a4a);
+  border-radius: 8px;
+  box-shadow: 0 12px 48px rgba(0,0,0,0.6);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 860px;
+}
+.modal3d-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--bg-header, #252535);
+  border-bottom: 1px solid var(--border, #3a3a4a);
+}
+.modal3d-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text, #d4d4d4);
+}
+.modal3d-tooltip {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-muted, #888);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.modal3d-close {
+  background: none;
+  border: none;
+  color: var(--text-muted, #888);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  line-height: 1;
+}
+.modal3d-close:hover { background: rgba(255,255,255,0.1); color: var(--text, #d4d4d4); }
+.modal3d-scene {
+  padding: 8px;
+  background: #111118;
+  user-select: none;
+}
+.modal3d-hint {
+  text-align: center;
+  font-size: 10px;
+  color: rgba(255,255,255,0.35);
+  padding: 4px 0 2px;
+}

@@ -167,6 +167,18 @@ export async function readNdjsonStream(
   return reconstructChildren(result);
 }
 
+// One-shot streamed scan: fetch the NDJSON endpoint and parse it incrementally
+// (line-by-line) instead of buffering one giant JSON blob in memory like the
+// `/api/scan` + res.json() path. Used by the FS-watch shallow rescan, which
+// fires repeatedly in the background — streaming keeps each patch's peak memory
+// to a single small line and reuses the exact parser the main scan uses. The
+// returned ScanResult already has children[] wired and paths set.
+export async function fetchScanStream(opts: ScanOptions, signal?: AbortSignal): Promise<ScanResult> {
+  const res = await fetch(scanStreamUrl(opts), { signal });
+  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+  return readNdjsonStream(res.body.getReader(), () => {});
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function useScan(): UseScanReturn {
@@ -198,13 +210,11 @@ export function useScan(): UseScanReturn {
     // nocache forces a fresh fetch (e.g. the rescan right after a native move).
     const cached = opts.nocache ? null : getCached(opts.path);
     if (cached) {
-      console.log("[useScan] startScan CACHE HIT path=", opts.path, "nodes=", cached.nodes?.length);
       setData(cached);
       setStatus("done");
       setProgress(null);
       return;
     }
-    console.log("[useScan] startScan CACHE MISS path=", opts.path, "— fetching from server");
 
     const controller = new AbortController();
     controllerRef.current = controller;
@@ -222,7 +232,6 @@ export function useScan(): UseScanReturn {
         const result = await readNdjsonStream(reader, (nodeCount, elapsed) => {
           setProgress({ nodes: nodeCount, elapsed });
         });
-        console.log("[useScan] startScan DONE path=", opts.path, "nodes=", result.nodes?.length, "sample=", result.nodes?.slice(0,3).map(n=>`${n.name}:${n.size}B`));
         setCached(opts.path, result);
         setData(result);
         setStatus("done");
@@ -265,8 +274,6 @@ export function useScan(): UseScanReturn {
         // Publish the final result so useEffect([data]) in WorkspaceTab can
         // drive the tree update through the same code path as startScan.
         // We do NOT clear data first (no setData(null)), so the tree never blanks.
-        const folders = result.nodes?.filter(n=>n.dir).slice(0,5).map(n=>`${n.name}:size=${n.size},files=${n.files},folders=${n.folders}`) ?? [];
-        console.log("[useScan] startRefresh DONE path=", opts.path, "nodes=", result.nodes?.length, "folders=", folders);
         setData(result);
         setStatus("done");
         setProgress(null);

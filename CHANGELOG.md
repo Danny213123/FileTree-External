@@ -4,6 +4,28 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.3.0] - 2026-06-02
+
+### Changed
+
+#### Performance
+- **Release build optimization**: added a `[profile.release]` section (`lto = true`, `codegen-units = 1`) so release builds get link-time optimization across the hot scan, hash, and JSON loops (previously absent, so release builds got no LTO).
+- **Lower-contention scanning**: the per-directory scan buffer is sharded into per-worker thread-local buffers merged at finalize — removing the single `Mutex<Vec<NodeRecord>>` bottleneck while preserving the positional `id == index` / parent / children contract. File-sampling fingerprints now use lock-free `AtomicU64`/`AtomicBool` instead of per-file mutexes, content-hash cache writes happen outside the cache lock, read-dominated `AppState` fields moved from `Mutex` to `RwLock`, and a process-wide thread gate bounds concurrent full-tree scans.
+- **O(1) asset serving and micro-optimizations**: embedded renderer assets are indexed into a `HashMap` once at startup instead of a per-request linear scan; `largest_by_size` uses `select_nth_unstable_by` for top-N selection; and the in-memory content-hash cache evicts oldest-first.
+- **Streamed duplicate JSON**: `/api/dupes`, `/api/dupes-scan`, `/api/dupes-v2`, and `/api/dupes-hash` stream their results through a chunked writer instead of building one large in-memory string (the response schema is unchanged).
+- **Frontend rendering**: the App shell is decoupled from tree churn via a new `useWorkbench` external store (`useSyncExternalStore`), so expand/scroll/filter no longer re-render the title bar, menus, or side-bar shell; the Explorer side-bar folder tree is virtualized; the heavy visible-row and `dirCache` recomputes run in a deferred, interruptible render so typing, Expand All, and sorting stay responsive on large trees; menus and filter normalization are memoized; and the 3D treemap modal is code-split out of the main bundle.
+
+### Fixed
+
+- **Live scan progress**: the scan loading screen advances again. `/api/scan-stream` was emitting progress events without the `type` discriminator the renderer's parser expects, so the file counter stayed at 0 for the whole scan; progress lines now carry `{ "type": "scanning", ... }`.
+- **Reparse-point junctions**: scanning a folder that contains legacy Windows compatibility junctions (e.g. `Documents\My Music`, `My Pictures`, `My Videos`, which carry deny-read ACLs) no longer floods the Problems panel with `FindFirstFileExW failed: error 5`. Directory reparse points are detected (`FILE_ATTRIBUTE_REPARSE_POINT` / symlink metadata) and shown as 0-byte junctions without being recursed into, avoiding the access-denied errors and double-counting against the real Music/Pictures/Videos folders.
+
+### Removed
+
+- The focus-ring highlight drawn over the selected editor pane when the view is split.
+
+---
+
 ## [1.2.0] - 2026-06-01
 
 ### Added

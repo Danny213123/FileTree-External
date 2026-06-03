@@ -1,10 +1,14 @@
-import { useMemo, useState, memo, useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from "react";
+import { useMemo, useState, memo, useEffect, useRef, useCallback, forwardRef, useImperativeHandle, lazy, Suspense } from "react";
 import type { NodeRecord, Metric, Unit } from "../api/types";
 import { layoutTreemap } from "../utils/treeLayout";
 import { formatBytes, formatCount } from "../utils/formatBytes";
-import { Treemap3DModal } from "./Treemap3DModal";
 import { NodeTooltip } from "./NodeTooltip";
 import { isNoOpMove } from "../lib/agent";
+
+// The 3D treemap modal (its own isometric SVG renderer) is only shown on demand
+// via the "3D" toggle, so it is code-split out of the main bundle with
+// React.lazy and loaded the first time the user opens it.
+const Treemap3DModal = lazy(() => import("./Treemap3DModal").then((m) => ({ default: m.Treemap3DModal })));
 
 // detail 1–5 → rendering limits
 function detailLimits(detail: number) {
@@ -617,13 +621,15 @@ export const Treemap = memo(function Treemap({
   return (
     <>
     {show3D && (
-      <Treemap3DModal
-        nodeById={nodeById}
-        viewId={viewId}
-        metric={metric}
-        onClose={onClose3D ?? (() => {})}
-        onNavigate={onNavigate}
-      />
+      <Suspense fallback={null}>
+        <Treemap3DModal
+          nodeById={nodeById}
+          viewId={viewId}
+          metric={metric}
+          onClose={onClose3D ?? (() => {})}
+          onNavigate={onNavigate}
+        />
+      </Suspense>
     )}
     <div className="treemap-shell">
       <div className="treemap-body">

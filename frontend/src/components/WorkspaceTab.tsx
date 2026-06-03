@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle, useSyncExternalStore, memo } from "react";
-import { useScan, reconstructChildren } from "../hooks/useScan";
+import { useScan, fetchScanStream } from "../hooks/useScan";
 import { useTreeState } from "../hooks/useTreeState";
 import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import {
-  revealPath, openPath, shellContextMenu, createFolder, fetchScan,
+  revealPath, openPath, shellContextMenu, createFolder,
   copyPath, renameItem, moveItems, deletePath, copyFiles,
   hasNativeMove, moveItemsNative, fetchDupesV2Bounded, runCommand,
   exportUrl, printReportAsPdf,
@@ -228,6 +228,11 @@ interface WorkspaceTabProps {
   onToggleBookmark: (path: string) => void;
   onScanPath: (path: string) => void;
   onStateChange: () => void;
+  // Publish this pane's sidebar/status snapshot to the shared workbench store
+  // (when focused). Routed separately from onStateChange so high-frequency tree
+  // edits (expand/collapse/filter/select) re-render only the store subscribers,
+  // never the App shell.
+  onWorkbenchChange: () => void;
   onOpenTerminal?: (cwd: string) => void;
   // Open `path` in a new workspace tab of editor group `groupId` (falls back to
   // the focused group). Used when a native folder drag is dropped on a tab strip.
@@ -245,7 +250,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     treemapDetail,
     tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
-    onClose3D, onToggleBookmark, onScanPath, onStateChange, onOpenTerminal,
+    onClose3D, onToggleBookmark, onScanPath, onStateChange, onWorkbenchChange, onOpenTerminal,
     onOpenFolderInTab, onUndo,
   }: WorkspaceTabProps,
   ref,
@@ -378,15 +383,21 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // scan no longer re-renders App/this pane on every tick.
   useEffect(() => { onStateChange(); }, [status, onStateChange]);
 
-  // The Explorer side bar lives once in App (shared, left of the editor groups)
-  // and pulls its data from the focused pane's getSidebarModel(). When THIS is
-  // the visible tab, notify App on tree/selection/path changes so the shared
-  // panel re-renders. notifyState is throttled, so scan-time row storms stay
-  // cheap; single user actions fire on its leading edge (instant). data/status/
-  // progress already notify above.
+  // The scan-path doubles as this pane's tab label (title bar + tab strip show
+  // its basename), so a path edit is shell-relevant — tick App (throttled) when
+  // focused. Kept out of the high-frequency tree effect below so expand / filter
+  // / select still never reach the shell.
+  useEffect(() => { if (active) onStateChange(); }, [scanPath, active, onStateChange]);
+
+  // The Explorer side bar / status bar / inspector live once in App (shared,
+  // around the editor groups) and pull their data from the focused pane's
+  // getSidebarModel(). When THIS is the visible tab, publish to the workbench
+  // store on tree/selection/path changes so ONLY those subscribers re-render —
+  // App's title bar/menus/tab bar stay put. data/status changes also publish via
+  // onStateChange above (which keeps the shell's scan-level state in sync too).
   useEffect(() => {
-    if (active) onStateChange();
-  }, [active, tree.visibleRows, tree.expanded, tree.selectedId, tree.nodeById, scanPath, onStateChange]);
+    if (active) onWorkbenchChange();
+  }, [active, tree.visibleRows, tree.expanded, tree.selectedId, tree.nodeById, scanPath, onWorkbenchChange]);
 
   const startWatch = useCallback((rootPath: string) => {
     if (fsEventsRef.current) { fsEventsRef.current.close(); fsEventsRef.current = null; }
@@ -443,7 +454,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           if (suppressWatchRef.current) break;
           invalidateScanCache(dir);
           try {
-            const raw = await fetchScan({
+            // Streamed (NDJSON) shallow rescan: parsed line-by-line so a
+            // background watch patch never buffers a whole JSON blob in memory.
+            const result = await fetchScanStream({
               path: dir,
               threads,
               includeHidden,
@@ -453,7 +466,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               maxDepth: 1,
               nocache: true,
             });
-            const result = reconstructChildren(raw);
             if (result?.nodes?.length) treeRef.current.patchDirectory(dir, result.nodes);
           } catch { /* ignore network errors */ }
         }

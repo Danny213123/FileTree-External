@@ -2738,69 +2738,9 @@ input:focus, select:focus {
 .nts-row span:last-child { color: var(--text); text-align: right; }
 .nts-error span { color: #e05; }
 
-/* ── 3D Modal ─────────────────────────────────────────────────────────────── */
-.modal3d-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.55);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-}
-.modal3d {
-  background: var(--bg-elevated, #1e1e2e);
-  border: 1px solid var(--border, #3a3a4a);
-  border-radius: 8px;
-  box-shadow: 0 12px 48px rgba(0,0,0,0.6);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  min-width: 860px;
-}
-.modal3d-header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 12px;
-  background: var(--bg-header, #252535);
-  border-bottom: 1px solid var(--border, #3a3a4a);
-}
-.modal3d-title {
-  font-weight: 600;
-  font-size: 13px;
-  color: var(--text, #d4d4d4);
-}
-.modal3d-tooltip {
-  flex: 1;
-  font-size: 12px;
-  color: var(--text-muted, #888);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.modal3d-close {
-  background: none;
-  border: none;
-  color: var(--text-muted, #888);
-  cursor: pointer;
-  font-size: 14px;
-  padding: 2px 6px;
-  border-radius: 4px;
-  line-height: 1;
-}
-.modal3d-close:hover { background: rgba(255,255,255,0.1); color: var(--text, #d4d4d4); }
-.modal3d-scene {
-  padding: 8px;
-  background: #111118;
-  user-select: none;
-}
-.modal3d-hint {
-  text-align: center;
-  font-size: 10px;
-  color: rgba(255,255,255,0.35);
-  padding: 4px 0 2px;
-}
+/* 3D treemap modal styles (.modal3d-*) were moved to a co-located, code-split
+   stylesheet: src/components/Treemap3DModal.css (imported by the lazy
+   Treemap3DModal), so they ship in that chunk rather than the initial bundle. */
 
 /* ── Duplicate Finder ─────────────────────────────────────────── */
 
@@ -3895,18 +3835,6 @@ input:focus, select:focus {
   position: relative;
   display: flex; flex-direction: column; min-width: 0; min-height: 0;
   background: var(--vsc-editor-bg); overflow: hidden;
-}
-
-/* When the editor is split, the focused pane gets a crisp 1px focus ring drawn
-   over its content (pointer-events:none) so the active group is obvious. App.tsx
-   only adds .focused when groups.length > 1, so a single pane stays ring-free. */
-.editor-group.focused::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  box-shadow: inset 0 0 0 1px var(--vsc-focus);
-  z-index: 6;
 }
 
 /* ── Per-tab workbench region (side bar + editor) ─────────── */

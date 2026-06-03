@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub(crate) use crate::dupes::IgnoreList;
@@ -112,7 +112,7 @@ pub(crate) struct ScanResult {
 }
 
 /// Precomputed, size-capped analytics for a scan. Built once in
-/// `snapshot_scan_result` and stored on `ScanResult`.
+/// `finalize_scan_result` and stored on `ScanResult`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ScanSummary {
     pub(crate) top_files: Vec<usize>,
@@ -122,18 +122,34 @@ pub(crate) struct ScanSummary {
     pub(crate) duplicate_candidates: Vec<DuplicateCandidate>,
 }
 
+/// A directory queued for scanning. Carries the directory's own path and depth so
+/// a worker can scan it WITHOUT consulting a shared node buffer — the node records
+/// now live in per-worker thread-local buffers, so the path/depth that the job
+/// needs travel with the job instead of being looked up by id.
+#[derive(Clone, Debug)]
+pub(crate) struct DirJob {
+    pub(crate) id: usize,
+    pub(crate) path: String,
+    pub(crate) depth: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct QueueState {
-    pub(crate) dirs: VecDeque<usize>,
+    pub(crate) dirs: VecDeque<DirJob>,
     pub(crate) active: usize,
     pub(crate) done: bool,
 }
 
+/// State shared by all scan workers. The node buffer is intentionally NOT here:
+/// to remove the single `Mutex<Vec<NodeRecord>>` whose lock every worker took once
+/// per directory, each worker accumulates its records in a thread-local
+/// `Vec<NodeRecord>` (returned from `worker_loop` and merged once at finalize).
+/// `errors` carries the owning node id alongside each message so the per-node error
+/// count can be applied during that single-threaded merge.
 #[derive(Debug)]
 pub(crate) struct WorkerShared {
     pub(crate) options: ScanOptions,
-    pub(crate) nodes: Mutex<Vec<NodeRecord>>,
-    pub(crate) errors: Mutex<Vec<ScanError>>,
+    pub(crate) errors: Mutex<Vec<(usize, ScanError)>>,
     pub(crate) queue: Mutex<QueueState>,
     pub(crate) queue_ready: Condvar,
     pub(crate) cancel: Arc<AtomicBool>,
@@ -159,6 +175,11 @@ pub(crate) struct HashCacheEntry {
     pub(crate) size: u64,
     pub(crate) mtime: u64,
     pub(crate) hash: u64,
+    /// In-memory insertion/refresh sequence (monotonic, minted on insert). NOT
+    /// persisted — re-minted in file order on load — so over-cap eviction can drop
+    /// the oldest entries first deterministically instead of dropping arbitrary
+    /// `HashMap` iteration-order entries. Larger = more recently inserted/re-hashed.
+    pub(crate) seq: u64,
 }
 
 /// Upper bound on the in-memory scan-result cache, measured in estimated
@@ -319,7 +340,10 @@ fn estimate_scan_bytes(result: &ScanResult) -> usize {
 #[derive(Debug)]
 pub(crate) struct AppState {
     pub(crate) initial_path: PathBuf,
-    pub(crate) last_scan: Mutex<Option<Arc<ScanResult>>>,
+    /// Read-dominated: every read-only route clones the `Arc` to view the current
+    /// scan, while only the scan routes replace it — an `RwLock` lets those reads
+    /// proceed concurrently instead of serializing on a `Mutex`.
+    pub(crate) last_scan: RwLock<Option<Arc<ScanResult>>>,
     /// Per-path scan-result cache keyed by normalized lowercase path, bounded by
     /// total estimated bytes with LRU eviction (see [`ScanCache`]). TTL freshness
     /// is enforced via `get_fresh`.
@@ -328,7 +352,10 @@ pub(crate) struct AppState {
     pub(crate) icon_cache: Mutex<HashMap<String, Vec<u8>>>,
     pub(crate) dupes_progress: Arc<DupesProgress>,
     pub(crate) dupes_cancel: Arc<AtomicBool>,
-    pub(crate) ignore_list: Mutex<IgnoreList>,
+    /// Read-dominated: consulted (read) on every duplicate scan to filter ignored
+    /// pairs, but mutated only when the user adds/clears an ignore entry. `RwLock`
+    /// so concurrent dupe scans don't serialize on it.
+    pub(crate) ignore_list: RwLock<IgnoreList>,
     pub(crate) ignore_list_path: PathBuf,
     /// Persistent content-hash cache `(path) -> (size, mtime, hash)` so unchanged
     /// files are never re-hashed across repeat duplicate scans. Persisted to
@@ -343,8 +370,11 @@ pub(crate) struct AppState {
     /// Canonicalized directories the user has scanned this session. File-content
     /// reads (file-text / thumbnail / owner) are confined to paths located under
     /// one of these roots, so a request can't read arbitrary files outside the
-    /// trees the user actually opened. Populated by the scan routes.
-    pub(crate) scan_roots: Mutex<Vec<PathBuf>>,
+    /// trees the user actually opened. Populated by the scan routes. Read-dominated
+    /// (checked on every confined read and every `dupes-hash` candidate, appended
+    /// to only when a new root is scanned), so an `RwLock` keeps those checks
+    /// concurrent.
+    pub(crate) scan_roots: RwLock<Vec<PathBuf>>,
 }
 
 #[derive(Debug)]
