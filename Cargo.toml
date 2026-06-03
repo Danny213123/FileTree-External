@@ -1,6 +1,6 @@
 [package]
 name = "filetree"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2024"
 description = "A standalone Windows disk-usage explorer with real-time threaded scans."
 repository = "https://github.com/Danny213123/FileTree"
@@ -11,6 +11,15 @@ publish = false
 # Compile the built renderer (frontend/dist) into the binary so the single
 # executable can serve every Vite-emitted chunk without shipping loose files.
 include_dir = "0.7"
+# Checksum actions (GET /api/checksum). RustCrypto hashers, streamed in chunks so
+# a large file is never loaded whole.
+md-5 = "0.11.0"
+sha2 = "0.11.0"
+# Archive create/extract (POST /api/compress, /api/extract). Pin to the pure-Rust
+# `deflate` backend only: the crate's default features pull in zstd/bzip2 C
+# `*-sys` crates (needing a C toolchain and slowing the build), none of which a
+# standard `.zip` needs — Deflated entries are universally readable.
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Release builds are CPU-bound on the filesystem walk and the duplicate hash
 # pipeline, so trade longer compile time for a faster binary: link-time

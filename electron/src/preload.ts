@@ -180,6 +180,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   shellContextMenu: (paths: string | string[], x: number, y: number): Promise<void> =>
     ipcRenderer.invoke("shellContextMenu", paths, x, y),
 
+  // Native OS desktop notification (F9 low-space alerts). Resolves true when a
+  // notification was shown (Notifications supported on this platform).
+  notify: (title: string, body: string): Promise<boolean> =>
+    ipcRenderer.invoke("notify", title, body),
+
   // Integrated terminal: spawn a real shell (PTY) and stream its output to
   // xterm.js in the renderer. `onData`/`onExit` return unsubscribe functions.
   terminal: {

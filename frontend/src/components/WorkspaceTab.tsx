@@ -8,16 +8,22 @@ import {
   hasNativeMove, moveItemsNative, fetchDupesV2Bounded, runCommand,
   exportUrl, printReportAsPdf, webFetch, webSearch,
   clipboardWriteFiles, clipboardReadFiles, copyItemsNative, hasNativeCopy,
+  compress, extract, checksum, copyText,
 } from "../api/client";
 import type { ScanOptions, ExportFormat } from "../api/client";
-import type { NodeRecord, SortKey } from "../api/types";
+import type { NodeRecord, SortKey, TagEntry } from "../api/types";
+import type { FilterRule } from "../hooks/useFilterRules";
 import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow, type AgentApi } from "../lib/agent";
 import { confirmRisky, isCrossDrive } from "../lib/confirmRisky";
 import { pushUndo, parentDir } from "../lib/undo";
+import { beginTransfer, finishTransfer } from "../lib/transfers";
 import { searchNodes } from "../lib/search";
+import { compareNodes } from "../hooks/useTreeState";
 import { toast, type ToastAction } from "../lib/toast";
 import { promptDialog } from "../lib/dialogs";
 import { TreeTable } from "./TreeTable";
+import { BulkRenameDialog } from "./BulkRenameDialog";
+import { TagPopover } from "./TagPopover";
 import { ConfigureColumnsMenu } from "./ConfigureColumnsMenu";
 import { Treemap } from "./Treemap";
 import type { ViewId } from "./ActivityBar";
@@ -67,11 +73,19 @@ export interface WorkspaceTabHandle {
   dropExternalInto: (paths: string[], destination: string) => Promise<void>;
   doRename: () => void;
   doRenamePath: (path: string) => void;
+  /** Open the bulk-rename dialog for the current selection (F3). */
+  doBulkRename: () => void;
   doDelete: () => void;
   doDeletePaths: (paths: string[]) => void;
   doMoveTo: () => void;
   doCopyPath: () => void;
   doCopyFiles: () => void;
+  /** Compress the current selection into a .zip beside it (F5). */
+  doCompress: () => void;
+  /** Extract the selected .zip into its own folder (F5). */
+  doExtract: () => void;
+  /** Copy the SHA-256 checksum of the selected file to the clipboard (F5). */
+  doChecksum: () => void;
   getRibbonState: () => RibbonState;
   setMetric: (m: string) => void;
   setUnit: (u: string) => void;
@@ -83,6 +97,12 @@ export interface WorkspaceTabHandle {
   showNotice: (message: string) => void;
   /** Force a fresh rescan of this pane (used after an undo changes the tree). */
   refresh: () => void;
+  /** Reveal/select a node by id (command palette file jump, F6). */
+  doNavigateId: (id: number) => void;
+  /** Current advanced filter rules — captured when saving a smart folder (F7). */
+  getFilterRules: () => FilterRule[];
+  /** Apply advanced filter rules — used when a smart folder is opened (F7). */
+  setFilterRules: (rules: FilterRule[]) => void;
 }
 
 export interface RibbonState {
@@ -209,6 +229,13 @@ interface WorkspaceTabProps {
   onPanelHeightChange: (n: number) => void;
   // data + options
   bookmarkList: string[];
+  // Tags & color labels (F4): path → entry map for the row badges + popover, the
+  // active tag filter (flattens the table to tagged paths), and the setter that
+  // persists edits (mirrors the bookmark store, threaded from App).
+  tagsByPath: Map<string, TagEntry>;
+  activeTagFilter: string | null;
+  onSetTags: (path: string, tags: string[], color?: string) => void;
+  onClearTagFilter: () => void;
   threads: number;
   includeHidden: boolean;
   followLinks: boolean;
@@ -250,7 +277,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   {
     tabId, initialPath, active, activeView, searchQuery, toolbarVisible, darkMode,
     panelOpen, onPanelOpenChange, panelHeight, onPanelHeightChange,
-    bookmarkList, threads, includeHidden, followLinks, collectOwners, onCollectOwnersChange, exclude,
+    bookmarkList, tagsByPath, activeTagFilter, onSetTags, onClearTagFilter,
+    threads, includeHidden, followLinks, collectOwners, onCollectOwnersChange, exclude,
     treemapDetail,
     tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
@@ -748,6 +776,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   }, [selectedNode, tree, data, scanPath, onOpenTerminal]);
 
   const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [bulkRenameOpen, setBulkRenameOpen] = useState(false);
+  // Tag editing popover anchored at the clicked row's tag badge (F4).
+  const [tagPopover, setTagPopover] = useState<{ path: string; x: number; y: number } | null>(null);
 
   const runRenamePath = useCallback((targetPath?: string) => {
     const pathToRename = targetPath ?? selectedNode?.path;
@@ -908,6 +939,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     });
     if (!proceed) { setMoveNotice("Paste canceled."); return; }
     if (!hasNativeCopy()) { setMoveNotice("Paste-copy requires the FileTree desktop app."); return; }
+    // F10: track the copy in the transfer queue.
+    const xferId = beginTransfer("copy", `${itemsLabel(sources.length)} → \u201C${basenameFromPath(destination)}\u201D`, sources.length);
     try {
       suppressWatchRef.current = true;
       const res = await copyItemsNative(sources, destination);
@@ -916,11 +949,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       } else if (res.moved === 0 && res.skipped > 0) {
         setMoveNotice("Nothing to paste here.");
       }
+      finishTransfer(xferId, res.failed === 0, res.failed > 0 ? `${res.failed} item${res.failed === 1 ? "" : "s"} failed` : undefined);
       invalidateAllScanCache();
       doScan(undefined, undefined, true);
     } catch (e) {
       suppressWatchRef.current = false;
-      setMoveNotice(`Paste failed: ${e instanceof Error ? e.message : String(e)}`);
+      const message = e instanceof Error ? e.message : String(e);
+      finishTransfer(xferId, false, message);
+      setMoveNotice(`Paste failed: ${message}`);
     }
   }, [doScan]);
 
@@ -956,6 +992,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       setMoveNotice("Move canceled.");
       return { ok: true };
     }
+    // F10: track this move in the transfer queue (status surfaces near the
+    // status bar). The native shell op shows its own granular progress dialog.
+    const xferId = beginTransfer("move", `${itemsLabel(realSources.length)} → \u201C${basenameFromPath(destination)}\u201D`, realSources.length);
     try {
       suppressWatchRef.current = true;
       let outcome: { ok: boolean; error?: string };
@@ -998,12 +1037,15 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           toast.success(`Moved ${itemsLabel(realSources.length)} to \u201C${basenameFromPath(destination)}\u201D.`, { action: undoAction });
         }
       }
+      finishTransfer(xferId, outcome.ok, outcome.error);
       invalidateAllScanCache();
       doScan(undefined, undefined, true);
       return outcome;
     } catch (error) {
       suppressWatchRef.current = false;
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      const message = error instanceof Error ? error.message : String(error);
+      finishTransfer(xferId, false, message);
+      return { ok: false, error: message };
     }
   }, [doScan, runMoveWithConflicts, undoAction]);
 
@@ -1056,6 +1098,90 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     const outcome = await handleInternalMove(selectedPaths, dest.trim());
     if (!outcome.ok) { toast.error(`Move failed: ${outcome.error ?? "unknown error"}`); return; }
   }, [selectedPaths, handleInternalMove]);
+
+  // ── F5: archive (zip) + checksum on the current selection ────────────────
+  // The table's right-click opens the native Explorer menu, so these actions
+  // are surfaced from the Edit menu via the handle. Long ops route through the
+  // transfers panel; the tree is rescanned afterward so new files appear.
+
+  const runCompress = useCallback(async () => {
+    const paths = selectedPaths;
+    if (paths.length === 0) { toast.info("Select one or more items to compress."); return; }
+    // Default the .zip into the first item's parent — always under a scan root,
+    // which the server requires for the destination.
+    const sep = paths[0].includes("/") && !paths[0].includes("\\") ? "/" : "\\";
+    const parent = parentDir(paths[0]);
+    const stem = paths.length === 1
+      ? basenameFromPath(paths[0]).replace(/\.[^.]+$/, "")
+      : basenameFromPath(parent);
+    const name = await promptDialog({
+      title: "Compress to .zip",
+      label: "Archive file name",
+      message: `Zip ${itemsLabel(paths.length)} into ${parent}${sep}…`,
+      initialValue: `${stem || "archive"}.zip`,
+      placeholder: "archive.zip",
+      confirmLabel: "Compress",
+      validate: (v) => (/[\\/:*?"<>|]/.test(v.trim()) ? "Illegal character in name" : null),
+    });
+    if (name == null) return;
+    let fileName = name.trim();
+    if (!/\.zip$/i.test(fileName)) fileName += ".zip";
+    const dest = `${parent}${sep}${fileName}`;
+    const xferId = beginTransfer("copy", `Compress ${itemsLabel(paths.length)} \u2192 \u201C${fileName}\u201D`, paths.length);
+    try {
+      const res = await compress(paths, dest);
+      finishTransfer(xferId, res.ok, res.error);
+      if (res.ok) {
+        toast.success(`Compressed ${itemsLabel(paths.length)} to \u201C${fileName}\u201D.`);
+        invalidateAllScanCache();
+        doScan(undefined, undefined, true);
+      } else {
+        toast.error(`Compress failed: ${res.error ?? "unknown error"}`);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      finishTransfer(xferId, false, msg);
+      toast.error(`Compress failed: ${msg}`);
+    }
+  }, [selectedPaths, doScan]);
+
+  const runExtract = useCallback(async () => {
+    const node = selectedNode;
+    if (!node || node.dir || !/\.zip$/i.test(node.path)) {
+      toast.info("Select a .zip file to extract.");
+      return;
+    }
+    // "Extract here" → into the archive's own containing folder.
+    const dest = parentDir(node.path);
+    const xferId = beginTransfer("copy", `Extract \u201C${node.name}\u201D`, 1);
+    try {
+      const res = await extract(node.path, dest);
+      finishTransfer(xferId, res.ok, res.error);
+      if (res.ok) {
+        toast.success(`Extracted \u201C${node.name}\u201D here.`);
+        invalidateAllScanCache();
+        doScan(undefined, undefined, true);
+      } else {
+        toast.error(`Extract failed: ${res.error ?? "unknown error"}`);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      finishTransfer(xferId, false, msg);
+      toast.error(`Extract failed: ${msg}`);
+    }
+  }, [selectedNode, doScan]);
+
+  const runChecksum = useCallback(async () => {
+    const node = selectedNode;
+    if (!node || node.dir) { toast.info("Select a file to checksum."); return; }
+    const res = await checksum(node.path, "sha256");
+    if (res.error || !res.hash) {
+      toast.error(`Checksum failed: ${res.error ?? "unknown error"}`);
+      return;
+    }
+    await copyText(res.hash);
+    toast.success(`SHA-256 of \u201C${node.name}\u201D copied:\n${res.hash}`);
+  }, [selectedNode]);
 
   // After a native drag moved item(s) OUT of this tree (a true move to Explorer
   // or another app), the source is gone from disk; drop our cached scan and
@@ -1180,11 +1306,15 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     doReveal: () => { if (selectedNode) revealPath(selectedNode.path); },
     doRename: runRename,
     doRenamePath: (path) => { void runRenamePath(path); },
+    doBulkRename: () => setBulkRenameOpen(true),
     doDelete: runDelete,
     doDeletePaths: (paths) => { void runDeletePaths(paths); },
     doMoveTo: runMoveTo,
     doCopyPath: runCopyPath,
     doCopyFiles: runCopyFiles,
+    doCompress: () => { void runCompress(); },
+    doExtract: () => { void runExtract(); },
+    doChecksum: () => { void runChecksum(); },
     doCutFiles: runCutFiles,
     doPaste: () => { void runPaste(); },
     dropExternalInto: (paths, destination) => dropExternalInto(paths, destination),
@@ -1228,10 +1358,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     },
     showNotice: (message) => setMoveNotice(message),
     refresh: () => { invalidateAllScanCache(); doScan(undefined, undefined, true); },
+    doNavigateId: (id) => handleNavigate(id),
+    getFilterRules: () => treeRef.current.filterRules,
+    setFilterRules: (rules) => treeRef.current.setFilterRules(rules),
   }), [status, data, progressStore, errorMessage, scanPath, tree, cancelScan, agentApi,
        doScan, handleNavigate, handleNavigateParent, handleExpand, handleNewFolder, selectedNode,
        openLocation, goBack, goForward, navHistory, runOpen, runReveal, onScanPath,
        runRename, runRenamePath, runDelete, runDeletePaths, runMoveTo, runCopyPath, runCopyFiles,
+       runCompress, runExtract, runChecksum,
        runCutFiles, runPaste, dropExternalInto]);
 
   // Bottom-panel (treemap) vertical resize.
@@ -1265,6 +1399,32 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     [tree.nodeById, searchQuery, tree.sortKey, tree.sortDir],
   );
   const searching = activeView === "search" && searchQuery.trim().length >= 2;
+
+  // Tag filter (F4): when a tag is active, flatten the table to the tagged paths
+  // (same flat-list treatment as Search). A lightweight predicate over the live
+  // node map — no mutation of the tree's own filter state.
+  const taggedPaths = useMemo(() => {
+    if (!activeTagFilter) return null;
+    const want = activeTagFilter.toLowerCase();
+    const set = new Set<string>();
+    for (const e of tagsByPath.values()) {
+      if (e.tags.some((t) => t.toLowerCase() === want)) set.add(e.path);
+    }
+    return set;
+  }, [tagsByPath, activeTagFilter]);
+  const tagResults = useMemo(() => {
+    if (!taggedPaths) return [];
+    const out: NodeRecord[] = [];
+    for (const n of tree.nodeById.values()) {
+      if (n.id >= 0 && n.path && taggedPaths.has(n.path)) out.push(n);
+    }
+    out.sort((a, b) => compareNodes(a, b, tree.sortKey, tree.sortDir));
+    return out;
+  }, [taggedPaths, tree.nodeById, tree.sortKey, tree.sortDir]);
+  const tagFiltering = !!activeTagFilter && !searching;
+  const showRows = searching ? searchResults : tagFiltering ? tagResults : tree.visibleRows;
+  const showFlat = searching || tagFiltering;
+
   const breadcrumbPath = data?.rootPath || scanPath;
   const canBack = navHistory.index > 0;
   const canForward = navHistory.index < navHistory.stack.length - 1;
@@ -1301,6 +1461,18 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           onForward={goForward}
           onUp={handleNavigateParent}
         />
+        {tagFiltering && (
+          <div className="tag-filter-bar" role="status">
+            <Icon name="funnel-fill" size={12} />
+            <span>Filtering by tag</span>
+            <span className="tag-filter-chip">{activeTagFilter}</span>
+            <span className="tag-filter-count">{tagResults.length} item{tagResults.length === 1 ? "" : "s"}</span>
+            <span className="spacer" />
+            <button className="tag-filter-clear" title="Clear tag filter" onClick={onClearTagFilter}>
+              <Icon name="x" size={12} /> Clear
+            </button>
+          </div>
+        )}
         {showTreemapView ? (
           <>
             {toolbarVisible && (
@@ -1393,6 +1565,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                 style={{ height: 24, width: 150, background: "var(--vsc-input-bg)", border: "1px solid var(--vsc-border)", color: "var(--text)" }}
               />
               <button onClick={() => setFilterDialogOpen(true)} title="Advanced filter">Rules</button>
+              <button
+                onClick={() => setBulkRenameOpen(true)}
+                disabled={selectedNodes.length === 0}
+                title="Bulk rename the selected items"
+              >Rename…</button>
               <span className="sep" />
               <ConfigureColumnsMenu
                 visibleColumns={visibleColumns}
@@ -1415,8 +1592,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             <div className="editor-stack">
               <div className="editor-main">
                 <TreeTable
-                  rows={searching ? searchResults : tree.visibleRows}
-                  flat={searching}
+                  rows={showRows}
+                  flat={showFlat}
                   nodeById={tree.nodeById}
                   expanded={tree.expanded}
                   selectedId={tree.selectedId}
@@ -1439,6 +1616,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   onAfterExternalMove={handleAfterExternalMove}
                   onSortChange={handleSortChange}
                   bookmarks={bookmarkSet}
+                  tags={tagsByPath}
+                  onEditTags={(path, x, y) => setTagPopover({ path, x, y })}
                   onToggleBookmark={onToggleBookmark}
                   renamingId={renamingId}
                   onRenameCommit={commitRename}
@@ -1497,6 +1676,26 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           initialRules={tree.filterRules}
           onApply={tree.setFilterRules}
           onClose={() => setFilterDialogOpen(false)}
+        />
+      )}
+
+      {bulkRenameOpen && (
+        <BulkRenameDialog
+          nodes={selectedNodes}
+          onClose={() => setBulkRenameOpen(false)}
+          onApplied={() => { invalidateAllScanCache(); doScan(undefined, undefined, true); }}
+          undoAction={undoAction}
+        />
+      )}
+
+      {tagPopover && (
+        <TagPopover
+          path={tagPopover.path}
+          x={tagPopover.x}
+          y={tagPopover.y}
+          entry={tagsByPath.get(tagPopover.path)}
+          onApply={onSetTags}
+          onClose={() => setTagPopover(null)}
         />
       )}
 

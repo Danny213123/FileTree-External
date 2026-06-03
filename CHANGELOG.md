@@ -4,6 +4,28 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.6.0] - 2026-06-03
+
+### Added
+
+- **Disk Cleanup / Reclaim Space assistant**: a dedicated view that categorizes reclaimable space (caches, temp files, logs, recycle bin, large and stale items) and frees it by moving the selected entries to the Windows Recycle Bin rather than hard-deleting them.
+- **Scan snapshots and historical diff**: save a scan as a named snapshot and compare any two saved snapshots to see what was added, removed, grew, or shrank between them.
+- **Media Gallery view**: a virtualized thumbnail grid that renders the images and videos in the current scan, staying responsive on very large folders.
+- **Bulk / batch rename**: rename many files at once with a live preview, supporting regex find/replace, tokens, and sequential numbering before any change is written to disk.
+- **Tags and color labels**: attach persistent, filterable tags and color labels to files and folders, retained across sessions.
+- **Command palette**: a Ctrl+P quick file jump and a Ctrl+Shift+P command launcher for keyboard-driven navigation and actions.
+- **Saved searches / Smart Folders**: persist a search query as a reusable Smart Folder that re-runs on demand.
+- **Archive actions**: compress selections to a `.zip`, extract archives, and compute SHA-256 checksums directly from the file table.
+- **Low-space monitor**: a background monitor that raises native desktop alerts when a drive runs low on free space.
+- **File-operation transfer manager with unified Undo**: a transfer manager that tracks copy/move/delete operations with progress, alongside a single unified Undo across file operations.
+
+### Fixed
+
+- **Cleanup date units**: the Disk Cleanup age thresholds now use the correct date units, so stale-item buckets are computed accurately.
+- **Low-space drive source**: the low-space monitor reads free-space from `/api/drives`, so its alerts reflect the actual mounted drives.
+
+---
+
 ## [1.5.0] - 2026-06-03
 
 ### Added

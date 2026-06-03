@@ -132,6 +132,9 @@ electron_1.contextBridge.exposeInMainWorld("electronAPI", {
     },
     // Real Windows shell context menu for the given path(s) at the cursor.
     shellContextMenu: (paths, x, y) => electron_1.ipcRenderer.invoke("shellContextMenu", paths, x, y),
+    // Native OS desktop notification (F9 low-space alerts). Resolves true when a
+    // notification was shown (Notifications supported on this platform).
+    notify: (title, body) => electron_1.ipcRenderer.invoke("notify", title, body),
     // Integrated terminal: spawn a real shell (PTY) and stream its output to
     // xterm.js in the renderer. `onData`/`onExit` return unsubscribe functions.
     terminal: {

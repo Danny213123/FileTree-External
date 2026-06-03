@@ -8,6 +8,7 @@ import {
   screen,
   session,
   safeStorage,
+  Notification,
 } from "electron";
 import * as path from "path";
 import * as net from "net";
@@ -649,6 +650,33 @@ if ($action) { [Console]::Out.WriteLine("FILETREE_ACTION:" + $action) }
 // TEMP diagnostic: print renderer-forwarded log lines to the terminal.
 ipcMain.on("diag", (_event, message: string) => {
   console.log("[renderer]", message);
+});
+
+// ── Native desktop notifications (F9 low-space alerts) ────────────────────────
+// The renderer asks MAIN to raise a real OS notification (Windows Action Center
+// toast) so a low-space warning is seen even when the window is unfocused. The
+// renderer de-dupes upstream; this just shows what it's given. Resolves true
+// when a notification was actually shown.
+ipcMain.handle("notify", (_event, title: string, body: string): boolean => {
+  try {
+    if (!Notification.isSupported()) return false;
+    const n = new Notification({
+      title: typeof title === "string" ? title : "FileTree",
+      body: typeof body === "string" ? body : "",
+    });
+    // Focus the app window when the user clicks the toast.
+    n.on("click", () => {
+      const win = BrowserWindow.getAllWindows()[0];
+      if (win) {
+        if (win.isMinimized()) win.restore();
+        win.focus();
+      }
+    });
+    n.show();
+    return true;
+  } catch {
+    return false;
+  }
 });
 
 // ── Mutating-request proxy ────────────────────────────────────────────────────

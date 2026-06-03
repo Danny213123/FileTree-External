@@ -219,29 +219,55 @@ export type SortKey =
 export type Metric = "size" | "allocated" | "files" | "folders";
 export type Unit = "auto" | "tb" | "gb" | "mb" | "kb" | "bytes";
 
-// ── Scan snapshots + growth diff (roadmap #5) ──────────────────────────────
+// ── Scan snapshots + growth diff (F2) ──────────────────────────────────────
+// These mirror the NEW snapshot store in `src/snapshots.rs` (a compact
+// folder→size capture under %APPDATA%\FileTree\snapshots\), reached via
+// GET /api/snapshots (list, a bare array), POST /api/snapshots-save,
+// GET /api/snapshots-diff?a=&b= and POST /api/snapshots-delete.
 
-/** One saved snapshot's metadata (also the manifest entry shape). */
+/** One saved snapshot's metadata — the exact GET /api/snapshots list element
+ *  and POST /api/snapshots-save response shape (`snapshots::SnapMeta`). */
 export interface SnapshotMeta {
   id: string;
-  rootPath: string;
-  /** Epoch ms the underlying scan was taken. */
-  scannedAt: number;
-  /** Epoch ms the snapshot was saved. */
-  savedAt: number;
-  label: string;
-  nodeCount: number;
+  /** Unix SECONDS the snapshot was created (×1000 for a JS Date / formatDate). */
+  createdAt: number;
+  /** Scanned root path captured. */
+  path: string;
   /** Aggregated total bytes of the scanned root at capture time. */
-  totalSize: number;
+  total: number;
+  /** Recursive file count of the scanned root at capture time. */
+  fileCount: number;
 }
 
-export interface SnapshotList {
-  snapshots: SnapshotMeta[];
+/** An added/removed folder in a snapshot diff (`{path,size}`). */
+export interface SnapshotDiffEntry {
+  path: string;
+  size: number;
 }
 
+/** A folder whose size changed between two snapshots (`{path,sizeA,sizeB,delta}`). */
+export interface SnapshotChangedEntry {
+  path: string;
+  sizeA: number;
+  sizeB: number;
+  /** sizeB - sizeA (can be negative). */
+  delta: number;
+}
+
+/** Raw GET /api/snapshots-diff response (`b` minus `a`), directories only. */
+export interface SnapshotDiff {
+  added: SnapshotDiffEntry[];
+  removed: SnapshotDiffEntry[];
+  changed: SnapshotChangedEntry[];
+}
+
+// The types below are a CLIENT-SIDE view model the diff views render. The
+// client (`fetchSnapshotDiff`) adapts the raw `SnapshotDiff` buckets above into
+// these rows + summary: `added`/`removed` map straight through and `changed`
+// splits into "grown"/"shrunk" by the sign of its delta.
 export type DiffStatus = "added" | "removed" | "grown" | "shrunk";
 
-/** One per-path delta between two snapshots (or snapshot vs current scan). */
+/** One per-folder delta between two snapshots. */
 export interface DiffRow {
   path: string;
   name: string;
@@ -258,13 +284,13 @@ export interface DiffSummary {
   removed: number;
   grown: number;
   shrunk: number;
-  /** Net byte change across all paths. */
+  /** Net byte change (newTotal - oldTotal). */
   netDelta: number;
   oldTotal: number;
   newTotal: number;
-  /** Total number of changed rows before the display cap. */
+  /** Number of changed rows shown. */
   rowCount: number;
-  /** True when `rows` was truncated to the server cap. */
+  /** True when any diff bucket hit the server cap (1000). */
   capped: boolean;
 }
 
@@ -273,4 +299,103 @@ export interface DiffResult {
   b: SnapshotMeta;
   summary: DiffSummary;
   rows: DiffRow[];
+}
+
+// ── Disk Cleanup / Reclaim Space assistant (roadmap #1) ────────────────────
+
+/** One reclaimable file/folder inside a cleanup category. */
+export interface CleanupItem {
+  path: string;
+  /** Bytes reclaimed by removing this item. */
+  size: number;
+  /** Unix SECONDS last-modified (0 when unknown); ×1000 for a JS Date. */
+  modified: number;
+}
+
+/** A bucket of reclaimable space (temp, caches, build artifacts, …). */
+export interface CleanupCategory {
+  id: string;
+  label: string;
+  description: string;
+  /** Aggregate bytes reclaimable across this category's items. */
+  total: number;
+  /** Number of items in the category. */
+  count: number;
+  items: CleanupItem[];
+}
+
+export interface CleanupScanResult {
+  categories: CleanupCategory[];
+}
+
+// ── Bulk rename (F3) ───────────────────────────────────────────────────────
+import type { FilterRule } from "../hooks/useFilterRules";
+
+/** One rename in a bulk-rename batch: move `from` (absolute path) to `to`
+ *  (absolute path, same parent). */
+export interface BulkRenameOp {
+  from: string;
+  to: string;
+}
+
+/** Per-op outcome echoed back by POST /api/bulk-rename. */
+export interface BulkRenameResultItem {
+  from: string;
+  to: string;
+  ok: boolean;
+  error?: string;
+}
+
+export interface BulkRenameResponse {
+  results: BulkRenameResultItem[];
+}
+
+// ── Tags & color labels (F4) ───────────────────────────────────────────────
+
+/** One tagged path: its labels plus an optional color (hex string). Mirrors the
+ *  GET /api/tags `items` entry shape exactly. */
+export interface TagEntry {
+  path: string;
+  tags: string[];
+  /** Optional hex color (e.g. "#e06c75") shown as the row dot. */
+  color?: string;
+}
+
+// ── Smart folders (F7) ──────────────────────────────────────────────────────
+
+/** A saved query: free-text search and/or advanced filter rules. */
+export interface SmartFolderQuery {
+  text?: string;
+  rules?: FilterRule[];
+}
+
+/** A named, persisted search/filter the user can re-apply with one click. */
+export interface SmartFolder {
+  id: string;
+  name: string;
+  query: SmartFolderQuery;
+}
+
+// ── Archive (zip) + checksums (F5) ─────────────────────────────────────────
+// Mirror `src/archive.rs` + the server.rs handlers. Note both compress and
+// extract return HTTP 200 even on failure, carrying `ok:false` + an `error`.
+
+/** POST /api/compress response (`{ok, dest, error?}`). */
+export interface CompressResult {
+  ok: boolean;
+  dest: string;
+  error?: string;
+}
+
+/** POST /api/extract response (`{ok, error?}`). */
+export interface ExtractResult {
+  ok: boolean;
+  error?: string;
+}
+
+/** GET /api/checksum response: `{algo, hash}` on success, `{error}` on failure. */
+export interface ChecksumResult {
+  algo: string;
+  hash: string;
+  error?: string;
 }

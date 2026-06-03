@@ -1,12 +1,23 @@
 import type {
   ScanResult,
   DriveList,
+  DriveEntry,
   Config,
   ExactDuplicatesResult,
   SpecialFolderList,
-  SnapshotList,
   SnapshotMeta,
+  SnapshotDiff,
   DiffResult,
+  DiffRow,
+  DiffStatus,
+  CleanupScanResult,
+  BulkRenameOp,
+  BulkRenameResponse,
+  TagEntry,
+  SmartFolder,
+  CompressResult,
+  ExtractResult,
+  ChecksumResult,
 } from "./types";
 
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -51,6 +62,8 @@ type ElectronAPI = {
     listTools: (server: unknown) => Promise<McpListResult>;
     callTool: (server: unknown, name: string, args: unknown) => Promise<McpCallResult>;
   };
+  /** Show a native OS desktop notification from the MAIN process (F9). */
+  notify?: (title: string, body: string) => Promise<boolean>;
 };
 
 export interface WebFetchResult {
@@ -359,6 +372,10 @@ export interface AppSettings {
   previewOpen?: boolean;
   detailsOpen?: boolean;
   inspectorWidth?: number;
+  // Low-space monitor (F9): alert when a drive's free space drops below this
+  // percentage. `lowSpaceAlerts` toggles the monitor on/off.
+  lowSpaceThreshold?: number;
+  lowSpaceAlerts?: boolean;
 }
 
 export async function fetchSettings(): Promise<AppSettings> {
@@ -431,46 +448,124 @@ export async function mcpCallTool(server: unknown, name: string, args: unknown):
   catch (e) { return { ok: false, error: (e as Error).message }; }
 }
 
-// ── Scan snapshots + growth diff (roadmap #5) ────────────────
+// ── Scan snapshots + growth diff (F2) ────────────────────────
+// All four operations target the NEW compact folder→size snapshot store
+// (`src/snapshots.rs`): GET /api/snapshots (list, bare array),
+// POST /api/snapshots-save, GET /api/snapshots-diff?a=&b= and
+// POST /api/snapshots-delete. The legacy singular `/api/snapshot-*` routes (the
+// older `crate::diff` NDJSON store) are intentionally no longer used here.
 
 /** List saved snapshots (newest first). Never throws — returns [] on failure. */
 export async function fetchSnapshots(): Promise<SnapshotMeta[]> {
   const res = await fetch("/api/snapshots");
   if (!res.ok) return [];
-  try { return ((await res.json()) as SnapshotList).snapshots ?? []; } catch { return []; }
+  try {
+    // GET /api/snapshots returns a bare array; tolerate a {snapshots:[…]} wrap.
+    const data = (await res.json()) as SnapshotMeta[] | { snapshots?: SnapshotMeta[] };
+    if (Array.isArray(data)) return data;
+    return data.snapshots ?? [];
+  } catch { return []; }
 }
 
 /**
- * Save the server's current scan of `path` as a new snapshot. The server reads
- * the freshly-scanned tree from its own cache (no large client upload) and
- * returns the updated snapshot list (newest first).
+ * Save the server's current scan of `path` as a new snapshot via
+ * POST /api/snapshots-save. The server reads the freshly-scanned tree from its
+ * own cache (no large client upload); the response is just the saved meta, so
+ * we re-fetch the manifest and return the updated list (newest first).
  */
-export async function saveSnapshot(path: string, label?: string): Promise<SnapshotMeta[]> {
-  const r = await postMutation("/api/snapshots", { path, ...(label ? { label } : {}) });
+export async function saveSnapshot(path: string): Promise<SnapshotMeta[]> {
+  const r = await postMutation("/api/snapshots-save", { path });
   if (!r.ok) throw new Error(mutateErrorText(r));
-  return (r.data as SnapshotList | null)?.snapshots ?? [];
+  return fetchSnapshots();
 }
 
+/** Delete a saved snapshot by id; returns the updated list (newest first). */
 export async function deleteSnapshot(id: string): Promise<SnapshotMeta[]> {
-  const r = await postMutation("/api/snapshot-delete", { id });
-  if (!r.ok) return fetchSnapshots();
-  return (r.data as SnapshotList | null)?.snapshots ?? [];
+  await postMutation("/api/snapshots-delete", { id });
+  return fetchSnapshots();
+}
+
+const SNAP_DIFF_CAP = 1000; // mirrors snapshots::DIFF_CAP (per-bucket cap)
+
+function baseName(p: string): string {
+  const parts = p.split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : p;
 }
 
 /**
- * Diff two snapshots, or a snapshot vs the live scan. Pass the literal "current"
- * for either side to compare against the server's current scan of `path`
- * (required when a side is "current").
+ * Diff two saved snapshots (`b` minus `a`) over their folder size maps. Adapts
+ * the raw GET /api/snapshots-diff response into the client view model the diff
+ * views render: `added`/`removed` pass through; each `changed` entry becomes a
+ * "grown"/"shrunk" row by the sign of its delta. The net/total figures come
+ * from the two snapshot metas (the diff endpoint only returns folder deltas).
  */
 export async function fetchSnapshotDiff(
-  a: string,
-  b: string,
-  path?: string,
+  a: SnapshotMeta,
+  b: SnapshotMeta,
   signal?: AbortSignal,
 ): Promise<DiffResult> {
-  const params = new URLSearchParams({ a, b });
-  if (path) params.set("path", path);
-  return getJson<DiffResult>(`/api/snapshot-diff?${params}`, signal);
+  const params = new URLSearchParams({ a: a.id, b: b.id });
+  const raw = await getJson<SnapshotDiff>(`/api/snapshots-diff?${params}`, signal);
+  const added = raw.added ?? [];
+  const removed = raw.removed ?? [];
+  const changed = raw.changed ?? [];
+
+  const rows: DiffRow[] = [];
+  for (const e of added) {
+    rows.push({ path: e.path, name: baseName(e.path), status: "added", oldSize: 0, newSize: e.size, delta: e.size, dir: true });
+  }
+  for (const e of removed) {
+    rows.push({ path: e.path, name: baseName(e.path), status: "removed", oldSize: e.size, newSize: 0, delta: -e.size, dir: true });
+  }
+  let grown = 0;
+  let shrunk = 0;
+  for (const e of changed) {
+    const status: DiffStatus = e.delta >= 0 ? "grown" : "shrunk";
+    if (e.delta >= 0) grown++; else shrunk++;
+    rows.push({ path: e.path, name: baseName(e.path), status, oldSize: e.sizeA, newSize: e.sizeB, delta: e.delta, dir: true });
+  }
+
+  return {
+    a,
+    b,
+    rows,
+    summary: {
+      added: added.length,
+      removed: removed.length,
+      grown,
+      shrunk,
+      oldTotal: a.total,
+      newTotal: b.total,
+      netDelta: b.total - a.total,
+      rowCount: rows.length,
+      capped:
+        added.length >= SNAP_DIFF_CAP ||
+        removed.length >= SNAP_DIFF_CAP ||
+        changed.length >= SNAP_DIFF_CAP,
+    },
+  };
+}
+
+// ── Disk Cleanup / Reclaim Space assistant (roadmap #1) ───────────────────
+// A read-only scan buckets reclaimable space by category (temp, caches, build
+// artifacts, recycle bin, old large downloads, confirmed duplicate sets) for a
+// scan root; the user then multi-selects and moves the selection to the Recycle
+// Bin. The recycle call routes through the token-authed mutate IPC like delete.
+
+/** Bucket reclaimable space under `path` by category. Throws on a non-200. */
+export async function fetchCleanupScan(
+  path: string,
+  signal?: AbortSignal,
+): Promise<CleanupScanResult> {
+  const params = new URLSearchParams({ path });
+  return getJson<CleanupScanResult>(`/api/cleanup-scan?${params}`, signal);
+}
+
+/** Move the given paths to the Recycle Bin (safe, restorable delete). */
+export async function recycleItems(paths: string[]): Promise<{ ok: boolean; error?: string }> {
+  const r = await postMutation("/api/recycle-items", { paths });
+  if (r.ok) return { ok: true };
+  return { ok: false, error: mutateErrorText(r) };
 }
 
 /** On-demand owner resolution for a single path (Details pane fallback). */
@@ -1067,4 +1162,151 @@ export async function dupeClearIgnoreList(): Promise<{ ok: boolean }> {
   const res = await fetch("/api/dupes-ignore", { method: "DELETE" });
   if (!res.ok) return { ok: false };
   return res.json() as Promise<{ ok: boolean }>;
+}
+
+// ── Bulk rename (F3) ─────────────────────────────────────────────────────────
+// POST a batch of {from,to} renames; the server applies them in order and echoes
+// a per-op result so the UI can surface partial failures. Routed through the
+// token-authed mutate IPC like rename/move. Degrades gracefully: a missing/404
+// endpoint (backend not yet landed) yields a synthesized all-failed result so
+// the dialog reports it instead of throwing.
+export async function bulkRename(ops: BulkRenameOp[]): Promise<BulkRenameResponse> {
+  const r = await postMutation("/api/bulk-rename", { ops });
+  if (!r.ok) {
+    const msg = mutateErrorText(r);
+    return { results: ops.map((o) => ({ from: o.from, to: o.to, ok: false, error: msg })) };
+  }
+  const data = (r.data ?? {}) as Partial<BulkRenameResponse>;
+  // Tolerate a server that returns nothing useful: treat as all-OK only when it
+  // explicitly says so; otherwise echo an empty list the caller can detect.
+  return { results: data.results ?? [] };
+}
+
+// ── Tags & color labels (F4) ──────────────────────────────────────────────────
+// Persisted exactly like bookmarks: a read-only GET plus a full-list-replace
+// POST routed through the token-authed mutate IPC. Never throws — a missing
+// endpoint yields an empty list so the feature degrades to "no tags yet".
+export async function fetchTags(): Promise<TagEntry[]> {
+  const res = await fetch("/api/tags");
+  if (!res.ok) return [];
+  try {
+    const data = (await res.json()) as { items?: TagEntry[] } | TagEntry[];
+    if (Array.isArray(data)) return data;
+    return data.items ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function saveTags(items: TagEntry[]): Promise<void> {
+  await postMutation("/api/tags", { items });
+}
+
+// ── Smart folders (F7) ────────────────────────────────────────────────────────
+// Saved searches/filters. GET returns a bare array; POST replaces the whole
+// list (token-authed). Never throws — a missing endpoint yields [].
+export async function fetchSmartFolders(): Promise<SmartFolder[]> {
+  const res = await fetch("/api/smart-folders");
+  if (!res.ok) return [];
+  try {
+    const data = (await res.json()) as SmartFolder[] | { items?: SmartFolder[] };
+    if (Array.isArray(data)) return data;
+    return data.items ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function saveSmartFolders(items: SmartFolder[]): Promise<void> {
+  await postMutation("/api/smart-folders", items);
+}
+
+// ── Archive (zip) + checksums (F5) ──────────────────────────────────────────
+// Compress/extract route through the token-authed mutate IPC (they write under
+// a scanned root). Both return HTTP 200 even on a logical failure, carrying
+// `ok:false` + an `error`, so we read the body rather than trusting the status.
+// checksum is a read-only GET. All three gate paths to a scanned root server-side.
+
+/** Zip `paths` into `dest` (a .zip path, whose parent must be under a scan root). */
+export async function compress(paths: string[], dest: string): Promise<CompressResult> {
+  const r = await postMutation("/api/compress", { paths, dest });
+  if (!r.ok) return { ok: false, dest, error: mutateErrorText(r) };
+  const d = (r.data ?? {}) as Partial<CompressResult>;
+  return { ok: d.ok ?? false, dest: d.dest ?? dest, error: d.ok ? undefined : (d.error ?? "Compress failed") };
+}
+
+/** Extract `archive` (a .zip) into `dest` (zip-slip guarded server-side). */
+export async function extract(archive: string, dest: string): Promise<ExtractResult> {
+  const r = await postMutation("/api/extract", { archive, dest });
+  if (!r.ok) return { ok: false, error: mutateErrorText(r) };
+  const d = (r.data ?? {}) as Partial<ExtractResult>;
+  return { ok: d.ok ?? false, error: d.ok ? undefined : (d.error ?? "Extract failed") };
+}
+
+/** Stream a file through SHA-256 (default) or MD5 and return the hex digest. */
+export async function checksum(path: string, algo: "sha256" | "md5" = "sha256"): Promise<ChecksumResult> {
+  const params = new URLSearchParams({ path, algo });
+  const res = await fetch(`/api/checksum?${params}`);
+  let data: Partial<ChecksumResult> = {};
+  try { data = (await res.json()) as Partial<ChecksumResult>; } catch { /* ignore */ }
+  if (!res.ok || !data.hash) {
+    return { algo, hash: "", error: data.error ?? `HTTP ${res.status}` };
+  }
+  return { algo: data.algo ?? algo, hash: data.hash };
+}
+
+/** Copy arbitrary text to the clipboard (Electron `copyText`, else /api/copy-path). */
+export async function copyText(text: string): Promise<void> {
+  if (eAPI().copyText) {
+    await eAPI().copyText!(text);
+  } else {
+    await fetch("/api/copy-path", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: text }),
+    }).catch(() => {});
+  }
+}
+
+// ── Drive free-space (F9) ──────────────────────────────────────────────────────
+// The backend has no dedicated /api/drive-space; GET /api/drives already reports
+// {root,label,total,free} (bytes) per volume, so the low-space monitor watches
+// that directly — the caller maps root→drive and computes percent-free from
+// total/free. Never throws.
+export async function fetchDriveSpace(): Promise<DriveEntry[]> {
+  try {
+    return (await fetchDrives()).drives ?? [];
+  } catch {
+    return [];
+  }
+}
+
+// ── Native desktop notification (F9) ───────────────────────────────────────────
+// Prefer the Electron MAIN-process Notification bridge (real OS toast even when
+// the window is unfocused). Outside Electron, fall back to the Web Notifications
+// API (requesting permission once). Never throws; resolves true when a
+// notification was shown.
+export async function notify(title: string, body: string): Promise<boolean> {
+  const api = eAPI();
+  if (typeof api.notify === "function") {
+    try { return await api.notify(title, body); } catch { /* fall through */ }
+  }
+  try {
+    if (typeof Notification !== "undefined") {
+      if (Notification.permission === "granted") {
+        new Notification(title, { body });
+        return true;
+      }
+      if (Notification.permission !== "denied") {
+        const perm = await Notification.requestPermission();
+        if (perm === "granted") {
+          new Notification(title, { body });
+          return true;
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return false;
 }

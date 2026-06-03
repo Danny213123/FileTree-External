@@ -533,6 +533,191 @@ fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
+/// Parse the F3 bulk-rename payload `{"ops":[{"from","to"}, ...]}` into
+/// `(from, to)` pairs. Uses the real JSON parser (not the naive single-key
+/// scanners above) because the array carries many `from`/`to` keys. Entries
+/// missing either field, or with an empty value, are dropped.
+fn extract_rename_ops(body: &str) -> Vec<(String, String)> {
+    let Some(root) = crate::json::parse(body) else {
+        return Vec::new();
+    };
+    let Some(arr) = root.get("ops").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let from = v.get("from").and_then(|x| x.as_str());
+        let to = v.get("to").and_then(|x| x.as_str());
+        if let (Some(f), Some(t)) = (from, to) {
+            if !f.is_empty() && !t.is_empty() {
+                out.push((f.to_string(), t.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// One planned/attempted bulk-rename op (internal to `bulk_rename_results`).
+struct RenamePlan {
+    from: String,
+    to: String,
+    from_path: PathBuf,
+    dst: PathBuf,
+    /// Phase-1 temp location, set once the source has been moved aside.
+    temp: Option<PathBuf>,
+    /// First error encountered; `None` means the op ultimately succeeded.
+    error: Option<String>,
+}
+
+/// Execute a batch of `{from,to}` renames and return `(from, to, ok, error?)`
+/// per op (input order preserved).
+///
+/// Each op renames an item *within its own directory* (a true rename, not a
+/// move): `to` may be a bare name or a full path, but if it carries a directory
+/// component it must resolve to the source's parent — anything else is rejected
+/// as an escape. Names go through the same `preflight` hygiene checks as
+/// `/api/rename`.
+///
+/// To tolerate transient collisions in a single batch (the classic `a→b`,
+/// `b→a` swap, or any cycle), the work is done in two phases: every valid source
+/// is first moved to a unique temp name in its parent, then each temp is moved
+/// to its final `to`. A destination that still exists at phase 2 is therefore a
+/// real, *out-of-batch* file, so the op is failed (never silently overwritten)
+/// and rolled back to its original name. The scan cache is invalidated for every
+/// touched parent directory.
+fn bulk_rename_results(
+    state: &AppState,
+    ops: &[(String, String)],
+) -> Vec<(String, String, bool, Option<String>)> {
+    let mut plans: Vec<RenamePlan> = Vec::with_capacity(ops.len());
+
+    // ── Validate every op up front ──────────────────────────────
+    for (from, to) in ops {
+        let from_path = PathBuf::from(from);
+        let mut plan = RenamePlan {
+            from: from.clone(),
+            to: to.clone(),
+            from_path: from_path.clone(),
+            dst: PathBuf::new(),
+            temp: None,
+            error: None,
+        };
+
+        if !path_within_scan_root(state, &from_path) {
+            plan.error = Some("Source is outside the scanned directories".to_string());
+            plans.push(plan);
+            continue;
+        }
+        let Some(parent) = from_path.parent().map(|p| p.to_path_buf()) else {
+            plan.error = Some("Source has no parent directory".to_string());
+            plans.push(plan);
+            continue;
+        };
+        let to_path = Path::new(to);
+        let Some(name_os) = to_path.file_name() else {
+            plan.error = Some("Destination name is empty".to_string());
+            plans.push(plan);
+            continue;
+        };
+        let name = name_os.to_string_lossy().to_string();
+        // If `to` includes a directory component it must point back at the source
+        // parent; otherwise the rename would escape the directory (rejected).
+        if let Some(to_parent) = to_path.parent() {
+            if !to_parent.as_os_str().is_empty() {
+                let same = match (fs::canonicalize(to_parent), fs::canonicalize(&parent)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                };
+                if !same {
+                    plan.error = Some("Destination escapes the source directory".to_string());
+                    plans.push(plan);
+                    continue;
+                }
+            }
+        }
+        if let Err(message) = crate::preflight::validate_name(&name) {
+            plan.error = Some(message);
+            plans.push(plan);
+            continue;
+        }
+        let dst = parent.join(&name);
+        if let Err(message) = crate::preflight::validate_path_length(&dst) {
+            plan.dst = dst;
+            plan.error = Some(message);
+            plans.push(plan);
+            continue;
+        }
+        plan.dst = dst;
+        plans.push(plan);
+    }
+
+    // ── Phase 1: move each valid source aside to a unique temp name ──
+    let pid = std::process::id();
+    for (i, plan) in plans.iter_mut().enumerate() {
+        if plan.error.is_some() {
+            continue;
+        }
+        let Some(parent) = plan.from_path.parent() else {
+            plan.error = Some("Source has no parent directory".to_string());
+            continue;
+        };
+        let temp = unique_target(parent, &format!(".filetree-rename-{pid}-{i}.tmp"));
+        match fs::rename(&plan.from_path, &temp) {
+            Ok(_) => plan.temp = Some(temp),
+            Err(e) => plan.error = Some(crate::preflight::describe_fs_error(&e, &plan.from_path)),
+        }
+    }
+
+    // ── Phase 2: move each temp to its final destination ──
+    for plan in plans.iter_mut() {
+        let Some(temp) = plan.temp.clone() else {
+            continue;
+        };
+        // Every batch source is a temp file now, so a surviving dst is an
+        // out-of-batch file: refuse to clobber it and restore the original.
+        if plan.dst.exists() {
+            plan.error = Some("Destination already exists".to_string());
+            let _ = fs::rename(&temp, &plan.from_path);
+            plan.temp = None;
+            continue;
+        }
+        if let Err(e) = fs::rename(&temp, &plan.dst) {
+            plan.error = Some(crate::preflight::describe_fs_error(&e, &plan.dst));
+            let _ = fs::rename(&temp, &plan.from_path);
+            plan.temp = None;
+        }
+    }
+
+    // ── Audit + cache invalidation ──
+    {
+        let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+        for plan in &plans {
+            let dst_str = plan.dst.to_string_lossy().to_string();
+            crate::audit::record(crate::audit::Entry {
+                op: "rename",
+                src: std::slice::from_ref(&plan.from),
+                dst: &dst_str,
+                error: plan.error.as_deref(),
+                by: "server",
+                ..Default::default()
+            });
+            if plan.error.is_none() {
+                if let Some(parent) = plan.from_path.parent() {
+                    cache.invalidate(&parent.to_string_lossy());
+                }
+            }
+        }
+    }
+
+    plans
+        .into_iter()
+        .map(|plan| {
+            let ok = plan.error.is_none();
+            (plan.from, plan.to, ok, plan.error)
+        })
+        .collect()
+}
+
 /// Decode raw bytes to a String, truncating to `max` bytes (UTF-8-lossy so a cut
 /// mid-codepoint is replaced rather than panicking). Returns (text, truncated).
 fn cap_output(bytes: &[u8], max: usize) -> (String, bool) {
@@ -810,6 +995,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         "/api/reveal",
         "/api/properties",
         "/api/snapshot-delete",
+        // 10-feature backend: batch filesystem mutations / deletes, plus the
+        // appdata-writing snapshot save/delete — all POST-only + session-token
+        // gated like every other mutation route.
+        "/api/recycle-items",
+        "/api/bulk-rename",
+        "/api/compress",
+        "/api/extract",
+        "/api/snapshots-save",
+        "/api/snapshots-delete",
         "/api/exit",
     ];
     let is_destructive = DESTRUCTIVE_ROUTES.contains(&route.as_str());
@@ -823,6 +1017,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         "/api/copy-path", "/api/rename", "/api/move-items", "/api/copy-files", "/api/drag-out",
         "/api/dupes-hash", "/api/dupes-action", "/api/dupes-make-ref", "/api/dupes-cancel",
         "/api/dupes-ignore", "/api/run-command", "/api/snapshots",
+        // 10-feature backend dual-mode stores: GET reads (open), POST writes
+        // (token-gated via `writes_on_post`).
+        "/api/tags", "/api/smart-folders",
     ];
     let method_allowed = if is_destructive {
         // No GET fall-through for destructive routes.
@@ -846,7 +1043,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
     // POST writes/persists (mutating). The write side is token-gated like a
     // destructive route; the read side stays open.
     let writes_on_post = request.method == "POST"
-        && matches!(route.as_str(), "/api/settings" | "/api/bookmarks" | "/api/snapshots");
+        && matches!(
+            route.as_str(),
+            "/api/settings"
+                | "/api/bookmarks"
+                | "/api/snapshots"
+                | "/api/tags"
+                | "/api/smart-folders"
+        );
 
     // Token gate: enforced on every destructive route and on the write (POST)
     // side of the dual-mode routes, whenever a session token is configured.
@@ -2362,7 +2566,13 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     ),
                 }
             } else {
-                respond_json(&mut stream, 200, "OK", &crate::diff::list_snapshots_json())
+                // F2: GET lists the new compact folder->size snapshot store
+                // (`%APPDATA%\FileTree\snapshots\`), matching the contract shape
+                // `[{id,createdAt,path,total,fileCount}]`. Saving goes through
+                // `/api/snapshots-save`; the legacy POST branch above and the
+                // singular `/api/snapshot-*` routes keep operating on the older
+                // `crate::diff` NDJSON store for backward compatibility.
+                respond_json(&mut stream, 200, "OK", &crate::snapshots::list_json())
             }
         }
         "/api/snapshot-delete" => {
@@ -2494,6 +2704,384 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             )?;
             ollama_stream_chat(&mut stream, &request.body, OLLAMA_PORT)?;
             write_final_chunk(&mut stream)
+        }
+        // ──────────────────────────────────────────────────────────────────
+        // 10-feature backend (F1 cleanup, F2 snapshots, F3 bulk-rename,
+        // F4 tags, F5 archive+checksum, F7 smart folders). All read/write of
+        // user paths is gated by `path_within_scan_root`; the mutating routes
+        // are whitelisted POST-only + session-token gated above.
+        // ──────────────────────────────────────────────────────────────────
+
+        // F1: reclaim-space scan over well-known categories. The `?path=` root
+        // only scopes build-artifacts + duplicates (reused from the cached scan);
+        // every other category measures system locations directly.
+        "/api/cleanup-scan" => {
+            let Some(path) = query
+                .get("path")
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+            else {
+                return respond_text(&mut stream, 400, "Bad request", "Missing path");
+            };
+            let root = PathBuf::from(&path);
+            if !path_within_scan_root(&state, &root) {
+                return respond_json(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "{\"error\":\"Path is outside the scanned directories\"}",
+                );
+            }
+            // Reuse the cached scan (if any) so build-artifacts/duplicates need no
+            // second full walk of the root.
+            let scan = find_current_scan(&state, &root);
+            let threads = query
+                .get("threads")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_thread_count);
+            let body = crate::cleanup::cleanup_scan_json(
+                &root,
+                scan.as_deref(),
+                &state.hash_cache,
+                &state.hash_cache_path,
+                threads,
+            );
+            respond_json(&mut stream, 200, "OK", &body)
+        }
+        // F1: send a batch of paths to the Recycle Bin. Each path must sit under a
+        // scanned root OR inside a known cleanup location (temp/cache/downloads),
+        // so the cleanup UI can actually delete what it surfaced.
+        "/api/recycle-items" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let paths = extract_json_str_array(&body_str, "paths");
+            if paths.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing paths");
+            }
+            let mut out = String::from("{\"results\":[");
+            for (i, p) in paths.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"path\":");
+                push_json_string(&mut out, p);
+                let pb = PathBuf::from(p);
+                let allowed = path_within_scan_root(&state, &pb)
+                    || crate::cleanup::is_within_cleanup_root(&pb);
+                if !allowed {
+                    out.push_str(",\"ok\":false,\"error\":");
+                    push_json_string(&mut out, "Path is outside the scanned or cleanup directories");
+                    out.push('}');
+                    continue;
+                }
+                let result = crate::recycle::recycle_path(&pb);
+                let err_text = result
+                    .as_ref()
+                    .err()
+                    .map(|e| crate::preflight::describe_fs_error(e, &pb));
+                crate::audit::record(crate::audit::Entry {
+                    op: "delete",
+                    disposition: "recycle",
+                    src: std::slice::from_ref(p),
+                    error: err_text.as_deref(),
+                    by: "server",
+                    ..Default::default()
+                });
+                match result {
+                    Ok(_) => {
+                        if let Some(parent) = pb.parent() {
+                            state
+                                .scan_cache
+                                .lock()
+                                .expect("scan_cache lock")
+                                .invalidate(&parent.to_string_lossy());
+                        }
+                        out.push_str(",\"ok\":true}");
+                    }
+                    Err(_) => {
+                        out.push_str(",\"ok\":false,\"error\":");
+                        push_json_string(
+                            &mut out,
+                            err_text.as_deref().unwrap_or("recycle failed"),
+                        );
+                        out.push('}');
+                    }
+                }
+            }
+            out.push_str("]}");
+            respond_json(&mut stream, 200, "OK", &out)
+        }
+        // F3: batch rename within each item's own directory (two-phase via temp
+        // names so a→b / b→a swaps don't transiently collide). Collisions with
+        // files outside the batch are rejected.
+        "/api/bulk-rename" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let ops = extract_rename_ops(&body_str);
+            if ops.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing ops");
+            }
+            let results = bulk_rename_results(&state, &ops);
+            let mut out = String::from("{\"results\":[");
+            for (i, (from, to, ok, err)) in results.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"from\":");
+                push_json_string(&mut out, from);
+                out.push_str(",\"to\":");
+                push_json_string(&mut out, to);
+                out.push_str(if *ok { ",\"ok\":true" } else { ",\"ok\":false" });
+                if let Some(e) = err {
+                    out.push_str(",\"error\":");
+                    push_json_string(&mut out, e);
+                }
+                out.push('}');
+            }
+            out.push_str("]}");
+            respond_json(&mut stream, 200, "OK", &out)
+        }
+        // F4: multi-tag + color labels store, dual-mode like /api/bookmarks.
+        "/api/tags" => {
+            if request.method == "POST" {
+                match crate::tags::save_tags(&request.body) {
+                    Ok(_) => respond_json(&mut stream, 200, "OK", "{\"ok\":true}"),
+                    Err(error) => {
+                        let mut body = String::from("{\"error\":");
+                        push_json_string(&mut body, &error.to_string());
+                        body.push('}');
+                        respond_json(&mut stream, 500, "Internal server error", &body)
+                    }
+                }
+            } else {
+                respond_json(&mut stream, 200, "OK", &crate::tags::load_tags_json())
+            }
+        }
+        // F7: saved searches / smart folders store, dual-mode like /api/bookmarks.
+        "/api/smart-folders" => {
+            if request.method == "POST" {
+                match crate::smartfolders::save(&request.body) {
+                    Ok(_) => respond_json(&mut stream, 200, "OK", "{\"ok\":true}"),
+                    Err(error) => {
+                        let mut body = String::from("{\"error\":");
+                        push_json_string(&mut body, &error.to_string());
+                        body.push('}');
+                        respond_json(&mut stream, 500, "Internal server error", &body)
+                    }
+                }
+            } else {
+                respond_json(&mut stream, 200, "OK", &crate::smartfolders::load_json())
+            }
+        }
+        // F5: zip a selection of files/folders into `dest`.
+        "/api/compress" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let paths = extract_json_str_array(&body_str, "paths");
+            let dest = extract_json_str(&body_str, "dest").unwrap_or_default();
+            if paths.is_empty() || dest.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing paths or dest");
+            }
+            for p in &paths {
+                if !path_within_scan_root(&state, Path::new(p)) {
+                    return respond_json(
+                        &mut stream,
+                        403,
+                        "Forbidden",
+                        "{\"error\":\"A source path is outside the scanned directories\"}",
+                    );
+                }
+            }
+            let dest_path = PathBuf::from(&dest);
+            // The `.zip` doesn't exist yet, so gate its parent directory instead.
+            let dest_ok = dest_path
+                .parent()
+                .map(|parent| path_within_scan_root(&state, parent))
+                .unwrap_or(false);
+            if !dest_ok {
+                return respond_json(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "{\"error\":\"Destination is outside the scanned directories\"}",
+                );
+            }
+            let mut body = String::from("{\"ok\":");
+            match crate::archive::compress(&paths, &dest_path) {
+                Ok(_) => {
+                    if let Some(parent) = dest_path.parent() {
+                        state
+                            .scan_cache
+                            .lock()
+                            .expect("scan_cache lock")
+                            .invalidate(&parent.to_string_lossy());
+                    }
+                    body.push_str("true,\"dest\":");
+                    push_json_string(&mut body, &dest);
+                    body.push('}');
+                    respond_json(&mut stream, 200, "OK", &body)
+                }
+                Err(e) => {
+                    body.push_str("false,\"dest\":");
+                    push_json_string(&mut body, &dest);
+                    body.push_str(",\"error\":");
+                    push_json_string(&mut body, &e);
+                    body.push('}');
+                    respond_json(&mut stream, 200, "OK", &body)
+                }
+            }
+        }
+        // F5: extract a zip into `dest` (zip-slip guarded inside the module).
+        "/api/extract" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let archive = extract_json_str(&body_str, "archive").unwrap_or_default();
+            let dest = extract_json_str(&body_str, "dest").unwrap_or_default();
+            if archive.is_empty() || dest.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing archive or dest");
+            }
+            let archive_path = PathBuf::from(&archive);
+            if !path_within_scan_root(&state, &archive_path) {
+                return respond_json(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "{\"error\":\"Archive is outside the scanned directories\"}",
+                );
+            }
+            let dest_path = PathBuf::from(&dest);
+            // The destination dir may already exist, or be a new dir under an
+            // existing scanned dir — accept either.
+            let dest_ok = path_within_scan_root(&state, &dest_path)
+                || dest_path
+                    .parent()
+                    .map(|parent| path_within_scan_root(&state, parent))
+                    .unwrap_or(false);
+            if !dest_ok {
+                return respond_json(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "{\"error\":\"Destination is outside the scanned directories\"}",
+                );
+            }
+            let mut body = String::from("{\"ok\":");
+            match crate::archive::extract(&archive_path, &dest_path) {
+                Ok(_) => {
+                    state
+                        .scan_cache
+                        .lock()
+                        .expect("scan_cache lock")
+                        .invalidate(&dest_path.to_string_lossy());
+                    body.push_str("true}");
+                    respond_json(&mut stream, 200, "OK", &body)
+                }
+                Err(e) => {
+                    body.push_str("false,\"error\":");
+                    push_json_string(&mut body, &e);
+                    body.push('}');
+                    respond_json(&mut stream, 200, "OK", &body)
+                }
+            }
+        }
+        // F5: stream a file through SHA-256 or MD5 and return the hex digest.
+        "/api/checksum" => {
+            let Some(path) = query
+                .get("path")
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+            else {
+                return respond_text(&mut stream, 400, "Bad request", "Missing path");
+            };
+            let file_path = PathBuf::from(&path);
+            if !path_within_scan_root(&state, &file_path) {
+                return respond_json(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "{\"error\":\"Path is outside the scanned directories\"}",
+                );
+            }
+            let algo = query
+                .get("algo")
+                .cloned()
+                .unwrap_or_else(|| "sha256".to_string());
+            match crate::archive::checksum(&file_path, &algo) {
+                Ok((normalized, hex)) => {
+                    let mut body = String::from("{\"algo\":");
+                    push_json_string(&mut body, &normalized);
+                    body.push_str(",\"hash\":");
+                    push_json_string(&mut body, &hex);
+                    body.push('}');
+                    respond_json(&mut stream, 200, "OK", &body)
+                }
+                Err(e) => {
+                    let mut body = String::from("{\"error\":");
+                    push_json_string(&mut body, &e);
+                    body.push('}');
+                    respond_json(&mut stream, 400, "Bad request", &body)
+                }
+            }
+        }
+        // F2: persist the current (cached) scan as a compact folder->size snapshot.
+        "/api/snapshots-save" => {
+            let path = query_or_body_str(&query, &request.body, "path")
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| state.initial_path.clone());
+            if !path_within_scan_root(&state, &path) {
+                return respond_json(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "{\"error\":\"Path is outside the scanned directories\"}",
+                );
+            }
+            match find_current_scan(&state, &path) {
+                Some(result) => match crate::snapshots::save_snapshot(&result) {
+                    Ok(meta) => {
+                        respond_json(&mut stream, 200, "OK", &crate::snapshots::meta_to_json(&meta))
+                    }
+                    Err(error) => {
+                        let mut body = String::from("{\"error\":");
+                        push_json_string(&mut body, &error.to_string());
+                        body.push('}');
+                        respond_json(&mut stream, 500, "Internal server error", &body)
+                    }
+                },
+                None => respond_json(
+                    &mut stream,
+                    409,
+                    "Conflict",
+                    "{\"error\":\"No scan is loaded for this path — scan it first, then save a snapshot.\"}",
+                ),
+            }
+        }
+        // F2: diff two saved snapshots (b minus a) over their folder size maps.
+        "/api/snapshots-diff" => {
+            let a_id = query.get("a").cloned().unwrap_or_default();
+            let b_id = query.get("b").cloned().unwrap_or_default();
+            match (
+                crate::snapshots::load_snapshot(&a_id),
+                crate::snapshots::load_snapshot(&b_id),
+            ) {
+                (Some(a), Some(b)) => {
+                    let body = crate::snapshots::diff_json(&a, &b);
+                    respond_json(&mut stream, 200, "OK", &body)
+                }
+                _ => respond_json(
+                    &mut stream,
+                    404,
+                    "Not found",
+                    "{\"error\":\"Snapshot not found\"}",
+                ),
+            }
+        }
+        // F2: delete a saved snapshot (file + manifest entry) by id.
+        "/api/snapshots-delete" => {
+            let id = query_or_body_str(&query, &request.body, "id").unwrap_or_default();
+            let body = if crate::snapshots::delete_snapshot(&id) {
+                "{\"ok\":true}"
+            } else {
+                "{\"ok\":false}"
+            };
+            respond_json(&mut stream, 200, "OK", body)
         }
         _ => respond_text(&mut stream, 404, "Not found", "Not found"),
     }

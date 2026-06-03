@@ -1,6 +1,6 @@
 import { useRef, useState, useCallback, useMemo, useEffect, memo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import type { NodeRecord, SortKey, Metric, Unit } from "../api/types";
+import type { NodeRecord, SortKey, Metric, Unit, TagEntry } from "../api/types";
 import { formatBytes, formatCount } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
 import { NodeTooltip } from "./NodeTooltip";
@@ -81,6 +81,10 @@ interface TreeTableProps {
   /** Live width update while dragging a header's resize handle. */
   onColumnResize: (key: SortKey, width: number) => void;
   bookmarks: Set<string>;
+  /** path → tag entry (labels + optional color) for the row tag dot/badge (F4). */
+  tags?: Map<string, TagEntry>;
+  /** Open the tag editing popover for a path at the click point (F4). */
+  onEditTags?: (path: string, x: number, y: number) => void;
   onToggleExpand: (id: number) => void;
   onSelect: (id: number, mode: "single" | "toggle" | "range") => void;
   onDoubleClick: (id: number) => void;
@@ -209,6 +213,8 @@ function TreeTableInner({
   columnWidths,
   onColumnResize,
   bookmarks,
+  tags,
+  onEditTags,
   onToggleExpand,
   onSelect,
   onDoubleClick,
@@ -862,6 +868,21 @@ function TreeTableInner({
                   ) : (
                     <span className={`name-text${isBundle ? " bundle-label" : ""}`}>{node.name}</span>
                   )}
+                  {!isBundle && node.path && onEditTags && (() => {
+                    const tagEntry = tags?.get(node.path);
+                    const tagged = !!tagEntry && (tagEntry.tags.length > 0 || !!tagEntry.color);
+                    return (
+                      <button
+                        className={`tag-btn${tagged ? " tagged" : ""}`}
+                        title={tagged ? `Tags: ${tagEntry!.tags.join(", ") || "(color only)"}` : "Add tags"}
+                        onClick={(e) => { e.stopPropagation(); onEditTags(node.path, e.clientX, e.clientY); }}
+                      >
+                        {tagEntry?.color
+                          ? <span className="tag-dot" style={{ background: tagEntry.color }} />
+                          : <Icon name={tagged ? "tag-fill" : "tag"} size={11} />}
+                      </button>
+                    );
+                  })()}
                   {!isBundle && node.path && (
                     <button
                       className={`bookmark-btn${bookmarks.has(node.path) ? " bookmarked" : ""}`}
