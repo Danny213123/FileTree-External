@@ -3616,33 +3616,76 @@ fn stream_fs_events_poll(mut stream: TcpStream, root: &str) -> sio::Result<()> {
 /// refuses any other port — no SSRF / open-proxy to arbitrary local ports.
 const OLLAMA_PORT: u16 = 11434;
 
+/// Short TTL for the in-memory `/api/tags` cache. The renderer polls
+/// `/api/ai-models` whenever the AI panel opens (and on a timer), so without a
+/// cache every poll opens a fresh TCP connection to Ollama and fully buffers its
+/// model list. Caching the last good body for a few seconds collapses those
+/// repeat polls into a single upstream hit while still reflecting a newly pulled
+/// or removed model promptly.
+const OLLAMA_MODELS_TTL: Duration = Duration::from_secs(8);
+
+/// Last good `/api/tags` JSON body and the instant it was fetched. `None` until
+/// the first successful fetch. Guarded by a `Mutex` because any of the
+/// per-connection worker threads may read or refresh it concurrently.
+static OLLAMA_MODELS_CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
+
+fn ollama_models_cache() -> &'static Mutex<Option<(Instant, String)>> {
+    OLLAMA_MODELS_CACHE.get_or_init(|| Mutex::new(None))
+}
+
 fn ollama_list_models() -> String {
+    // Serve a still-fresh cached body without touching Ollama at all.
+    if let Ok(guard) = ollama_models_cache().lock() {
+        if let Some((fetched_at, body)) = guard.as_ref() {
+            if fetched_at.elapsed() < OLLAMA_MODELS_TTL {
+                return body.clone();
+            }
+        }
+    }
+
+    match ollama_fetch_models() {
+        // Fresh body: cache it with the fetch time for subsequent polls.
+        Some(body) => {
+            if let Ok(mut guard) = ollama_models_cache().lock() {
+                *guard = Some((Instant::now(), body.clone()));
+            }
+            body
+        }
+        // Upstream unreachable/empty: fall back to the last good body if we have
+        // one (even if past its TTL), else the existing empty-models shape.
+        None => {
+            if let Ok(guard) = ollama_models_cache().lock() {
+                if let Some((_, body)) = guard.as_ref() {
+                    return body.clone();
+                }
+            }
+            "{\"models\":[]}".to_string()
+        }
+    }
+}
+
+/// One-shot fetch of Ollama's `/api/tags` JSON body. Returns `None` on any
+/// connect/write/header/decode error or an empty body so the caller can fall
+/// back to the cache or the empty-models shape. Hardcodes the 127.0.0.1 host and
+/// the allowlisted Ollama port — no SSRF surface.
+fn ollama_fetch_models() -> Option<String> {
     use std::net::TcpStream;
-    let Ok(mut conn) = TcpStream::connect(("127.0.0.1", OLLAMA_PORT)) else {
-        return "{\"models\":[]}".to_string();
-    };
+    let mut conn = TcpStream::connect(("127.0.0.1", OLLAMA_PORT)).ok()?;
     let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(4)));
     let req = b"GET /api/tags HTTP/1.1\r\nHost: localhost:11434\r\nConnection: close\r\n\r\n";
-    if conn.write_all(req).is_err() {
-        return "{\"models\":[]}".to_string();
-    }
+    conn.write_all(req).ok()?;
     let mut reader = BufReader::new(conn);
-    let Ok(headers) = read_http_response_headers(&mut reader) else {
-        return "{\"models\":[]}".to_string();
-    };
+    let headers = read_http_response_headers(&mut reader).ok()?;
     let mut body = String::new();
     if header_has_token(&headers, "transfer-encoding", "chunked") {
-        match read_chunked_body_to_string(&mut reader) {
-            Ok(decoded) => body = decoded,
-            Err(_) => return "{\"models\":[]}".to_string(),
-        }
+        body = read_chunked_body_to_string(&mut reader).ok()?;
     } else {
         let _ = reader.read_to_string(&mut body);
     }
     if body.is_empty() {
-        "{\"models\":[]}".to_string()
+        None
     } else {
-        body
+        Some(body)
     }
 }
 
@@ -3831,7 +3874,11 @@ fn ollama_stream_chat(stream: &mut TcpStream, body: &[u8], port: u16) -> sio::Re
             break;
         }
     }
-    // Stream body lines back to the browser as chunked NDJSON
+    // Stream body lines back to the browser as chunked NDJSON. A failed write to
+    // the client means it aborted the request (closed the socket / clicked stop),
+    // so propagate the error: that stops reading from Ollama and drops `conn`
+    // here, freeing this per-connection thread immediately instead of draining
+    // the upstream for up to its 120s read timeout while nobody is listening.
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     loop {
@@ -3843,16 +3890,16 @@ fn ollama_stream_chat(stream: &mut TcpStream, body: &[u8], port: u16) -> sio::Re
                 while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line_bytes = buf.drain(..=pos).collect::<Vec<_>>();
                     if !line_bytes.iter().all(|&b| b == b'\r' || b == b'\n') {
-                        let _ = write_chunk(stream, &line_bytes);
+                        write_chunk(stream, &line_bytes)?;
                     }
                 }
             }
             Err(_) => break,
         }
     }
-    // Flush any remaining bytes
+    // Flush any remaining bytes (only reached when the client stayed healthy).
     if !buf.is_empty() {
-        let _ = write_chunk(stream, &buf);
+        write_chunk(stream, &buf)?;
     }
     Ok(())
 }

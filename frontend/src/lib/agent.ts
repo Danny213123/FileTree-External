@@ -7,6 +7,9 @@
 // through the same `executeTool` against the same `AgentApi`.
 
 import type { NodeRecord, ScanResult } from "../api/types";
+import { fetchFileText, type WebFetchResult, type WebSearchResult } from "../api/client";
+import { loadAiSettings } from "./aiSettings";
+import { appendMemory, memoryBlock } from "./aiMemory";
 
 export interface RunCommandResult {
   ok: boolean;
@@ -15,6 +18,33 @@ export interface RunCommandResult {
   stderr?: string;
   truncated?: boolean;
   error?: string;
+}
+
+// Result of a bounded, read-only file read (GET /api/file-text + client-side
+// offset/limit windowing). `truncated` is true when more content exists than was
+// returned (either the server's ~64 KiB cap, or the client offset/limit window).
+export interface ReadFileResult {
+  ok: boolean;
+  path?: string;
+  content?: string;
+  /** Number of lines returned in `content`. */
+  lines?: number;
+  /** Total characters available in the server's (already-capped) read. */
+  total_chars?: number;
+  truncated?: boolean;
+  /** Line offset to pass next to continue reading (when truncated by limit). */
+  next_offset?: number;
+  binary?: boolean;
+  error?: string;
+}
+
+export interface ReadFileOpts {
+  /** 0-based line offset to start reading from. */
+  offset?: number;
+  /** Max lines to return from `offset`. */
+  limit?: number;
+  /** Hard cap on returned characters (defaults to ~64 KiB). */
+  maxBytes?: number;
 }
 
 export interface AgentApi {
@@ -31,7 +61,19 @@ export interface AgentApi {
   // Run an arbitrary shell command (approval-gated in the UI). Used for general
   // CLI work and, crucially, for deletions via the Recycle Bin recipe so the
   // model can report a real exit code instead of fabricating "moved to trash".
-  runCommand: (command: string, cwd?: string) => Promise<RunCommandResult>;
+  // `shell` selects PowerShell (default) or cmd.
+  runCommand: (command: string, cwd?: string, shell?: "powershell" | "cmd") => Promise<RunCommandResult>;
+  // Read a bounded text window of a file (read-only). Scoped apis restrict reads
+  // to the attached folder(s).
+  readFile: (path: string, opts?: ReadFileOpts) => Promise<ReadFileResult>;
+  // Create/overwrite a text file (Tier-2 mutating; implemented via run_command).
+  writeFile: (path: string, content: string) => Promise<RunCommandResult>;
+  // Replace `oldString` with `newString` in a file (Tier-2 mutating).
+  editFile: (path: string, oldString: string, newString: string) => Promise<RunCommandResult>;
+  // Approval-gated network fetch (Electron main IPC). Returns bounded text.
+  webFetch: (url: string, opts?: { maxBytes?: number }) => Promise<WebFetchResult>;
+  // Approval-gated, best-effort keyless web search.
+  webSearch: (query: string) => Promise<WebSearchResult>;
 }
 
 export interface ToolDef {
@@ -47,7 +89,28 @@ export interface ToolDef {
   };
 }
 
-export const MUTATING_TOOLS = new Set(["move_items", "rename_item", "create_folder", "run_command", "recycle_items"]);
+export const MUTATING_TOOLS = new Set([
+  "move_items",
+  "rename_item",
+  "create_folder",
+  "run_command",
+  "recycle_items",
+  "write_file",
+  "edit_file",
+]);
+
+// Read-only tools that nonetheless ALWAYS require explicit approval because they
+// shell out or reach the network (so they can never run silently under
+// auto-approve / allowlist). Kept in sync with ALWAYS_APPROVE_TOOLS in runtime.ts.
+// These are NOT in MUTATING_TOOLS (they don't change the scanned tree) but they
+// still surface a Tier-2 approval card.
+export const APPROVAL_ONLY_TOOLS = new Set([
+  "git_status",
+  "git_diff",
+  "git_log",
+  "web_fetch",
+  "web_search",
+]);
 
 // Build ONE resilient PowerShell batch that sends every given path to the
 // Recycle Bin (recoverable). It continues past per-item failures, handles file
@@ -68,6 +131,54 @@ export function buildRecycleCommand(paths: string[]): string {
     "  } catch { $failed += \"$p ($($_.Exception.Message))\" }",
     "}",
     "if ($failed.Count) { Write-Error ('Failed: ' + ($failed -join '; ')); exit 1 } else { Write-Output \"Recycled $($paths.Count) item(s).\"; exit 0 }",
+  ].join("\n");
+}
+
+// Base64 the UTF-8 payload so arbitrary file content (quotes, newlines, $, etc.)
+// can never break out of the PowerShell string or inject commands. The path is
+// single-quote escaped. WriteAllText creates parent-existing files / overwrites.
+function b64Utf8(s: string): string {
+  // btoa needs latin1; encode UTF-8 first so non-ASCII survives the round-trip.
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+// One PowerShell batch that writes `content` to `path` (create or overwrite),
+// reporting a real exit code. Parent directory is created if missing.
+export function buildWriteFileCommand(path: string, content: string): string {
+  const p = `'${path.replace(/'/g, "''")}'`;
+  const b = b64Utf8(content);
+  return [
+    `$p = ${p}`,
+    `$bytes = [Convert]::FromBase64String('${b}')`,
+    "$text = [Text.Encoding]::UTF8.GetString($bytes)",
+    "$dir = Split-Path -LiteralPath $p -Parent",
+    "if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }",
+    "[IO.File]::WriteAllText($p, $text, (New-Object Text.UTF8Encoding $false))",
+    "Write-Output \"Wrote $($text.Length) chars to $p\"",
+  ].join("\n");
+}
+
+// One PowerShell batch that replaces every occurrence of `oldString` with
+// `newString` in `path`, on the FULL on-disk content (not a truncated preview),
+// and fails (exit 1) if the old text is not present.
+export function buildEditFileCommand(path: string, oldString: string, newString: string): string {
+  const p = `'${path.replace(/'/g, "''")}'`;
+  const bOld = b64Utf8(oldString);
+  const bNew = b64Utf8(newString);
+  return [
+    `$p = ${p}`,
+    "if (-not (Test-Path -LiteralPath $p)) { Write-Error 'File not found'; exit 1 }",
+    `$old = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${bOld}'))`,
+    `$new = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${bNew}'))`,
+    "$c = [IO.File]::ReadAllText($p)",
+    "$count = ([regex]::Matches($c, [regex]::Escape($old))).Count",
+    "if ($count -eq 0) { Write-Error 'old_string not found in file'; exit 1 }",
+    "$c = $c.Replace($old, $new)",
+    "[IO.File]::WriteAllText($p, $c, (New-Object Text.UTF8Encoding $false))",
+    "Write-Output \"Replaced $count occurrence(s) in $p\"",
   ].join("\n");
 }
 
@@ -163,6 +274,119 @@ export const SEARCH_TOOLS: ToolDef[] = [
       parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description:
+        "Read the text contents of a file (read-only). Returns a bounded window (the server caps reads at ~64 KiB). Use `offset` (0-based line number) and `limit` (max lines) to page through larger files; the result reports `truncated` and `next_offset` so you can continue.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Absolute file path to read." },
+          offset: { type: "integer", description: "0-based line to start from (default 0)." },
+          limit: { type: "integer", description: "Max lines to return (default 400)." },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "grep",
+      description:
+        "Search file CONTENTS in the current scan for a string or simple regex. Optionally restrict candidate files by `dir`, `glob`, or `ext`. Returns matches with path, line number and a snippet. Bounded: caps how many files are read and total bytes scanned, and reports `truncated` when limits were hit.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Text or regex to find in file contents." },
+          regex: { type: "boolean", description: "Treat `query` as a JS regular expression (default false = literal)." },
+          dir: { type: "string", description: "Absolute folder to restrict the search to." },
+          glob: { type: "string", description: "Filename wildcard filter, e.g. *.ts" },
+          ext: { type: "string", description: "Extension filter, e.g. txt (no dot)." },
+          max_results: { type: "integer", description: "Max matches to return (default 50, max 200)." },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_status",
+      description: "Show `git status` for a git repository folder (read-only). Requires approval (runs a shell command).",
+      parameters: {
+        type: "object",
+        properties: { dir: { type: "string", description: "Absolute path of the repo (defaults to the scanned folder)." } },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_diff",
+      description: "Show `git diff` (unstaged, or staged with staged=true) for a repo folder (read-only). Requires approval.",
+      parameters: {
+        type: "object",
+        properties: {
+          dir: { type: "string", description: "Absolute path of the repo (defaults to the scanned folder)." },
+          staged: { type: "boolean", description: "Diff staged changes (--cached) instead of the working tree." },
+          path: { type: "string", description: "Optional file/subpath to limit the diff to." },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_log",
+      description: "Show recent commits (`git log`) for a repo folder (read-only). Requires approval.",
+      parameters: {
+        type: "object",
+        properties: {
+          dir: { type: "string", description: "Absolute path of the repo (defaults to the scanned folder)." },
+          count: { type: "integer", description: "How many commits to show (default 20, max 100)." },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "web_fetch",
+      description: "Fetch the text content of a web URL (http/https). Requires approval (makes a network request). Returns bounded text.",
+      parameters: {
+        type: "object",
+        properties: { url: { type: "string", description: "Absolute http(s) URL to fetch." } },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "web_search",
+      description: "Search the web for a query (best-effort, keyless). Requires approval. Returns a short list of result titles, URLs and snippets.",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string", description: "Search query." } },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "remember",
+      description: "Persist a short note to long-term memory so it is available in future chats (e.g. a user preference or an important fact). Read-only with respect to files.",
+      parameters: {
+        type: "object",
+        properties: { note: { type: "string", description: "The fact to remember (kept brief)." } },
+        required: ["note"],
+      },
+    },
+  },
 ];
 
 // ── Mutating tools (Action agent) ────────────────────────────
@@ -242,6 +466,39 @@ export const ACTION_TOOLS: ToolDef[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "write_file",
+      description:
+        "Create a new text file or OVERWRITE an existing one with the given content. Destructive: the user sees a diff preview and must approve. Use absolute paths.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Absolute path of the file to write." },
+          content: { type: "string", description: "The full new text content of the file." },
+        },
+        required: ["path", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "edit_file",
+      description:
+        "Edit an existing text file by replacing an exact substring. `old_string` must appear verbatim in the file. Destructive: the user sees a diff preview and must approve. To insert/append, read the file first and use write_file instead.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Absolute path of the file to edit." },
+          old_string: { type: "string", description: "Exact existing text to replace." },
+          new_string: { type: "string", description: "Replacement text." },
+        },
+        required: ["path", "old_string", "new_string"],
+      },
+    },
+  },
 ];
 
 // All tools (kept for single-agent fallbacks / back-compat).
@@ -289,6 +546,45 @@ export function isNoOpMove(source: string, destination: string): boolean {
   );
 }
 
+// Shared read-only file reader used by BOTH the real api (WorkspaceTab) and the
+// scoped api (ChatPanel). Fetches the server's bounded text head (GET
+// /api/file-text, ~64 KiB, scan-root gated) and applies a client-side line
+// window (offset/limit) plus an optional hard byte cap, reporting truncation and
+// the next line offset so the model can page. Scoping (which paths are allowed)
+// is enforced by the caller BEFORE invoking this.
+const READ_FILE_MAX_BYTES = 64 * 1024;
+export async function readFileWindow(path: string, opts: ReadFileOpts = {}, signal?: AbortSignal): Promise<ReadFileResult> {
+  if (!path) return { ok: false, error: "path required" };
+  let preview: Awaited<ReturnType<typeof fetchFileText>>;
+  try {
+    preview = await fetchFileText(path, signal);
+  } catch (e) {
+    return { ok: false, path, error: (e as Error).message };
+  }
+  if (preview.binary) return { ok: true, path, binary: true, content: "", lines: 0 };
+  let text = preview.text ?? "";
+  const cap = Math.max(1, Math.min(opts.maxBytes ?? READ_FILE_MAX_BYTES, READ_FILE_MAX_BYTES));
+  let capTruncated = false;
+  if (text.length > cap) { text = text.slice(0, cap); capTruncated = true; }
+  const allLines = text.split(/\r?\n/);
+  const offset = Math.max(0, Math.floor(opts.offset ?? 0));
+  const limit = opts.limit != null ? Math.max(1, Math.floor(opts.limit)) : 400;
+  const windowLines = allLines.slice(offset, offset + limit);
+  const moreLines = offset + limit < allLines.length;
+  // Truncated if the server capped the file, our byte cap cut it, or there are
+  // more lines beyond this window.
+  const truncated = !!preview.truncated || capTruncated || moreLines;
+  return {
+    ok: true,
+    path,
+    content: windowLines.join("\n"),
+    lines: windowLines.length,
+    total_chars: text.length,
+    truncated,
+    next_offset: moreLines ? offset + limit : undefined,
+  };
+}
+
 // Two-pointer wildcard match (* and ?), mirrors the Rust backend matcher.
 export function wildcardMatch(pattern: string, value: string): boolean {
   const p = pattern, v = value;
@@ -308,7 +604,81 @@ export function wildcardMatch(pattern: string, value: string): boolean {
   return pi === p.length;
 }
 
+// ── Per-scan node index (perf) ───────────────────────────────
+// find/list_dir/list_by_extension/list_largest used to re-scan and re-sort the
+// full getNodes() array on every call. We build a reusable index ONCE per nodes
+// array and cache it keyed on that array's identity (a WeakMap). The index is
+// invalidated automatically whenever the scan changes, because a new scan yields
+// a new nodes array reference (so callers must return a STABLE array per scan —
+// WorkspaceTab memoizes it; the scoped api holds one array per build).
+interface NodeIndex {
+  /** Real items (id>0, has path), sorted by size descending — reused by find/list_largest. */
+  bySizeDesc: NodeRecord[];
+  /** normPath(parentDir) → immediate children. */
+  byParent: Map<string, NodeRecord[]>;
+}
+const indexCache = new WeakMap<NodeRecord[], NodeIndex>();
+export function getNodeIndex(nodes: NodeRecord[]): NodeIndex {
+  const cached = indexCache.get(nodes);
+  if (cached) return cached;
+  const real = nodes.filter((n) => n.id > 0 && n.path);
+  const bySizeDesc = [...real].sort((a, b) => b.size - a.size);
+  const byParent = new Map<string, NodeRecord[]>();
+  for (const n of real) {
+    const key = normPath(parentOf(n.path));
+    const arr = byParent.get(key);
+    if (arr) arr.push(n);
+    else byParent.set(key, [n]);
+  }
+  const idx: NodeIndex = { bySizeDesc, byParent };
+  indexCache.set(nodes, idx);
+  return idx;
+}
+
+// ── Content-match scorer (semantic groundwork) ───────────────
+// `grep` ranks/keeps matches through a pluggable scorer. The default is a
+// literal/regex matcher. This interface is the seam where an embeddings-backed
+// ranker could later be dropped in (score by semantic similarity) without
+// touching the grep plumbing — implement `score()` and pass it to runGrep.
+export interface MatchScorer {
+  /** Compile any per-query state (e.g. a RegExp, or later an embedding). */
+  prepare(query: string, opts: { regex?: boolean }): void;
+  /** Return a >0 score for a matching line, or 0/negative to reject it. */
+  score(line: string): number;
+}
+
+class LiteralRegexScorer implements MatchScorer {
+  private needle = "";
+  private re: RegExp | null = null;
+  prepare(query: string, opts: { regex?: boolean }): void {
+    this.re = null;
+    this.needle = query.toLowerCase();
+    if (opts.regex) {
+      try { this.re = new RegExp(query, "i"); } catch { this.re = null; }
+    }
+  }
+  score(line: string): number {
+    if (this.re) return this.re.test(line) ? 1 : 0;
+    return line.toLowerCase().includes(this.needle) ? 1 : 0;
+  }
+}
+
 // ── Scan context (shared by all agent prompts) ───────────────
+// User project rules + persisted memory, read at run start and appended to every
+// agent's system prompt. Empty string when neither is set.
+function instructionsBlock(): string {
+  const out: string[] = [];
+  try {
+    const rules = loadAiSettings().rules?.trim();
+    if (rules) out.push("User project rules (follow these):\n" + rules);
+  } catch { /* ignore */ }
+  try {
+    const mem = memoryBlock();
+    if (mem) out.push(mem);
+  } catch { /* ignore */ }
+  return out.join("\n\n");
+}
+
 export function scanContext(api: AgentApi): string {
   const result = api.getScanResult();
   const scanPath = api.getScanPath();
@@ -325,6 +695,8 @@ export function scanContext(api: AgentApi): string {
     lines.push("Largest items:");
     for (const n of top) lines.push(`  ${n.dir ? "DIR " : "FILE"} ${n.path} - ${mb(n.size)} MB`);
   }
+  const extra = instructionsBlock();
+  if (extra) lines.push("", extra);
   return lines.join("\n");
 }
 
@@ -340,6 +712,8 @@ export function scanSummary(api: AgentApi): string {
   const lines: string[] = [`Current scan: ${scanPath || result.rootPath}`];
   if (root) lines.push(`Total: ${mb(root.size)} MB across ${root.files} files / ${root.folders} folders.`);
   lines.push("You do NOT have the file or folder listing — only the Search agent can read it.");
+  const extra = instructionsBlock();
+  if (extra) lines.push("", extra);
   return lines.join("\n");
 }
 
@@ -394,13 +768,12 @@ export async function executeTool(name: string, args: Record<string, unknown>, a
     }
     case "list_largest": {
       const count = Math.min(Number(args.count) || 15, 40);
+      const offset = Math.max(0, Number(args.offset) || 0);
       const filesOnly = !!args.files_only;
-      const items = api.getNodes()
-        .filter((n) => n.id > 0 && n.path && (!filesOnly || !n.dir))
-        .sort((a, b) => b.size - a.size)
-        .slice(0, count)
-        .map((n) => ({ path: n.path, name: n.name, is_dir: n.dir, size_mb: mb(n.size) }));
-      return { items };
+      const all = getNodeIndex(api.getNodes()).bySizeDesc.filter((n) => !filesOnly || !n.dir);
+      const page = all.slice(offset, offset + count);
+      const items = page.map((n) => ({ path: n.path, name: n.name, is_dir: n.dir, size_mb: mb(n.size) }));
+      return paginate({ items }, all.length, offset, items.length);
     }
     case "find": {
       const query = String(args.query || "").toLowerCase();
@@ -408,34 +781,77 @@ export async function executeTool(name: string, args: Record<string, unknown>, a
       const dir = String(args.dir || "");
       const filesOnly = !!args.files_only;
       const limit = Math.min(Number(args.limit) || 30, 100);
+      const offset = Math.max(0, Number(args.offset) || 0);
       if (!query && !glob) return { ok: false, error: "Provide a query or glob." };
-      const matches = api.getNodes()
-        .filter((n) => n.id > 0 && n.path && n.name)
+      const matches = getNodeIndex(api.getNodes()).bySizeDesc
+        .filter((n) => n.name)
         .filter((n) => (!filesOnly || !n.dir))
         .filter((n) => (!dir || underPath(n.path, dir)))
         .filter((n) => {
           const name = n.name.toLowerCase();
           if (glob) return wildcardMatch(glob, name);
           return name.includes(query);
-        })
-        .sort((a, b) => b.size - a.size);
-      const items = matches.slice(0, limit).map((n) => ({ path: n.path, name: n.name, is_dir: n.dir, size_mb: mb(n.size) }));
-      return { total_matches: matches.length, returned: items.length, items };
+        });
+      const page = matches.slice(offset, offset + limit);
+      const items = page.map((n) => ({ path: n.path, name: n.name, is_dir: n.dir, size_mb: mb(n.size) }));
+      // Keep the legacy `total_matches`/`returned` fields plus the standard
+      // pagination envelope so older prompts and the new ones both work.
+      return { total_matches: matches.length, ...paginate({ items }, matches.length, offset, items.length) };
     }
     case "list_dir": {
       const dir = String(args.path || "");
       if (!dir) return { ok: false, error: "path required" };
-      const children = api.getNodes()
-        .filter((n) => n.id > 0 && n.path && eqPath(parentOf(n.path), dir))
-        .sort((a, b) => b.size - a.size)
-        .slice(0, 200)
-        .map((n) => ({ name: n.name, is_dir: n.dir, size_mb: mb(n.size), path: n.path }));
-      return { path: dir, count: children.length, children };
+      const limit = Math.min(Number(args.limit) || 200, 500);
+      const offset = Math.max(0, Number(args.offset) || 0);
+      const all = (getNodeIndex(api.getNodes()).byParent.get(normPath(dir)) ?? [])
+        .slice()
+        .sort((a, b) => b.size - a.size);
+      const page = all.slice(offset, offset + limit);
+      const children = page.map((n) => ({ name: n.name, is_dir: n.dir, size_mb: mb(n.size), path: n.path }));
+      return { path: dir, count: children.length, ...paginate({ children }, all.length, offset, children.length) };
     }
     case "list_by_extension": {
       const result = api.getScanResult();
-      const stats = (result?.extensionStats ?? []).slice(0, 25).map((s) => ({ ext: s.ext || "(none)", size_mb: mb(s.bytes), files: s.files }));
-      return { extensions: stats };
+      const limit = Math.min(Number(args.limit) || 25, 100);
+      const offset = Math.max(0, Number(args.offset) || 0);
+      const all = result?.extensionStats ?? [];
+      const page = all.slice(offset, offset + limit).map((s) => ({ ext: s.ext || "(none)", size_mb: mb(s.bytes), files: s.files }));
+      return paginate({ extensions: page }, all.length, offset, page.length);
+    }
+    case "read_file": {
+      const path = String(args.path || "");
+      if (!path) return { ok: false, error: "path required" };
+      const offset = Math.max(0, Number(args.offset) || 0);
+      const limit = args.limit != null ? Math.max(1, Number(args.limit)) : undefined;
+      return await api.readFile(path, { offset, limit });
+    }
+    case "grep": {
+      return await runGrep(api, args, signal);
+    }
+    case "git_status":
+    case "git_diff":
+    case "git_log": {
+      const dir = String(args.dir || api.getScanPath() || "").trim();
+      if (!dir) return { ok: false, error: "No folder is scanned and no dir provided." };
+      const command = buildGitCommand(name, args, dir);
+      const res = await api.runCommand(command, dir);
+      return { ...res, git: name };
+    }
+    case "web_fetch": {
+      const url = String(args.url || "").trim();
+      if (!/^https?:\/\//i.test(url)) return { ok: false, error: "Provide an absolute http(s) URL." };
+      return await api.webFetch(url);
+    }
+    case "web_search": {
+      const query = String(args.query || "").trim();
+      if (!query) return { ok: false, error: "query required" };
+      return await api.webSearch(query);
+    }
+    case "remember": {
+      const note = String(args.note || "").trim();
+      if (!note) return { ok: false, error: "note required" };
+      appendMemory(note);
+      return { ok: true, remembered: note };
     }
     case "find_duplicates": {
       const minBytes = Math.max(0, (Number(args.min_size_mb) || 1) * 1e6);
@@ -474,7 +890,10 @@ export async function executeTool(name: string, args: Record<string, unknown>, a
       const command = String(args.command || "");
       if (!command.trim()) return { ok: false, error: "command required" };
       const cwd = args.cwd ? String(args.cwd) : undefined;
-      return await api.runCommand(command, cwd);
+      // Forward the shell selector (the schema exposes it but it was previously
+      // dropped, so `shell:"cmd"` silently ran under PowerShell).
+      const shell = args.shell === "cmd" || args.shell === "powershell" ? args.shell : undefined;
+      return await api.runCommand(command, cwd, shell);
     }
     case "rename_item": {
       const path = String(args.path || "");
@@ -485,9 +904,123 @@ export async function executeTool(name: string, args: Record<string, unknown>, a
       const path = String(args.path || "");
       return await api.createFolder(path);
     }
+    case "write_file": {
+      const path = String(args.path || "");
+      const content = typeof args.content === "string" ? args.content : String(args.content ?? "");
+      if (!path) return { ok: false, error: "path required" };
+      return await api.writeFile(path, content);
+    }
+    case "edit_file": {
+      const path = String(args.path || "");
+      const oldString = typeof args.old_string === "string" ? args.old_string : "";
+      const newString = typeof args.new_string === "string" ? args.new_string : "";
+      if (!path) return { ok: false, error: "path required" };
+      if (!oldString) return { ok: false, error: "old_string required" };
+      return await api.editFile(path, oldString, newString);
+    }
     default:
       return { ok: false, error: `unknown tool ${name}` };
   }
+}
+
+// Standard pagination envelope so the model knows how much it got, how much
+// exists, and how to fetch the rest. `key` is the array field name in `base`.
+function paginate<T extends Record<string, unknown>>(
+  base: T,
+  total: number,
+  offset: number,
+  returned: number,
+): T & { returned: number; total: number; truncated: boolean; next_offset: number | null } {
+  const end = offset + returned;
+  const truncated = end < total;
+  return {
+    ...base,
+    returned,
+    total,
+    truncated,
+    next_offset: truncated ? end : null,
+  };
+}
+
+// Build a read-only git command for the requested subcommand. Output is parsed
+// by the server's run-command; we just shape the argument string.
+function buildGitCommand(tool: string, args: Record<string, unknown>, _dir: string): string {
+  if (tool === "git_status") return "git status --porcelain=v1 -b";
+  if (tool === "git_log") {
+    const count = Math.min(Math.max(Number(args.count) || 20, 1), 100);
+    return `git log --oneline -n ${count}`;
+  }
+  // git_diff
+  const staged = args.staged ? " --cached" : "";
+  const sub = args.path ? ` -- "${String(args.path).replace(/"/g, '\\"')}"` : "";
+  return `git --no-pager diff${staged}${sub}`;
+}
+
+// Bounded content search across in-memory candidate files. Picks candidates from
+// the scan tree (dir/glob/ext filters), reads each via api.readFile, and keeps
+// lines the (pluggable) scorer accepts. Caps files read AND total bytes so a
+// huge tree can never stall the turn; signals `truncated` when a cap was hit.
+const GREP_MAX_FILES = 80;
+const GREP_MAX_BYTES = 2 * 1024 * 1024;
+const GREP_MAX_FILE_BYTES = 64 * 1024;
+
+async function runGrep(
+  api: AgentApi,
+  args: Record<string, unknown>,
+  signal?: AbortSignal,
+  scorer: MatchScorer = new LiteralRegexScorer(),
+): Promise<unknown> {
+  const query = String(args.query || "");
+  if (!query) return { ok: false, error: "query required" };
+  const dir = String(args.dir || "");
+  const glob = String(args.glob || "").toLowerCase();
+  const ext = String(args.ext || "").replace(/^\./, "").toLowerCase();
+  const maxResults = Math.min(Math.max(Number(args.max_results) || 50, 1), 200);
+  scorer.prepare(query, { regex: !!args.regex });
+
+  const candidates = getNodeIndex(api.getNodes()).bySizeDesc.filter((n) => {
+    if (n.dir) return false;
+    if (dir && !underPath(n.path, dir)) return false;
+    if (ext && (n.extension || "").toLowerCase().replace(/^\./, "") !== ext) return false;
+    if (glob && !wildcardMatch(glob, n.name.toLowerCase())) return false;
+    return true;
+  });
+
+  const matches: { path: string; line: number; snippet: string }[] = [];
+  let filesRead = 0;
+  let bytesRead = 0;
+  let truncated = false;
+
+  for (const node of candidates) {
+    if (signal?.aborted) { truncated = true; break; }
+    if (filesRead >= GREP_MAX_FILES || bytesRead >= GREP_MAX_BYTES) { truncated = true; break; }
+    let res: ReadFileResult;
+    try { res = await api.readFile(node.path, { maxBytes: GREP_MAX_FILE_BYTES }); }
+    catch { continue; }
+    if (!res.ok || res.binary || !res.content) continue;
+    filesRead++;
+    bytesRead += res.content.length;
+    if (res.truncated) truncated = true;
+    const lines = res.content.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (scorer.score(lines[i]) > 0) {
+        matches.push({ path: node.path, line: i + 1, snippet: lines[i].trim().slice(0, 200) });
+        if (matches.length >= maxResults) { truncated = true; break; }
+      }
+    }
+    if (matches.length >= maxResults) break;
+  }
+
+  return {
+    ok: true,
+    query,
+    matches,
+    files_scanned: filesRead,
+    candidates: candidates.length,
+    returned: matches.length,
+    truncated,
+    note: truncated ? "Results capped — narrow with dir/glob/ext or a more specific query." : undefined,
+  };
 }
 
 // Turn a read-only tool result into a readable, multi-line findings string with
@@ -543,9 +1076,10 @@ export function formatFindings(tool: string, result: unknown): string {
 // orchestrator when summarizing a sub-agent's work.
 export function summarizeToolResult(tool: string, result: unknown): string {
   const r = result as Record<string, unknown>;
-  // run_command reports its own status from the real exit code, so handle it
-  // before the generic ok===false shortcut (which would hide the exit/stderr).
-  if (tool === "run_command") {
+  // run_command (and the git_* tools that route through it) report their own
+  // status from the real exit code, so handle them before the generic ok===false
+  // shortcut (which would hide the exit/stderr).
+  if (tool === "run_command" || tool === "git_status" || tool === "git_diff" || tool === "git_log" || tool === "write_file" || tool === "edit_file") {
     if (typeof r?.error === "string" && r.error) return r.error;
     const code = r?.exit_code;
     const codeLabel = code === null || code === undefined ? "?" : String(code);
@@ -581,6 +1115,16 @@ export function summarizeToolResult(tool: string, result: unknown): string {
       return "scanning…";
     case "reveal":
       return "opened in Explorer";
+    case "read_file":
+      return r.binary ? "binary (not text)" : `${r.lines ?? 0} lines${r.truncated ? " (truncated)" : ""}`;
+    case "grep":
+      return `${(r.matches as unknown[])?.length ?? 0} matches in ${r.files_scanned ?? 0} files`;
+    case "web_fetch":
+      return r.ok ? `fetched${r.truncated ? " (truncated)" : ""}` : String(r.error ?? "failed");
+    case "web_search":
+      return `${(r.results as unknown[])?.length ?? 0} results`;
+    case "remember":
+      return "noted";
     default:
       return "done";
   }
@@ -590,8 +1134,15 @@ export function summarizeToolResult(tool: string, result: unknown): string {
 // card so the user can verify what actually happened. Only run_command produces
 // output worth showing in full (the real stdout/stderr + exit code); everything
 // else returns "" and the card falls back to its compact summary.
+const COMMAND_OUTPUT_TOOLS = new Set(["run_command", "git_status", "git_diff", "git_log", "write_file", "edit_file"]);
 export function formatToolOutput(tool: string, result: unknown): string {
-  if (tool !== "run_command") return "";
+  if (tool === "web_fetch") {
+    const r = result as Record<string, unknown>;
+    if (r?.ok === false) return String(r.error ?? "fetch failed");
+    const text = String(r?.text ?? "").slice(0, 4000);
+    return text + (r?.truncated ? "\n(output truncated)" : "");
+  }
+  if (!COMMAND_OUTPUT_TOOLS.has(tool)) return "";
   const r = result as Record<string, unknown>;
   if (typeof r?.error === "string" && r.error && r.exit_code === undefined && r.stdout === undefined) {
     return r.error;

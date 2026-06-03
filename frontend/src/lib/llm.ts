@@ -17,6 +17,10 @@ export interface LlmToolCall {
   id: string;
   name: string;
   args: Record<string, unknown>;
+  // Set when the model emitted tool arguments that were not valid JSON. The
+  // runtime feeds a clear error back to the model (instead of silently running
+  // with {}), so it can re-issue the call with well-formed arguments.
+  argsError?: string;
 }
 
 export type LlmRole = "system" | "user" | "assistant" | "tool";
@@ -83,16 +87,36 @@ export function hasCloudGateway(): boolean {
 }
 
 // ── Public model listing ─────────────────────────────────────
+// Cache the Ollama /api/ai-models result for a short TTL so reopening the model
+// picker doesn't refetch every time. In-flight requests are shared so concurrent
+// openers don't each hit the server.
+const OLLAMA_MODELS_TTL_MS = 30_000;
+let ollamaModelsCache: { at: number; models: string[] } | null = null;
+let ollamaModelsInFlight: Promise<string[]> | null = null;
+
+async function fetchOllamaModels(): Promise<string[]> {
+  try {
+    const res = await fetch("/api/ai-models");
+    if (!res.ok) return [];
+    const data = (await res.json()) as { models?: { name: string }[] };
+    return (data.models ?? []).map((m) => m.name);
+  } catch {
+    return [];
+  }
+}
+
 export async function listModels(provider: LlmProvider, apiKey?: string): Promise<string[]> {
   if (provider === "ollama") {
-    try {
-      const res = await fetch("/api/ai-models");
-      if (!res.ok) return [];
-      const data = (await res.json()) as { models?: { name: string }[] };
-      return (data.models ?? []).map((m) => m.name);
-    } catch {
-      return [];
-    }
+    const now = Date.now();
+    if (ollamaModelsCache && now - ollamaModelsCache.at < OLLAMA_MODELS_TTL_MS) return ollamaModelsCache.models;
+    if (ollamaModelsInFlight) return ollamaModelsInFlight;
+    ollamaModelsInFlight = fetchOllamaModels().then((models) => {
+      // Only cache a non-empty list so a transient offline blip isn't sticky.
+      if (models.length) ollamaModelsCache = { at: Date.now(), models };
+      ollamaModelsInFlight = null;
+      return models;
+    });
+    return ollamaModelsInFlight;
   }
   const b = bridge();
   if (!b) return CLOUD_FALLBACK_MODELS[provider] ?? [];
@@ -187,7 +211,12 @@ async function* streamOllama(req: LlmRequest): AsyncGenerator<LlmEvent> {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   const think = createThinkSplitter();
-  const toolCalls: LlmToolCall[] = [];
+  // Accumulate tool calls so each logical call has ONE stable id for the whole
+  // turn, even if Ollama splits them across NDJSON chunks. Ollama tool calls may
+  // carry a numeric index; when present we accumulate into that slot, otherwise
+  // we append. The id is minted once (first time the slot is seen), never per
+  // chunk — so the assistant message and its tool result share a consistent id.
+  const toolAcc: LlmToolCall[] = [];
   let buf = "";
   try {
     while (true) {
@@ -200,7 +229,7 @@ async function* streamOllama(req: LlmRequest): AsyncGenerator<LlmEvent> {
         const trimmed = line.trim();
         if (!trimmed) continue;
         let parsed: {
-          message?: { content?: string; thinking?: string; tool_calls?: { function: { name: string; arguments: unknown } }[] };
+          message?: { content?: string; thinking?: string; tool_calls?: { function: { name: string; arguments: unknown }; index?: number }[] };
           error?: string;
         };
         try {
@@ -218,8 +247,19 @@ async function* streamOllama(req: LlmRequest): AsyncGenerator<LlmEvent> {
           for (const piece of think.push(msg.content)) yield piece;
         }
         if (msg?.tool_calls?.length) {
-          for (const tc of msg.tool_calls) {
-            toolCalls.push({ id: uid("call_"), name: tc.function.name, args: asObject(tc.function.arguments) });
+          const rawCalls: { function: { name: string; arguments: unknown }; index?: number }[] = msg.tool_calls;
+          for (let i = 0; i < rawCalls.length; i++) {
+            const tc = rawCalls[i];
+            const slot = typeof tc.index === "number" ? tc.index : toolAcc.length;
+            const { args, error } = parseToolArgs(tc.function.arguments);
+            if (toolAcc[slot]) {
+              // Same logical call continued in a later chunk: keep its id, update.
+              toolAcc[slot].name = tc.function.name || toolAcc[slot].name;
+              toolAcc[slot].args = args;
+              toolAcc[slot].argsError = error;
+            } else {
+              toolAcc[slot] = { id: uid("call_"), name: tc.function.name, args, argsError: error };
+            }
           }
         }
       }
@@ -230,19 +270,28 @@ async function* streamOllama(req: LlmRequest): AsyncGenerator<LlmEvent> {
     return;
   }
   for (const piece of think.flush()) yield piece;
+  const toolCalls = toolAcc.filter(Boolean);
   if (toolCalls.length) yield { type: "tool_calls", value: toolCalls };
   yield { type: "done" };
 }
 
-function asObject(raw: unknown): Record<string, unknown> {
+// Parse tool-call arguments robustly. Objects pass through; strings are JSON.parsed
+// and a parse failure is reported via `error` (so the runtime can feed back
+// "invalid JSON arguments" instead of silently running the tool with {}).
+function parseToolArgs(raw: unknown): { args: Record<string, unknown>; error?: string } {
+  if (raw == null) return { args: {} };
+  if (typeof raw === "object") return { args: raw as Record<string, unknown> };
   if (typeof raw === "string") {
+    const s = raw.trim();
+    if (!s) return { args: {} };
     try {
-      return JSON.parse(raw) as Record<string, unknown>;
-    } catch {
-      return {};
+      const v = JSON.parse(s);
+      return v && typeof v === "object" ? { args: v as Record<string, unknown> } : { args: {}, error: "arguments were not a JSON object" };
+    } catch (e) {
+      return { args: {}, error: (e as Error).message };
     }
   }
-  return (raw as Record<string, unknown>) ?? {};
+  return { args: {} };
 }
 
 // ── Cloud (Electron main IPC) ────────────────────────────────

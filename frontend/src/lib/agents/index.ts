@@ -8,6 +8,7 @@ import {
   SEARCH_TOOLS,
   executeTool,
   formatFindings,
+  normPath,
   scanContext,
   scanSummary,
   summarizeToolResult,
@@ -16,11 +17,62 @@ import {
 } from "../agent";
 import type { LlmImage, LlmMessage } from "../llm";
 import { runAgent } from "./runtime";
-import type { AgentSpec, RunContext, RunResult, StepStatus } from "./types";
+import type { AgentFacts, AgentSpec, RunContext, RunResult, StepStatus } from "./types";
 
 function stepStatusOf(result: unknown): StepStatus {
   return (result as { ok?: boolean })?.ok === false ? "error" : "done";
 }
+
+// Harvest machine-readable facts (real paths + counts) from a tool result into
+// the run accumulator, so the orchestrator gets structured findings — not just
+// the sub-agent's prose. Shared by both sub-agents.
+function extractAgentFacts(tool: string, result: unknown, acc: AgentFacts): void {
+  const r = result as Record<string, unknown> | null;
+  if (!r || typeof r !== "object") return;
+  const pushPath = (p: unknown) => {
+    if (typeof p === "string" && p && acc.paths.length < 60 && !acc.paths.includes(p)) acc.paths.push(p);
+  };
+  const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+  for (const it of arr(r.items)) pushPath((it as { path?: unknown })?.path);
+  for (const it of arr(r.children)) pushPath((it as { path?: unknown })?.path);
+  for (const m of arr(r.matches)) pushPath((m as { path?: unknown })?.path);
+  for (const g of arr(r.groups)) {
+    for (const f of arr((g as { files?: unknown }).files)) {
+      pushPath(typeof f === "string" ? f : (f as { path?: unknown })?.path);
+    }
+  }
+  if (typeof r.path === "string") pushPath(r.path);
+  if (typeof r.total === "number") acc.counts[`${tool}_total`] = r.total;
+  if (typeof r.total_matches === "number") acc.counts.matches = r.total_matches as number;
+  if (typeof r.group_count === "number") acc.counts.duplicate_groups = r.group_count as number;
+  if (typeof r.total_waste_mb === "number") acc.counts.waste_mb = r.total_waste_mb as number;
+}
+
+// Build the context note handed to a sub-agent so it sees the overall request
+// and a digest of prior turns — not just its bare delegated task.
+function subAgentContext(ctx: RunContext): LlmMessage[] {
+  const parts: string[] = [];
+  if (ctx.userTask) parts.push(`The user's overall request this turn: ${ctx.userTask}`);
+  if (ctx.priorDigest) parts.push(`Relevant context from earlier in the conversation:\n${ctx.priorDigest}`);
+  if (!parts.length) return [];
+  return [{ role: "user", content: parts.join("\n\n") }];
+}
+
+// Route a tool call: known built-in tools go through executeTool; anything else
+// is treated as an MCP tool and dispatched through the run context's MCP bridge.
+async function runToolOrMcp(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: RunContext,
+  builtins: Set<string>,
+): Promise<unknown> {
+  if (builtins.has(name)) return executeTool(name, args, ctx.api, ctx.signal);
+  if (ctx.runMcpTool) return ctx.runMcpTool(name, args);
+  return { ok: false, error: `unknown tool ${name}` };
+}
+
+const SEARCH_TOOL_NAMES = new Set(SEARCH_TOOLS.map((t) => t.function.name));
+const ACTION_TOOL_NAMES = new Set([...SEARCH_TOOLS, ...ACTION_TOOLS].map((t) => t.function.name));
 
 // Read-only tool names. The Search agent's findings are only trustworthy if at
 // least one of these actually executed.
@@ -94,29 +146,34 @@ function coerceTask(v: unknown): string {
 }
 
 // ── Sub-agents ───────────────────────────────────────────────
-export function searchSpec(api: AgentApi): AgentSpec {
+export function searchSpec(api: AgentApi, extraTools: ToolDef[] = []): AgentSpec {
+  const builtins = SEARCH_TOOL_NAMES;
+  const mcpLine = extraTools.length
+    ? "Additional external (MCP) tools are available; use them when relevant to gather information.\n"
+    : "";
   return {
     agent: "search",
     maxSteps: 8,
-    tools: SEARCH_TOOLS,
+    tools: [...SEARCH_TOOLS, ...extraTools],
     systemPrompt: [
       "You are the Search agent inside FileTree, a disk-usage explorer.",
-      "Your job is read-only investigation: find files/folders, list directories, compute sizes, and detect duplicates using the tools provided.",
+      "Your job is read-only investigation: find files/folders, list directories, read file contents, search inside files (grep), compute sizes, and detect duplicates using the tools provided.",
       "Use absolute Windows paths exactly as they appear in the scan. Call tools to gather facts — never guess paths.",
+      "Large results are paginated: when a tool result has truncated=true, use offset/limit (and next_offset) to read more instead of guessing the rest.",
       "NEVER output a file name, path, or size that did not come from a tool result in this run. If a tool returns no matching files, say so plainly — do not invent example files.",
-      "When you have gathered what was asked, reply with a concise findings summary (key paths with sizes). Do not ask the user questions.",
+      mcpLine + "When you have gathered what was asked, reply with a concise findings summary (key paths with sizes). Do not ask the user questions.",
       "",
       scanContext(api),
     ].join("\n"),
     runTool: async (name, args, ctx) => {
-      const result = await executeTool(name, args, ctx.api, ctx.signal);
+      const result = await runToolOrMcp(name, args, ctx, builtins);
       return { result, summary: summarizeToolResult(name, result), status: stepStatusOf(result) };
     },
     // Findings are only real if a read-only tool actually ran. If the model
     // tries to summarize without one, run the best-matching tool ourselves so
     // the report is backed by real data instead of guesses.
     guardFinal: ({ task, ranTools }) => {
-      if (ranTools.some((t) => READ_ONLY_TOOLS.has(t))) return { action: "accept" };
+      if (ranTools.some((t) => READ_ONLY_TOOLS.has(t) || !builtins.has(t))) return { action: "accept" };
       return {
         action: "force",
         call: chooseSearchTool(task),
@@ -124,20 +181,22 @@ export function searchSpec(api: AgentApi): AgentSpec {
       };
     },
     formatFindings: (name, result) => formatFindings(name, result),
+    extractFacts: extractAgentFacts,
   };
 }
 
-export function actionSpec(api: AgentApi): AgentSpec {
+export function actionSpec(api: AgentApi, extraTools: ToolDef[] = []): AgentSpec {
+  const builtins = ACTION_TOOL_NAMES;
   return {
     agent: "action",
     maxSteps: 8,
-    tools: ACTION_TOOLS,
+    tools: [...ACTION_TOOLS, ...extraTools],
     systemPrompt: [
       "You are the Action agent inside FileTree, a disk-usage explorer.",
-      "You perform file changes: move, delete (recycle), rename, create folders, and run shell commands.",
-      "You change files ONLY by calling the tools (move_items, recycle_items, rename_item, create_folder, run_command). Never write a sentence claiming a file was moved, deleted, renamed, or that a command ran — only a real tool call counts. If you have not called the tool, nothing has happened.",
+      "You perform file changes: move, delete (recycle), rename, create folders, write/edit text files, and run shell commands.",
+      "You change files ONLY by calling the tools (move_items, recycle_items, rename_item, create_folder, write_file, edit_file, run_command). Never write a sentence claiming a file was moved, deleted, renamed, written, or that a command ran — only a real tool call counts. If you have not called the tool, nothing has happened.",
       "To DELETE files or folders, call recycle_items ONCE, passing ALL of the absolute paths to delete in its `paths` array. They go to the Recycle Bin (recoverable), the user sees a SINGLE approval card for the whole batch, and you get back a real exit code — never claim anything was deleted unless recycle_items returns exit code 0. Do NOT delete with run_command/Remove-Item/rm, and do NOT call recycle_items once per file.",
-      "Use run_command only for general (non-delete) shell work.",
+      "To create or overwrite a text file use write_file; to change part of an existing file use edit_file (old_string must match exactly). Use run_command only for general (non-delete) shell work.",
       "Every action is shown to the user for explicit approval before it runs, so call tools directly with precise absolute Windows paths.",
       "Use ONLY the exact absolute paths given in your task. If your task does not contain a concrete absolute path, do NOT guess or pick a file yourself — reply that an explicit path is required.",
       "Only perform the changes described in your task. Do not invent extra deletions or run unrelated commands.",
@@ -146,9 +205,10 @@ export function actionSpec(api: AgentApi): AgentSpec {
       scanContext(api),
     ].join("\n"),
     runTool: async (name, args, ctx) => {
-      const result = await executeTool(name, args, ctx.api, ctx.signal);
+      const result = await runToolOrMcp(name, args, ctx, builtins);
       return { result, summary: summarizeToolResult(name, result), status: stepStatusOf(result) };
     },
+    extractFacts: extractAgentFacts,
   };
 }
 
@@ -182,12 +242,45 @@ const DELEGATION_TOOLS: ToolDef[] = [
   },
 ];
 
+// Deterministic path-verification: pull every absolute Windows path cited in the
+// draft final answer and return those that are NOT present in the current scan
+// tree. Used to catch fabricated/hallucinated file names before they reach the
+// user — supplementing (and reducing reliance on) the SPECIFICS_RE heuristic.
+// Tolerates the scan root and any path that is a real ancestor of a scanned node.
+function missingCitedPaths(text: string, api: AgentApi): string[] {
+  const matches = text.match(/[A-Za-z]:\\[^\n"'`<>|]+/g);
+  if (!matches || !matches.length) return [];
+  const nodes = api.getNodes();
+  const known = new Set<string>();
+  for (const n of nodes) if (n.path) known.add(normPath(n.path));
+  const scanRoot = normPath(api.getScanPath() || "");
+  const missing: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of matches) {
+    const p = raw.trim().replace(/[).,;:]+$/, "");
+    const np = normPath(p);
+    if (!np || seen.has(np)) continue;
+    seen.add(np);
+    if (np === scanRoot || known.has(np)) continue;
+    // Accept a cited folder that is a real ancestor of some scanned node.
+    let isAncestor = false;
+    for (const k of known) { if (k.startsWith(np + "\\")) { isAncestor = true; break; } }
+    if (isAncestor) continue;
+    missing.push(p);
+    if (missing.length >= 8) break;
+  }
+  return missing;
+}
+
 export function orchestratorSpec(api: AgentApi, attachedContext: string): AgentSpec {
   // Fires at most once per turn: after Search finds the files for an action
   // request, nudge the orchestrator to actually propose the change instead of
   // stopping at the listing. Kept here (not via the shared nudges counter) so
   // it can never loop regardless of how many search nudges happened.
   let continuationNudged = false;
+  // Fires at most once per turn: if the draft answer cites a path that isn't in
+  // the scan, send the model back to Search to correct it before answering.
+  let pathNudged = false;
   return {
     agent: "orchestrator",
     maxSteps: 12,
@@ -208,18 +301,21 @@ export function orchestratorSpec(api: AgentApi, attachedContext: string): AgentS
     runTool: async (name, args, ctx, runId) => {
       const task = coerceTask(args.task) || coerceTask(args);
       if (!task) return { result: { ok: false, error: "Missing task." }, summary: "no task", status: "error" };
+      const priorMessages = subAgentContext(ctx);
       if (name === "delegate_to_search") {
-        const sub = await runAgent(searchSpec(ctx.api), ctx, { task, parentId: runId });
+        const sub = await runAgent(searchSpec(ctx.api, ctx.mcpReadTools ?? []), ctx, { task, parentId: runId, priorMessages });
+        // Return STRUCTURED findings (paths/counts the orchestrator can cite and
+        // act on) alongside the prose report, not just `sub.text`.
         return {
-          result: { agent: "search", report: sub.text || "(no findings)" },
+          result: { agent: "search", report: sub.text || "(no findings)", facts: sub.facts ?? { paths: [], counts: {}, notes: [] } },
           summary: "Search agent finished",
           status: sub.status === "error" ? "error" : "done",
         };
       }
       if (name === "delegate_to_action") {
-        const sub = await runAgent(actionSpec(ctx.api), ctx, { task, parentId: runId });
+        const sub = await runAgent(actionSpec(ctx.api, ctx.mcpWriteTools ?? []), ctx, { task, parentId: runId, priorMessages });
         return {
-          result: { agent: "action", report: sub.text || "(done)" },
+          result: { agent: "action", report: sub.text || "(done)", facts: sub.facts ?? { paths: [], counts: {}, notes: [] } },
           summary: "Action agent finished",
           status: sub.status === "error" ? "error" : "done",
         };
@@ -245,6 +341,23 @@ export function orchestratorSpec(api: AgentApi, attachedContext: string): AgentS
             "You found the files but haven't made the change the user asked for. Call delegate_to_action now with the EXACT absolute path(s) copied from the Search findings — the user will see an on-screen approval card and Approve or Skip it. Do NOT ask the user to confirm in chat.",
           notice: "Found the files but no change proposed yet — prompting the assistant to take the action.",
         };
+      }
+      // Deterministic path-verification gate: if the draft answer cites concrete
+      // absolute paths that are NOT in the current scan tree, the model likely
+      // fabricated them. Send it back to Search once to correct. Skipped after an
+      // action ran (the tree may legitimately have changed and the scan is stale).
+      if (!acted && !pathNudged) {
+        const missing = missingCitedPaths(finalText, api);
+        if (missing.length) {
+          pathNudged = true;
+          return {
+            action: "nudge",
+            message:
+              `These path(s) in your answer are NOT in the current scan tree: ${missing.join(", ")}. ` +
+              "Do not cite paths from memory or assumption. Call delegate_to_search to locate the real path(s), then answer using ONLY paths returned by a tool.",
+            notice: "Draft answer cited a path that isn't in the scan — verifying via Search before replying.",
+          };
+        }
       }
       if (searched) return { action: "accept" };
       if (!needsRealData(task, finalText)) return { action: "accept" };

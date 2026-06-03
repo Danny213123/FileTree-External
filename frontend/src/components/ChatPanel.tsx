@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { type AgentApi } from "../lib/agent";
+import { type AgentApi, readFileWindow, underPath } from "../lib/agent";
+import { buildMcpRuntime } from "../lib/agents/mcp";
 import {
   listModels,
   isToolCapable,
@@ -15,7 +16,7 @@ import { runOrchestrator } from "../lib/agents";
 import type { AgentEvent } from "../lib/agents";
 import { ALWAYS_APPROVE_TOOLS } from "../lib/agents/runtime";
 import type { AgentKind, RunStatus, StepStatus, ToolCallView } from "../lib/agents/types";
-import { loadAiSettings, saveAiSettings, loadAiKeys, saveAiKey, keyFor, type AiSettings } from "../lib/aiSettings";
+import { loadAiSettings, saveAiSettings, loadAiKeys, saveAiKey, keyFor, type AiSettings, type McpServerConfig } from "../lib/aiSettings";
 import { loadChatSession, saveChatSession, loadChatIndex, deleteChatSession, type ChatSessionBlob, type ChatSessionMeta } from "../lib/chatSessions";
 import { scanStreamUrl, fetchDupesV2Bounded } from "../api/client";
 import { getCached, setCached } from "../lib/scanCache";
@@ -112,6 +113,30 @@ function basename(p: string): string {
   return p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
 }
 
+// Render a turn's tool calls into a single compact line for conversation memory,
+// e.g. `list_dir(C:\…\Downloads)→12 children; find_duplicates→3 groups`. Folded
+// into convoRef so later turns recall what tools actually did, not just the prose.
+function formatTurnToolTrace(map: Map<string, { name: string; args: Record<string, unknown>; summary?: string; status?: string }>): string {
+  const parts: string[] = [];
+  for (const t of map.values()) {
+    if (!t.status) continue; // never completed (skipped pre-approval, etc.)
+    const keyArg =
+      (typeof t.args.path === "string" && t.args.path) ||
+      (typeof t.args.dir === "string" && t.args.dir) ||
+      (typeof t.args.query === "string" && `"${t.args.query}"`) ||
+      (typeof t.args.glob === "string" && t.args.glob) ||
+      (typeof t.args.destination === "string" && t.args.destination) ||
+      (typeof t.args.command === "string" && t.args.command) ||
+      (typeof t.args.url === "string" && t.args.url) ||
+      "";
+    const head = keyArg ? `${t.name}(${String(keyArg).slice(0, 80)})` : t.name;
+    const tail = t.status === "rejected" ? "skipped" : (t.summary ? t.summary.slice(0, 80) : t.status);
+    parts.push(`${head}→${tail}`);
+    if (parts.length >= 12) break;
+  }
+  return parts.join("; ");
+}
+
 interface NativeDropAPI {
   onNativeDropInternal?: (cb: (x: number, y: number, paths: string[]) => void) => () => void;
   getPathForFile?: (file: File) => string;
@@ -177,6 +202,15 @@ function buildScopedApi(base: AgentApi, dirs: string[], scans: ScanResult[]): Ag
       const res = await fetchDupesV2Bounded({ paths: dirs, mode: "exact", minSize: minSizeBytes }, signal);
       return { groups: res.groups.map((g) => ({ waste: g.waste, files: g.files.map((f) => ({ path: f.path, size: f.size })) })) };
     },
+    // Scoped reads: only allow reading files inside one of the attached folders
+    // (the server is also scan-root gated, but enforce the scope here too so an
+    // attached-folder chat can never read outside its declared scope).
+    readFile: async (path, opts) => {
+      if (!dirs.some((d) => underPath(path, d))) {
+        return { ok: false, path, error: "Path is outside the attached folder scope." };
+      }
+      return readFileWindow(path, opts);
+    },
   };
 }
 
@@ -217,19 +251,33 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
   const runAutoApproveRef = useRef(false);
   const convoSummaryRef = useRef("");
   const summarizedCountRef = useRef(0);
+  // Tool-trace memory: per-turn record of tool calls (name + key args + result
+  // digest), keyed by callId, folded into convoRef so follow-up turns remember
+  // what the tools actually did — not just the final prose answer.
+  const turnToolsRef = useRef<Map<string, { name: string; args: Record<string, unknown>; summary?: string; status?: string }>>(new Map());
+  // Coalesce text/thinking stream deltas: buffer per-run deltas and flush on a
+  // rAF so a long answer doesn't trigger a re-render per token.
+  const deltaBufRef = useRef<Map<string, { text: string; thinking: string }>>(new Map());
+  const rafRef = useRef<number | null>(null);
 
-  const updateAi = useCallback((patch: { provider?: LlmProvider; model?: string; keys?: Partial<AiSettings["keys"]>; allow?: string[] }) => {
+  const updateAi = useCallback((patch: { provider?: LlmProvider; model?: string; keys?: Partial<AiSettings["keys"]>; allow?: string[]; rules?: string; mcpServers?: McpServerConfig[] }) => {
     setAi((prev) => {
       const next: AiSettings = {
+        ...prev,
         provider: patch.provider ?? prev.provider,
         model: patch.model ?? prev.model,
         keys: { ...prev.keys, ...(patch.keys ?? {}) },
         allow: patch.allow ?? prev.allow,
+        rules: patch.rules ?? prev.rules,
+        mcpServers: patch.mcpServers ?? prev.mcpServers,
       };
       saveAiSettings(next);
       return next;
     });
   }, []);
+
+  const setRules = useCallback((rules: string) => updateAi({ rules }), [updateAi]);
+  const setMcpServers = useCallback((mcpServers: McpServerConfig[]) => updateAi({ mcpServers }), [updateAi]);
 
   // Cloud API keys are stored in Electron safeStorage (with a localStorage
   // fallback for plain-browser dev). Reflect each edit in state immediately and
@@ -271,6 +319,9 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
   }, []);
 
   useEffect(() => { loadModels(); }, [loadModels]);
+
+  // Cancel any pending stream-delta rAF on unmount.
+  useEffect(() => () => { if (rafRef.current != null) cancelAnimationFrame(rafRef.current); }, []);
 
   // Load cloud keys from safeStorage on mount, migrating any legacy localStorage
   // keys into the secret store, then merge the resolved keys into settings state.
@@ -332,6 +383,36 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     return () => { if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current); };
   }, [items, runs, sessionId]);
 
+  // Flush buffered text/thinking deltas into run state in one batched update.
+  const flushDeltas = useCallback(() => {
+    rafRef.current = null;
+    const buf = deltaBufRef.current;
+    if (!buf.size) return;
+    const pending = new Map(buf);
+    buf.clear();
+    setRuns((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const [runId, d] of pending) {
+        const r = next[runId];
+        if (!r) continue;
+        next[runId] = { ...r, text: r.text + d.text, thinking: r.thinking + d.thinking };
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, []);
+
+  const queueDelta = useCallback((runId: string, kind: "text" | "thinking", delta: string) => {
+    const buf = deltaBufRef.current;
+    const cur = buf.get(runId) ?? { text: "", thinking: "" };
+    cur[kind] += delta;
+    buf.set(runId, cur);
+    if (rafRef.current == null) {
+      rafRef.current = window.requestAnimationFrame(flushDeltas);
+    }
+  }, [flushDeltas]);
+
   // ── Event reducer ──────────────────────────────────────────
   const applyEvent = useCallback((ev: AgentEvent) => {
     switch (ev.kind) {
@@ -353,20 +434,27 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
         break;
       }
       case "thinking":
-        setRuns((prev) => { const r = prev[ev.runId]; return r ? { ...prev, [ev.runId]: { ...r, thinking: r.thinking + ev.delta } } : prev; });
+        queueDelta(ev.runId, "thinking", ev.delta);
         break;
       case "text":
-        setRuns((prev) => { const r = prev[ev.runId]; return r ? { ...prev, [ev.runId]: { ...r, text: r.text + ev.delta } } : prev; });
+        queueDelta(ev.runId, "text", ev.delta);
         break;
       case "text_reset":
         // A final-answer guard rejected the streamed text (e.g. a fabricated
-        // file list). Drop it so only the corrected, tool-backed answer shows.
+        // file list). Drop it (and any buffered deltas) so only the corrected,
+        // tool-backed answer shows.
+        deltaBufRef.current.delete(ev.runId);
         setRuns((prev) => { const r = prev[ev.runId]; return r && r.text ? { ...prev, [ev.runId]: { ...r, text: "" } } : prev; });
         break;
       case "tool_start": {
         // Search delegation is represented purely by its child agent card.
         // delegate_to_action keeps a ToolState so the Tier-1 plan card renders.
         if (ev.tool === "delegate_to_search") break;
+        // Record into per-turn tool-trace memory (skip the action plan wrapper;
+        // its real tools are recorded when the sub-agent runs them).
+        if (ev.tool !== "delegate_to_action") {
+          turnToolsRef.current.set(ev.callId, { name: ev.tool, args: ev.args });
+        }
         setRuns((prev) => {
           const r = prev[ev.runId];
           if (!r) return prev;
@@ -376,6 +464,13 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
         break;
       }
       case "tool_update":
+        {
+          const trace = turnToolsRef.current.get(ev.callId);
+          if (trace && (ev.status === "done" || ev.status === "error" || ev.status === "rejected")) {
+            trace.status = ev.status;
+            if (ev.summary) trace.summary = ev.summary;
+          }
+        }
         setRuns((prev) => {
           const r = prev[ev.runId];
           const t = r?.tools[ev.callId];
@@ -384,6 +479,9 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
         });
         break;
       case "agent_end":
+        // Flush any buffered stream deltas first so the run's `text` is complete
+        // before we finalize it (otherwise the tail token could be lost).
+        flushDeltas();
         // The run (orchestrator or a sub-agent) just finished. Keep its final
         // answer + step timeline, but drop the transient process-chatter
         // notices (retry/force/step-limit/empty-response, guard nudges, …) that
@@ -409,7 +507,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
         }
         break;
     }
-  }, []);
+  }, [queueDelta, flushDeltas]);
 
   const requestApproval = useCallback((callId: string, view: ToolCallView) => {
     // Once the user picks "Approve all in this run", later actions in the same
@@ -607,6 +705,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     setBusy(true);
     // Fresh turn → require approval again (clears any prior "approve all").
     runAutoApproveRef.current = false;
+    turnToolsRef.current = new Map();
     setItems((prev) => [...prev, { type: "user", id: uid(), text: raw.trim() || text, attached: attachedSnapshot.map((a) => ({ kind: a.kind, name: a.name })) }]);
 
     if (provider === "ollama" && !isToolCapable(provider, selectedModel)) {
@@ -669,8 +768,10 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     try {
       let effectiveApi = api;
       if (attachedDirs.length) {
-        const scoped: { dir: string; scan: ScanResult }[] = [];
-        for (const dir of attachedDirs) {
+        // Pre-scan every attached folder IN PARALLEL (reusing the scan cache) so
+        // the orchestrator starts as soon as the slowest scan resolves — never
+        // serialized folder-by-folder.
+        const scanOne = async (dir: string): Promise<{ dir: string; scan: ScanResult } | null> => {
           try {
             let scan = getCached(dir);
             if (!scan) {
@@ -680,16 +781,23 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
                 setCached(dir, scan);
               }
             }
-            if (scan) scoped.push({ dir, scan });
+            return scan ? { dir, scan } : null;
           } catch (e) {
             if ((e as Error).name === "AbortError") throw e;
             applyEvent({ kind: "notice", level: "warn", text: `Couldn't read attached folder ${dir}: ${(e as Error).message}` });
+            return null;
           }
-        }
+        };
+        const scoped = (await Promise.all(attachedDirs.map(scanOne))).filter((s): s is { dir: string; scan: ScanResult } => !!s);
         if (scoped.length) {
           effectiveApi = buildScopedApi(api, scoped.map((s) => s.dir), scoped.map((s) => s.scan));
         }
       }
+
+      // Discover configured MCP servers' tools (best-effort) and register them
+      // into the agent's tool list for this run. Read-only by default; tools that
+      // declare side effects are approval-gated like other mutating tools.
+      const mcpRuntime = await buildMcpRuntime(ai.mcpServers).catch(() => null);
 
       const res = await runOrchestrator(
         {
@@ -699,10 +807,25 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
           // Read the allowlist live so an "Always allow" chosen mid-run applies
           // to the rest of this turn without a stale closure.
           allowTool: (t) => loadAiSettings().allow.includes(t),
+          // Thread the overall request + a brief digest of prior turns so the
+          // orchestrator can pass real context (not a bare task) to sub-agents.
+          userTask: text,
+          priorDigest: convoSummaryRef.current || undefined,
+          // MCP tools discovered this run (empty when none configured).
+          mcpReadTools: mcpRuntime?.readTools ?? [],
+          mcpWriteTools: mcpRuntime?.writeTools ?? [],
+          runMcpTool: mcpRuntime?.runTool,
+          gatedTools: mcpRuntime?.approvalNames.length ? new Set(mcpRuntime.approvalNames) : undefined,
         },
         { userText: text, attachedContext: combinedContext, priorConvo, images: images.length ? images : undefined },
       );
-      convoRef.current.push({ role: "assistant", content: res.text || "" });
+      // Tool-trace memory: fold a compact record of what the tools did this turn
+      // into the assistant message kept in convoRef, so follow-up turns recall
+      // the real actions/results, not just the prose. (convoRef is never rendered;
+      // it only feeds prior-conversation context back to the model.)
+      const trace = formatTurnToolTrace(turnToolsRef.current);
+      const assistantContent = (res.text || "") + (trace ? `\n\n[tools this turn: ${trace}]` : "");
+      convoRef.current.push({ role: "assistant", content: assistantContent });
     } catch (err) {
       if ((err as Error).name !== "AbortError") applyEvent({ kind: "notice", level: "error", text: (err as Error).message });
     } finally {
@@ -710,7 +833,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
       abortRef.current = null;
       resolveAllApprovals(false);
     }
-  }, [busy, getAgentApi, selectedModel, provider, apiKey, attached, references, autoApprove, applyEvent, requestApproval, resolveAllApprovals, buildAttachedContext, includeHidden, threads]);
+  }, [busy, getAgentApi, selectedModel, provider, apiKey, attached, references, autoApprove, applyEvent, requestApproval, resolveAllApprovals, buildAttachedContext, includeHidden, threads, ai.mcpServers]);
 
   const stop = useCallback(() => {
     abortRef.current?.abort();
@@ -856,6 +979,8 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
             onChange={setKeys}
             onToggleAuto={setAutoApprove}
             onRemoveAllow={removeAllow}
+            onChangeRules={setRules}
+            onChangeMcp={setMcpServers}
             onClose={() => setShowKeys(false)}
           />
         )}
@@ -1122,8 +1247,10 @@ function PlanCard({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { to
 
 function ToolStep({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { tool?: ToolState; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
   if (!tool) return null;
-  // Mutating action tools render as the richer Tier-2 command-approval card.
-  if (tool.mutating) return <ActionCard tool={tool} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />;
+  // Mutating action tools — and read-only tools that still require explicit
+  // approval (git/web/side-effecting MCP) — render as the richer Tier-2 card so
+  // the user actually gets Approve/Skip buttons.
+  if (tool.mutating || tool.requiresApproval) return <ActionCard tool={tool} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />;
   // Read-only search steps stay as a compact one-liner.
   const argLine = compactArgs(tool);
   const dotClass = tool.status === "error" ? "err" : tool.status === "rejected" ? "rej" : tool.status === "done" ? "ok" : tool.status === "pending" ? "wait" : "run";
@@ -1146,19 +1273,21 @@ function ActionCard({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { 
   const dest = tool.args.destination as string | undefined;
   const newName = tool.args.new_name as string | undefined;
   const isCmd = tool.tool === "run_command";
+  const isEdit = tool.tool === "write_file" || tool.tool === "edit_file";
   const cwd = isCmd ? (tool.args.cwd as string | undefined) : undefined;
   const pending = tool.status === "pending";
   const dotClass = tool.status === "error" ? "err" : tool.status === "rejected" ? "rej" : tool.status === "done" ? "ok" : pending ? "wait" : "run";
   const statusLabel = tool.status === "rejected" ? "Skipped" : tool.status === "done" ? (tool.summary || "Done") : tool.status === "error" ? (tool.summary || "Failed") : "";
   // Ran without surfacing a card (global auto-approve or an allowlisted tool).
   const autoRan = !tool.requiresApproval && tool.status !== "pending";
-  // run_command can never be bypassed, so don't offer the allow/approve-all menu.
+  // run_command + always-approve tools can never be bypassed, so don't offer the
+  // allow/approve-all menu for them.
   const canAllow = !ALWAYS_APPROVE_TOOLS.has(tool.tool);
   return (
     <div className={`approval-card action-card ${tool.status}`}>
       <div className="approval-card-head">
         <span className={`tool-dot ${dotClass}`} />
-        <span className="approval-card-title">{isCmd ? "Action agent wants to run a command" : "Action agent wants to run"}</span>
+        <span className="approval-card-title">{actionCardTitle(tool.tool)}</span>
         {autoRan && <span className="approval-status auto" title="Ran without a review card (auto-approved or on the allowlist)">Auto-approved</span>}
         {!pending && statusLabel && <span className={`approval-status ${tool.status === "error" ? "err" : tool.status === "done" ? "ok" : "rej"}`}>{statusLabel}</span>}
       </div>
@@ -1167,7 +1296,8 @@ function ActionCard({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { 
         {cwd && <div className="approval-meta">Working dir: <code>{cwd}</code></div>}
         {dest && <div className="approval-meta">Destination: <code>{dest}</code></div>}
         {newName && <div className="approval-meta">New name: <code>{newName}</code></div>}
-        {paths.length > 0 && (
+        {isEdit && <DiffPreview tool={tool} />}
+        {paths.length > 0 && !isEdit && (
           <ul className="agent-card-paths">
             {paths.slice(0, 10).map((p, i) => <li key={i} title={p}>{p}</li>)}
             {paths.length > 10 && <li>…and {paths.length - 10} more</li>}
@@ -1217,6 +1347,17 @@ function parsePlanPaths(text: string): string[] {
   return out;
 }
 
+// Title line for the Tier-2 approval card, tuned to the tool family.
+function actionCardTitle(tool: string): string {
+  if (tool === "run_command") return "Action agent wants to run a command";
+  if (tool === "write_file" || tool === "edit_file") return "Action agent wants to edit a file";
+  if (tool === "git_status" || tool === "git_diff" || tool === "git_log") return "Assistant wants to run a git command";
+  if (tool === "web_fetch") return "Assistant wants to fetch a web page";
+  if (tool === "web_search") return "Assistant wants to search the web";
+  if (tool.startsWith("mcp__")) return "Assistant wants to use an MCP tool";
+  return "Action agent wants to run";
+}
+
 // Turn a mutating tool call into a plain-language command line for the card.
 function humanizeCommand(tool: ToolState): string {
   const paths = (tool.args.paths as string[]) ?? (tool.args.path ? [String(tool.args.path)] : []);
@@ -1228,8 +1369,44 @@ function humanizeCommand(tool: ToolState): string {
     case "move_items": return `Move ${items} to ${basename(String(tool.args.destination ?? ""))}`;
     case "rename_item": return `Rename ${basename(String(tool.args.path ?? ""))} → ${String(tool.args.new_name ?? "")}`;
     case "create_folder": return `Create folder ${basename(String(tool.args.path ?? ""))}`;
-    default: return tool.tool;
+    case "write_file": return `Write ${basename(String(tool.args.path ?? ""))}`;
+    case "edit_file": return `Edit ${basename(String(tool.args.path ?? ""))}`;
+    case "git_status": return "git status";
+    case "git_diff": return `git diff${tool.args.staged ? " --staged" : ""}`;
+    case "git_log": return `git log -n ${Number(tool.args.count) || 20}`;
+    case "web_fetch": return `Fetch ${String(tool.args.url ?? "")}`;
+    case "web_search": return `Search “${String(tool.args.query ?? "")}”`;
+    default: return tool.tool.startsWith("mcp__") ? tool.tool.replace(/^mcp__/, "").replace(/__/g, " · ") : tool.tool;
   }
+}
+
+// Old-vs-new preview for write_file / edit_file so the user sees the change
+// before approving. edit_file shows the exact substring replacement; write_file
+// shows the (bounded) new content being created/overwritten.
+function DiffPreview({ tool }: { tool: ToolState }) {
+  const clip = (s: string, n = 1200) => (s.length > n ? s.slice(0, n) + "\n… (truncated)" : s);
+  if (tool.tool === "edit_file") {
+    const oldStr = String(tool.args.old_string ?? "");
+    const newStr = String(tool.args.new_string ?? "");
+    return (
+      <div className="approval-diff">
+        <div className="approval-diff-path"><code>{String(tool.args.path ?? "")}</code></div>
+        <pre className="approval-diff-block">
+          {clip(oldStr).split("\n").map((l, i) => <div key={"o" + i} className="diff-line del">- {l}</div>)}
+          {clip(newStr).split("\n").map((l, i) => <div key={"n" + i} className="diff-line add">+ {l}</div>)}
+        </pre>
+      </div>
+    );
+  }
+  const content = String(tool.args.content ?? "");
+  return (
+    <div className="approval-diff">
+      <div className="approval-diff-path"><code>{String(tool.args.path ?? "")}</code> · new content</div>
+      <pre className="approval-diff-block">
+        {clip(content).split("\n").map((l, i) => <div key={"n" + i} className="diff-line add">+ {l}</div>)}
+      </pre>
+    </div>
+  );
 }
 
 function compactArgs(tool: ToolState): string {
@@ -1476,12 +1653,14 @@ function ModelPicker({ groups, provider, model, disabled, onPick }: {
   );
 }
 
-function SettingsMenu({ ai, autoApprove, onChange, onToggleAuto, onRemoveAllow, onClose }: {
+function SettingsMenu({ ai, autoApprove, onChange, onToggleAuto, onRemoveAllow, onChangeRules, onChangeMcp, onClose }: {
   ai: AiSettings;
   autoApprove: boolean;
   onChange: (keys: Partial<AiSettings["keys"]>) => void;
   onToggleAuto: (v: boolean) => void;
   onRemoveAllow: (tool: string) => void;
+  onChangeRules: (rules: string) => void;
+  onChangeMcp: (servers: McpServerConfig[]) => void;
   onClose: () => void;
 }) {
   const ALLOW_LABELS: Record<string, string> = {
@@ -1502,6 +1681,19 @@ function SettingsMenu({ ai, autoApprove, onChange, onToggleAuto, onRemoveAllow, 
         <input type="checkbox" checked={autoApprove} onChange={(e) => onToggleAuto(e.target.checked)} />
         <span>Auto-approve file actions</span>
       </label>
+      <div className="chat-keys-divider" />
+      <label>Custom instructions / project rules
+        <textarea
+          className="chat-rules-input"
+          value={ai.rules}
+          placeholder="e.g. Always prefer recycling over permanent deletion. Treat C:\Work as read-only."
+          onChange={(e) => onChangeRules(e.target.value)}
+          rows={3}
+          spellCheck={false}
+        />
+      </label>
+      <p className="chat-keys-note">Injected into the assistant's system prompt every turn.</p>
+      <McpServersEditor servers={ai.mcpServers} onChange={onChangeMcp} />
       <div className="chat-keys-allow">
         <div className="chat-keys-allow-head">Always-allowed actions</div>
         {ai.allow.length === 0 ? (
@@ -1527,6 +1719,66 @@ function SettingsMenu({ ai, autoApprove, onChange, onToggleAuto, onRemoveAllow, 
         <input type="password" value={ai.keys.anthropic} placeholder="sk-ant-…" onChange={(e) => onChange({ anthropic: e.target.value })} autoComplete="off" spellCheck={false} />
       </label>
       <p className="chat-keys-note">Keys are stored locally on this machine and sent only to the provider you select.</p>
+    </div>
+  );
+}
+
+// Minimal MCP server management: add/remove/enable servers (stdio command or
+// http URL). Discovered tools are registered into the agent at run start.
+function McpServersEditor({ servers, onChange }: { servers: McpServerConfig[]; onChange: (s: McpServerConfig[]) => void }) {
+  const add = () => {
+    const id = `mcp${Date.now().toString(36)}`;
+    onChange([...servers, { id, name: "New server", enabled: true, transport: "stdio", command: "", args: [] }]);
+  };
+  const update = (id: string, patch: Partial<McpServerConfig>) =>
+    onChange(servers.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  const remove = (id: string) => onChange(servers.filter((s) => s.id !== id));
+  return (
+    <div className="chat-keys-allow">
+      <div className="chat-keys-allow-head">
+        MCP servers
+        <span className="spacer" />
+        <button className="icon" onClick={add} title="Add an MCP server"><Icon name="plus" size={12} /></button>
+      </div>
+      {servers.length === 0 ? (
+        <p className="chat-keys-note">None. Add a Model Context Protocol server to give the assistant extra tools.</p>
+      ) : (
+        <ul className="mcp-list">
+          {servers.map((s) => (
+            <li key={s.id} className="mcp-row">
+              <label className="mcp-row-top" title="Enable this server">
+                <input type="checkbox" checked={s.enabled} onChange={(e) => update(s.id, { enabled: e.target.checked })} />
+                <input className="mcp-name" value={s.name} placeholder="Name" onChange={(e) => update(s.id, { name: e.target.value })} />
+                <select value={s.transport} onChange={(e) => update(s.id, { transport: e.target.value as "stdio" | "http" })}>
+                  <option value="stdio">stdio</option>
+                  <option value="http">http</option>
+                </select>
+                <button className="icon" onClick={() => remove(s.id)} title="Remove"><Icon name="x" size={11} /></button>
+              </label>
+              {s.transport === "stdio" ? (
+                <input
+                  className="mcp-cmd"
+                  value={[s.command ?? "", ...(s.args ?? [])].join(" ").trim()}
+                  placeholder="command arg1 arg2 (e.g. npx -y @modelcontextprotocol/server-filesystem C:\\)"
+                  onChange={(e) => {
+                    const parts = e.target.value.split(/\s+/).filter(Boolean);
+                    update(s.id, { command: parts[0] ?? "", args: parts.slice(1) });
+                  }}
+                  spellCheck={false}
+                />
+              ) : (
+                <input
+                  className="mcp-cmd"
+                  value={s.url ?? ""}
+                  placeholder="https://host/mcp (JSON-RPC endpoint)"
+                  onChange={(e) => update(s.id, { url: e.target.value })}
+                  spellCheck={false}
+                />
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

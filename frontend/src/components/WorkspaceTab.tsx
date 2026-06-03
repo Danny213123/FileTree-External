@@ -6,12 +6,12 @@ import {
   revealPath, openPath, shellContextMenu, createFolder,
   copyPath, renameItem, moveItems, deletePath, copyFiles,
   hasNativeMove, moveItemsNative, fetchDupesV2Bounded, runCommand,
-  exportUrl, printReportAsPdf,
+  exportUrl, printReportAsPdf, webFetch, webSearch,
   clipboardWriteFiles, clipboardReadFiles, copyItemsNative, hasNativeCopy,
 } from "../api/client";
 import type { ScanOptions, ExportFormat } from "../api/client";
 import type { NodeRecord, SortKey } from "../api/types";
-import { isNoOpMove, type AgentApi } from "../lib/agent";
+import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow, type AgentApi } from "../lib/agent";
 import { confirmRisky, isCrossDrive } from "../lib/confirmRisky";
 import { pushUndo, parentDir } from "../lib/undo";
 import { toast, type ToastAction } from "../lib/toast";
@@ -1090,12 +1090,30 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     reveal: async (path: string) => { revealPath(path); },
     // Run an approved shell command, then refresh the tree (deletions, recycle,
     // etc. change the folder). cwd defaults to this tab's scanned folder.
-    runCommand: async (command: string, cwd?: string) => {
-      const res = await runCommand(command, cwd ?? scanPath);
+    runCommand: async (command: string, cwd?: string, shell?: "powershell" | "cmd") => {
+      const res = await runCommand(command, cwd ?? scanPath, shell ? { shell } : undefined);
       invalidateAllScanCache();
       doScan(undefined, undefined, true);
       return res;
     },
+    // Read-only bounded text read (server caps at ~64 KiB; we window by line).
+    readFile: async (path: string, opts) => readFileWindow(path, opts),
+    // Create/overwrite a text file via an approved PowerShell write, then rescan.
+    writeFile: async (path: string, content: string) => {
+      const res = await runCommand(buildWriteFileCommand(path, content), parentDir(path) || scanPath);
+      invalidateAllScanCache();
+      doScan(undefined, undefined, true);
+      return res;
+    },
+    // Exact-substring edit via an approved PowerShell replace, then rescan.
+    editFile: async (path: string, oldString: string, newString: string) => {
+      const res = await runCommand(buildEditFileCommand(path, oldString, newString), parentDir(path) || scanPath);
+      invalidateAllScanCache();
+      doScan(undefined, undefined, true);
+      return res;
+    },
+    webFetch: async (url: string, opts) => webFetch(url, opts),
+    webSearch: async (query: string) => webSearch(query),
   }), [scanPath, data, tree.nodeById, openLocation, doScan, handleInternalMove]);
 
   useImperativeHandle(ref, () => ({

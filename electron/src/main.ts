@@ -1002,6 +1002,208 @@ function toAnthropicMessages(messages: LlmMessage[]): { system: string; messages
   return { system, messages: out };
 }
 
+// ── Web fetch / search (approval-gated agent tools) ──────────────────────────
+// The renderer's CSP forbids outbound requests, so the network call is performed
+// here in MAIN. Both are bounded (size-capped, timed out) so a hostile/huge
+// response can never wedge the agent. Each is gated behind an approval card in
+// the chat before it is ever invoked.
+const WEB_FETCH_TIMEOUT_MS = 15000;
+const WEB_FETCH_MAX_BYTES = 256 * 1024;
+
+interface WebFetchResult { ok: boolean; status?: number; contentType?: string; text?: string; truncated?: boolean; url?: string; error?: string; }
+
+// Strip tags/scripts/styles from HTML into readable-ish plain text (bounded).
+function htmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n\s*\n+/g, "\n\n")
+    .trim();
+}
+
+async function doWebFetch(url: string, maxBytes: number): Promise<WebFetchResult> {
+  if (!/^https?:\/\//i.test(url)) return { ok: false, error: "Only http(s) URLs are allowed.", url };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WEB_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: controller.signal, redirect: "follow", headers: { "User-Agent": "FileTree/1.0 (+agent web_fetch)" } });
+    const contentType = res.headers.get("content-type") ?? "";
+    const raw = await res.text();
+    const isHtml = /html/i.test(contentType) || /^\s*<(?:!doctype|html)/i.test(raw);
+    let text = isHtml ? htmlToText(raw) : raw;
+    const cap = Math.max(1, Math.min(maxBytes || WEB_FETCH_MAX_BYTES, WEB_FETCH_MAX_BYTES));
+    const truncated = text.length > cap;
+    if (truncated) text = text.slice(0, cap);
+    return { ok: res.ok, status: res.status, contentType, text, truncated, url };
+  } catch (e) {
+    const err = e as Error;
+    return { ok: false, error: err.name === "AbortError" ? "Request timed out." : err.message, url };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+ipcMain.handle("web-fetch", async (_event, url: string, opts?: { maxBytes?: number }): Promise<WebFetchResult> => {
+  return doWebFetch(url, opts?.maxBytes ?? WEB_FETCH_MAX_BYTES);
+});
+
+interface WebSearchResult { ok: boolean; answer?: string; results?: { title: string; url: string; snippet: string }[]; error?: string; }
+
+// Keyless best-effort search via DuckDuckGo's HTML endpoint, parsed into a small
+// list of {title,url,snippet}. No API key required; intentionally minimal.
+ipcMain.handle("web-search", async (_event, query: string): Promise<WebSearchResult> => {
+  const q = (query ?? "").trim();
+  if (!q) return { ok: false, error: "Empty query." };
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WEB_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: controller.signal, headers: { "User-Agent": "Mozilla/5.0 (FileTree agent web_search)" } });
+    if (!res.ok) return { ok: false, error: `Search HTTP ${res.status}` };
+    const html = await res.text();
+    const results: { title: string; url: string; snippet: string }[] = [];
+    const linkRe = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m: RegExpExecArray | null;
+    while ((m = linkRe.exec(html)) && results.length < 8) {
+      let href = m[1];
+      // DuckDuckGo wraps targets in a redirect (…/l/?uddg=<encoded>) — unwrap it.
+      const uddg = href.match(/[?&]uddg=([^&]+)/);
+      if (uddg) { try { href = decodeURIComponent(uddg[1]); } catch { /* keep */ } }
+      const title = htmlToText(m[2]).slice(0, 200);
+      if (href && title) results.push({ title, url: href, snippet: "" });
+    }
+    return { ok: true, results };
+  } catch (e) {
+    const err = e as Error;
+    return { ok: false, error: err.name === "AbortError" ? "Search timed out." : err.message };
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+// ── Minimal MCP (Model Context Protocol) client ──────────────────────────────
+// Supports two transports: a spawned process speaking newline-delimited JSON-RPC
+// over stdio, and an HTTP JSON-RPC endpoint. Connections are short-lived: we
+// initialize, run the requested method, and tear down. Enough to discover
+// (tools/list) and invoke (tools/call) tools from a configured server.
+interface McpServer { id?: string; name?: string; transport: "stdio" | "http"; command?: string; args?: string[]; url?: string; }
+const MCP_TIMEOUT_MS = 20000;
+
+interface JsonRpcResponse { jsonrpc: "2.0"; id?: number | string; result?: any; error?: { code: number; message: string }; }
+
+// Run a JSON-RPC conversation over a freshly-spawned stdio MCP server: perform
+// the initialize handshake, then the caller-supplied request, returning its result.
+function mcpStdioCall(server: McpServer, method: string, params: unknown): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!server.command) { reject(new Error("stdio MCP server has no command")); return; }
+    const child = spawn(server.command, server.args ?? [], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    let buf = "";
+    let stderr = "";
+    let settled = false;
+    let nextId = 1;
+    const initId = nextId++;
+    const callId = nextId++;
+    let initialized = false;
+
+    const finish = (err: Error | null, value?: any) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { child.kill(); } catch { /* already gone */ }
+      if (err) reject(err); else resolve(value);
+    };
+    const timer = setTimeout(() => finish(new Error("MCP request timed out")), MCP_TIMEOUT_MS);
+
+    const send = (msg: unknown) => { try { child.stdin.write(JSON.stringify(msg) + "\n"); } catch { /* pipe closed */ } };
+
+    child.on("error", (e) => finish(e));
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("exit", (code) => { if (!settled) finish(new Error(`MCP server exited (${code})${stderr ? ": " + stderr.slice(0, 200) : ""}`)); });
+
+    child.stdout.on("data", (chunk) => {
+      buf += chunk.toString();
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let msg: JsonRpcResponse;
+        try { msg = JSON.parse(line); } catch { continue; }
+        if (msg.id === initId) {
+          if (msg.error) { finish(new Error(msg.error.message)); return; }
+          initialized = true;
+          send({ jsonrpc: "2.0", method: "notifications/initialized" });
+          send({ jsonrpc: "2.0", id: callId, method, params });
+        } else if (msg.id === callId) {
+          if (msg.error) finish(new Error(msg.error.message));
+          else finish(null, msg.result);
+        }
+      }
+    });
+
+    // Kick off the handshake.
+    send({
+      jsonrpc: "2.0", id: initId, method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "FileTree", version: "1.0" } },
+    });
+    void initialized;
+  });
+}
+
+async function mcpHttpCall(server: McpServer, method: string, params: unknown): Promise<any> {
+  if (!server.url) throw new Error("http MCP server has no url");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MCP_TIMEOUT_MS);
+  try {
+    const res = await fetch(server.url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`MCP HTTP ${res.status}`);
+    const json = (await res.json()) as JsonRpcResponse;
+    if (json.error) throw new Error(json.error.message);
+    return json.result;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function mcpCall(server: McpServer, method: string, params: unknown): Promise<any> {
+  return server.transport === "http" ? mcpHttpCall(server, method, params) : mcpStdioCall(server, method, params);
+}
+
+ipcMain.handle("mcp:listTools", async (_event, server: McpServer) => {
+  try {
+    const result = await mcpCall(server, "tools/list", {});
+    return { ok: true, tools: Array.isArray(result?.tools) ? result.tools : [] };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
+ipcMain.handle("mcp:callTool", async (_event, server: McpServer, name: string, args: unknown) => {
+  try {
+    const result = await mcpCall(server, "tools/call", { name, arguments: args ?? {} });
+    // MCP tool results are an array of content blocks; flatten text for the model.
+    const content = Array.isArray(result?.content)
+      ? result.content.map((c: any) => (typeof c?.text === "string" ? c.text : JSON.stringify(c))).join("\n")
+      : typeof result?.content === "string" ? result.content : JSON.stringify(result ?? {});
+    return { ok: !result?.isError, content, isError: !!result?.isError };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+});
+
 ipcMain.on("ondragstart", (event, arg: string | string[]) => {
   const filePaths = (Array.isArray(arg) ? arg : [arg]).filter((filePath) => filePath && fs.existsSync(filePath));
   if (filePaths.length === 0) return;

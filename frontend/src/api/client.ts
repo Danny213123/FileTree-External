@@ -42,7 +42,57 @@ type ElectronAPI = {
   moveItemsNative?: (paths: string[], destination: string) => Promise<NativeMoveResult>;
   copyItemsNative?: (paths: string[], destination: string) => Promise<NativeMoveResult>;
   restoreFromRecycleBin?: (originalPath: string) => Promise<boolean>;
+  /** Approval-gated network fetch performed in the Electron MAIN process. */
+  webFetch?: (url: string, opts?: { maxBytes?: number }) => Promise<WebFetchResult>;
+  /** Best-effort keyless web search (DuckDuckGo) performed in MAIN. */
+  webSearch?: (query: string) => Promise<WebSearchResult>;
+  /** Minimal MCP client (list/call) bridged through MAIN. */
+  mcp?: {
+    listTools: (server: unknown) => Promise<McpListResult>;
+    callTool: (server: unknown, name: string, args: unknown) => Promise<McpCallResult>;
+  };
 };
+
+export interface WebFetchResult {
+  ok: boolean;
+  status?: number;
+  contentType?: string;
+  text?: string;
+  truncated?: boolean;
+  url?: string;
+  error?: string;
+}
+
+export interface WebSearchResultItem {
+  title: string;
+  url: string;
+  snippet: string;
+}
+export interface WebSearchResult {
+  ok: boolean;
+  answer?: string;
+  results?: WebSearchResultItem[];
+  error?: string;
+}
+
+export interface McpToolInfo {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  /** MCP tool annotations; `readOnlyHint:false` / `destructiveHint:true` ⇒ gate it. */
+  annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; title?: string };
+}
+export interface McpListResult {
+  ok: boolean;
+  tools?: McpToolInfo[];
+  error?: string;
+}
+export interface McpCallResult {
+  ok: boolean;
+  content?: string;
+  isError?: boolean;
+  error?: string;
+}
 
 const eAPI = (): ElectronAPI =>
   (window as unknown as { electronAPI?: ElectronAPI }).electronAPI ?? {};
@@ -339,6 +389,46 @@ export async function fetchFileText(path: string, signal?: AbortSignal): Promise
   const res = await fetch(`/api/file-text?${params.toString()}`, { signal });
   if (!res.ok) return { binary: true };
   try { return await res.json() as FileTextPreview; } catch { return { binary: true }; }
+}
+
+// ── Web fetch / search (Electron MAIN IPC; approval-gated in the agent) ──────
+// The renderer's CSP is connect-src 'self', so all outbound network requests are
+// performed in the Electron MAIN process. In plain-browser dev these degrade to
+// a direct fetch (usually CORS-blocked), returning an error the model can read.
+
+export async function webFetch(url: string, opts?: { maxBytes?: number }): Promise<WebFetchResult> {
+  const api = eAPI();
+  if (typeof api.webFetch === "function") return api.webFetch(url, opts);
+  try {
+    const res = await fetch(url);
+    const text = await res.text();
+    const max = opts?.maxBytes ?? 64 * 1024;
+    const truncated = text.length > max;
+    return { ok: res.ok, status: res.status, text: truncated ? text.slice(0, max) : text, truncated, url };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message, url };
+  }
+}
+
+export async function webSearch(query: string): Promise<WebSearchResult> {
+  const api = eAPI();
+  if (typeof api.webSearch === "function") return api.webSearch(query);
+  return { ok: false, error: "Web search requires the FileTree desktop app." };
+}
+
+// ── MCP client bridge (Electron MAIN performs the JSON-RPC) ──────────────────
+export async function mcpListTools(server: unknown): Promise<McpListResult> {
+  const api = eAPI();
+  if (!api.mcp) return { ok: false, error: "MCP requires the FileTree desktop app." };
+  try { return await api.mcp.listTools(server); }
+  catch (e) { return { ok: false, error: (e as Error).message }; }
+}
+
+export async function mcpCallTool(server: unknown, name: string, args: unknown): Promise<McpCallResult> {
+  const api = eAPI();
+  if (!api.mcp) return { ok: false, error: "MCP requires the FileTree desktop app." };
+  try { return await api.mcp.callTool(server, name, args); }
+  catch (e) { return { ok: false, error: (e as Error).message }; }
 }
 
 // ── Scan snapshots + growth diff (roadmap #5) ────────────────
