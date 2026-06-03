@@ -11,7 +11,9 @@ use crate::io::{
     display_name, is_hidden_entry, metadata_modified_ms, now_ms, platform_allocated_size,
     platform_allocated_size_raw, should_exclude, should_recurse,
 };
-use crate::model::{NodeRecord, QueueState, ScanError, ScanOptions, ScanResult, WorkerShared};
+use crate::model::{
+    DirJob, NodeRecord, QueueState, ScanError, ScanOptions, ScanResult, WorkerShared,
+};
 
 // ──────────────────────────────────────────────────────────────────
 // Extension extraction from raw name string (avoids Path allocation)
@@ -109,33 +111,34 @@ where
         attributes: root_attributes,
     };
 
-    let queue = if root_is_dir {
-        VecDeque::from([0usize])
+    // Reserve worker-thread slots from the process-wide scan budget so that
+    // several concurrent scans share the CPU instead of each spawning a full
+    // thread pool. The permit is held (RAII) until every worker has joined at the
+    // end of this function, then released for the next waiting scan.
+    let scan_permit = crate::io::acquire_scan_threads(options.threads.clamp(1, 64));
+    let thread_count = scan_permit.threads();
+
+    // Root is id 0 and lives outside the worker buffers. If it is a directory,
+    // seed the queue with its own scan job; the path + depth the job needs travel
+    // WITH the job, so a worker never has to read a shared node buffer to scan it.
+    let initial_queue: VecDeque<DirJob> = if root_is_dir {
+        VecDeque::from([DirJob { id: 0, path: root_node.path.clone(), depth: 0 }])
     } else {
         VecDeque::new()
     };
-    let done = queue.is_empty();
-    let thread_count = options.threads.clamp(1, 64);
+    let done = initial_queue.is_empty();
 
-    // Pre-allocate nodes with a generous capacity hint.
-    // Most Windows drive scans have 100k–2M nodes; start at 256k to avoid
-    // the 20+ doublings that happen with a default Vec.
-    let nodes_initial = Vec::with_capacity(256_000);
-    let mut nodes_init = nodes_initial;
-    nodes_init.push(root_node);
-
-    // Atomic node counter — workers use fetch_add to claim ID slots without
-    // holding the nodes mutex, then write into the pre-reserved slots.
-    // Invariant: node_count.load() == nodes.lock().len() at all times that
-    // the nodes mutex is NOT held by a worker.
-    let node_count = Arc::new(AtomicUsize::new(1)); // root occupies id=0
+    // Atomic node counter — a worker fetch_adds to claim a contiguous id range for
+    // the children of the directory it is scanning, assigns those ids, and writes
+    // the records into its OWN thread-local buffer (no shared lock). Root is id 0,
+    // so the counter starts at 1; the final node count equals this counter.
+    let node_count = Arc::new(AtomicUsize::new(1));
 
     let shared = Arc::new(WorkerShared {
         options,
-        nodes: Mutex::new(nodes_init),
         errors: Mutex::new(Vec::new()),
         queue: Mutex::new(QueueState {
-            dirs: queue,
+            dirs: initial_queue,
             active: 0,
             done,
         }),
@@ -170,33 +173,109 @@ where
         }
     }
 
+    // Collect each worker's thread-local node buffer (workers have all joined, so
+    // every record they produced is now owned here).
+    let mut worker_buffers: Vec<Vec<NodeRecord>> = Vec::with_capacity(thread_count);
     for handle in handles {
-        let _ = handle.join();
+        if let Ok(buf) = handle.join() {
+            worker_buffers.push(buf);
+        }
     }
 
-    Ok(snapshot_scan_result(
-        &shared,
+    let total_nodes = node_count_shared.load(Ordering::Relaxed);
+    let pending_errors =
+        std::mem::take(&mut *shared.errors.lock().expect("errors lock poisoned"));
+
+    Ok(finalize_scan_result(
+        root_node,
+        worker_buffers,
+        total_nodes,
+        pending_errors,
         scanned_at_ms,
         started.elapsed().as_millis() as u64,
         thread_count,
     ))
 }
 
-pub(crate) fn snapshot_scan_result(
-    shared: &WorkerShared,
+/// Assemble the final, contiguous node buffer from the root node plus every
+/// worker's thread-local buffer, then aggregate. The sharded scan produces id
+/// blocks in nondeterministic worker order, so this SCATTERS each record to
+/// `nodes[record.id]`, restoring the positional `id == index` contract exactly —
+/// the invariant every endpoint, serializer, and `aggregate_nodes` itself relies
+/// on. `parent.children` lists and per-node error counts are rebuilt here (they
+/// can't be maintained across independent buffers during the walk).
+pub(crate) fn finalize_scan_result(
+    root: NodeRecord,
+    worker_buffers: Vec<Vec<NodeRecord>>,
+    total_nodes: usize,
+    pending_errors: Vec<(usize, ScanError)>,
     scanned_at_ms: u64,
     elapsed_ms: u64,
     thread_count: usize,
 ) -> ScanResult {
-    // Clone nodes and errors while holding their locks, then drop locks
-    // immediately so worker threads are not blocked during aggregation.
-    // Workers have already joined (handles are joined before this is called), so
-    // move the buffers out instead of cloning them (~250-400 MB at 750k nodes).
-    // mem::take leaves empty Vecs behind, which is fine — the scan is finished.
-    let mut nodes = std::mem::take(&mut *shared.nodes.lock().expect("nodes lock poisoned"));
-    let errors = std::mem::take(&mut *shared.errors.lock().expect("errors lock poisoned"));
+    // Scatter by id into a pre-sized buffer. The placeholder carries only empty
+    // String/Vec fields (no heap allocation), so filling `total_nodes` slots is
+    // cheap; each real record is then MOVED into its slot (its heap strings are
+    // moved, not copied). Ids are contiguous (root = 0, plus every fetch_add
+    // block), so each slot is written exactly once.
+    let placeholder = NodeRecord {
+        id: 0,
+        parent: None,
+        name: String::new(),
+        path: String::new(),
+        is_dir: false,
+        is_link: false,
+        hidden: false,
+        readonly: false,
+        size: 0,
+        allocated: 0,
+        files: 0,
+        folders: 0,
+        modified_ms: 0,
+        created_ms: 0,
+        accessed_ms: 0,
+        depth: 0,
+        errors: 0,
+        children: Vec::new(),
+        extension: String::new(),
+        owner: String::new(),
+        attributes: 0,
+    };
+    let mut nodes: Vec<NodeRecord> = vec![placeholder; total_nodes.max(1)];
+    let root_id = root.id;
+    if root_id < nodes.len() {
+        nodes[root_id] = root;
+    }
+    for buf in worker_buffers {
+        for node in buf {
+            let id = node.id;
+            if id < nodes.len() {
+                nodes[id] = node;
+            }
+        }
+    }
 
-    // Aggregation is O(n) and must not hold any shared lock.
+    // Rebuild each parent's children list from the parent pointers, in ascending
+    // id order. This reproduces the previous incremental push order exactly (a
+    // directory's children always occupied one contiguous, ascending id block),
+    // and `aggregate_nodes` re-sorts children anyway.
+    for id in 0..nodes.len() {
+        let Some(parent) = nodes[id].parent else { continue };
+        if parent < nodes.len() {
+            nodes[parent].children.push(id);
+        }
+    }
+
+    // Apply the deferred per-node error counts, then collect the error messages.
+    let mut errors = Vec::with_capacity(pending_errors.len());
+    for (node_id, err) in pending_errors {
+        if let Some(node) = nodes.get_mut(node_id) {
+            node.errors = node.errors.saturating_add(1);
+        }
+        errors.push(err);
+    }
+
+    // Aggregation is O(n) and operates on the owned buffer (no shared lock held).
     aggregate_nodes(&mut nodes);
 
     let root_path = nodes.first().map(|node| node.path.clone()).unwrap_or_default();
@@ -229,16 +308,22 @@ impl Drop for ActiveGuard {
     }
 }
 
-fn worker_loop(shared: Arc<WorkerShared>, node_count: Arc<AtomicUsize>) {
+/// Run one scan worker, returning the thread-local node buffer it accumulated.
+/// Each worker owns its `Vec<NodeRecord>`; nodes are scattered into the final
+/// contiguous buffer by id in `finalize_scan_result`, so workers never contend
+/// on a shared node lock — they only take the (short-lived) queue lock to claim
+/// the next directory job and to push freshly discovered sub-directories.
+fn worker_loop(shared: Arc<WorkerShared>, node_count: Arc<AtomicUsize>) -> Vec<NodeRecord> {
+    let mut local_buf: Vec<NodeRecord> = Vec::new();
     loop {
         if shared.cancel.load(Ordering::Relaxed) {
             let mut queue = shared.queue.lock().expect("queue lock poisoned");
             queue.done = true;
             shared.queue_ready.notify_all();
-            return;
+            return local_buf;
         }
 
-        let job_id = {
+        let job = {
             let mut queue = shared.queue.lock().expect("queue lock poisoned");
             loop {
                 if shared.cancel.load(Ordering::Relaxed) {
@@ -246,9 +331,9 @@ fn worker_loop(shared: Arc<WorkerShared>, node_count: Arc<AtomicUsize>) {
                     shared.queue_ready.notify_all();
                     break None;
                 }
-                if let Some(id) = queue.dirs.pop_front() {
+                if let Some(job) = queue.dirs.pop_front() {
                     queue.active += 1;
-                    break Some(id);
+                    break Some(job);
                 }
                 if queue.done {
                     break None;
@@ -260,39 +345,45 @@ fn worker_loop(shared: Arc<WorkerShared>, node_count: Arc<AtomicUsize>) {
             }
         };
 
-        let Some(dir_id) = job_id else {
-            return;
+        let Some(job) = job else {
+            return local_buf;
         };
 
         {
             let _guard = ActiveGuard {
                 shared: Arc::clone(&shared),
             };
-            scan_directory_job(&shared, &node_count, dir_id);
+            scan_directory_job(&shared, &node_count, &job, &mut local_buf);
         }
     }
 }
 
-fn scan_directory_job(shared: &Arc<WorkerShared>, node_count: &Arc<AtomicUsize>, dir_id: usize) {
+fn scan_directory_job(
+    shared: &Arc<WorkerShared>,
+    node_count: &Arc<AtomicUsize>,
+    job: &DirJob,
+    local_buf: &mut Vec<NodeRecord>,
+) {
     if shared.cancel.load(Ordering::Relaxed) {
         return;
     }
 
-    let (dir_path, dir_depth) = {
-        let nodes = shared.nodes.lock().expect("nodes lock poisoned");
-        let Some(node) = nodes.get(dir_id) else {
-            return;
-        };
-        (node.path.clone(), node.depth)
-    };
-
+    // The directory's own path and depth travel WITH the job (it was recorded by
+    // whichever worker discovered it), so there is no shared node buffer to read.
     #[cfg(windows)]
     {
-        scan_directory_win32(shared, node_count, dir_id, &dir_path, dir_depth);
+        scan_directory_win32(shared, node_count, job.id, &job.path, job.depth, local_buf);
     }
     #[cfg(not(windows))]
     {
-        scan_directory_portable(shared, node_count, dir_id, &PathBuf::from(&dir_path), dir_depth);
+        scan_directory_portable(
+            shared,
+            node_count,
+            job.id,
+            &PathBuf::from(&job.path),
+            job.depth,
+            local_buf,
+        );
     }
 }
 
@@ -307,6 +398,7 @@ fn scan_directory_win32(
     dir_id: usize,
     dir_path: &str,
     dir_depth: usize,
+    local_buf: &mut Vec<NodeRecord>,
 ) {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -498,8 +590,23 @@ fn scan_directory_win32(
             String::new()
         };
 
-        let needs_queue = is_dir && should_recurse(depth, shared.options.max_depth);
-        let at_depth_limit = is_dir && !needs_queue && shared.options.max_depth.is_some();
+        // A reparse-point directory (junction / directory symlink / mount point)
+        // is recorded but NEVER recursed into. Enumerating one with
+        // FindFirstFileExW can fail with ERROR_ACCESS_DENIED (error 5): the legacy
+        // "My Music" / "My Pictures" / "My Videos" compatibility junctions inside a
+        // user's Documents carry deny-read ACLs, so trying to open them surfaces an
+        // alarming scan error. Their real targets live under the user profile and
+        // are scanned at that canonical location, so skipping the junction also
+        // avoids double-counting and reparse-loop cycles. The node still keeps
+        // `is_link = true` and the FILE_ATTRIBUTE_REPARSE_POINT bit in `attributes`
+        // (so the client can flag it as a junction) and is emitted as a 0-byte
+        // directory with no children and no error. Genuinely-inaccessible NON-
+        // reparse directories are still queued and still record their real error.
+        let is_reparse_dir = is_dir && is_link;
+        let needs_queue =
+            is_dir && !is_reparse_dir && should_recurse(depth, shared.options.max_depth);
+        let at_depth_limit =
+            is_dir && !is_reparse_dir && !needs_queue && shared.options.max_depth.is_some();
 
         // Owner is opt-in: GetNamedSecurityInfo opens a security descriptor per
         // entry, so resolving it unconditionally would slow large scans. The
@@ -562,50 +669,44 @@ fn scan_directory_win32(
 
     let n = local_nodes.len();
 
-    // Atomically reserve n consecutive ID slots.
-    // This avoids holding the nodes mutex while we build child IDs.
+    // Atomically reserve n consecutive global IDs for this directory's children.
     let first_id = node_count.fetch_add(n, Ordering::Relaxed);
 
-    // Assign IDs to local nodes before acquiring any lock
+    // Assign the reserved IDs. The records then go into this worker's own buffer;
+    // `finalize_scan_result` scatters every record to `nodes[id]`, so the global
+    // `id == index` contract holds no matter which worker produced the record.
     for (i, node) in local_nodes.iter_mut().enumerate() {
         node.id = first_id + i;
     }
 
-    // One lock acquisition to push all nodes + update parent's children list
-    {
-        let mut nodes = shared.nodes.lock().expect("nodes lock poisoned");
-        // Ensure Vec has capacity for the new slots
-        if nodes.len() + n > nodes.capacity() {
-            nodes.reserve(n.max(4096));
-        }
-        // Extend Vec with the new nodes (which now have correct IDs)
-        nodes.extend(local_nodes.into_iter());
-        // Register all children on the parent in one pass
-        if let Some(parent_node) = nodes.get_mut(dir_id) {
-            for i in 0..n {
-                parent_node.children.push(first_id + i);
-            }
-        }
-    }
-
-    // Collect directories to enqueue and depth-limit errors
-    let mut dirs_to_scan: Vec<usize> = Vec::new();
+    // Build the sub-directory jobs and depth-limit errors BEFORE moving the
+    // records into the buffer (the job carries the child's id/path/depth so the
+    // worker that picks it up needs no shared node lookup).
+    let mut dirs_to_scan: Vec<DirJob> = Vec::new();
     let mut depth_limit_iter = depth_limit_paths.into_iter();
-
     for (i, &sentinel) in pending_dir_indices.iter().enumerate() {
-        let child_id = first_id + i;
+        let child = &local_nodes[i];
+        let child_id = child.id;
         if sentinel == usize::MAX {
             let path_str = depth_limit_iter.next().unwrap_or_default();
             add_scan_error(shared, child_id, &path_str, "depth limit reached".to_string());
         } else if sentinel != usize::MAX - 1 {
-            dirs_to_scan.push(child_id);
+            dirs_to_scan.push(DirJob {
+                id: child_id,
+                path: child.path.clone(),
+                depth: child.depth,
+            });
         }
     }
 
+    // Append to the worker-local buffer — no shared node lock. Parent/child links
+    // are rebuilt from the `parent` pointers during finalize.
+    local_buf.extend(local_nodes);
+
     if !dirs_to_scan.is_empty() {
         let mut queue = shared.queue.lock().expect("queue lock poisoned");
-        for id in dirs_to_scan {
-            queue.dirs.push_back(id);
+        for job in dirs_to_scan {
+            queue.dirs.push_back(job);
         }
         shared.queue_ready.notify_all();
     }
@@ -621,6 +722,7 @@ fn scan_directory_portable(
     dir_id: usize,
     dir_path: &Path,
     dir_depth: usize,
+    local_buf: &mut Vec<NodeRecord>,
 ) {
     let entries = match fs::read_dir(dir_path) {
         Ok(entries) => entries,
@@ -689,8 +791,18 @@ fn scan_directory_portable(
             0
         };
 
-        let needs_queue = is_dir && should_recurse(depth, shared.options.max_depth);
-        let at_depth_limit = is_dir && !needs_queue && shared.options.max_depth.is_some();
+        // A symlink / reparse-point directory is recorded but NEVER recursed into,
+        // mirroring the Windows fast path: following it can hit an inaccessible or
+        // cyclic target (and on Windows the legacy Documents compatibility
+        // junctions deny read access entirely), while the real target is scanned at
+        // its canonical location. `is_link` comes from the `symlink_metadata` read
+        // above, so it stays set even when `follow_links` resolved `metadata`
+        // through the link. No recursion, no scan error — just a leaf node.
+        let is_reparse_dir = is_dir && is_link;
+        let needs_queue =
+            is_dir && !is_reparse_dir && should_recurse(depth, shared.options.max_depth);
+        let at_depth_limit =
+            is_dir && !is_reparse_dir && !needs_queue && shared.options.max_depth.is_some();
 
         let owner = if shared.options.collect_owners {
             crate::owner::owner_of(&path_string)
@@ -754,56 +866,53 @@ fn scan_directory_portable(
         node.id = first_id + i;
     }
 
-    {
-        let mut nodes = shared.nodes.lock().expect("nodes lock poisoned");
-        if nodes.len() + n > nodes.capacity() {
-            nodes.reserve(n.max(4096));
-        }
-        nodes.extend(local_nodes.into_iter());
-        if let Some(parent_node) = nodes.get_mut(dir_id) {
-            for i in 0..n {
-                parent_node.children.push(first_id + i);
-            }
-        }
-    }
-
-    let mut dirs_to_scan: Vec<usize> = Vec::new();
+    // Build sub-directory jobs / depth-limit errors before the buffer move, so
+    // each job carries the child id/path/depth (no shared node lookup needed).
+    let mut dirs_to_scan: Vec<DirJob> = Vec::new();
     let mut depth_limit_iter = depth_limit_paths.into_iter();
-
     for (i, &sentinel) in pending_dirs.iter().enumerate() {
-        let child_id = first_id + i;
+        let child = &local_nodes[i];
+        let child_id = child.id;
         if sentinel == usize::MAX {
             let path_str = depth_limit_iter.next().unwrap_or_default();
             add_scan_error(shared, child_id, &path_str, "depth limit reached".to_string());
         } else if sentinel != usize::MAX - 1 {
-            dirs_to_scan.push(child_id);
+            dirs_to_scan.push(DirJob {
+                id: child_id,
+                path: child.path.clone(),
+                depth: child.depth,
+            });
         }
     }
 
+    // Append to the worker-local buffer — no shared node lock. Parent/child links
+    // are rebuilt from the `parent` pointers during finalize.
+    local_buf.extend(local_nodes);
+
     if !dirs_to_scan.is_empty() {
         let mut queue = shared.queue.lock().expect("queue lock poisoned");
-        for id in dirs_to_scan {
-            queue.dirs.push_back(id);
+        for job in dirs_to_scan {
+            queue.dirs.push_back(job);
         }
         shared.queue_ready.notify_all();
     }
 }
 
 fn add_scan_error(shared: &WorkerShared, node_id: usize, path: &str, message: String) {
-    {
-        let mut nodes = shared.nodes.lock().expect("nodes lock poisoned");
-        if let Some(node) = nodes.get_mut(node_id) {
-            node.errors += 1;
-        }
-    }
+    // The node owning this error may live in another worker's buffer, so the
+    // per-node `errors` count can't be bumped here. Record `(node_id, error)` and
+    // apply the increment in `finalize_scan_result`, where the full buffer exists.
     shared
         .errors
         .lock()
         .expect("errors lock poisoned")
-        .push(ScanError {
-            path: path.to_string(),
-            message,
-        });
+        .push((
+            node_id,
+            ScanError {
+                path: path.to_string(),
+                message,
+            },
+        ));
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -903,7 +1012,7 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
 mod tests {
     use super::*;
     use crate::io::now_ms;
-    use crate::model::{QueueState, ScanOptions, WorkerShared};
+    use crate::model::{DirJob, QueueState, ScanOptions, WorkerShared};
 
     fn make_test_node(id: usize, parent: Option<usize>, is_dir: bool, size: u64) -> NodeRecord {
         NodeRecord {
@@ -957,35 +1066,22 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_result_has_correct_aggregation() {
-        let mut root = make_test_node(0, None, true, 0);
+    fn finalize_result_has_correct_aggregation() {
+        // Root (id 0) lives outside the worker buffers; its two file children were
+        // produced by a worker into that worker's own thread-local buffer.
+        let root = make_test_node(0, None, true, 0);
         let child_a = make_test_node(1, Some(0), false, 500);
         let child_b = make_test_node(2, Some(0), false, 300);
-        root.children = vec![1, 2];
 
-        let _node_count = Arc::new(AtomicUsize::new(3));
-        let shared = Arc::new(WorkerShared {
-            options: ScanOptions {
-                root: PathBuf::from("/test"),
-                include_hidden: true,
-                follow_links: false,
-                exclude_patterns: Vec::new(),
-                max_depth: None,
-                threads: 1,
-                collect_owners: false,
-            },
-            nodes: Mutex::new(vec![root, child_a, child_b]),
-            errors: Mutex::new(Vec::new()),
-            queue: Mutex::new(QueueState {
-                dirs: VecDeque::new(),
-                active: 0,
-                done: true,
-            }),
-            queue_ready: Condvar::new(),
-            cancel: Arc::new(AtomicBool::new(false)),
-        });
-
-        let result = snapshot_scan_result(&shared, 1_000_000, 42, 1);
+        let result = finalize_scan_result(
+            root,
+            vec![vec![child_a, child_b]],
+            3,
+            Vec::new(),
+            1_000_000,
+            42,
+            1,
+        );
 
         assert_eq!(
             result.nodes[0].size, 800,
@@ -1000,38 +1096,103 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_releases_nodes_lock_before_aggregation() {
-        let mut root = make_test_node(0, None, true, 0);
-        let child = make_test_node(1, Some(0), false, 100);
-        root.children = vec![1];
+    fn finalize_scatters_nodes_by_id_regardless_of_buffer_order() {
+        // Tree: root(0) ▸ [file(1), dir(2) ▸ file(4), file(3)].
+        // The worker buffers are presented OUT OF ID ORDER (the dir-2 worker's
+        // buffer, whose node has the highest id, is listed first). finalize must
+        // still scatter every record to nodes[id] so the positional `id == index`
+        // contract — relied on by every endpoint/serializer — holds exactly.
+        let root = make_test_node(0, None, true, 0);
+        let n1 = make_test_node(1, Some(0), false, 10);
+        let n2 = make_test_node(2, Some(0), true, 0);
+        let n3 = make_test_node(3, Some(0), false, 30);
+        let mut n4 = make_test_node(4, Some(2), false, 40);
+        n4.depth = 2; // grandchild: child of dir 2 (which is at depth 1)
 
-        let shared = Arc::new(WorkerShared {
-            options: ScanOptions {
-                root: PathBuf::from("/test"),
-                include_hidden: true,
-                follow_links: false,
-                exclude_patterns: Vec::new(),
-                max_depth: None,
-                threads: 1,
-                collect_owners: false,
-            },
-            nodes: Mutex::new(vec![root, child]),
-            errors: Mutex::new(Vec::new()),
-            queue: Mutex::new(QueueState {
-                dirs: VecDeque::new(),
-                active: 0,
-                done: true,
-            }),
-            queue_ready: Condvar::new(),
-            cancel: Arc::new(AtomicBool::new(false)),
-        });
-
-        let _result = snapshot_scan_result(&shared, 1_000_000, 0, 1);
-
-        assert!(
-            shared.nodes.try_lock().is_ok(),
-            "nodes lock should be released after snapshot_scan_result returns"
+        let result = finalize_scan_result(
+            root,
+            vec![vec![n4], vec![n1, n2, n3]],
+            5,
+            Vec::new(),
+            1_000_000,
+            7,
+            2,
         );
+
+        for (idx, node) in result.nodes.iter().enumerate() {
+            assert_eq!(node.id, idx, "node at index {idx} must have id == index");
+        }
+        assert_eq!(result.nodes[2].size, 40, "dir should aggregate its child");
+        assert_eq!(result.nodes[0].size, 80, "root should aggregate the whole tree");
+        assert_eq!(result.nodes[0].files, 3, "root should count every file");
+    }
+
+    #[test]
+    fn aggregate_is_order_independent_across_scrambled_id_blocks() {
+        // The sharded scan reserves per-worker id BLOCKS from an atomic counter and
+        // merges thread-local buffers at finalize, so a parent and its descendants
+        // can be assigned ids in any relative order and arrive in any buffer order.
+        // This builds a directory chain whose ids deliberately VIOLATE a
+        // "parent.id < child.id" assumption — directory A (id 3) owns sub-directory
+        // B (id 1), which has a LOWER id than its own parent — and presents the
+        // worker buffers out of id order. Aggregation keys on DEPTH, not id order,
+        // so every leaf size must still roll up through the whole chain. (An
+        // id-order aggregation would compute A from a not-yet-aggregated B and
+        // leave directory sizes at 0 — the reported "folders show 0 B" symptom.)
+        let mut root = make_test_node(0, None, true, 0);
+        let mut a = make_test_node(3, Some(0), true, 0); // depth 1 dir
+        let mut b = make_test_node(1, Some(3), true, 0); // depth 2 dir (id 1 < parent id 3)
+        let mut f = make_test_node(2, Some(1), false, 500); // depth 3 file
+        root.depth = 0;
+        a.depth = 1;
+        b.depth = 2;
+        f.depth = 3;
+
+        // Buffers intentionally out of id order; root (id 0) is supplied separately.
+        let result = finalize_scan_result(
+            root,
+            vec![vec![b, f], vec![a]],
+            4,
+            Vec::new(),
+            1_000_000,
+            0,
+            2,
+        );
+
+        for (idx, node) in result.nodes.iter().enumerate() {
+            assert_eq!(node.id, idx, "id == index contract must hold at {idx}");
+        }
+        assert_eq!(result.nodes[2].size, 500, "leaf file keeps its size");
+        assert_eq!(result.nodes[1].size, 500, "dir B aggregates its file child");
+        assert_eq!(
+            result.nodes[3].size, 500,
+            "dir A aggregates dir B even though B.id < A.id"
+        );
+        assert_eq!(result.nodes[0].size, 500, "root aggregates the whole chain");
+        assert_eq!(result.nodes[0].files, 1, "root counts the single leaf file");
+        assert_eq!(result.nodes[0].folders, 2, "root counts both sub-directories");
+    }
+
+    #[test]
+    fn finalize_applies_deferred_node_errors() {
+        // Errors are recorded as (node_id, ScanError) during the scan and the
+        // per-node count is applied in finalize. A dir-level error should roll up
+        // into the root's aggregated error count.
+        let root = make_test_node(0, None, true, 0);
+        let child = make_test_node(1, Some(0), false, 100);
+        let pending = vec![(
+            1usize,
+            ScanError {
+                path: "/test/node_1".to_string(),
+                message: "denied".to_string(),
+            },
+        )];
+
+        let result = finalize_scan_result(root, vec![vec![child]], 2, pending, 1_000_000, 0, 1);
+
+        assert_eq!(result.nodes[1].errors, 1, "deferred error should land on the node");
+        assert_eq!(result.nodes[0].errors, 1, "child error should roll up to root");
+        assert_eq!(result.errors.len(), 1, "the error message should be retained");
     }
 
     #[test]
@@ -1046,7 +1207,6 @@ mod tests {
                 threads: 1,
                 collect_owners: false,
             },
-            nodes: Mutex::new(Vec::new()),
             errors: Mutex::new(Vec::new()),
             queue: Mutex::new(QueueState {
                 dirs: VecDeque::new(),
@@ -1086,10 +1246,13 @@ mod tests {
                 threads: 1,
                 collect_owners: false,
             },
-            nodes: Mutex::new(Vec::new()),
             errors: Mutex::new(Vec::new()),
             queue: Mutex::new(QueueState {
-                dirs: VecDeque::from(vec![0]),
+                dirs: VecDeque::from(vec![DirJob {
+                    id: 0,
+                    path: String::new(),
+                    depth: 0,
+                }]),
                 active: 2,
                 done: false,
             }),
@@ -1156,5 +1319,153 @@ mod tests {
         assert_eq!(join_path("C:\\foo", "bar"), "C:\\foo\\bar");
         assert_eq!(join_path("C:\\foo\\", "bar"), "C:\\foo\\bar");
         assert_eq!(join_path("/usr/local", "bin"), "/usr/local\\bin");
+    }
+
+    // ── Functional, end-to-end scan of a real on-disk tree ──────────────────
+    // Builds a temp tree with KNOWN byte sizes, scans it through the real entry
+    // point, and proves (a) the live progress counter reaches the true total and
+    // (b) every directory's aggregated size equals the sum of its contents —
+    // regardless of how the sharded workers ordered their id blocks.
+    #[test]
+    fn functional_scan_aggregates_sizes_and_counts() {
+        use std::fs;
+        let base = std::env::temp_dir()
+            .join(format!("filetree_func_{}_{}", std::process::id(), now_ms()));
+        let sub1 = base.join("sub1");
+        let sub2 = sub1.join("sub2");
+        fs::create_dir_all(&sub2).unwrap();
+        // root/a.txt = 100, sub1/b.txt = 200, sub1/c.txt = 50, sub1/sub2/d.txt = 1000
+        fs::write(base.join("a.txt"), vec![b'a'; 100]).unwrap();
+        fs::write(sub1.join("b.txt"), vec![b'b'; 200]).unwrap();
+        fs::write(sub1.join("c.txt"), vec![b'c'; 50]).unwrap();
+        fs::write(sub2.join("d.txt"), vec![b'd'; 1000]).unwrap();
+
+        let options = ScanOptions {
+            root: base.clone(),
+            include_hidden: true,
+            follow_links: false,
+            exclude_patterns: Vec::new(),
+            max_depth: None,
+            threads: 4,
+            collect_owners: false,
+        };
+
+        // Capture the highest progress count the callback observed.
+        let max_progress = Arc::new(AtomicUsize::new(0));
+        let mp = Arc::clone(&max_progress);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = scan_path_with_progress(options, cancel, move |count, _elapsed| {
+            mp.fetch_max(count, Ordering::Relaxed);
+        })
+        .expect("scan should succeed");
+
+        let total_nodes = result.nodes.len();
+        // root + 2 dirs (sub1, sub2) + 4 files = 7
+        assert_eq!(total_nodes, 7, "expected 7 nodes, got {total_nodes}");
+
+        let find = |name: &str| {
+            result
+                .nodes
+                .iter()
+                .find(|n| n.is_dir && n.name == name)
+                .unwrap_or_else(|| panic!("dir {name} should be present"))
+        };
+
+        let root = &result.nodes[0];
+        assert_eq!(root.size, 1350, "root size must equal sum of every file");
+        assert_eq!(root.files, 4, "root must count all 4 files");
+        assert_eq!(find("sub1").size, 1250, "sub1 = b(200)+c(50)+sub2(1000)");
+        assert_eq!(find("sub2").size, 1000, "sub2 = d(1000)");
+
+        // The live counter must have reached the true total (not stuck at 0).
+        let seen = max_progress.load(Ordering::Relaxed);
+        assert!(seen > 0, "progress counter must increment above 0 (was {seen})");
+        assert_eq!(seen, total_nodes, "progress counter must reach the node total");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // ── Reparse-point (junction) directories are skipped, not errored ───────
+    // Recreates the reported bug: a directory junction (like the legacy
+    // "My Music"/"My Pictures"/"My Videos" compatibility junctions inside
+    // Documents) must be listed as a 0-byte leaf flagged as a link — never
+    // recursed into and never recorded as a "FindFirstFileExW failed" error.
+    // Uses `mklink /J`, which (unlike `/D` symlinks) needs no admin rights; if
+    // the environment forbids junction creation the test no-ops instead of
+    // failing. The junction here points to a READABLE target, so without the fix
+    // it would be enumerated and its 1000-byte child double-counted under the
+    // junction — asserting the junction's aggregated size is 0 proves it was
+    // treated as a non-recursed leaf.
+    #[cfg(windows)]
+    #[test]
+    fn scan_skips_reparse_point_directory_without_error() {
+        use std::fs;
+        use std::process::Command;
+
+        let base = std::env::temp_dir()
+            .join(format!("filetree_junction_{}_{}", std::process::id(), now_ms()));
+        let target = base.join("target");
+        fs::create_dir_all(&target).expect("create target dir");
+        fs::write(target.join("data.bin"), vec![b'x'; 1000]).expect("write target file");
+
+        let link = base.join("link");
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .status();
+
+        // Skip gracefully if junction creation is not permitted here.
+        let created = matches!(status, Ok(s) if s.success()) && link.exists();
+        if !created {
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+
+        let options = ScanOptions {
+            root: base.clone(),
+            include_hidden: true,
+            follow_links: false,
+            exclude_patterns: Vec::new(),
+            max_depth: None,
+            threads: 2,
+            collect_owners: false,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = scan_path_with_progress(options, cancel, |_, _| {})
+            .expect("scan should succeed");
+
+        let junction = result
+            .nodes
+            .iter()
+            .find(|n| n.name == "link")
+            .expect("junction node should be present in the scan");
+        assert!(junction.is_link, "junction must be flagged is_link");
+        assert!(junction.is_dir, "a directory junction keeps FILE_ATTRIBUTE_DIRECTORY");
+        assert_eq!(
+            junction.size, 0,
+            "reparse-point dir must not be recursed (size would be 1000 if it were)"
+        );
+        assert_eq!(junction.errors, 0, "skipping a junction must not record an error");
+
+        // The hard requirement: NO FindFirstFileExW error for the junction.
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("FindFirstFileExW")),
+            "scanning a reparse-point dir must produce no FindFirstFileExW error, got: {:?}",
+            result.errors
+        );
+
+        // The real target is still scanned at its canonical location (counted once).
+        let target_dir = result
+            .nodes
+            .iter()
+            .find(|n| n.is_dir && n.name == "target")
+            .expect("target dir should be scanned");
+        assert_eq!(target_dir.size, 1000, "the real target is scanned normally");
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

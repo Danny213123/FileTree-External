@@ -1,6 +1,6 @@
 [package]
 name = "filetree"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
 description = "A standalone Windows disk-usage explorer with real-time threaded scans."
 repository = "https://github.com/Danny213123/FileTree"
@@ -11,3 +11,12 @@ publish = false
 # Compile the built renderer (frontend/dist) into the binary so the single
 # executable can serve every Vite-emitted chunk without shipping loose files.
 include_dir = "0.7"
+
+# Release builds are CPU-bound on the filesystem walk and the duplicate hash
+# pipeline, so trade longer compile time for a faster binary: link-time
+# optimization across crates plus a single codegen unit let the optimizer inline
+# the hot scan/hash loops it otherwise can't see across boundaries. opt-level
+# stays at its default (3).
+[profile.release]
+lto = true
+codegen-units = 1

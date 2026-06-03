@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useDeferredValue } from "react";
 import type { NodeRecord, SortKey, Metric, Unit } from "../api/types";
 import { type FilterRule, type CompiledRule, compileRules, applyCompiledRules } from "./useFilterRules";
 import { attributeLetters } from "../lib/attributes";
@@ -228,10 +228,13 @@ function collectVisibleRows(
   // RegExps precompiled once), so a non-empty list means rule-mode is on.
   const hasActiveRules = compiledRules.length > 0;
   const hasSimpleFilter = !hasActiveRules && filter.length > 0;
+  // Normalize the simple-filter needle ONCE per recompute instead of calling
+  // filter.toLowerCase() for every node in passesFilter (the per-row hot path).
+  const filterLower = hasSimpleFilter ? filter.toLowerCase() : "";
 
   const passesFilter = (node: NodeRecord): boolean => {
     if (hasActiveRules) return applyCompiledRules(compiledRules, node);
-    if (hasSimpleFilter) return node.name.toLowerCase().includes(filter.toLowerCase());
+    if (hasSimpleFilter) return node.name.toLowerCase().includes(filterLower);
     return true;
   };
 
@@ -315,22 +318,54 @@ export function useTreeState(): UseTreeStateReturn {
     return m;
   }, [nodes]);
 
-  // Rebuild sort+bundle cache only when data or sort changes — not on expand/filter
+  // ── Concurrent responsiveness (non-blocking heavy recomputes) ──────────────
+  // The two expensive derivations below — buildDirCache (sorts every directory's
+  // children) and collectVisibleRows (walks the whole open tree) — used to run
+  // synchronously on every filter keystroke, "Expand All", sort change, etc.,
+  // blocking typing/clicks on large trees. They now consume DEFERRED copies of
+  // the *interaction* inputs (filter, expansion, sort, show-files) via
+  // useDeferredValue: React commits the urgent render first (the filter box,
+  // twisties and selection update instantly off the non-deferred state) and
+  // recomputes the rows in a low-priority render it can interrupt, so a burst of
+  // keystrokes coalesces to the latest value instead of blocking on each.
+  //
+  // Correctness / convergence: useDeferredValue always settles on the LATEST
+  // value (it never drops the final update), and inputs that change together in
+  // one update defer together (same urgent cycle), so visibleRows steps from one
+  // CONSISTENT snapshot to the next and ends exactly where the synchronous
+  // version would — identical functions, identical args, identical row order.
+  // nodeById is deliberately NOT deferred: it stays urgent so the returned map
+  // and the rows never skew, and scan / merge / patchDirectory (which mutate
+  // nodeById) keep their exact prior synchronous behavior.
+  const dFilter = useDeferredValue(filter);
+  const dExpanded = useDeferredValue(expanded);
+  const dExpandedAll = useDeferredValue(expandedAll);
+  const dCollapsedOverrides = useDeferredValue(collapsedOverrides);
+  const dShowFiles = useDeferredValue(showFiles);
+  const dSortKey = useDeferredValue(sortKey);
+  const dSortDir = useDeferredValue(sortDir);
+
+  // Rebuild sort+bundle cache only when data or (deferred) sort changes — not on
+  // expand/filter. Keyed on the urgent nodeById so it stays in lockstep with the
+  // returned map; the deferred sort keeps a sort switch from blocking input.
   const dirCache = useMemo(
-    () => buildDirCache(nodeById, sortKey, sortDir),
-    [nodeById, sortKey, sortDir],
+    () => buildDirCache(nodeById, dSortKey, dSortDir),
+    [nodeById, dSortKey, dSortDir],
   );
 
   // Precompile filter rules (regex/glob → cached, ReDoS-guarded RegExp) ONCE per
-  // rule-set change, not per visible row. The row hot path reuses these.
+  // rule-set change, not per visible row. Compilation stays URGENT (so the
+  // ReDoS guard runs immediately on edit); only its consumption by the row walk
+  // is deferred so applying a rule to a large tree doesn't block.
   const compiledRules = useMemo(() => compileRules(filterRules), [filterRules]);
+  const dCompiledRules = useDeferredValue(compiledRules);
 
   const visibleRows = useMemo(
     () => collectVisibleRows(
-      nodeById, expanded, expandedAll, collapsedOverrides,
-      dirCache, filter, compiledRules, showFiles,
+      nodeById, dExpanded, dExpandedAll, dCollapsedOverrides,
+      dirCache, dFilter, dCompiledRules, dShowFiles,
     ),
-    [nodeById, expanded, expandedAll, collapsedOverrides, dirCache, filter, compiledRules, showFiles],
+    [nodeById, dExpanded, dExpandedAll, dCollapsedOverrides, dirCache, dFilter, dCompiledRules, dShowFiles],
   );
 
   const toggleExpand = useCallback((id: number) => {

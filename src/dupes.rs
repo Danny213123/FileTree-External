@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::export::push_json_string;
@@ -12,6 +12,16 @@ use crate::model::{node_abs_path, DupesProgress, HashCacheEntry, NodeRecord};
 /// otherwise grow the map without limit; surplus entries are evicted (a miss
 /// just re-hashes). Durable copies live in the on-disk cache regardless.
 pub(crate) const MAX_HASH_CACHE_ENTRIES: usize = 500_000;
+
+/// Monotonic source for `HashCacheEntry::seq`. One per process (the hash cache is
+/// a single per-`AppState` map), so a global counter gives every insert/refresh a
+/// strictly increasing stamp that eviction uses to drop oldest-first.
+static HASH_CACHE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Mint the next monotonic cache sequence number.
+pub(crate) fn next_hash_cache_seq() -> u64 {
+    HASH_CACHE_SEQ.fetch_add(1, Ordering::Relaxed)
+}
 
 // ── Core types ─────────────────────────────────────────────────────────────
 
@@ -251,11 +261,22 @@ pub(crate) fn hash_candidate_groups(
         .copied()
         .filter(|&i| full_hash[i].is_none())
         .collect();
-    let sample_fp: Vec<Mutex<Option<u64>>> = (0..files.len()).map(|_| Mutex::new(None)).collect();
+    // Lock-free per-file sample store: `sample_fp[i]` holds the fingerprint and
+    // `sample_done[i]` marks it computed. A real FNV-1a sample can be ANY u64
+    // (a reserved sentinel could collide with a genuine hash), so a separate
+    // "done" flag distinguishes "not computed" from a real value instead of a
+    // magic hash. Each index is written by exactly one worker, and `parallel_for`
+    // (scoped threads) joins every worker before these are read in step 4, so the
+    // join supplies the happens-before edge and Relaxed ordering is sufficient.
+    let sample_fp: Vec<AtomicU64> = (0..files.len()).map(|_| AtomicU64::new(0)).collect();
+    let sample_done: Vec<AtomicBool> = (0..files.len()).map(|_| AtomicBool::new(false)).collect();
     parallel_for(uncached.len(), threads, cancel, |k| {
         let i = uncached[k];
         match fnv1a_file_sample(&files[i].path, files[i].size) {
-            Ok(fp) => *sample_fp[i].lock().expect("sample lock") = Some(fp),
+            Ok(fp) => {
+                sample_fp[i].store(fp, Ordering::Relaxed);
+                sample_done[i].store(true, Ordering::Relaxed);
+            }
             Err(e) => errors
                 .lock()
                 .expect("hash errors lock")
@@ -277,8 +298,8 @@ pub(crate) fn hash_candidate_groups(
             if full_hash[i].is_some() {
                 continue;
             }
-            let fp = *sample_fp[i].lock().expect("sample lock");
-            if let Some(fp) = fp {
+            if sample_done[i].load(Ordering::Relaxed) {
+                let fp = sample_fp[i].load(Ordering::Relaxed);
                 by_sample.entry(fp).or_default().push(i);
             }
         }
@@ -316,28 +337,48 @@ pub(crate) fn hash_candidate_groups(
     let computed = computed.into_inner().expect("computed lock");
     if !computed.is_empty() {
         let mut new_entries: Vec<(PathBuf, HashCacheEntry)> = Vec::with_capacity(computed.len());
-        let mut guard = cache.lock().expect("hash_cache lock");
-        for &(i, h) in &computed {
-            full_hash[i] = Some(h);
-            let entry = HashCacheEntry { size: files[i].size, mtime: files[i].mtime, hash: h };
-            guard.insert(files[i].path.clone(), entry);
-            new_entries.push((files[i].path.clone(), entry));
-        }
-        // Bound the resident cache so a long session can't grow it without limit.
-        // Evicting an entry only costs a future re-hash; the durable copy was just
-        // appended to disk below, so nothing persistent is lost.
-        if guard.len() > MAX_HASH_CACHE_ENTRIES {
-            let surplus = guard.len() - MAX_HASH_CACHE_ENTRIES;
-            let victims: Vec<PathBuf> = guard.keys().take(surplus).cloned().collect();
-            for key in victims {
-                guard.remove(&key);
+        // Update the in-memory cache (insert + bounded eviction) under the lock,
+        // collecting the new rows to persist. The lock is dropped at the end of
+        // this block — BEFORE any disk I/O — so a hashing thread elsewhere never
+        // waits on this thread's file write to read/seed/insert into the cache.
+        {
+            let mut guard = cache.lock().expect("hash_cache lock");
+            for &(i, h) in &computed {
+                full_hash[i] = Some(h);
+                let entry = HashCacheEntry {
+                    size: files[i].size,
+                    mtime: files[i].mtime,
+                    hash: h,
+                    seq: next_hash_cache_seq(),
+                };
+                guard.insert(files[i].path.clone(), entry);
+                new_entries.push((files[i].path.clone(), entry));
+            }
+            // Bound the resident cache so a long session can't grow it without
+            // limit. Evicting an entry only costs a future re-hash; the durable
+            // copy is appended to disk just below, so nothing persistent is lost.
+            //
+            // Evict OLDEST-FIRST by insertion/refresh `seq` (deterministic), rather
+            // than the previous arbitrary `HashMap::keys().take()` order. `seq`s are
+            // unique (minted via `fetch_add`), so the `surplus`-th smallest seq is a
+            // clean threshold: drop every entry below it. Only the cheap `u64` seqs
+            // are collected here (no per-path clones over the whole map).
+            if guard.len() > MAX_HASH_CACHE_ENTRIES {
+                let surplus = guard.len() - MAX_HASH_CACHE_ENTRIES;
+                let mut seqs: Vec<u64> = guard.values().map(|e| e.seq).collect();
+                seqs.select_nth_unstable(surplus);
+                let threshold = seqs[surplus];
+                guard.retain(|_, e| e.seq >= threshold);
             }
         }
-        // Incremental persistence: append only the new rows (not the whole map)
-        // while holding the cache lock, so concurrent appenders can't interleave
-        // partial lines. The on-disk format tolerates these trailing rows (see
+        // Incremental persistence, now performed AFTER releasing the cache lock so
+        // disk I/O never blocks concurrent hashers. Appends only the new rows (not
+        // the whole map); the on-disk format tolerates these trailing rows (see
         // `load_hash_cache`), and a stale duplicate row is overridden on load by
-        // the later one for the same path.
+        // the later one for the same path. `new_entries` is this call's own buffer,
+        // so dropping the lock first cannot corrupt it; a rare interleave with
+        // another appender only yields a malformed line that `load_hash_cache`
+        // skips (that path is simply re-hashed later).
         if let Some(path) = cache_path {
             let _ = append_hash_cache(path, &new_entries);
         }
@@ -456,7 +497,9 @@ pub(crate) fn load_hash_cache(path: &Path) -> (HashMap<PathBuf, HashCacheEntry>,
                 capped = true;
                 continue;
             }
-            map.insert(key, HashCacheEntry { size, mtime, hash });
+            // Re-mint `seq` in file order: rows written earlier (older) get smaller
+            // stamps, so runtime eviction drops them first. `seq` is not persisted.
+            map.insert(key, HashCacheEntry { size, mtime, hash, seq: next_hash_cache_seq() });
         }
     }
     let should_compact = capped || rows > map.len();
@@ -1378,12 +1421,32 @@ fn parse_json_string(s: &str) -> Option<(String, &str)> {
 
 // ── JSON serialization ──────────────────────────────────────────────────────
 
+/// Serialize duplicate groups to a `String`. Thin wrapper over
+/// [`write_groups_to_json`] for the small single-group `/api/dupes-make-ref`
+/// response; writing into a `Vec<u8>` is infallible so the result is always `Ok`.
 pub(crate) fn groups_to_json(
     groups: &[DupeGroupV2],
     mode: ScanMode,
     errors: &[String],
     ignored_count: usize,
 ) -> String {
+    let mut out: Vec<u8> = Vec::new();
+    let _ = write_groups_to_json(&mut out, groups, mode, errors, ignored_count);
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// Stream duplicate groups as JSON to `w` through a small reused buffer that is
+/// flushed per-group, so a large `/api/dupes-v2` response is delivered
+/// incrementally instead of materialising one giant `String`. The emitted bytes
+/// are byte-for-byte identical to the previous in-memory serialization.
+pub(crate) fn write_groups_to_json<W: Write>(
+    w: &mut W,
+    groups: &[DupeGroupV2],
+    mode: ScanMode,
+    errors: &[String],
+    ignored_count: usize,
+) -> io::Result<()> {
+    const FLUSH_THRESHOLD: usize = 64 * 1024;
     let mode_str = match mode {
         ScanMode::Exact    => "exact",
         ScanMode::Filename => "filename",
@@ -1447,6 +1510,10 @@ pub(crate) fn groups_to_json(
             out.push_str("}}");
         }
         out.push_str("]}");
+        if out.len() >= FLUSH_THRESHOLD {
+            w.write_all(out.as_bytes())?;
+            out.clear();
+        }
     }
     out.push_str("],\"errors\":[");
     for (i, e) in errors.iter().enumerate() {
@@ -1456,5 +1523,6 @@ pub(crate) fn groups_to_json(
     out.push_str("],\"ignoredCount\":");
     out.push_str(&ignored_count.to_string());
     out.push('}');
-    out
+    w.write_all(out.as_bytes())?;
+    Ok(())
 }

@@ -242,13 +242,13 @@ function textSubject(field: FilterField, name: string, path: string, owner: stri
 
 // Text predicate over a PRE-COMPILED rule: the (cached, ReDoS-guarded) RegExp
 // for regex/glob operators is built once per rule by compileRules() and reused
-// here for every node — no per-node compilation or even cache lookup. Non-regex
+// here for every node — no per-node compilation or even cache lookup. The
+// comparison value (`valueLower`) is likewise lowercased once at compile time,
+// and `subject` is computed/cached once per node by the caller. Non-regex
 // operators (contains/startsWith/…) are plain string ops.
-function testTextCompiled(cr: CompiledRule, name: string, path: string, owner: string): boolean {
-  const { rule, regex } = cr;
-  const v = rule.value.toLowerCase();
+function testTextCompiled(cr: CompiledRule, subject: string): boolean {
+  const { rule, regex, valueLower: v } = cr;
   if (!v) return true;
-  const subject = textSubject(rule.field, name, path, owner);
 
   const matches = (): boolean => {
     switch (rule.operator) {
@@ -347,13 +347,28 @@ function testType(rule: FilterRule, extension: string): boolean {
   return rule.operator === "isNotOneOf" ? !isMatch : isMatch;
 }
 
-/** Returns true if a node passes a single PRE-COMPILED rule. */
-function testRuleCompiled(cr: CompiledRule, node: FilterableNode): boolean {
+/** Returns true if a node passes a single PRE-COMPILED rule. For text fields the
+ *  per-field subject (lowercased name/path/parent/…) is read from the optional
+ *  per-node `subjectCache` so multiple text rules on the same node don't each
+ *  recompute (and re-lowercase) it. */
+function testRuleCompiled(
+  cr: CompiledRule,
+  node: FilterableNode,
+  subjectCache?: Map<FilterField, string>,
+): boolean {
   switch (fieldKind(cr.rule.field)) {
     case "size": return testSize(cr.rule, node.size);
     case "date": return testDate(cr.rule, node.modified);
     case "type": return testType(cr.rule, node.extension);
-    default: return testTextCompiled(cr, node.name, node.path, node.owner ?? "");
+    default: {
+      const field = cr.rule.field;
+      let subject = subjectCache?.get(field);
+      if (subject === undefined) {
+        subject = textSubject(field, node.name, node.path, node.owner ?? "");
+        subjectCache?.set(field, subject);
+      }
+      return testTextCompiled(cr, subject);
+    }
   }
 }
 
@@ -384,6 +399,9 @@ function globToRegexSource(pattern: string): string {
 export interface CompiledRule {
   rule: FilterRule;
   regex?: RegExp | null;
+  /** `rule.value.toLowerCase()` precomputed ONCE here (per rule-set change)
+   *  instead of recomputing it for every node in the text-match hot path. */
+  valueLower: string;
 }
 
 /** Precompile a rule set: keep only the active rules and compile each regex/glob
@@ -391,15 +409,16 @@ export interface CompiledRule {
  *  result (see useTreeState) so it is built per rule-set change, not per row. */
 export function compileRules(rules: FilterRule[]): CompiledRule[] {
   return rules.filter(isActiveRule).map((rule): CompiledRule => {
+    const valueLower = rule.value.toLowerCase();
     switch (rule.operator) {
       case "matchesRegex":
       case "notMatchesRegex":
-        return { rule, regex: compileSafeRegex(rule.value, "i") };
+        return { rule, valueLower, regex: compileSafeRegex(rule.value, "i") };
       case "matchesPattern":
       case "notMatchesPattern":
-        return { rule, regex: compileSafeRegex(globToRegexSource(rule.value.toLowerCase()), "i") };
+        return { rule, valueLower, regex: compileSafeRegex(globToRegexSource(valueLower), "i") };
       default:
-        return { rule };
+        return { rule, valueLower };
     }
   });
 }
@@ -409,14 +428,19 @@ export function compileRules(rules: FilterRule[]): CompiledRule[] {
 export function applyCompiledRules(compiled: CompiledRule[], node: FilterableNode): boolean {
   if (compiled.length === 0) return true;
 
+  // Cache text subjects per node only when ≥2 rules could reuse them — a single
+  // rule computes its subject once anyway, so the (per-node) Map allocation is
+  // skipped on the common single-rule path.
+  const subjectCache = compiled.length > 1 ? new Map<FilterField, string>() : undefined;
+
   // First rule always applies as-is; subsequent rules use their join.
-  let result = testRuleCompiled(compiled[0], node);
+  let result = testRuleCompiled(compiled[0], node, subjectCache);
   for (let i = 1; i < compiled.length; i++) {
     const c = compiled[i];
     if (c.rule.join === "or") {
-      result = result || testRuleCompiled(c, node);
+      result = result || testRuleCompiled(c, node, subjectCache);
     } else {
-      result = result && testRuleCompiled(c, node);
+      result = result && testRuleCompiled(c, node, subjectCache);
     }
   }
   return result;

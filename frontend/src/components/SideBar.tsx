@@ -1,4 +1,5 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef, useLayoutEffect } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import type { ViewId } from "./ActivityBar";
 import type { DriveEntry, NodeRecord, ScanResult, SpecialFolder, Unit } from "../api/types";
 import { BookmarksTab } from "./BookmarksTab";
@@ -67,16 +68,47 @@ export interface SideBarProps {
   dupes?: DuplicatesController;
 }
 
+const SIDEBAR_FOLDER_ROW_H = 22; // keep in sync with .folder-row height in global.css
+
 function ExplorerView(props: SideBarProps) {
   const [locOpen, setLocOpen] = useState(true);
   const [foldersOpen, setFoldersOpen] = useState(true);
-  const FOLDER_CAP = 800; // not virtualized — cap to avoid freezing on "Expand All"
-  const allFolderRows = props.treeRows.filter((r) => r.dir && r.id >= 0);
-  const folderRows = allFolderRows.slice(0, FOLDER_CAP);
+  // Directory rows for the side-bar tree. Memoized so it isn't refiltered on
+  // every virtualizer re-render (each scroll tick) — only when the tree changes.
+  const folderRows = useMemo(
+    () => props.treeRows.filter((r) => r.dir && r.id >= 0),
+    [props.treeRows],
+  );
   const hasScan = props.data !== null;
 
+  // Virtualize the folder tree against the shared side-bar scroll container so
+  // an "Expand All" with thousands of folders renders only the visible window
+  // rather than every row (replaces the old hard 800-row cap). scrollMargin
+  // offsets the list past the path box + Locations section so the whole side
+  // bar still scrolls as one unit.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const folderTreeRef = useRef<HTMLDivElement>(null);
+  const [scrollMargin, setScrollMargin] = useState(0);
+  const folderVirtualizer = useVirtualizer({
+    count: foldersOpen ? folderRows.length : 0,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => SIDEBAR_FOLDER_ROW_H,
+    overscan: 15,
+    scrollMargin,
+  });
+  // Re-measure the folder list's offset within the scroll container whenever the
+  // content above it changes height (Locations toggled, drive/bookmark counts,
+  // first scan). Runs before paint so row positions are never visibly off.
+  useLayoutEffect(() => {
+    const scrollEl = scrollRef.current;
+    const treeEl = folderTreeRef.current;
+    if (!scrollEl || !treeEl) return;
+    const margin = treeEl.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top + scrollEl.scrollTop;
+    setScrollMargin((prev) => (Math.abs(prev - margin) > 0.5 ? margin : prev));
+  }, [locOpen, foldersOpen, hasScan, props.drives.length, props.specialFolders.length, props.bookmarkList.length]);
+
   return (
-    <div className="sidebar-content">
+    <div className="sidebar-content" ref={scrollRef}>
       <div className="explorer-path">
         <input
           value={props.scanPath}
@@ -141,8 +173,13 @@ function ExplorerView(props: SideBarProps) {
             <span className="chev"><Icon name="chevron-down" size={11} /></span> Folders
           </div>
           {foldersOpen && (
-            <div className="folder-tree">
-              {folderRows.map((row) => {
+            <div
+              className="folder-tree"
+              ref={folderTreeRef}
+              style={{ height: folderVirtualizer.getTotalSize(), position: "relative" }}
+            >
+              {folderVirtualizer.getVirtualItems().map((vItem) => {
+                const row = folderRows[vItem.index];
                 const node = props.nodeById.get(row.id);
                 const hasChildren = !!node && node.children.some((cid) => props.nodeById.get(cid)?.dir);
                 const isOpen = props.expanded.has(row.id);
@@ -150,6 +187,7 @@ function ExplorerView(props: SideBarProps) {
                   <div
                     key={row.id}
                     className={`folder-row${row.id === props.selectedId ? " selected" : ""}`}
+                    style={{ position: "absolute", top: vItem.start - scrollMargin, left: 0, right: 0, height: SIDEBAR_FOLDER_ROW_H }}
                     onClick={() => props.onSelectFolder(row.id)}
                   >
                     {row.depth > 0 && (
@@ -170,11 +208,6 @@ function ExplorerView(props: SideBarProps) {
                   </div>
                 );
               })}
-              {allFolderRows.length > folderRows.length && (
-                <div className="folder-row" style={{ paddingLeft: 8, color: "var(--muted-2)" }}>
-                  …{allFolderRows.length - folderRows.length} more (collapse to narrow)
-                </div>
-              )}
             </div>
           )}
         </>

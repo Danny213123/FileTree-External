@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState, useEffect, useCallback } from "react";
 import type { NodeRecord, Metric } from "../api/types";
 import { formatBytes, formatCount } from "../utils/formatBytes";
+import "./Treemap3DModal.css";
 
 const BRANCH_COLORS = [
   "#1c5ea8", "#1a7a5a", "#7a3fa0", "#c06020",

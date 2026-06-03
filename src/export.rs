@@ -230,6 +230,19 @@ pub(crate) fn write_scan_result_ndjson<W: Write>(w: &mut W, result: &ScanResult)
     Ok(())
 }
 
+/// One live-scan progress ping for the `/api/scan-stream` NDJSON protocol.
+///
+/// MUST carry the `"type":"scanning"` discriminator, exactly like every other
+/// stream line (`meta` / `node` / `done` / `error`): the client parses each line
+/// by switching on `type`, so a ping without it is silently dropped and the
+/// progress counter appears frozen at 0 for the whole scan. (The previous
+/// `{"scanning":true,...}` shape lacked `type` and caused precisely that.)
+/// `node_count` is the running scanned-node total (a live `AtomicUsize`) and
+/// `elapsed_ms` the wall-clock time since the scan began.
+pub(crate) fn scan_progress_ndjson_line(node_count: usize, elapsed_ms: u64) -> String {
+    format!("{{\"type\":\"scanning\",\"nodeCount\":{node_count},\"elapsedMs\":{elapsed_ms}}}\n")
+}
+
 /// Convenience wrapper that collects write_scan_result_json output into a String.
 /// Only called for small/cached scans and exports; prefer write_scan_result_json for live scans.
 pub(crate) fn scan_result_to_json(result: &ScanResult) -> String {
@@ -411,8 +424,13 @@ fn push_xml_escaped(output: &mut String, value: &str) {
 /// the "largest entries" table in the HTML report and the rows of the XLSX.
 fn largest_by_size(result: &ScanResult, limit: usize) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..result.nodes.len()).collect();
+    // Partition the `limit` largest to the front in O(n), then sort only those
+    // (O(limit log limit)) instead of fully sorting every node index (O(n log n)).
+    if idx.len() > limit {
+        idx.select_nth_unstable_by(limit, |&a, &b| result.nodes[b].size.cmp(&result.nodes[a].size));
+        idx.truncate(limit);
+    }
     idx.sort_unstable_by(|&a, &b| result.nodes[b].size.cmp(&result.nodes[a].size));
-    idx.truncate(limit);
     idx
 }
 
@@ -1035,5 +1053,24 @@ mod tests {
         let mut output = String::new();
         push_csv_field(&mut output, "a,b \"c\"");
         assert_eq!(output, "\"a,b \"\"c\"\"\"");
+    }
+
+    #[test]
+    fn scan_progress_line_uses_type_discriminator() {
+        // The live-scan progress ping MUST be discriminated by `"type":"scanning"`
+        // like every other NDJSON line, or the client drops it and the progress
+        // counter freezes at 0. Lock the wire shape so the regression can't return.
+        let line = scan_progress_ndjson_line(42, 1500);
+        assert!(line.ends_with('\n'), "each NDJSON record is newline-terminated");
+        let trimmed = line.trim_end();
+        assert!(
+            trimmed.contains("\"type\":\"scanning\""),
+            "progress line must carry the type discriminator, got: {trimmed}"
+        );
+        assert!(!trimmed.contains("\"scanning\":true"), "must not use the old shape");
+        assert_eq!(
+            trimmed,
+            "{\"type\":\"scanning\",\"nodeCount\":42,\"elapsedMs\":1500}"
+        );
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -29,7 +30,51 @@ pub(crate) struct DupeFilter {
     pub(crate) search_prefix: String,
 }
 
-/// Full-detail duplicate scan. Returns JSON with file paths, names, sizes, dates.
+/// A scanned file projected into exactly the fields the v1 duplicate serializer
+/// emits, with its absolute path already reconstructed. Decoupling the serializer
+/// from a single `ScanResult` node buffer lets a multi-root duplicate scan append
+/// each source's candidates (see [`collect_dupe_nodes`]) instead of merging every
+/// source into one combined buffer and rewriting all of its `id`/`parent`/
+/// `children` indices — the `Arc<ScanResult>` sharing pattern used by `dupes-v2`.
+pub(crate) struct DupeNode {
+    pub(crate) id: usize,
+    pub(crate) name: String,
+    pub(crate) extension: String,
+    /// Absolute path (files don't store their own path; rebuilt from parent + name).
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) modified_ms: u64,
+}
+
+/// Project every file in `nodes` (directories skipped — they never appear in
+/// duplicate output) into [`DupeNode`]s appended to `out`. `id_offset` is added to
+/// each node's id so several scans can be concatenated while keeping ids globally
+/// unique. Passing `id_offset = previous_total_node_count` (counting directories
+/// too) reproduces, exactly, the ids the old merge-and-re-index path produced, so
+/// the streamed JSON is byte-for-byte identical. Iterating `nodes` in index order
+/// preserves the candidate ordering the hashing/grouping pipeline depends on.
+pub(crate) fn collect_dupe_nodes(nodes: &[NodeRecord], id_offset: usize, out: &mut Vec<DupeNode>) {
+    out.reserve(nodes.len());
+    for node in nodes {
+        if node.is_dir {
+            continue;
+        }
+        out.push(DupeNode {
+            id: node.id + id_offset,
+            name: node.name.clone(),
+            extension: node.extension.clone(),
+            path: node_abs_path(nodes, node.id),
+            size: node.size,
+            modified_ms: node.modified_ms,
+        });
+    }
+}
+
+/// Full-detail duplicate scan. Streams JSON (file paths, names, sizes, dates) to
+/// `w` instead of materialising the whole body in one `String` — the response can
+/// be large, so it is flushed through a small reused buffer as groups are emitted.
+/// The emitted bytes are byte-for-byte identical to the previous in-memory build;
+/// only the delivery is incremental.
 ///
 /// Delegates hashing to the single shared pipeline [`hash_candidate_groups`]
 /// (size-group → head/tail sample → full FNV hash only for sample-colliding
@@ -37,18 +82,20 @@ pub(crate) struct DupeFilter {
 /// full-hashing every same-size file itself. The rich filtering (extension /
 /// name / date / directional keep-vs-search) and the JSON response shape are
 /// unchanged.
-pub(crate) fn duplicates_full_json(
-    result: &ScanResult,
+pub(crate) fn write_duplicates_full_json<W: Write>(
+    w: &mut W,
+    candidates: &[DupeNode],
     filter: DupeFilter,
     limit: usize,
     cache: &Mutex<HashMap<PathBuf, HashCacheEntry>>,
     cache_path: Option<&Path>,
     threads: usize,
-) -> String {
-    // 1. Apply the rich filters once, keeping node ids for the response.
-    let mut candidate_ids: Vec<usize> = Vec::new();
-    for node in &result.nodes {
-        if node.is_dir || node.size == 0 || node.size < filter.min_size {
+) -> std::io::Result<()> {
+    // 1. Apply the rich filters once, keeping the surviving candidates for the
+    //    response. (Directories were already dropped by `collect_dupe_nodes`.)
+    let mut picked: Vec<&DupeNode> = Vec::new();
+    for node in candidates {
+        if node.size == 0 || node.size < filter.min_size {
             continue;
         }
         if let Some(max) = filter.max_size {
@@ -76,17 +123,17 @@ pub(crate) fn duplicates_full_json(
         if filter.date_to > 0 && node.modified_ms > filter.date_to {
             continue;
         }
-        candidate_ids.push(node.id);
+        picked.push(node);
     }
 
     // 2. Hash through the unified pipeline. `inputs[k]` is parallel to
-    //    `candidate_ids[k]`; emitted group indices are indices into `inputs`.
-    let inputs: Vec<HashInput> = candidate_ids
+    //    `picked[k]`; emitted group indices are indices into `inputs`.
+    let inputs: Vec<HashInput> = picked
         .iter()
-        .map(|&id| HashInput {
-            path: PathBuf::from(node_abs_path(&result.nodes, id)),
-            size: result.nodes[id].size,
-            mtime: result.nodes[id].modified_ms / 1000,
+        .map(|node| HashInput {
+            path: PathBuf::from(&node.path),
+            size: node.size,
+            mtime: node.modified_ms / 1000,
         })
         .collect();
     let (hash_groups, hash_errors) =
@@ -120,6 +167,9 @@ pub(crate) fn duplicates_full_json(
     });
     groups.truncate(limit);
 
+    // Flush the buffer to `w` once it grows past this, keeping peak memory at
+    // ~one buffer + one group instead of the whole response.
+    const FLUSH_THRESHOLD: usize = 64 * 1024;
     let mut output = String::from("{\"groups\":[");
     for (index, (size, hash, idxs)) in groups.iter().enumerate() {
         if index > 0 {
@@ -148,7 +198,7 @@ pub(crate) fn duplicates_full_json(
             if fi > 0 {
                 output.push(',');
             }
-            let node = &result.nodes[candidate_ids[k]];
+            let node = picked[k];
             let path = path_at(k);
             let is_original = if directional && !filter.keep_prefix.is_empty() {
                 path.starts_with(&filter.keep_prefix)
@@ -165,6 +215,10 @@ pub(crate) fn duplicates_full_json(
             output.push('}');
         }
         output.push_str("]}");
+        if output.len() >= FLUSH_THRESHOLD {
+            w.write_all(output.as_bytes())?;
+            output.clear();
+        }
     }
     output.push_str("],\"errors\":[");
     for (ei, err) in hash_errors.iter().take(50).enumerate() {
@@ -174,7 +228,8 @@ pub(crate) fn duplicates_full_json(
         push_json_string(&mut output, err);
     }
     output.push_str("]}");
-    output
+    w.write_all(output.as_bytes())?;
+    Ok(())
 }
 
 /// Exact (byte-identical) duplicate groups above `min_size`. Delegates hashing
@@ -261,7 +316,7 @@ pub(crate) fn exact_duplicates_json(
 }
 
 /// Compute all capped analytics once. Called when a scan finalises (see
-/// `snapshot_scan_result`) and stored on `ScanResult`, so JSON/NDJSON responses,
+/// `finalize_scan_result`) and stored on `ScanResult`, so JSON/NDJSON responses,
 /// cache hits, and exports reuse it instead of re-scanning every node per request.
 pub(crate) fn scan_summary(nodes: &[NodeRecord], scanned_at_ms: u64) -> ScanSummary {
     ScanSummary {
@@ -403,4 +458,118 @@ pub(crate) fn duplicate_candidates(nodes: &[NodeRecord], limit: usize) -> Vec<Du
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.waste));
     candidates.truncate(limit);
     candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(id: usize, parent: Option<usize>, name: &str, path: &str, is_dir: bool, size: u64) -> NodeRecord {
+        NodeRecord {
+            id,
+            parent,
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir,
+            is_link: false,
+            hidden: false,
+            readonly: false,
+            size,
+            allocated: size,
+            files: if is_dir { 0 } else { 1 },
+            folders: 0,
+            modified_ms: 1_000 + id as u64,
+            created_ms: 0,
+            accessed_ms: 0,
+            depth: if parent.is_some() { 1 } else { 0 },
+            errors: 0,
+            children: Vec::new(),
+            extension: if is_dir { String::new() } else { "txt".to_string() },
+            owner: String::new(),
+            attributes: 0,
+        }
+    }
+
+    // The legacy `/api/dupes-scan` algorithm: concatenate every source's nodes
+    // into one buffer, rewriting each node's id/parent/children by the running
+    // offset. Reproduced here so the test can prove the new per-source candidate
+    // projection emits the SAME (id, path, name, size, mtime) sequence the old
+    // merged buffer fed to the serializer.
+    fn legacy_merge(sources: &[Vec<NodeRecord>]) -> Vec<NodeRecord> {
+        let mut merged: Vec<NodeRecord> = Vec::new();
+        for src in sources {
+            let offset = merged.len();
+            for node in src {
+                let mut node = node.clone();
+                node.id += offset;
+                if let Some(p) = node.parent {
+                    node.parent = Some(p + offset);
+                }
+                node.children = node.children.iter().map(|c| c + offset).collect();
+                merged.push(node);
+            }
+        }
+        merged
+    }
+
+    #[test]
+    fn collect_dupe_nodes_matches_legacy_merge_projection() {
+        // Source A: root dir + a top-level file + a sub-dir + a nested file.
+        let source_a = vec![
+            mk(0, None, "A", "C:\\A", true, 0),
+            mk(1, Some(0), "x.txt", "", false, 10),
+            mk(2, Some(0), "sub", "C:\\A\\sub", true, 0),
+            mk(3, Some(2), "y.txt", "", false, 20),
+        ];
+        // Source B: root dir + one file.
+        let source_b = vec![
+            mk(0, None, "B", "C:\\B", true, 0),
+            mk(1, Some(0), "z.txt", "", false, 30),
+        ];
+
+        // New path: project each source with a running id offset (full node count,
+        // directories included — exactly how the legacy offset advanced).
+        let mut new_candidates: Vec<DupeNode> = Vec::new();
+        let mut offset = 0usize;
+        for src in [&source_a, &source_b] {
+            collect_dupe_nodes(src, offset, &mut new_candidates);
+            offset += src.len();
+        }
+
+        // Legacy path: merge, then take files in buffer order with reconstructed paths.
+        let merged = legacy_merge(&[source_a.clone(), source_b.clone()]);
+        let legacy: Vec<(usize, String, String, u64, u64)> = merged
+            .iter()
+            .filter(|n| !n.is_dir)
+            .map(|n| {
+                (
+                    n.id,
+                    n.name.clone(),
+                    node_abs_path(&merged, n.id),
+                    n.size,
+                    n.modified_ms,
+                )
+            })
+            .collect();
+
+        let got: Vec<(usize, String, String, u64, u64)> = new_candidates
+            .iter()
+            .map(|c| (c.id, c.name.clone(), c.path.clone(), c.size, c.modified_ms))
+            .collect();
+
+        assert_eq!(
+            got, legacy,
+            "per-source projection must reproduce the legacy merged ids/paths/order exactly"
+        );
+
+        // Spot-check the absolute values so a regression in either path is caught.
+        assert_eq!(new_candidates.len(), 3, "directories must be skipped");
+        assert_eq!(new_candidates[0].id, 1);
+        assert_eq!(new_candidates[0].path, "C:\\A\\x.txt");
+        assert_eq!(new_candidates[1].id, 3);
+        assert_eq!(new_candidates[1].path, "C:\\A\\sub\\y.txt");
+        // Source B's file: legacy id = local id (1) + offset (source A's 4 nodes) = 5.
+        assert_eq!(new_candidates[2].id, 5);
+        assert_eq!(new_candidates[2].path, "C:\\B\\z.txt");
+    }
 }
