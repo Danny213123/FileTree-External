@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { NodeRecord, ScanResult, Unit } from "../api/types";
 import { fetchFileText } from "../api/client";
 import { formatBytes, formatCount } from "../utils/formatBytes";
@@ -6,6 +6,7 @@ import { DetailsTab } from "./DetailsTab";
 import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
+import { pickFolderThumb } from "../lib/thumbs";
 
 const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "tif", "tiff", "avif", "heic", "ico"]);
 const VIDEO_EXTS = new Set(["mp4", "mkv", "mov", "avi", "wmv", "webm", "m4v", "flv"]);
@@ -28,6 +29,9 @@ interface InspectorPaneProps {
   node: NodeRecord | undefined;
   data: ScanResult | null;
   nodeById: Map<number, NodeRecord>;
+  /** Bookmarked paths — used to prefer a bookmarked media file when picking a
+   *  folder's representative thumbnail in the preview. */
+  bookmarks: Set<string>;
   unit: Unit;
   showPreview: boolean;
   showDetails: boolean;
@@ -42,7 +46,7 @@ interface InspectorPaneProps {
 // "Details" panes. Both sections are independently toggleable and driven by the
 // focused tab's currently-selected tree node (updates live as selection moves).
 export function InspectorPane({
-  width, node, data, nodeById, unit,
+  width, node, data, nodeById, bookmarks, unit,
   showPreview, showDetails, onClosePreview, onCloseDetails,
   onOpen, onReveal, onCopyPath,
 }: InspectorPaneProps) {
@@ -57,7 +61,7 @@ export function InspectorPane({
             </button>
           </div>
           <div className="inspector-section-body">
-            <PreviewBody node={node} unit={unit} />
+            <PreviewBody node={node} unit={unit} nodeById={nodeById} bookmarks={bookmarks} />
           </div>
         </section>
       )}
@@ -86,7 +90,12 @@ export function InspectorPane({
   );
 }
 
-function PreviewBody({ node, unit }: { node: NodeRecord | undefined; unit: Unit }) {
+function PreviewBody({ node, unit, nodeById, bookmarks }: {
+  node: NodeRecord | undefined;
+  unit: Unit;
+  nodeById: Map<number, NodeRecord>;
+  bookmarks: Set<string>;
+}) {
   if (!node) {
     return (
       <EmptyState
@@ -97,7 +106,7 @@ function PreviewBody({ node, unit }: { node: NodeRecord | undefined; unit: Unit 
       />
     );
   }
-  if (node.dir) return <FolderPreview node={node} unit={unit} />;
+  if (node.dir) return <FolderPreview node={node} unit={unit} nodeById={nodeById} bookmarks={bookmarks} />;
 
   const ext = (node.extension ?? "").toLowerCase();
   if (isImage(ext) || isVideo(ext)) return <MediaPreview node={node} unit={unit} />;
@@ -180,7 +189,36 @@ function IconPreview({ node, unit }: { node: NodeRecord; unit: Unit }) {
   );
 }
 
-function FolderPreview({ node, unit }: { node: NodeRecord; unit: Unit }) {
+function FolderPreview({ node, unit, nodeById, bookmarks }: {
+  node: NodeRecord;
+  unit: Unit;
+  nodeById: Map<number, NodeRecord>;
+  bookmarks: Set<string>;
+}) {
+  const [error, setError] = useState(false);
+  // Representative media beneath the folder (largest bookmarked, else largest).
+  const thumb = useMemo(
+    () => pickFolderThumb(node.id, nodeById, bookmarks),
+    [node.id, nodeById, bookmarks],
+  );
+  useEffect(() => { setError(false); }, [thumb]);
+
+  // Show the representative thumbnail like MediaPreview; fall back to the folder
+  // icon when there's no media beneath it (or the thumbnail fails to load).
+  if (thumb && !error) {
+    return (
+      <div className="preview-block">
+        <div className="preview-media">
+          <img
+            src={`/api/thumbnail?path=${encodeURIComponent(thumb)}`}
+            alt={node.name}
+            onError={() => setError(true)}
+          />
+        </div>
+        <FileMeta node={node} unit={unit} />
+      </div>
+    );
+  }
   return (
     <div className="preview-block preview-iconly">
       <div className="preview-icon-big">

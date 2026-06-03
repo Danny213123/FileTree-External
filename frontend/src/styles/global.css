@@ -1215,6 +1215,11 @@ input:focus, select:focus {
   border-radius: 1px;
   outline: none;
   box-sizing: border-box;
+  /* Override the row's user-select:none so dragging the cursor inside the
+     rename box highlights text (instead of starting the native file drag). */
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
 }
 
 .row.hidden-entry { opacity: 0.55; }

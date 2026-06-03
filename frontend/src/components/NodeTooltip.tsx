@@ -2,26 +2,28 @@ import { useEffect, useRef, useState } from "react";
 import type { NodeRecord, Unit } from "../api/types";
 import { formatBytes, formatCount } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
-
-const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "tif", "tiff", "avif", "heic"]);
-const VIDEO_EXTS = new Set(["mp4", "mkv", "mov", "avi", "wmv", "webm", "m4v", "flv"]);
-
-function isImage(ext: string) { return IMAGE_EXTS.has(ext.toLowerCase()); }
-function isVideo(ext: string) { return VIDEO_EXTS.has(ext.toLowerCase()); }
+import { isImage, isVideo } from "../lib/thumbs";
 
 interface Props {
   node: NodeRecord;
   unit: Unit;
   anchorX: number;
   anchorY: number;
+  /** Explicit thumbnail source path (e.g. a folder's representative media).
+   *  When set it takes precedence over the node's own file thumbnail, enabling
+   *  folder thumbnails in the hover card. */
+  thumbPath?: string;
 }
 
-export function NodeTooltip({ node, unit, anchorX, anchorY }: Props) {
+export function NodeTooltip({ node, unit, anchorX, anchorY, thumbPath }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ left: anchorX + 16, top: anchorY + 8 });
   const ext = (node.extension ?? "").toLowerCase();
   // Both images and videos are served as image/png from the server-side thumbnail route.
   const showThumb = !node.dir && (isImage(ext) || isVideo(ext)) && !!node.path;
+  // A folder passes an explicit thumbPath (representative media beneath it); a
+  // media file falls back to its own path. Whichever resolves drives the <img>.
+  const effectiveThumb = thumbPath ?? (showThumb ? node.path : undefined);
   const [thumbLoaded, setThumbLoaded] = useState(false);
   const [thumbError, setThumbError] = useState(false);
 
@@ -46,10 +48,10 @@ export function NodeTooltip({ node, unit, anchorX, anchorY }: Props) {
     >
       <div className="node-tooltip-name">{node.name}</div>
 
-      {showThumb && !thumbError && (
+      {effectiveThumb && !thumbError && (
         <div className="node-tooltip-thumb">
           <img
-            src={`/api/thumbnail?path=${encodeURIComponent(node.path)}`}
+            src={`/api/thumbnail?path=${encodeURIComponent(effectiveThumb)}`}
             alt=""
             onLoad={() => setThumbLoaded(true)}
             onError={() => setThumbError(true)}

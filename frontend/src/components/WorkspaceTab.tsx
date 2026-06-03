@@ -14,6 +14,7 @@ import type { NodeRecord, SortKey } from "../api/types";
 import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow, type AgentApi } from "../lib/agent";
 import { confirmRisky, isCrossDrive } from "../lib/confirmRisky";
 import { pushUndo, parentDir } from "../lib/undo";
+import { searchNodes } from "../lib/search";
 import { toast, type ToastAction } from "../lib/toast";
 import { promptDialog } from "../lib/dialogs";
 import { TreeTable } from "./TreeTable";
@@ -195,6 +196,9 @@ interface WorkspaceTabProps {
   active: boolean;
   // Drives the in-pane treemap "view"; the shared side bar (App) tracks its own.
   activeView: ViewId;
+  // Activity-bar Search query (already debounced in App). When activeView ===
+  // "search" and this has >= 2 chars, the main table renders flat search results.
+  searchQuery: string;
   // Whether the per-pane controls toolbar row (under the tabs) is shown. Toggled
   // from the tab bar's toolbar button; per-editor-group, defaults to visible.
   toolbarVisible: boolean;
@@ -244,7 +248,7 @@ interface WorkspaceTabProps {
 
 const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(function WorkspaceTab(
   {
-    tabId, initialPath, active, activeView, toolbarVisible, darkMode,
+    tabId, initialPath, active, activeView, searchQuery, toolbarVisible, darkMode,
     panelOpen, onPanelOpenChange, panelHeight, onPanelHeightChange,
     bookmarkList, threads, includeHidden, followLinks, collectOwners, onCollectOwnersChange, exclude,
     treemapDetail,
@@ -1253,6 +1257,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   }, [panelHeight, onPanelHeightChange]);
 
   const showTreemapView = activeView === "treemap";
+  // Flat, sorted name/path matches across the whole scan. Rendered in the main
+  // table (replacing the tree rows) when the Search view is active with a >= 2
+  // char query; re-sorts automatically because it reads the active sortKey/dir.
+  const searchResults = useMemo(
+    () => searchNodes(tree.nodeById, searchQuery, tree.sortKey, tree.sortDir, 2000),
+    [tree.nodeById, searchQuery, tree.sortKey, tree.sortDir],
+  );
+  const searching = activeView === "search" && searchQuery.trim().length >= 2;
   const breadcrumbPath = data?.rootPath || scanPath;
   const canBack = navHistory.index > 0;
   const canForward = navHistory.index < navHistory.stack.length - 1;
@@ -1403,7 +1415,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             <div className="editor-stack">
               <div className="editor-main">
                 <TreeTable
-                  rows={tree.visibleRows}
+                  rows={searching ? searchResults : tree.visibleRows}
+                  flat={searching}
                   nodeById={tree.nodeById}
                   expanded={tree.expanded}
                   selectedId={tree.selectedId}
