@@ -50,9 +50,29 @@ export function loadChatSession(id: string): ChatSessionBlob | null {
   }
 }
 
+// Strip the heavy, non-essential bits before persisting so localStorage doesn't
+// balloon: image data URLs (often hundreds of KB each) are dropped from the
+// stored convo/items, and verbose tool `output` blobs in the UI runs are capped.
+// The live in-memory session keeps everything; only what's WRITTEN is pruned.
+const MAX_STORED_OUTPUT = 2000;
+function pruneBlob(blob: ChatSessionBlob): ChatSessionBlob {
+  return JSON.parse(
+    JSON.stringify(blob, (key, value) => {
+      // Drop multimodal image payloads wherever they appear (convo messages,
+      // attached chips, etc.) — they don't need to survive a reload.
+      if (key === "images" || key === "dataUrl") return undefined;
+      // Cap long captured command/tool output kept in the rendered runs.
+      if (key === "output" && typeof value === "string" && value.length > MAX_STORED_OUTPUT) {
+        return value.slice(0, MAX_STORED_OUTPUT) + "\n…(truncated)";
+      }
+      return value;
+    }),
+  ) as ChatSessionBlob;
+}
+
 export function saveChatSession(id: string, title: string, blob: ChatSessionBlob, count: number): void {
   try {
-    localStorage.setItem(blobKey(id), JSON.stringify(blob));
+    localStorage.setItem(blobKey(id), JSON.stringify(pruneBlob(blob)));
     const index = loadChatIndex().filter((s) => s.id !== id);
     index.unshift({ id, title: title || "New chat", ts: Date.now(), count });
     const trimmed = index.slice(0, MAX_SESSIONS);

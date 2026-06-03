@@ -7,6 +7,22 @@
 
 import type { LlmProvider } from "./llm";
 
+// One configured Model Context Protocol server. `transport` selects how Electron
+// main reaches it: a spawned process speaking newline-delimited JSON-RPC over
+// stdio, or an HTTP JSON-RPC endpoint. Disabled servers are kept but skipped.
+export interface McpServerConfig {
+  id: string;
+  name: string;
+  enabled: boolean;
+  transport: "stdio" | "http";
+  /** stdio: executable to spawn. */
+  command?: string;
+  /** stdio: arguments for the executable. */
+  args?: string[];
+  /** http: JSON-RPC endpoint URL. */
+  url?: string;
+}
+
 export interface AiSettings {
   provider: LlmProvider;
   model: string;
@@ -15,6 +31,11 @@ export interface AiSettings {
   // per-action approval card (e.g. "move_items", "delegate_to_action"). Note:
   // run_command can never be allow-listed; it always requires explicit approval.
   allow: string[];
+  // User-authored custom instructions / project rules injected into every
+  // agent's system prompt (scanContext/scanSummary). Empty by default.
+  rules: string;
+  // Configured MCP servers whose tools are discovered + registered at run start.
+  mcpServers: McpServerConfig[];
 }
 
 const KEY = "filetree.ai.settings";
@@ -30,6 +51,8 @@ const DEFAULTS: AiSettings = {
   model: "",
   keys: { openai: "", anthropic: "" },
   allow: [],
+  rules: "",
+  mcpServers: [],
 };
 
 /** safeStorage-backed secret store exposed by the Electron preload. */
@@ -65,12 +88,22 @@ export function loadAiSettings(): AiSettings {
       anthropic: parsed.keys?.anthropic ?? "",
     },
     allow: Array.isArray(parsed.allow) ? parsed.allow.filter((t): t is string => typeof t === "string") : [],
+    rules: typeof parsed.rules === "string" ? parsed.rules : DEFAULTS.rules,
+    mcpServers: Array.isArray(parsed.mcpServers)
+      ? parsed.mcpServers.filter((m): m is McpServerConfig => !!m && typeof (m as McpServerConfig).id === "string")
+      : [],
   };
 }
 
 export function saveAiSettings(s: AiSettings): void {
   try {
-    const payload: Partial<AiSettings> = { provider: s.provider, model: s.model, allow: s.allow };
+    const payload: Partial<AiSettings> = {
+      provider: s.provider,
+      model: s.model,
+      allow: s.allow,
+      rules: s.rules,
+      mcpServers: s.mcpServers,
+    };
     // Cloud keys belong in safeStorage when available; never persist them as
     // plaintext in localStorage. Only the plain-browser fallback writes them.
     if (!secretStore()) payload.keys = s.keys;

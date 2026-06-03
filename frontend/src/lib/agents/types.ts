@@ -45,6 +45,28 @@ export interface RunContext {
   // surfacing an approval card (read live so a mid-run "always allow" applies).
   allowTool: (tool: string) => boolean;
   newId: (prefix?: string) => string;
+  // The user's original request for this whole turn + a brief digest of prior
+  // turns, threaded so the orchestrator can pass real context (not just a bare
+  // task string) down to sub-agents.
+  userTask?: string;
+  priorDigest?: string;
+  // Extra MCP tools (read-only / gated) discovered at run start, plus the
+  // executor that runs them. Merged into the Search/Action agents' tool lists.
+  mcpReadTools?: ToolDef[];
+  mcpWriteTools?: ToolDef[];
+  runMcpTool?: (name: string, args: Record<string, unknown>) => Promise<unknown>;
+  // Tool names (beyond the static MUTATING/ALWAYS_APPROVE sets) that must surface
+  // an approval card and run sequentially — e.g. side-effecting MCP tools.
+  gatedTools?: Set<string>;
+}
+
+// Structured findings accumulated from a (sub-)agent's tool results, surfaced to
+// the orchestrator ALONGSIDE the prose report so it has machine-readable facts
+// (real paths it can cite/act on, counts) — not just narration.
+export interface AgentFacts {
+  paths: string[];
+  counts: Record<string, number>;
+  notes: string[];
 }
 
 // Inputs to a final-answer guard: the user's request for this run, the answer
@@ -90,10 +112,15 @@ export interface AgentSpec {
   // Used as a deterministic fallback so that, even if the model never phrases an
   // answer after a forced tool call, the run still returns the real data.
   formatFindings?: (toolName: string, result: unknown) => string;
+  // Optional: pull structured facts (paths/counts) out of a tool result into the
+  // run's accumulator, so the parent gets machine-readable findings.
+  extractFacts?: (toolName: string, result: unknown, acc: AgentFacts) => void;
 }
 
 export interface RunResult {
   runId: string;
   text: string;
   status: RunStatus;
+  // Structured findings gathered this run (empty unless the spec extracts them).
+  facts?: AgentFacts;
 }

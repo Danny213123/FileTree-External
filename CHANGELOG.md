@@ -4,6 +4,42 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.4.0] - 2026-06-02
+
+### Added
+
+#### AI Assistant tools
+- **`read_file`**: a read-only content tool wired to `/api/file-text` (scan-root gated, ~64 KiB server cap) with client-side line windowing (`offset`/`limit`) that returns `truncated` + `next_offset`, so the assistant can verify file types/configs/logs instead of inferring from scan metadata.
+- **`grep` content search**: searches inside files by picking candidates from the scan tree (optional `dir`/`glob`/`ext` filters), reading them via `read_file`, and returning path + line + snippet matches -- bounded by file count and total bytes, with a pluggable `MatchScorer` seam for a future embeddings-backed ranker.
+- **`write_file` / `edit_file`**: Tier-2 approval-gated tools that create or patch text files, each surfaced through a new diff preview in the action approval card (old vs new for edits, new content for writes).
+- **Read-only `git_status` / `git_diff` / `git_log`**: run the corresponding git commands for a folder and parse the output into structured results.
+- **`web_fetch` / `web_search`**: approval-gated tools implemented in the Electron main process -- a bounded HTML-to-text fetch with a timeout, plus a keyless DuckDuckGo search.
+- **`remember`**: a persistent memory tool backed by a local note store the assistant reads at the start of each run.
+
+#### AI Assistant capabilities
+- **MCP client**: configure Model Context Protocol servers (minimal stdio and HTTP JSON-RPC with the initialize handshake); their tools are discovered, namespaced as `mcp__server__tool`, and registered at runtime, with read-only tools ungated and side-effecting tools approval-gated.
+- **Project rules and memory**: a user-editable rules / custom-instructions field in the assistant settings is injected into the system prompts alongside the persistent memory store.
+- **Parallel execution**: independent read-only tool calls within a turn run concurrently, and multiple `delegate_to_search` sub-agents issued in one orchestrator turn run in parallel; mutating and approval-gated calls remain sequential.
+
+### Changed
+
+#### AI Assistant accuracy
+- **Cross-turn tool memory**: a compact per-turn trace (tool name, key args, result digest) is folded into the conversation so follow-up turns remember what was found and done, instead of seeing only past final answers.
+- **Structured sub-agent results**: delegations now return `{ agent, report, facts: { paths, counts, notes } }` and sub-agents receive the overall task plus a prior-turn digest, rather than a bare task string and a prose-only report.
+- **Truncation signaling and pagination**: `list_largest`, `find`, `list_dir`, and `list_by_extension` return `{ returned, total, truncated, next_offset }` and accept an `offset`, and the per-tool output cap was raised to 8000 chars and annotated with how much was cut and how to page for more.
+- **Path-verification gate**: paths cited in a draft final answer are verified against the current scan tree, and a fabricated path forces one corrective search pass.
+
+#### AI Assistant performance
+- **Backend**: `/api/ai-models` is served from an 8-second in-memory cache (and serves the last good value on upstream errors), and the Ollama chat proxy now stops reading upstream as soon as the client disconnects, freeing the per-connection thread instead of draining Ollama for up to its 120-second timeout.
+- **Frontend**: attached-folder pre-scans run in parallel and reuse the scan cache; the model list is cached client-side (30-second TTL with in-flight request sharing); a per-scan node index (by size and parent) backs `find`/`list_dir`/`list_largest`/`grep`; streaming text and thinking deltas are coalesced through a `requestAnimationFrame` buffer; and persisted chat sessions strip image data URLs and cap stored tool output.
+
+### Fixed
+
+- **`run_command` shell selection**: the `shell` parameter (defined in the tool schema) is now forwarded end-to-end instead of being silently dropped.
+- **Tool-call robustness**: malformed JSON tool arguments are reported back to the model as an error instead of being silently replaced with `{}`, and Ollama tool-call IDs are now stable per call across streamed chunks.
+
+---
+
 ## [1.3.0] - 2026-06-02
 
 ### Changed

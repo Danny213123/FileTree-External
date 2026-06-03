@@ -111,6 +111,19 @@ electron_1.contextBridge.exposeInMainWorld("electronAPI", {
             return () => electron_1.ipcRenderer.removeListener("llmEvent", listener);
         },
     },
+    // ── Agent web access (approval-gated) ──────────────────────────────────────
+    // Outbound network requests run in MAIN (renderer CSP forbids them). Both are
+    // bounded (size cap + timeout) and only invoked after the user approves the
+    // tool call in chat.
+    webFetch: (url, opts) => electron_1.ipcRenderer.invoke("web-fetch", url, opts),
+    webSearch: (query) => electron_1.ipcRenderer.invoke("web-search", query),
+    // ── MCP client bridge ───────────────────────────────────────────────────────
+    // Minimal Model Context Protocol client (stdio / http JSON-RPC) lives in MAIN;
+    // the renderer discovers (listTools) and invokes (callTool) configured servers.
+    mcp: {
+        listTools: (server) => electron_1.ipcRenderer.invoke("mcp:listTools", server),
+        callTool: (server, name, args) => electron_1.ipcRenderer.invoke("mcp:callTool", server, name, args),
+    },
     // Context menu actions dispatched from Electron main (rename, delete, etc.)
     onContextMenuAction: (cb) => {
         const listener = (_evt, action, path) => cb(action, path);

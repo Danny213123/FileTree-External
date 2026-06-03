@@ -12,7 +12,7 @@
 
 import { MUTATING_TOOLS, formatToolOutput } from "../agent";
 import { llmStream, type LlmImage, type LlmMessage, type LlmToolCall } from "../llm";
-import type { AgentSpec, RunContext, RunResult } from "./types";
+import type { AgentFacts, AgentSpec, RunContext, RunResult } from "./types";
 
 // Tools that ALWAYS surface an approval card, no matter the user's auto-approve
 // setting or per-tool allowlist. These are the destructive ones: they move,
@@ -26,7 +26,24 @@ export const ALWAYS_APPROVE_TOOLS = new Set([
   "recycle_items",
   "rename_item",
   "create_folder",
+  // New mutating edit tools — Tier-2 gated, never auto-approvable.
+  "write_file",
+  "edit_file",
+  // Read-only but shell/network-touching, so they always need explicit approval.
+  "git_status",
+  "git_diff",
+  "git_log",
+  "web_fetch",
+  "web_search",
 ]);
+
+// A call needs ordered, blocking handling (its own approval card and/or sequential
+// side effects) when it mutates, is the plan delegation, or is in ALWAYS_APPROVE.
+// Everything else (plain read-only search tools, delegate_to_search) is safe to
+// run concurrently with its siblings in the same turn.
+function needsSerialHandling(name: string): boolean {
+  return MUTATING_TOOLS.has(name) || ALWAYS_APPROVE_TOOLS.has(name) || name === "delegate_to_action";
+}
 
 export async function runAgent(
   spec: AgentSpec,
@@ -47,6 +64,9 @@ export async function runAgent(
   let nudged = false; // generic one-shot nudge for agents without a guardFinal
   let nudges = 0; // interventions made by guardFinal (nudge or force)
   const ranTools = new Set<string>();
+  // Structured findings accumulated from this run's tool results (paths/counts),
+  // surfaced to the parent alongside the prose so it has machine-readable facts.
+  const facts: AgentFacts = { paths: [], counts: {}, notes: [] };
   let finalText = "";
   // Best real findings gathered this run — from ANY tool whose result
   // formatFindings can render, not just a forced one. Used as a fallback answer
@@ -58,11 +78,29 @@ export async function runAgent(
   let reachedFinal = false;
   let status: RunResult["status"] = "done";
 
-  // Execute a single tool call: approval-gate mutating/plan calls, run it,
-  // stream UI updates, and append the result to history. Shared by the model's
-  // own tool calls and any call the runtime forces via the final-answer guard.
+  // Append one tool result to history (and harvest structured facts). Kept
+  // separate from execution so parallel calls record in a stable, original order.
+  function recordToolResult(call: LlmToolCall, result: unknown): void {
+    if (spec.extractFacts) {
+      try { spec.extractFacts(call.name, result, facts); } catch { /* best-effort */ }
+    }
+    history.push({ role: "tool", content: safeJson(call.name, result), toolCallId: call.id, toolName: call.name });
+  }
+
+  // Execute a single tool call: validate args, approval-gate mutating/plan calls,
+  // run it, and stream UI updates. Does NOT push to history (the caller records
+  // results in order via recordToolResult). Shared by the model's own tool calls
+  // and any call the runtime forces via the final-answer guard.
   async function runOneCall(call: LlmToolCall): Promise<{ result: unknown; status: "done" | "error" | "rejected" }> {
     ranTools.add(call.name);
+    // Malformed tool arguments: don't silently run with {} — feed a clear error
+    // back so the model re-issues the call with valid JSON.
+    if (call.argsError) {
+      const resultObj = { ok: false, error: `Invalid JSON arguments for ${call.name}: ${call.argsError}. Re-call the tool with valid JSON arguments.` };
+      ctx.emit({ kind: "tool_start", runId, callId: call.id, tool: call.name, args: call.args, mutating: MUTATING_TOOLS.has(call.name), requiresApproval: false });
+      ctx.emit({ kind: "tool_update", runId, callId: call.id, status: "error", summary: "invalid arguments" });
+      return { result: resultObj, status: "error" };
+    }
     const mutating = MUTATING_TOOLS.has(call.name);
     // Two-tier approval: mutating tools are the per-action gate (Tier 2), and
     // delegate_to_action is the plan gate (Tier 1) — both pause for the user
@@ -73,7 +111,9 @@ export async function runAgent(
     // auto-approves or has "always allowed" this specific tool. Tools in
     // ALWAYS_APPROVE_TOOLS (run_command) override that escape hatch entirely —
     // they always require an explicit, per-call approval.
-    const alwaysApprove = ALWAYS_APPROVE_TOOLS.has(call.name);
+    // Side-effecting MCP tools (declared at run start) always require approval,
+    // exactly like ALWAYS_APPROVE_TOOLS — auto-approve/allowlist can't bypass them.
+    const alwaysApprove = ALWAYS_APPROVE_TOOLS.has(call.name) || (ctx.gatedTools?.has(call.name) ?? false);
     const requiresApproval =
       alwaysApprove || ((mutating || isPlanDelegation) && !ctx.autoApprove && !ctx.allowTool(call.name));
     ctx.emit({ kind: "tool_start", runId, callId: call.id, tool: call.name, args: call.args, mutating, requiresApproval });
@@ -113,7 +153,6 @@ export async function runAgent(
 
     const output = formatToolOutput(call.name, resultObj);
     ctx.emit({ kind: "tool_update", runId, callId: call.id, status: stepStatus, summary, output: output || undefined });
-    history.push({ role: "tool", content: safeJson(resultObj), toolCallId: call.id, toolName: call.name });
     return { result: resultObj, status: stepStatus };
   }
 
@@ -166,13 +205,36 @@ export async function runAgent(
     });
 
     if (toolCalls.length) {
-      for (const call of toolCalls) {
+      // Run independent READ-ONLY calls concurrently; keep serial-handling calls
+      // (mutating, plan delegation, or always-approve) strictly sequential so
+      // their approval cards surface and any side effects stay ordered. Then
+      // record every result back into history in the ORIGINAL call order so the
+      // model sees a stable, deterministic transcript.
+      const serialName = (name: string) => needsSerialHandling(name) || (ctx.gatedTools?.has(name) ?? false);
+      const parallel = toolCalls.filter((c) => !serialName(c.name));
+      const serial = toolCalls.filter((c) => serialName(c.name));
+      const resultById = new Map<string, unknown>();
+
+      await Promise.all(
+        parallel.map(async (call) => {
+          const ran = await runOneCall(call);
+          resultById.set(call.id, ran.result);
+        }),
+      );
+      for (const call of serial) {
         if (ctx.signal.aborted) break;
         const ran = await runOneCall(call);
+        resultById.set(call.id, ran.result);
+      }
+
+      for (const call of toolCalls) {
+        if (!resultById.has(call.id)) continue; // aborted before this serial call ran
+        const result = resultById.get(call.id);
+        recordToolResult(call, result);
         // Capture renderable findings from real (model-issued) calls too, so a
         // model that gathers data but then stalls still yields a useful answer.
         if (spec.formatFindings) {
-          const findings = spec.formatFindings(call.name, ran.result);
+          const findings = spec.formatFindings(call.name, result);
           if (findings.trim()) fallbackFindings = findings;
         }
       }
@@ -218,6 +280,7 @@ export async function runAgent(
         const forced: LlmToolCall = { id: ctx.newId("call_"), name: decision.call.name, args: decision.call.args };
         history.push({ role: "assistant", content: "", toolCalls: [forced] });
         const ran = await runOneCall(forced);
+        recordToolResult(forced, ran.result);
         if (spec.formatFindings) {
           const findings = spec.formatFindings(forced.name, ran.result);
           if (findings.trim()) fallbackFindings = findings;
@@ -262,13 +325,24 @@ export async function runAgent(
     ctx.emit({ kind: "notice", runId, level: "warn", text: "The model returned an empty response. Try a tool-capable model (e.g. qwen2.5, llama3.1) or a cloud provider." });
   }
   ctx.emit({ kind: "agent_end", runId, agent: spec.agent, status, summary: finalText });
-  return { runId, text: finalText, status };
+  return { runId, text: finalText, status, facts };
 }
 
-function safeJson(value: unknown): string {
+// Serialize a tool result for the model. When it exceeds the cap we keep the
+// head and tell the model HOW MUCH was cut and how to get the rest (most
+// read-only tools accept offset/limit and return next_offset), so a truncated
+// result is actionable instead of a silent dead end.
+const TOOL_JSON_CAP = 8000;
+function safeJson(toolName: string, value: unknown): string {
   try {
     const s = JSON.stringify(value);
-    return s.length > 4000 ? s.slice(0, 4000) + "…(truncated)" : s;
+    if (s.length <= TOOL_JSON_CAP) return s;
+    const cut = s.length - TOOL_JSON_CAP;
+    return (
+      s.slice(0, TOOL_JSON_CAP) +
+      `…[truncated ${cut} more chars from the ${toolName} result. ` +
+      `Narrow your query (dir/glob/ext/files_only) or paginate with offset/limit (use next_offset) to see the rest.]`
+    );
   } catch {
     return String(value);
   }
