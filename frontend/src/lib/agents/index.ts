@@ -29,16 +29,34 @@ function stepStatusOf(result: unknown): StepStatus {
 function extractAgentFacts(tool: string, result: unknown, acc: AgentFacts): void {
   const r = result as Record<string, unknown> | null;
   if (!r || typeof r !== "object") return;
-  const pushPath = (p: unknown) => {
-    if (typeof p === "string" && p && acc.paths.length < 60 && !acc.paths.includes(p)) acc.paths.push(p);
+  const sizes = acc.sizes ?? (acc.sizes = {});
+  // Dedupe by NORMALIZED path (sizes keyed by normPath doubles as the seen-set),
+  // recording the largest known size so the handoff can sort by size and keep
+  // the biggest paths. A generous bound caps memory; the final cap is applied at
+  // the delegation handoff AFTER sorting (so large paths survive, not just early ones).
+  const pushPath = (p: unknown, sizeMb?: unknown) => {
+    if (typeof p !== "string" || !p) return;
+    const np = normPath(p);
+    const size = typeof sizeMb === "number" && Number.isFinite(sizeMb) ? sizeMb : undefined;
+    if (np in sizes) {
+      if (size != null && size > sizes[np]) sizes[np] = size;
+      return;
+    }
+    if (acc.paths.length >= 200) return;
+    acc.paths.push(p);
+    sizes[np] = size ?? 0;
   };
   const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
-  for (const it of arr(r.items)) pushPath((it as { path?: unknown })?.path);
-  for (const it of arr(r.children)) pushPath((it as { path?: unknown })?.path);
+  const sizeOf = (x: unknown) => (x as { size_mb?: unknown })?.size_mb;
+  for (const it of arr(r.items)) pushPath((it as { path?: unknown })?.path, sizeOf(it));
+  for (const it of arr(r.children)) pushPath((it as { path?: unknown })?.path, sizeOf(it));
   for (const m of arr(r.matches)) pushPath((m as { path?: unknown })?.path);
   for (const g of arr(r.groups)) {
+    // Duplicate-group files are plain path strings; use the group's reclaimable
+    // waste as a size proxy so duplicates sort sensibly among the verified paths.
+    const waste = (g as { waste_mb?: unknown }).waste_mb;
     for (const f of arr((g as { files?: unknown }).files)) {
-      pushPath(typeof f === "string" ? f : (f as { path?: unknown })?.path);
+      pushPath(typeof f === "string" ? f : (f as { path?: unknown })?.path, (f as { size_mb?: unknown })?.size_mb ?? waste);
     }
   }
   if (typeof r.path === "string") pushPath(r.path);
@@ -46,6 +64,46 @@ function extractAgentFacts(tool: string, result: unknown, acc: AgentFacts): void
   if (typeof r.total_matches === "number") acc.counts.matches = r.total_matches as number;
   if (typeof r.group_count === "number") acc.counts.duplicate_groups = r.group_count as number;
   if (typeof r.total_waste_mb === "number") acc.counts.waste_mb = r.total_waste_mb as number;
+}
+
+// Cap on verified paths surfaced in the delegation handoff (text block + the
+// facts.paths echoed back to the orchestrator). Applied AFTER sorting by size.
+const VERIFIED_PATHS_CAP = 40;
+
+// Turn a sub-agent's accumulated facts into a deduped, size-sorted list of
+// verified paths so the LARGEST survive the cap. Sizes come from facts.sizes
+// (keyed by normalized path); unknown sizes sort last.
+function sortedVerifiedPaths(facts: AgentFacts): { path: string; size?: number }[] {
+  const sizes = facts.sizes ?? {};
+  const seen = new Set<string>();
+  const out: { path: string; size?: number }[] = [];
+  for (const p of facts.paths) {
+    const np = normPath(p);
+    if (seen.has(np)) continue;
+    seen.add(np);
+    const size = sizes[np];
+    out.push({ path: p, size: typeof size === "number" && size > 0 ? size : undefined });
+  }
+  out.sort((a, b) => (b.size ?? -1) - (a.size ?? -1));
+  return out;
+}
+
+// Compose the Search agent's tool result: a plain-text "Verified paths" block
+// (real paths + sizes, largest first) prepended ABOVE the prose report, plus a
+// size-sorted, capped facts.paths the orchestrator can cite/act on verbatim. The
+// internal `sizes` map is dropped from the echoed facts to keep the payload lean.
+function buildSearchHandoff(report: string, facts: AgentFacts): { report: string; facts: AgentFacts } {
+  const sorted = sortedVerifiedPaths(facts);
+  const top = sorted.slice(0, VERIFIED_PATHS_CAP);
+  const block = top.length
+    ? "Verified paths (from tool results this turn, largest first — cite these exactly):\n" +
+      top.map((e) => `- ${e.path}${e.size != null ? ` — ${e.size} MB` : ""}`).join("\n") +
+      "\n\n"
+    : "";
+  return {
+    report: block + report,
+    facts: { paths: top.map((e) => e.path), counts: facts.counts, notes: facts.notes },
+  };
 }
 
 // Build the context note handed to a sub-agent so it sees the overall request
@@ -163,7 +221,9 @@ export function searchSpec(api: AgentApi, extraTools: ToolDef[] = []): AgentSpec
       "NEVER output a file name, path, or size that did not come from a tool result in this run. If a tool returns no matching files, say so plainly — do not invent example files.",
       mcpLine + "When you have gathered what was asked, reply with a concise findings summary (key paths with sizes). Do not ask the user questions.",
       "",
-      scanContext(api),
+      // Stats-only context (no embedded top-10): the Search agent reads real data
+      // via tools, so the stale listing is omitted to keep the prompt light.
+      scanContext(api, { listTop: false }),
     ].join("\n"),
     runTool: async (name, args, ctx) => {
       const result = await runToolOrMcp(name, args, ctx, builtins);
@@ -202,7 +262,9 @@ export function actionSpec(api: AgentApi, extraTools: ToolDef[] = []): AgentSpec
       "Only perform the changes described in your task. Do not invent extra deletions or run unrelated commands.",
       "After the tool returns, reply with a short summary of what the tool actually did, citing the real exit code for commands (or that it was rejected).",
       "",
-      scanContext(api),
+      // Stats-only context (no embedded top-10): the Action agent acts on the
+      // explicit paths in its task, so the stale listing is omitted.
+      scanContext(api, { listTop: false }),
     ].join("\n"),
     runTool: async (name, args, ctx) => {
       const result = await runToolOrMcp(name, args, ctx, builtins);
@@ -294,6 +356,7 @@ export function orchestratorSpec(api: AgentApi, attachedContext: string): AgentS
       "Workflow: (1) briefly state your plan, (2) call delegate_to_search (or delegate_to_action) with one focused, self-contained task, (3) wait for the result, delegating again if needed, (4) give a clear, concise final answer in plain text with no tool call. Do not fabricate paths, sizes, or results.",
       "After a delete or move action SUCCEEDS, do NOT automatically re-run a duplicate search (or any other search) just to double-check your own work. If the Action agent's report shows the targeted files were recycled/moved (exit code 0), summarize what was done and finalize with plain text. Only delegate_to_search again if the action failed or only partially succeeded, or the user explicitly asks for a fresh scan.",
       "Use absolute Windows paths exactly as they appear in the findings the Search agent returns.",
+      "Final-answer format: when listing files or folders, use a Markdown bullet list with ONE item per line formatted as `path — size` (omit the size when it is unknown). Do NOT use Markdown tables unless the user explicitly asks for a table. State each file/path only ONCE — never repeat the same list, and never restate it again in a different format or a closing recap.",
       attachedContext ? "\nUser-attached context:\n" + attachedContext : "",
       "",
       scanSummary(api),
@@ -305,9 +368,12 @@ export function orchestratorSpec(api: AgentApi, attachedContext: string): AgentS
       if (name === "delegate_to_search") {
         const sub = await runAgent(searchSpec(ctx.api, ctx.mcpReadTools ?? []), ctx, { task, parentId: runId, priorMessages });
         // Return STRUCTURED findings (paths/counts the orchestrator can cite and
-        // act on) alongside the prose report, not just `sub.text`.
+        // act on) alongside the prose report, not just `sub.text`. A plain-text
+        // "Verified paths" block (deduped, size-sorted) leads the report so the
+        // orchestrator cites real paths — and the largest survive the cap.
+        const handoff = buildSearchHandoff(sub.text || "(no findings)", sub.facts ?? { paths: [], counts: {}, notes: [] });
         return {
-          result: { agent: "search", report: sub.text || "(no findings)", facts: sub.facts ?? { paths: [], counts: {}, notes: [] } },
+          result: { agent: "search", report: handoff.report, facts: handoff.facts },
           summary: "Search agent finished",
           status: sub.status === "error" ? "error" : "done",
         };

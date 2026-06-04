@@ -504,6 +504,41 @@ export const ACTION_TOOLS: ToolDef[] = [
 // All tools (kept for single-agent fallbacks / back-compat).
 export const TOOLS: ToolDef[] = [...SEARCH_TOOLS, ...ACTION_TOOLS];
 
+const TOOL_BY_NAME = new Map<string, ToolDef>(TOOLS.map((t) => [t.function.name, t]));
+
+// Required string fields where an EMPTY value is legitimate (edit_file deletes
+// text by replacing with ""). Every other required string must be non-empty.
+const EMPTY_OK_FIELDS = new Set(["new_string"]);
+
+// Validate a MUTATING tool call's args against its declared schema BEFORE it
+// executes: each `required` field must be present and of the right type (and
+// non-empty for strings/arrays, the `new_string` deletion case aside). Returns
+// an error message, or null when valid. This stops a malformed or silently-empty
+// cloud tool call (e.g. a model emitting {} for recycle_items, or move_items
+// with no destination) from running a destructive op with no real target.
+function validateRequiredArgs(name: string, args: Record<string, unknown>): string | null {
+  const params = TOOL_BY_NAME.get(name)?.function.parameters;
+  const required = params?.required ?? [];
+  if (!required.length) return null;
+  const props = (params?.properties ?? {}) as Record<string, { type?: string }>;
+  for (const field of required) {
+    const v = args[field];
+    if (v === undefined || v === null) return `missing required field: ${field}`;
+    const type = props[field]?.type;
+    if (type === "array") {
+      if (!Array.isArray(v) || v.length === 0) return `missing required field: ${field} (expected a non-empty array)`;
+    } else if (type === "string") {
+      if (typeof v !== "string") return `invalid type for field: ${field} (expected a string)`;
+      if (!v.trim() && !EMPTY_OK_FIELDS.has(field)) return `missing required field: ${field} (expected a non-empty string)`;
+    } else if (type === "integer" || type === "number") {
+      if (typeof v !== "number" || !Number.isFinite(v)) return `invalid type for field: ${field} (expected a number)`;
+    } else if (type === "boolean") {
+      if (typeof v !== "boolean") return `invalid type for field: ${field} (expected a boolean)`;
+    }
+  }
+  return null;
+}
+
 function mb(bytes: number): number {
   return Math.round((bytes / 1e6) * 10) / 10;
 }
@@ -679,7 +714,12 @@ function instructionsBlock(): string {
   return out.join("\n\n");
 }
 
-export function scanContext(api: AgentApi): string {
+// `listTop` controls whether the embedded top-10 "Largest items" listing is
+// included. Sub-agents pass `false` (stats-only) so this heavy, stale listing
+// isn't re-embedded in every sub-agent system prompt across a turn — they read
+// real data via tools anyway. The legacy single-agent prompt keeps it.
+export function scanContext(api: AgentApi, opts: { listTop?: boolean } = {}): string {
+  const listTop = opts.listTop ?? true;
   const result = api.getScanResult();
   const scanPath = api.getScanPath();
   if (!result) return "No folder is scanned yet. Use scan_folder to begin.";
@@ -687,13 +727,20 @@ export function scanContext(api: AgentApi): string {
   const root = api.getNodes().find((n) => n.id === 0);
   lines.push(`Current scan: ${scanPath || result.rootPath}`);
   if (root) lines.push(`Total: ${mb(root.size)} MB across ${root.files} files / ${root.folders} folders.`);
-  const top = api.getNodes()
-    .filter((n) => n.id > 0 && n.path)
-    .sort((a, b) => b.size - a.size)
-    .slice(0, 10);
-  if (top.length) {
-    lines.push("Largest items:");
-    for (const n of top) lines.push(`  ${n.dir ? "DIR " : "FILE"} ${n.path} - ${mb(n.size)} MB`);
+  if (listTop) {
+    const top = api.getNodes()
+      .filter((n) => n.id > 0 && n.path)
+      .sort((a, b) => b.size - a.size)
+      .slice(0, 10);
+    if (top.length) {
+      // Framed as stale hints, NOT a source of truth: this listing can be out of
+      // date (files moved/deleted since the scan), so the model must confirm via
+      // list_largest/find before quoting anything as a final answer.
+      lines.push("Largest items (STALE HINTS from the last scan — do NOT quote these as final; always confirm current paths/sizes via list_largest/find):");
+      for (const n of top) lines.push(`  ${n.dir ? "DIR " : "FILE"} ${n.path} - ${mb(n.size)} MB`);
+    }
+  } else {
+    lines.push("Use the tools to read the file/folder listing — do not guess paths or sizes.");
   }
   const extra = instructionsBlock();
   if (extra) lines.push("", extra);
@@ -753,6 +800,13 @@ export function describeToolCall(name: string, rawArgs: unknown): ToolCallView {
 // Execute a tool call and return a compact JSON-serializable result to feed back
 // to the model as a role:"tool" message.
 export async function executeTool(name: string, args: Record<string, unknown>, api: AgentApi, signal?: AbortSignal): Promise<unknown> {
+  // Schema-level guard for destructive tools: never execute a mutating action
+  // with missing/empty/wrong-typed required args (a silently-empty {} from the
+  // model would otherwise act on nothing — or, for move/recycle, the wrong set).
+  if (MUTATING_TOOLS.has(name)) {
+    const invalid = validateRequiredArgs(name, args);
+    if (invalid) return { ok: false, error: invalid };
+  }
   switch (name) {
     case "get_stats": {
       const result = api.getScanResult();

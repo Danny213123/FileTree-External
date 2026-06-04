@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, createContext, useContext } from "react";
 import { type AgentApi, readFileWindow, underPath } from "../lib/agent";
 import { buildMcpRuntime } from "../lib/agents/mcp";
 import {
@@ -7,16 +7,18 @@ import {
   isVisionCapable,
   llmStream,
   CLOUD_FALLBACK_MODELS,
+  fallbackModelFor,
   type LlmImage,
   type LlmMessage,
+  type LlmOptions,
   type LlmProvider,
   uid,
 } from "../lib/llm";
 import { runOrchestrator } from "../lib/agents";
 import type { AgentEvent } from "../lib/agents";
 import { ALWAYS_APPROVE_TOOLS } from "../lib/agents/runtime";
-import type { AgentKind, RunStatus, StepStatus, ToolCallView } from "../lib/agents/types";
-import { loadAiSettings, saveAiSettings, loadAiKeys, saveAiKey, keyFor, type AiSettings, type McpServerConfig } from "../lib/aiSettings";
+import type { AgentDebugEntry, AgentKind, RunStatus, StepStatus, ToolCallView } from "../lib/agents/types";
+import { loadAiSettings, saveAiSettings, loadAiKeys, saveAiKey, keyFor, samplingOptions, type AiSettings, type McpServerConfig } from "../lib/aiSettings";
 import { loadChatSession, saveChatSession, loadChatIndex, deleteChatSession, type ChatSessionBlob, type ChatSessionMeta } from "../lib/chatSessions";
 import { scanStreamUrl, fetchDupesV2Bounded } from "../api/client";
 import { getCached, setCached } from "../lib/scanCache";
@@ -53,8 +55,43 @@ interface RefItem {
 // Memory tuning: once the running history exceeds SUMMARY_THRESHOLD messages,
 // everything older than the most recent RECENT_WINDOW is folded into a rolling
 // summary so long chats stay within context without dropping early facts.
-const RECENT_WINDOW = 8;
+// RECENT_WINDOW is the SINGLE source of truth for the recent-message window —
+// used both for the summary boundary and the plain recent slice (this replaced
+// an earlier slice(-12)-vs-RECENT_WINDOW(8) mismatch that sent inconsistent
+// amounts of history depending on whether summarization had kicked in).
+const RECENT_WINDOW = 12;
 const SUMMARY_THRESHOLD = 16;
+
+// Rough context-token budget per provider, used to size the prior-conversation
+// trim below. Ollama uses the configured (small) num_ctx; cloud models have far
+// larger windows, so a generous budget means the trim effectively never fires
+// for them (their own provider-side limits remain the real ceiling).
+function providerCtxTokens(provider: LlmProvider, numCtx: number): number {
+  if (provider === "ollama") return numCtx || 8192;
+  if (provider === "anthropic") return 200_000;
+  return 128_000; // openai
+}
+
+// Conservative prior-conversation trim. Estimates context size at ~4 chars/token
+// and keeps the prior turns to roughly half the model's num_ctx window, leaving
+// the rest for the system prompt, tool schemas, and the response. Drops the
+// OLDEST non-system messages first; a leading summary system message is always
+// kept. This only ever fires when well over budget — normal chats pass through
+// untouched — so it's a safety net against silent context truncation.
+function trimPriorConvo(messages: LlmMessage[], numCtx: number): LlmMessage[] {
+  const budget = Math.max(4000, Math.floor((numCtx || 8192) * 4 * 0.5));
+  const sizeOf = (m: LlmMessage) => (m.content?.length ?? 0) + 16;
+  let total = messages.reduce((n, m) => n + sizeOf(m), 0);
+  if (total <= budget) return messages;
+  const out = [...messages];
+  // Preserve a leading "Summary of earlier conversation" system message.
+  const start = out[0]?.role === "system" ? 1 : 0;
+  while (total > budget && out.length - start > 1) {
+    total -= sizeOf(out[start]);
+    out.splice(start, 1);
+  }
+  return out;
+}
 
 interface ToolState {
   callId: string;
@@ -214,6 +251,11 @@ function buildScopedApi(base: AgentApi, dirs: string[], scans: ScanResult[]): Ag
   };
 }
 
+// Lets nested message renderers (RunView / SubAgentCard → Markdown) trigger a
+// tree/Explorer reveal for a clicked Windows path without threading a callback
+// through every intermediate component. Undefined outside a ChatPanel.
+const RevealPathContext = createContext<((path: string) => void) | undefined>(undefined);
+
 export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewSession, onRestoreSession, includeHidden = false, threads }: ChatPanelProps) {
   const [ai, setAi] = useState<AiSettings>(() => loadAiSettings());
   const [groups, setGroups] = useState<ModelGroup[]>([]);
@@ -232,6 +274,17 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
   // The input value at which the user pressed Escape to dismiss the @-mention
   // popup; the popup re-opens once the input changes again.
   const [mentionDismissed, setMentionDismissed] = useState<string | null>(null);
+  // Per-message edit-and-resend: the user message currently being edited inline
+  // (null = none) plus its working draft.
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  // True while the pre-turn rolling summary is being computed, so the UI can show
+  // a "Compressing earlier messages…" status instead of an unexplained pause.
+  const [summarizing, setSummarizing] = useState(false);
+  // Per-turn debug bundle (last turn): a JSON snapshot of each agent run's steps,
+  // tools, guard nudges, and char counts, copied on demand. No external telemetry.
+  const [debugReady, setDebugReady] = useState(false);
+  const lastDebugRef = useRef<string>("");
 
   const provider = ai.provider;
   const selectedModel = ai.model;
@@ -728,22 +781,41 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
       const boundary = Math.max(0, history.length - RECENT_WINDOW);
       if (boundary > summarizedCountRef.current) {
         const aged = history.slice(summarizedCountRef.current, boundary);
-        const summary = await summarizeConversation({
-          prevSummary: convoSummaryRef.current,
-          messages: aged,
-          provider, model: selectedModel, apiKey, signal: controller.signal,
-        });
-        if (summary) {
+        // Surface progress: summarization is a blocking pre-turn LLM call, so
+        // show a status line (and a notice if it fails) instead of a silent pause.
+        setSummarizing(true);
+        let summary: string | null;
+        try {
+          summary = await summarizeConversation({
+            prevSummary: convoSummaryRef.current,
+            messages: aged,
+            provider, model: selectedModel, apiKey, signal: controller.signal,
+            // Summaries must be faithful, not creative — push temperature lower than
+            // the chat default while keeping the same anti-repetition guards.
+            options: { ...samplingOptions(ai), temperature: 0.2 },
+          });
+        } finally {
+          setSummarizing(false);
+        }
+        if (summary === null) {
+          applyEvent({ kind: "notice", level: "warn", text: "Couldn't compress earlier messages — continuing with the most recent ones." });
+        } else if (summary) {
           convoSummaryRef.current = summary;
           summarizedCountRef.current = boundary;
         }
       }
       priorConvo = convoSummaryRef.current
         ? [{ role: "system", content: "Summary of earlier conversation:\n" + convoSummaryRef.current }, ...history.slice(-RECENT_WINDOW)]
-        : history.slice(-12);
+        : history.slice(-RECENT_WINDOW);
     } else {
-      priorConvo = history.slice(-12);
+      priorConvo = history.slice(-RECENT_WINDOW);
     }
+    // Conservative safety net: keep the prior-conversation context within a rough
+    // char budget derived from the PROVIDER's context window so a long history
+    // can't blow the model's window (a contributor to the silent-truncation
+    // degeneration). Cloud models have huge windows so this rarely fires for them;
+    // for Ollama it tracks the configured num_ctx. A leading summary is preserved.
+    priorConvo = trimPriorConvo(priorConvo, providerCtxTokens(provider, ai.numCtx));
 
     convoRef.current.push({ role: "user", content: text, images: images.length ? images : undefined });
 
@@ -764,6 +836,10 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     const attachedDirs = attachedSnapshot
       .filter((a) => a.kind === "path" && a.isDir && a.path)
       .map((a) => a.path as string);
+
+    // Per-turn debug log: each agent run (orchestrator + sub-agents) appends one
+    // structured entry as it finishes. Serialized into a copyable bundle below.
+    const debugLog: AgentDebugEntry[] = [];
 
     try {
       let effectiveApi = api;
@@ -802,6 +878,14 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
       const res = await runOrchestrator(
         {
           provider, model: selectedModel, apiKey, api: effectiveApi,
+          // Anti-repetition + context-budget decoding controls applied to every
+          // turn the orchestrator and its sub-agents make this run.
+          options: samplingOptions(ai),
+          // Optional alternate model the runtime switches to after a persistent
+          // mid-stream error (cloud only; undefined for Ollama / no distinct peer).
+          fallbackModel: fallbackModelFor(provider, selectedModel),
+          // Per-turn structured debug sink (steps/tools/nudges/char counts).
+          debug: debugLog,
           autoApprove, signal: controller.signal,
           emit: applyEvent, requestApproval, newId: uid,
           // Read the allowlist live so an "Always allow" chosen mid-run applies
@@ -830,10 +914,24 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
       if ((err as Error).name !== "AbortError") applyEvent({ kind: "notice", level: "error", text: (err as Error).message });
     } finally {
       setBusy(false);
+      setSummarizing(false);
       abortRef.current = null;
       resolveAllApprovals(false);
+      // Snapshot a copyable debug bundle for this turn (built even on error/abort,
+      // since the per-agent entries are recorded as each run ends).
+      if (debugLog.length) {
+        lastDebugRef.current = JSON.stringify({
+          at: new Date().toISOString(),
+          provider, model: selectedModel,
+          fallbackModel: fallbackModelFor(provider, selectedModel) ?? null,
+          task: text,
+          orchestratorRunId: debugLog.find((d) => d.agent === "orchestrator")?.runId,
+          agents: debugLog,
+        }, null, 2);
+        setDebugReady(true);
+      }
     }
-  }, [busy, getAgentApi, selectedModel, provider, apiKey, attached, references, autoApprove, applyEvent, requestApproval, resolveAllApprovals, buildAttachedContext, includeHidden, threads, ai.mcpServers]);
+  }, [busy, getAgentApi, selectedModel, provider, apiKey, attached, references, autoApprove, applyEvent, requestApproval, resolveAllApprovals, buildAttachedContext, includeHidden, threads, ai]);
 
   const stop = useCallback(() => {
     abortRef.current?.abort();
@@ -851,7 +949,84 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     setRuns({});
     setAttached([]);
     setReferences([]);
+    setEditingId(null);
   }, [busy]);
+
+  // Reveal a Windows path (clicked in assistant markdown) in Explorer via the
+  // tab's AgentApi facade. Best-effort: ignored if no tab/api is available.
+  const revealPath = useCallback((path: string) => {
+    try { void getAgentApi()?.reveal(path); } catch { /* no active scan */ }
+  }, [getAgentApi]);
+
+  const copyText = useCallback((text: string) => {
+    if (text) void navigator.clipboard?.writeText(text).catch(() => {});
+  }, []);
+
+  const copyDebug = useCallback(() => {
+    if (lastDebugRef.current) void navigator.clipboard?.writeText(lastDebugRef.current).catch(() => {});
+  }, []);
+
+  // Truncate the conversation at the user message rendered as `items[itemIndex]`
+  // (dropping it and everything after, in BOTH the UI list and the model-history
+  // convoRef), then resubmit `newText`. Backs both "regenerate last turn" (same
+  // text) and "edit a prior user message and resend" (changed text). `send`
+  // re-adds the user bubble + history entry and runs a fresh turn.
+  const resendFrom = useCallback((itemIndex: number, newText: string) => {
+    if (busy) return;
+    const text = newText.trim();
+    if (!text) return;
+    // Which user-turn (0-based) this item is, so we can find the matching message
+    // in convoRef (a flat [user, assistant, …] list).
+    const userOrdinal = items.slice(0, itemIndex + 1).filter((it) => it.type === "user").length - 1;
+    if (userOrdinal < 0) return;
+    const convo = convoRef.current;
+    let cut = convo.length;
+    let seen = 0;
+    for (let i = 0; i < convo.length; i++) {
+      if (convo[i].role !== "user") continue;
+      if (seen === userOrdinal) { cut = i; break; }
+      seen++;
+    }
+    convoRef.current = convo.slice(0, cut);
+    // The rolling-summary boundary may now point past the trimmed history; reset
+    // it so the next turn re-derives the summary from a consistent prefix.
+    if (summarizedCountRef.current > convoRef.current.length) {
+      summarizedCountRef.current = 0;
+      convoSummaryRef.current = "";
+    }
+    // Drop run state for the runs in/after the truncated tail (and their children).
+    const removed = new Set(
+      items.slice(itemIndex).filter((it) => it.type === "run").map((it) => (it as { runId: string }).runId),
+    );
+    if (removed.size) {
+      setRuns((prev) => {
+        const next: Record<string, RunState> = {};
+        for (const [id, r] of Object.entries(prev)) {
+          if (removed.has(id) || (r.parentId && removed.has(r.parentId))) continue;
+          next[id] = r;
+        }
+        return next;
+      });
+    }
+    setItems((prev) => prev.slice(0, itemIndex));
+    setEditingId(null);
+    void send(text);
+  }, [busy, items, send]);
+
+  // Regenerate the last turn: re-run the orchestrator on the most recent user
+  // message (after rewinding its user+assistant pair from history).
+  const regenerate = useCallback(() => {
+    if (busy) return;
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (items[i].type === "user") { resendFrom(i, (items[i] as { text: string }).text); return; }
+    }
+  }, [busy, items, resendFrom]);
+
+  const startEdit = useCallback((id: string, text: string) => { setEditingId(id); setEditDraft(text); }, []);
+  const submitEdit = useCallback((id: string) => {
+    const idx = items.findIndex((it) => it.id === id);
+    if (idx >= 0) resendFrom(idx, editDraft);
+  }, [items, editDraft, resendFrom]);
 
   const banner = useMemo(() => {
     if (provider === "ollama" && modelStatus === "offline") return { text: "Ollama isn't running. Start it and pull a tool-capable model.", action: "retry" as const };
@@ -911,6 +1086,9 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
       <div className="chat-header">
         <span className="title">AI Assistant</span>
         <span className="spacer" />
+        {debugReady && (
+          <button className="icon" title="Copy debug bundle for the last turn (steps, tools, char counts)" onClick={copyDebug}><Icon name="list-task" size={14} /></button>
+        )}
         <button className={`icon${showHistory ? " on" : ""}`} title="Chat history" onClick={() => setShowHistory((v) => !v)}><Icon name="clock-history" size={14} /></button>
         <button className="icon" title="Clear chat" onClick={clear} disabled={busy}><Icon name="trash" size={14} /></button>
         <button className="icon" title="Hide assistant" onClick={onClose}><Icon name="chevron-double-right" size={14} /></button>
@@ -935,6 +1113,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
         </div>
       )}
 
+      <RevealPathContext.Provider value={revealPath}>
       <div className="chat-messages">
         {items.length === 0 && (
           <div className="chat-welcome">
@@ -947,8 +1126,30 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
             </div>
           </div>
         )}
-        {items.map((m) => {
+        {items.map((m, mi) => {
           if (m.type === "user") {
+            if (editingId === m.id) {
+              return (
+                <div key={m.id} className="chat-msg user editing">
+                  <div className="chat-msg-role">You</div>
+                  <textarea
+                    className="chat-edit-input"
+                    value={editDraft}
+                    autoFocus
+                    rows={Math.min(8, Math.max(1, editDraft.split("\n").length))}
+                    onChange={(e) => setEditDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") { e.preventDefault(); setEditingId(null); }
+                      else if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitEdit(m.id); }
+                    }}
+                  />
+                  <div className="chat-edit-actions">
+                    <button className="agent-btn-approve" onClick={() => submitEdit(m.id)} disabled={busy || !editDraft.trim()}>Send</button>
+                    <button className="agent-btn-ghost" onClick={() => setEditingId(null)}>Cancel</button>
+                  </div>
+                </div>
+              );
+            }
             return (
               <div key={m.id} className="chat-msg user">
                 <div className="chat-msg-role">You</div>
@@ -962,14 +1163,34 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
                     })}
                   </div>
                 )}
+                <div className="chat-msg-actions">
+                  <button className="chat-msg-action" title="Copy" onClick={() => copyText(m.text)}><Icon name="duplicates" size={12} /></button>
+                  <button className="chat-msg-action" title="Edit & resend" onClick={() => startEdit(m.id, m.text)} disabled={busy}><Icon name="pencil-square" size={12} /></button>
+                </div>
               </div>
             );
           }
           if (m.type === "notice") return <NoticeLine key={m.id} level={m.level} text={m.text} />;
-          return <RunView key={m.id} runId={m.runId} runs={runs} onApprove={(c) => resolveApproval(c, true)} onReject={(c) => resolveApproval(c, false)} onApproveAll={approveAll} onAllowlist={allowlist} />;
+          return (
+            <RunView
+              key={m.id}
+              runId={m.runId}
+              runs={runs}
+              isLast={mi === items.length - 1}
+              busy={busy}
+              onRegenerate={regenerate}
+              onCopy={copyText}
+              onApprove={(c) => resolveApproval(c, true)}
+              onReject={(c) => resolveApproval(c, false)}
+              onApproveAll={approveAll}
+              onAllowlist={allowlist}
+            />
+          );
         })}
+        {summarizing && <LiveStatus label="Compressing earlier messages" />}
         <div ref={bottomRef} />
       </div>
+      </RevealPathContext.Provider>
 
       <div className="composer-wrap">
         {showKeys && (
@@ -1089,8 +1310,9 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
 }
 
 // ── Run timeline ─────────────────────────────────────────────
-function RunView({ runId, runs, onApprove, onReject, onApproveAll, onAllowlist }: { runId: string; runs: Record<string, RunState>; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
+function RunView({ runId, runs, isLast, busy, onRegenerate, onCopy, onApprove, onReject, onApproveAll, onAllowlist }: { runId: string; runs: Record<string, RunState>; isLast?: boolean; busy?: boolean; onRegenerate?: () => void; onCopy?: (text: string) => void; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
   const run = runs[runId];
+  const onRevealPath = useContext(RevealPathContext);
   if (!run) return null;
   const isOrch = run.agent === "orchestrator";
   const streaming = run.status === "running";
@@ -1101,7 +1323,7 @@ function RunView({ runId, runs, onApprove, onReject, onApproveAll, onAllowlist }
       <StepList run={run} runs={runs} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />
       {run.text.trim() && (
         <div className="chat-msg-text">
-          <Markdown text={run.text} />
+          <Markdown text={run.text} onPathClick={onRevealPath} />
           {streaming && <span className="chat-cursor">{"\u258B"}</span>}
         </div>
       )}
@@ -1115,6 +1337,16 @@ function RunView({ runId, runs, onApprove, onReject, onApproveAll, onAllowlist }
       <div className="chat-msg assistant orchestrator">
         <div className="chat-msg-role"><Icon name="robot" size={12} /> Assistant</div>
         <div className="chat-msg-body">{body}</div>
+        {!streaming && (run.text.trim() || isLast) && (
+          <div className="chat-msg-actions">
+            {run.text.trim() && onCopy && (
+              <button className="chat-msg-action" title="Copy response" onClick={() => onCopy(run.text)}><Icon name="duplicates" size={12} /></button>
+            )}
+            {isLast && onRegenerate && (
+              <button className="chat-msg-action" title="Regenerate response" onClick={onRegenerate} disabled={busy}><Icon name="arrow-repeat" size={12} /></button>
+            )}
+          </div>
+        )}
       </div>
     );
   }
@@ -1138,6 +1370,7 @@ function StepList({ run, runs, onApprove, onReject, onApproveAll, onAllowlist }:
 
 function SubAgentCard({ runId, runs, onApprove, onReject, onApproveAll, onAllowlist }: { runId: string; runs: Record<string, RunState>; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
   const run = runs[runId];
+  const onRevealPath = useContext(RevealPathContext);
   const [collapsed, setCollapsed] = useState(false);
   if (!run) return null;
   const isSearch = run.agent === "search";
@@ -1159,7 +1392,7 @@ function SubAgentCard({ runId, runs, onApprove, onReject, onApproveAll, onAllowl
           {run.task && <div className="subagent-task">{String(run.task)}</div>}
           {run.thinking.trim() && <ThinkingBlock text={run.thinking} open={streaming && !run.text} live={streaming && !run.text} />}
           <StepList run={run} runs={runs} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />
-          {run.text.trim() && <div className="subagent-summary"><Markdown text={run.text} />{streaming && <span className="chat-cursor">{"\u258B"}</span>}</div>}
+          {run.text.trim() && <div className="subagent-summary"><Markdown text={run.text} onPathClick={onRevealPath} />{streaming && <span className="chat-cursor">{"\u258B"}</span>}</div>}
           {run.notices.map((n, i) => <NoticeLine key={i} level={n.level} text={n.text} />)}
           {streaming && <LiveStatus label={currentActivity(run, runs)} />}
         </div>
@@ -1552,12 +1785,15 @@ async function summarizeConversation(opts: {
   model: string;
   apiKey?: string;
   signal: AbortSignal;
-}): Promise<string> {
+  options?: LlmOptions;
+}): Promise<string | null> {
   const transcript = opts.messages
     .filter((m) => m.role === "user" || m.role === "assistant")
     .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
     .filter((l) => l.trim().length > 6)
     .join("\n");
+  // Nothing summarizable (e.g. all-empty aged messages): keep the prior summary
+  // unchanged — this is success, not a failure, so callers shouldn't warn.
   if (!transcript.trim()) return opts.prevSummary;
   const system =
     "You maintain a concise running summary of a conversation between a user and a file-management assistant. " +
@@ -1572,12 +1808,17 @@ async function summarizeConversation(opts: {
       apiKey: opts.apiKey,
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
       signal: opts.signal,
+      options: opts.options,
     })) {
       if (ev.type === "text") out += ev.value;
-      else if (ev.type === "error") return "";
+      // Distinguish a real failure (null → caller warns + falls back to recent)
+      // from a legitimately empty result.
+      else if (ev.type === "error") return null;
     }
-  } catch {
-    return "";
+  } catch (e) {
+    // Abort is expected on stop/new-turn; treat as a non-event (no warning).
+    if ((e as Error).name === "AbortError") return opts.prevSummary;
+    return null;
   }
   return out.trim();
 }
@@ -1642,6 +1883,14 @@ function ModelPicker({ groups, provider, model, disabled, onPick }: {
                   >
                     <span className="model-picker-check">{sel && <Icon name="check" size={12} />}</span>
                     <span className="model-picker-item-name">{m}</span>
+                    <span className="model-picker-badges">
+                      {isToolCapable(g.provider, m) && (
+                        <span className="model-badge tool" title="Supports tool-calling (required for agent actions)"><Icon name="tools" size={9} /> Tools</span>
+                      )}
+                      {isVisionCapable(g.provider, m) && (
+                        <span className="model-badge vision" title="Can read attached images"><Icon name="image" size={9} /> Vision</span>
+                      )}
+                    </span>
                   </button>
                 );
               })}

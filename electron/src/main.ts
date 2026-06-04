@@ -785,7 +785,10 @@ ipcMain.handle("secrets:delete", (_event, key: string): void => {
 // translate the renderer's provider-agnostic message format to each provider's
 // schema and stream a single unified event protocol back over "llmEvent".
 type LlmRole = "system" | "user" | "assistant" | "tool";
-interface LlmToolCall { id: string; name: string; args: Record<string, unknown>; }
+// `argsError` is set when the model emitted tool arguments that were not valid
+// JSON. It is forwarded to the renderer so the agent runtime feeds a clear error
+// back to the model (instead of silently running a mutating tool with {} args).
+interface LlmToolCall { id: string; name: string; args: Record<string, unknown>; argsError?: string; }
 interface LlmImage { dataUrl: string; mediaType: string; }
 interface LlmMessage { role: LlmRole; content: string; toolCalls?: LlmToolCall[]; toolCallId?: string; toolName?: string; images?: LlmImage[]; }
 interface LlmToolDef { type: "function"; function: { name: string; description: string; parameters: unknown }; }
@@ -795,7 +798,10 @@ type LlmEvent =
   | { type: "tool_calls"; value: LlmToolCall[] }
   | { type: "done" }
   | { type: "error"; value: string };
-interface LlmPayload { provider: string; model: string; apiKey?: string; messages: LlmMessage[]; tools?: LlmToolDef[]; }
+// Decoding controls forwarded from the renderer (camel-cased). Each cloud
+// provider maps the relevant subset to its own wire format below.
+interface LlmOptions { temperature?: number; topP?: number; repeatPenalty?: number; repeatLastN?: number; numCtx?: number; numPredict?: number; frequencyPenalty?: number; maxTokens?: number; }
+interface LlmPayload { provider: string; model: string; apiKey?: string; messages: LlmMessage[]; tools?: LlmToolDef[]; options?: LlmOptions; }
 
 const llmAbort = new Map<string, AbortController>();
 
@@ -840,37 +846,129 @@ async function* sseLines(res: Response): AsyncGenerator<string> {
   if (buf) yield buf;
 }
 
-function parseArgs(s: string): Record<string, unknown> {
-  try { return s ? JSON.parse(s) : {}; } catch { return {}; }
+// Parse tool-call arguments robustly. Empty/whitespace → {} (a tool with no
+// args is valid). Non-empty invalid JSON, or JSON that isn't an object, reports
+// an `error` so the renderer can feed "invalid JSON arguments" back to the model
+// rather than silently executing a mutating tool with empty args.
+function parseToolArgs(raw: string): { args: Record<string, unknown>; error?: string } {
+  const s = (raw ?? "").trim();
+  if (!s) return { args: {} };
+  try {
+    const v = JSON.parse(s);
+    return v && typeof v === "object" && !Array.isArray(v)
+      ? { args: v as Record<string, unknown> }
+      : { args: {}, error: "arguments were not a JSON object" };
+  } catch (e) {
+    return { args: {}, error: (e as Error).message };
+  }
 }
 function shorten(s: string): string { return s.length > 200 ? s.slice(0, 200) + "…" : s; }
 function randId(): string { return `call_${Math.random().toString(36).slice(2, 10)}`; }
 
+// ── Cloud retry / backoff (429/503) ──────────────────────────────────────────
+// Cloud providers occasionally rate-limit (429) or hiccup (502/503). Retry a
+// bounded number of times with exponential backoff, honoring Retry-After when
+// present, and map terminal HTTP/network failures to a short, friendly message.
+const MAX_LLM_RETRIES = 3;
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
+function backoffMs(attempt: number): number {
+  return Math.min(500 * 2 ** attempt + Math.random() * 250, 8000);
+}
+
+// Resolves true after `ms`, or false immediately if the signal aborts first.
+function delay(ms: number, signal: AbortSignal): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve(false);
+    const onAbort = () => { clearTimeout(timer); resolve(false); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(true); }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function parseRetryAfterMs(res: Response): number | null {
+  const ra = res.headers.get("retry-after");
+  if (!ra) return null;
+  const secs = Number(ra);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const when = Date.parse(ra);
+  return Number.isNaN(when) ? null : Math.max(0, when - Date.now());
+}
+
+function friendlyHttpError(provider: string, status: number, body: string): string {
+  if (status === 429) return `${provider} is rate-limiting requests (HTTP 429). Please wait a moment and try again.`;
+  if (status === 401 || status === 403) return `${provider} rejected the API key (HTTP ${status}). Check your key in settings.`;
+  if (RETRYABLE_STATUS.has(status)) return `${provider} is temporarily unavailable (HTTP ${status}). Please try again shortly.`;
+  return `${provider} HTTP ${status}: ${shorten(body)}`;
+}
+
+// Fetch with bounded exponential backoff on retryable statuses / transient
+// network errors. Returns a successful Response, or null after emitting a
+// friendly error (or on abort). The caller streams the body on success.
+async function fetchLlmWithRetry(
+  url: string,
+  init: RequestInit,
+  signal: AbortSignal,
+  provider: string,
+  emit: (ev: LlmEvent) => void,
+): Promise<Response | null> {
+  for (let attempt = 0; ; attempt++) {
+    let res: Response;
+    try {
+      res = await fetch(url, init);
+    } catch (e) {
+      if ((e as Error).name === "AbortError" || signal.aborted) return null;
+      if (attempt < MAX_LLM_RETRIES) { if (!(await delay(backoffMs(attempt), signal))) return null; continue; }
+      emit({ type: "error", value: `${provider} request failed: ${(e as Error).message}` });
+      return null;
+    }
+    if (res.ok) return res;
+    if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_LLM_RETRIES) {
+      const wait = parseRetryAfterMs(res) ?? backoffMs(attempt);
+      await res.body?.cancel().catch(() => {}); // free the socket before retrying
+      if (!(await delay(wait, signal))) return null;
+      continue;
+    }
+    const body = await res.text().catch(() => "");
+    emit({ type: "error", value: friendlyHttpError(provider, res.status, body) });
+    return null;
+  }
+}
+
 async function streamOpenAi(payload: LlmPayload, signal: AbortSignal, emit: (ev: LlmEvent) => void): Promise<void> {
+  const o = payload.options ?? {};
+  // o1/o3/o4 reasoning models reject temperature/top_p/frequency_penalty and use
+  // max_completion_tokens instead of max_tokens — apply sampling only to the
+  // chat-completion models that accept it.
+  const isReasoning = /^o\d/i.test(payload.model);
+  const sampling = isReasoning
+    ? { max_completion_tokens: o.maxTokens ?? 1536 }
+    : {
+        temperature: o.temperature ?? 0.3,
+        top_p: o.topP ?? 0.9,
+        frequency_penalty: o.frequencyPenalty ?? 0.3,
+        max_tokens: o.maxTokens ?? 1536,
+      };
   const body = {
     model: payload.model,
     messages: toOpenAiMessages(payload.messages),
     stream: true,
+    ...sampling,
     ...(payload.tools?.length ? { tools: payload.tools, tool_choice: "auto" as const } : {}),
   };
-  let res: Response;
-  try {
-    res = await fetch("https://api.openai.com/v1/chat/completions", {
+  const res = await fetchLlmWithRetry(
+    "https://api.openai.com/v1/chat/completions",
+    {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${payload.apiKey ?? ""}` },
       body: JSON.stringify(body),
       signal,
-    });
-  } catch (e) {
-    if ((e as Error).name === "AbortError") return;
-    emit({ type: "error", value: `OpenAI request failed: ${(e as Error).message}` });
-    return;
-  }
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    emit({ type: "error", value: `OpenAI HTTP ${res.status}: ${shorten(t)}` });
-    return;
-  }
+    },
+    signal,
+    "OpenAI",
+    emit,
+  );
+  if (!res) return;
   const toolAcc: Record<number, { id: string; name: string; args: string }> = {};
   try {
     for await (const line of sseLines(res)) {
@@ -900,16 +998,23 @@ async function streamOpenAi(payload: LlmPayload, signal: AbortSignal, emit: (ev:
   }
   const calls: LlmToolCall[] = Object.values(toolAcc)
     .filter((c) => c.name)
-    .map((c) => ({ id: c.id || randId(), name: c.name, args: parseArgs(c.args) }));
+    .map((c) => {
+      const { args, error } = parseToolArgs(c.args);
+      return { id: c.id || randId(), name: c.name, args, argsError: error };
+    });
   if (calls.length) emit({ type: "tool_calls", value: calls });
   emit({ type: "done" });
 }
 
 async function streamAnthropic(payload: LlmPayload, signal: AbortSignal, emit: (ev: LlmEvent) => void): Promise<void> {
   const { system, messages } = toAnthropicMessages(payload.messages);
+  const o = payload.options ?? {};
   const body = {
     model: payload.model,
-    max_tokens: 2048,
+    // Bounded output + low temperature. max_tokens comes from the payload
+    // (default 2048), overridable by the maxTokens setting.
+    max_tokens: o.maxTokens ?? 2048,
+    temperature: o.temperature ?? 0.3,
     stream: true,
     ...(system ? { system } : {}),
     messages,
@@ -917,24 +1022,19 @@ async function streamAnthropic(payload: LlmPayload, signal: AbortSignal, emit: (
       ? { tools: payload.tools.map((t) => ({ name: t.function.name, description: t.function.description, input_schema: t.function.parameters })) }
       : {}),
   };
-  let res: Response;
-  try {
-    res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetchLlmWithRetry(
+    "https://api.anthropic.com/v1/messages",
+    {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": payload.apiKey ?? "", "anthropic-version": "2023-06-01" },
       body: JSON.stringify(body),
       signal,
-    });
-  } catch (e) {
-    if ((e as Error).name === "AbortError") return;
-    emit({ type: "error", value: `Anthropic request failed: ${(e as Error).message}` });
-    return;
-  }
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    emit({ type: "error", value: `Anthropic HTTP ${res.status}: ${shorten(t)}` });
-    return;
-  }
+    },
+    signal,
+    "Anthropic",
+    emit,
+  );
+  if (!res) return;
   const blocks: Record<number, { type: string; id?: string; name?: string; json: string }> = {};
   const calls: LlmToolCall[] = [];
   try {
@@ -958,7 +1058,10 @@ async function streamAnthropic(payload: LlmPayload, signal: AbortSignal, emit: (
       } else if (json.type === "content_block_stop") {
         const idx: number = json.index ?? 0;
         const b = blocks[idx];
-        if (b && b.type === "tool_use" && b.name) calls.push({ id: b.id || randId(), name: b.name, args: parseArgs(b.json || "{}") });
+        if (b && b.type === "tool_use" && b.name) {
+          const { args, error } = parseToolArgs(b.json);
+          calls.push({ id: b.id || randId(), name: b.name, args, argsError: error });
+        }
       } else if (json.type === "error") {
         emit({ type: "error", value: json.error?.message || "Anthropic stream error" });
         return;

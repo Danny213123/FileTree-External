@@ -1,7 +1,7 @@
 // Event + context model shared by the orchestrator and its sub-agents.
 
 import type { AgentApi, ToolDef } from "../agent";
-import type { LlmProvider } from "../llm";
+import type { LlmOptions, LlmProvider } from "../llm";
 
 export type AgentKind = "orchestrator" | "search" | "action";
 export type RunStatus = "running" | "done" | "error";
@@ -35,6 +35,9 @@ export interface RunContext {
   provider: LlmProvider;
   model: string;
   apiKey?: string;
+  // Decoding controls (temperature/repeat penalty/num_ctx/etc.) applied to every
+  // LLM turn this run makes. Anti-repetition defaults apply when omitted.
+  options?: LlmOptions;
   api: AgentApi;
   autoApprove: boolean;
   signal: AbortSignal;
@@ -45,6 +48,14 @@ export interface RunContext {
   // surfacing an approval card (read live so a mid-run "always allow" applies).
   allowTool: (tool: string) => boolean;
   newId: (prefix?: string) => string;
+  // Optional alternate model the runtime may switch to after a persistent
+  // mid-stream error (rate limit / upstream failure). Empty/equal-to-model means
+  // no fallback. Computed by the host (e.g. a sibling cloud model) — never local.
+  fallbackModel?: string;
+  // Optional per-turn debug sink. When provided, each agent run (orchestrator +
+  // sub-agents) appends ONE structured entry (steps, tools, guard nudges, char
+  // counts) so the host can offer a "copy debug bundle" affordance. No telemetry.
+  debug?: AgentDebugEntry[];
   // The user's original request for this whole turn + a brief digest of prior
   // turns, threaded so the orchestrator can pass real context (not just a bare
   // task string) down to sub-agents.
@@ -66,6 +77,25 @@ export interface RunContext {
 export interface AgentFacts {
   paths: string[];
   counts: Record<string, number>;
+  notes: string[];
+  // Best-known size (MB) per path, keyed by NORMALIZED path. Lets the delegation
+  // handoff dedupe + sort the verified paths by size so the largest survive the
+  // cap and lead the "Verified paths" block fed back to the orchestrator.
+  sizes?: Record<string, number>;
+}
+
+// One structured record per agent run, accumulated into RunContext.debug for an
+// optional, local-only "copy debug bundle" affordance. char counts are rough
+// (history length / output length), not real token counts.
+export interface AgentDebugEntry {
+  runId: string;
+  agent: AgentKind;
+  steps: number;
+  tools: string[];
+  guardNudges: number;
+  inputChars: number;
+  outputChars: number;
+  status: RunStatus;
   notes: string[];
 }
 

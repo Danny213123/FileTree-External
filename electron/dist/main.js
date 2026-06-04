@@ -811,43 +811,127 @@ async function* sseLines(res) {
     if (buf)
         yield buf;
 }
-function parseArgs(s) {
+// Parse tool-call arguments robustly. Empty/whitespace → {} (a tool with no
+// args is valid). Non-empty invalid JSON, or JSON that isn't an object, reports
+// an `error` so the renderer can feed "invalid JSON arguments" back to the model
+// rather than silently executing a mutating tool with empty args.
+function parseToolArgs(raw) {
+    const s = (raw ?? "").trim();
+    if (!s)
+        return { args: {} };
     try {
-        return s ? JSON.parse(s) : {};
+        const v = JSON.parse(s);
+        return v && typeof v === "object" && !Array.isArray(v)
+            ? { args: v }
+            : { args: {}, error: "arguments were not a JSON object" };
     }
-    catch {
-        return {};
+    catch (e) {
+        return { args: {}, error: e.message };
     }
 }
 function shorten(s) { return s.length > 200 ? s.slice(0, 200) + "…" : s; }
 function randId() { return `call_${Math.random().toString(36).slice(2, 10)}`; }
+// ── Cloud retry / backoff (429/503) ──────────────────────────────────────────
+// Cloud providers occasionally rate-limit (429) or hiccup (502/503). Retry a
+// bounded number of times with exponential backoff, honoring Retry-After when
+// present, and map terminal HTTP/network failures to a short, friendly message.
+const MAX_LLM_RETRIES = 3;
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+function backoffMs(attempt) {
+    return Math.min(500 * 2 ** attempt + Math.random() * 250, 8000);
+}
+// Resolves true after `ms`, or false immediately if the signal aborts first.
+function delay(ms, signal) {
+    return new Promise((resolve) => {
+        if (signal.aborted)
+            return resolve(false);
+        const onAbort = () => { clearTimeout(timer); resolve(false); };
+        const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(true); }, ms);
+        signal.addEventListener("abort", onAbort, { once: true });
+    });
+}
+function parseRetryAfterMs(res) {
+    const ra = res.headers.get("retry-after");
+    if (!ra)
+        return null;
+    const secs = Number(ra);
+    if (Number.isFinite(secs))
+        return Math.max(0, secs * 1000);
+    const when = Date.parse(ra);
+    return Number.isNaN(when) ? null : Math.max(0, when - Date.now());
+}
+function friendlyHttpError(provider, status, body) {
+    if (status === 429)
+        return `${provider} is rate-limiting requests (HTTP 429). Please wait a moment and try again.`;
+    if (status === 401 || status === 403)
+        return `${provider} rejected the API key (HTTP ${status}). Check your key in settings.`;
+    if (RETRYABLE_STATUS.has(status))
+        return `${provider} is temporarily unavailable (HTTP ${status}). Please try again shortly.`;
+    return `${provider} HTTP ${status}: ${shorten(body)}`;
+}
+// Fetch with bounded exponential backoff on retryable statuses / transient
+// network errors. Returns a successful Response, or null after emitting a
+// friendly error (or on abort). The caller streams the body on success.
+async function fetchLlmWithRetry(url, init, signal, provider, emit) {
+    for (let attempt = 0;; attempt++) {
+        let res;
+        try {
+            res = await fetch(url, init);
+        }
+        catch (e) {
+            if (e.name === "AbortError" || signal.aborted)
+                return null;
+            if (attempt < MAX_LLM_RETRIES) {
+                if (!(await delay(backoffMs(attempt), signal)))
+                    return null;
+                continue;
+            }
+            emit({ type: "error", value: `${provider} request failed: ${e.message}` });
+            return null;
+        }
+        if (res.ok)
+            return res;
+        if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_LLM_RETRIES) {
+            const wait = parseRetryAfterMs(res) ?? backoffMs(attempt);
+            await res.body?.cancel().catch(() => { }); // free the socket before retrying
+            if (!(await delay(wait, signal)))
+                return null;
+            continue;
+        }
+        const body = await res.text().catch(() => "");
+        emit({ type: "error", value: friendlyHttpError(provider, res.status, body) });
+        return null;
+    }
+}
 async function streamOpenAi(payload, signal, emit) {
+    const o = payload.options ?? {};
+    // o1/o3/o4 reasoning models reject temperature/top_p/frequency_penalty and use
+    // max_completion_tokens instead of max_tokens — apply sampling only to the
+    // chat-completion models that accept it.
+    const isReasoning = /^o\d/i.test(payload.model);
+    const sampling = isReasoning
+        ? { max_completion_tokens: o.maxTokens ?? 1536 }
+        : {
+            temperature: o.temperature ?? 0.3,
+            top_p: o.topP ?? 0.9,
+            frequency_penalty: o.frequencyPenalty ?? 0.3,
+            max_tokens: o.maxTokens ?? 1536,
+        };
     const body = {
         model: payload.model,
         messages: toOpenAiMessages(payload.messages),
         stream: true,
+        ...sampling,
         ...(payload.tools?.length ? { tools: payload.tools, tool_choice: "auto" } : {}),
     };
-    let res;
-    try {
-        res = await fetch("https://api.openai.com/v1/chat/completions", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${payload.apiKey ?? ""}` },
-            body: JSON.stringify(body),
-            signal,
-        });
-    }
-    catch (e) {
-        if (e.name === "AbortError")
-            return;
-        emit({ type: "error", value: `OpenAI request failed: ${e.message}` });
+    const res = await fetchLlmWithRetry("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${payload.apiKey ?? ""}` },
+        body: JSON.stringify(body),
+        signal,
+    }, signal, "OpenAI", emit);
+    if (!res)
         return;
-    }
-    if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        emit({ type: "error", value: `OpenAI HTTP ${res.status}: ${shorten(t)}` });
-        return;
-    }
     const toolAcc = {};
     try {
         for await (const line of sseLines(res)) {
@@ -891,16 +975,23 @@ async function streamOpenAi(payload, signal, emit) {
     }
     const calls = Object.values(toolAcc)
         .filter((c) => c.name)
-        .map((c) => ({ id: c.id || randId(), name: c.name, args: parseArgs(c.args) }));
+        .map((c) => {
+        const { args, error } = parseToolArgs(c.args);
+        return { id: c.id || randId(), name: c.name, args, argsError: error };
+    });
     if (calls.length)
         emit({ type: "tool_calls", value: calls });
     emit({ type: "done" });
 }
 async function streamAnthropic(payload, signal, emit) {
     const { system, messages } = toAnthropicMessages(payload.messages);
+    const o = payload.options ?? {};
     const body = {
         model: payload.model,
-        max_tokens: 2048,
+        // Bounded output + low temperature. max_tokens comes from the payload
+        // (default 2048), overridable by the maxTokens setting.
+        max_tokens: o.maxTokens ?? 2048,
+        temperature: o.temperature ?? 0.3,
         stream: true,
         ...(system ? { system } : {}),
         messages,
@@ -908,26 +999,14 @@ async function streamAnthropic(payload, signal, emit) {
             ? { tools: payload.tools.map((t) => ({ name: t.function.name, description: t.function.description, input_schema: t.function.parameters })) }
             : {}),
     };
-    let res;
-    try {
-        res = await fetch("https://api.anthropic.com/v1/messages", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "x-api-key": payload.apiKey ?? "", "anthropic-version": "2023-06-01" },
-            body: JSON.stringify(body),
-            signal,
-        });
-    }
-    catch (e) {
-        if (e.name === "AbortError")
-            return;
-        emit({ type: "error", value: `Anthropic request failed: ${e.message}` });
+    const res = await fetchLlmWithRetry("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": payload.apiKey ?? "", "anthropic-version": "2023-06-01" },
+        body: JSON.stringify(body),
+        signal,
+    }, signal, "Anthropic", emit);
+    if (!res)
         return;
-    }
-    if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        emit({ type: "error", value: `Anthropic HTTP ${res.status}: ${shorten(t)}` });
-        return;
-    }
     const blocks = {};
     const calls = [];
     try {
@@ -966,8 +1045,10 @@ async function streamAnthropic(payload, signal, emit) {
             else if (json.type === "content_block_stop") {
                 const idx = json.index ?? 0;
                 const b = blocks[idx];
-                if (b && b.type === "tool_use" && b.name)
-                    calls.push({ id: b.id || randId(), name: b.name, args: parseArgs(b.json || "{}") });
+                if (b && b.type === "tool_use" && b.name) {
+                    const { args, error } = parseToolArgs(b.json);
+                    calls.push({ id: b.id || randId(), name: b.name, args, argsError: error });
+                }
             }
             else if (json.type === "error") {
                 emit({ type: "error", value: json.error?.message || "Anthropic stream error" });

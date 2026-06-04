@@ -4,6 +4,24 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.7.0] - 2026-06-03
+
+### Fixed
+
+- **AI chat response degeneration**: repetition/degeneration loops on disk-usage queries are fixed end-to-end -- explicit decoding controls (`temperature`, `top_p`, repeat penalty, `num_ctx`, `num_predict`/`max_tokens`) are now sent across Ollama, OpenAI, and Anthropic; the guard-nudge self-correction spiral that fed the model its own repetition is stopped; and a streaming repetition/degeneration guard with a stall timeout aborts a derailing run and retries it once at a low temperature.
+- **Summarization notice**: fixed a latent bug where the "couldn't compress earlier messages" notice never fired when older history could not be summarized.
+
+### Added
+
+- **Configurable sampling / decoding settings** for the AI chat, wired through every provider (Ollama, OpenAI, Anthropic).
+- **Regenerate last turn**, plus per-message **Copy** and **Edit-and-resend**.
+- **Clickable Windows paths** in assistant replies -- reveal the file in the tree or open it in Explorer.
+- **Cloud tool reliability**: tool-argument errors are propagated back to the model, and mutating tools validate their required fields before running.
+- **Automatic retry with backoff** for rate-limited or unavailable cloud requests, with an optional fallback model.
+- **Sharper orchestration**: more accurate delegation handoff (verified paths sorted by size), prompt hardening (stale-hint framing and final-answer formatting), a unified conversation window with token budgeting and summarization progress UX, model capability (tools/vision) badges in the model picker, and a per-turn debug bundle.
+
+---
+
 ## [1.6.0] - 2026-06-03
 
 ### Added
