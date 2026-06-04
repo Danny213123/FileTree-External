@@ -11,8 +11,66 @@
 // file names/sizes when it refuses to delegate to the Search agent.
 
 import { MUTATING_TOOLS, formatToolOutput } from "../agent";
-import { llmStream, type LlmImage, type LlmMessage, type LlmToolCall } from "../llm";
-import type { AgentFacts, AgentSpec, RunContext, RunResult } from "./types";
+import { llmStream, type LlmImage, type LlmMessage, type LlmOptions, type LlmToolCall } from "../llm";
+import type { AgentDebugEntry, AgentFacts, AgentSpec, RunContext, RunResult } from "./types";
+
+// Abort an in-flight stream if no event arrives for this long (model wedged /
+// upstream hung). Surfaced to the user as a timeout notice.
+const STREAM_STALL_MS = 30_000;
+
+// Replaces a guard-rejected assistant draft kept in history. Keeping the FULL
+// fabricated draft is what fed the self-correction spiral ("Wait, I see a
+// mistake in my previous response…"); a terse stub lets the model move on
+// without re-reading its own invented file names/sizes.
+const WITHHELD_DRAFT = "(draft withheld — it was not grounded in tool results; answer only from Search findings)";
+
+// ── Degeneration detection (provider-agnostic, runs on accumulated text) ──────
+// Two failure modes seen with weak local models on disk-usage queries:
+//   (a) the same line/sentence repeated several times in a row, then
+//   (b) a collapse into a short repeating unit (e.g. "나나나…", "....").
+// Detect either on the growing text so the runtime can abort + retry before the
+// stream wastes the whole context on junk.
+const DEGEN_MIN_LEN = 80;
+
+// (b) A unit of ≤3 chars repeated to cover >~40 chars at the tail. Skips
+// whitespace/punctuation units (markdown rules, "----", "....", "***") which can
+// legitimately run long; real degeneration collapses into repeated letters.
+function hasShortCycleTail(text: string): boolean {
+  const tail = text.slice(-240);
+  for (let unit = 1; unit <= 3; unit++) {
+    if (tail.length < unit * 4) continue;
+    const cand = tail.slice(tail.length - unit);
+    if (/^[\s\-=_*#.~`+|]+$/.test(cand)) continue;
+    let i = tail.length;
+    let reps = 0;
+    while (i - unit >= 0 && tail.slice(i - unit, i) === cand) { reps++; i -= unit; }
+    if (reps >= 4 && reps * unit >= 40) return true;
+  }
+  return false;
+}
+
+// (a) The last non-trivial unit (line or sentence) repeated ≥3 times in a row.
+// Requires length ≥16 so legit short repeats (bullets, table rules) don't trip.
+function hasRepeatedTailUnit(units: string[]): boolean {
+  if (units.length < 3) return false;
+  const last = units[units.length - 1];
+  if (last.length < 16) return false;
+  let reps = 1;
+  for (let i = units.length - 2; i >= 0 && units[i] === last; i--) reps++;
+  return reps >= 3;
+}
+
+export function isDegenerate(text: string): boolean {
+  if (text.length < DEGEN_MIN_LEN) return false;
+  if (hasShortCycleTail(text)) return true;
+  const window = text.slice(-1200);
+  const lines = window.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (hasRepeatedTailUnit(lines)) return true;
+  // Sentence split without lookbehind (drops the terminator, which is fine for
+  // equality of consecutive sentences).
+  const sentences = window.split(/[.!?。！？]+\s+/).map((s) => s.trim()).filter(Boolean);
+  return hasRepeatedTailUnit(sentences);
+}
 
 // Tools that ALWAYS surface an approval card, no matter the user's auto-approve
 // setting or per-tool allowlist. These are the destructive ones: they move,
@@ -63,6 +121,10 @@ export async function runAgent(
   let toolsDisabled = false;
   let nudged = false; // generic one-shot nudge for agents without a guardFinal
   let nudges = 0; // interventions made by guardFinal (nudge or force)
+  // Assistant stub-drafts + their paired nudge prompts created by guardFinal
+  // "nudge" cycles. Tracked by reference so a later "force" can drop ALL of them
+  // (not just the latest) and keep the model from re-reading withheld mistakes.
+  const nudgeExchanges: LlmMessage[] = [];
   const ranTools = new Set<string>();
   // Structured findings accumulated from this run's tool results (paths/counts),
   // surfaced to the parent alongside the prose so it has machine-readable facts.
@@ -77,6 +139,20 @@ export async function runAgent(
   // out of the step budget mid-task). Drives the step-limit notice below.
   let reachedFinal = false;
   let status: RunResult["status"] = "done";
+  // Model actually used for streaming. May switch to ctx.fallbackModel after a
+  // persistent mid-stream error (see the error-retry in the loop below), and
+  // stays switched for the rest of this run once the fallback succeeds.
+  let activeModel = ctx.model;
+  let erroredRetried = false; // at most one automatic retry after a stream error
+  // Per-turn debug accumulation (one entry per agent run): step count, tool
+  // names, guard nudges, and rough input/output char counts. Only surfaced when
+  // the host provides a sink (ctx.debug); never sent anywhere.
+  const dbg: AgentDebugEntry = {
+    runId, agent: spec.agent, steps: 0, tools: [], guardNudges: 0,
+    inputChars: 0, outputChars: 0, status: "running", notes: [],
+  };
+  const historyChars = () =>
+    history.reduce((n, m) => n + (m.content?.length ?? 0) + (m.toolCalls ? JSON.stringify(m.toolCalls).length : 0), 0);
 
   // Append one tool result to history (and harvest structured facts). Kept
   // separate from execution so parallel calls record in a stable, original order.
@@ -93,6 +169,7 @@ export async function runAgent(
   // and any call the runtime forces via the final-answer guard.
   async function runOneCall(call: LlmToolCall): Promise<{ result: unknown; status: "done" | "error" | "rejected" }> {
     ranTools.add(call.name);
+    dbg.tools.push(call.name);
     // Malformed tool arguments: don't silently run with {} — feed a clear error
     // back so the model re-issues the call with valid JSON.
     if (call.argsError) {
@@ -156,35 +233,130 @@ export async function runAgent(
     return { result: resultObj, status: stepStatus };
   }
 
+  // Run ONE streaming attempt with a stall timer and live degeneration detection,
+  // both backed by a per-step AbortController chained to the run-wide signal (so a
+  // user cancel still aborts, but we can also abort just this attempt to retry).
+  // `optionsOverride` lets the degeneration retry crank up the anti-repetition
+  // controls without disturbing the run's normal sampling options.
+  async function streamOnce(optionsOverride?: LlmOptions, modelOverride?: string): Promise<{
+    text: string;
+    toolCalls: LlmToolCall[];
+    errored: boolean;
+    degenerated: boolean;
+    stalled: boolean;
+  }> {
+    let text = "";
+    const toolCalls: LlmToolCall[] = [];
+    let errored = false;
+    let degenerated = false;
+    let stalled = false;
+    // Rough input-size accounting for the debug bundle (measured before the call;
+    // history is only mutated by the caller after streamOnce returns).
+    dbg.inputChars += historyChars();
+
+    const stepAbort = new AbortController();
+    const onParentAbort = () => stepAbort.abort();
+    if (ctx.signal.aborted) stepAbort.abort();
+    else ctx.signal.addEventListener("abort", onParentAbort);
+
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    const armStall = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => { stalled = true; stepAbort.abort(); }, STREAM_STALL_MS);
+    };
+    armStall();
+
+    try {
+      for await (const ev of llmStream({
+        provider: ctx.provider,
+        model: modelOverride ?? activeModel,
+        apiKey: ctx.apiKey,
+        messages: history,
+        tools: useTools ? spec.tools : undefined,
+        signal: stepAbort.signal,
+        options: optionsOverride ? { ...ctx.options, ...optionsOverride } : ctx.options,
+      })) {
+        armStall(); // any event = progress; reset the stall countdown
+        if (ev.type === "thinking") {
+          ctx.emit({ kind: "thinking", runId, delta: ev.value });
+        } else if (ev.type === "text") {
+          text += ev.value;
+          ctx.emit({ kind: "text", runId, delta: ev.value });
+          if (!degenerated && isDegenerate(text)) {
+            degenerated = true;
+            stepAbort.abort(); // stop the runaway stream immediately
+            break;
+          }
+        } else if (ev.type === "tool_calls") {
+          toolCalls.push(...ev.value);
+        } else if (ev.type === "error") {
+          ctx.emit({ kind: "notice", runId, level: "error", text: ev.value });
+          errored = true;
+        }
+      }
+    } finally {
+      if (stallTimer) clearTimeout(stallTimer);
+      ctx.signal.removeEventListener("abort", onParentAbort);
+    }
+    dbg.outputChars += text.length + toolCalls.reduce((n, c) => n + (c.args ? JSON.stringify(c.args).length : 0), 0);
+    return { text, toolCalls, errored, degenerated, stalled };
+  }
+
   for (let step = 0; step < spec.maxSteps; step++) {
     if (ctx.signal.aborted) {
       status = "error";
       break;
     }
+    dbg.steps++;
 
-    let text = "";
-    const toolCalls: LlmToolCall[] = [];
-    let errored = false;
+    let { text, toolCalls, errored, degenerated, stalled } = await streamOnce();
 
-    for await (const ev of llmStream({
-      provider: ctx.provider,
-      model: ctx.model,
-      apiKey: ctx.apiKey,
-      messages: history,
-      tools: useTools ? spec.tools : undefined,
-      signal: ctx.signal,
-    })) {
-      if (ev.type === "thinking") {
-        ctx.emit({ kind: "thinking", runId, delta: ev.value });
-      } else if (ev.type === "text") {
-        text += ev.value;
-        ctx.emit({ kind: "text", runId, delta: ev.value });
-      } else if (ev.type === "tool_calls") {
-        toolCalls.push(...ev.value);
-      } else if (ev.type === "error") {
-        ctx.emit({ kind: "notice", runId, level: "error", text: ev.value });
-        errored = true;
+    // Degeneration / stall guard: the model started repeating itself or went
+    // silent. Clear the on-screen partial and retry ONCE with stronger
+    // anti-repetition + lower temperature. If it still fails, stop this step and
+    // fall back to whatever real findings were gathered (never surface junk).
+    if ((degenerated || stalled) && !ctx.signal.aborted) {
+      const why = stalled ? "stalled (no output for 30s)" : "began repeating itself";
+      dbg.notes.push(stalled ? "stalled" : "degenerated");
+      ctx.emit({ kind: "notice", runId, level: "warn", text: `The model ${why} — retrying once with stronger anti-repetition settings.` });
+      ctx.emit({ kind: "text_reset", runId });
+      const retry = await streamOnce({ temperature: 0.2, topP: 0.85, repeatPenalty: 1.3 });
+      text = retry.text;
+      toolCalls = retry.toolCalls;
+      errored = retry.errored;
+      degenerated = retry.degenerated;
+      stalled = retry.stalled;
+      if ((degenerated || stalled) && !ctx.signal.aborted) {
+        dbg.notes.push(stalled ? "stalled again" : "still degenerating");
+        ctx.emit({ kind: "notice", runId, level: "error", text: `The model ${stalled ? "stalled again" : "kept degenerating"} — stopping this step and using the results gathered so far.` });
+        ctx.emit({ kind: "text_reset", runId });
+        finalText = "";
+        reachedFinal = false;
+        break;
       }
+    }
+
+    // Mid-stream error guard: retry ONCE per run. If the host supplied a distinct
+    // fallback model (cloud only), switch to it for the retry — and keep using it
+    // for the rest of the run if it succeeds — so a rate-limited / failing model
+    // doesn't sink the whole turn. The cloud transport already did its own
+    // HTTP-level 429/503 backoff before surfacing this error.
+    if (errored && !ctx.signal.aborted && !erroredRetried) {
+      erroredRetried = true;
+      const useFallback = !!ctx.fallbackModel && ctx.fallbackModel !== activeModel;
+      dbg.notes.push(useFallback ? `error → retry with ${ctx.fallbackModel}` : "error → retry");
+      ctx.emit({
+        kind: "notice", runId, level: "warn",
+        text: useFallback ? `The model errored — retrying with ${ctx.fallbackModel}.` : "The model errored — retrying once.",
+      });
+      ctx.emit({ kind: "text_reset", runId });
+      const retry = await streamOnce(undefined, useFallback ? ctx.fallbackModel : undefined);
+      if (useFallback && !retry.errored && !ctx.signal.aborted) activeModel = ctx.fallbackModel!;
+      text = retry.text;
+      toolCalls = retry.toolCalls;
+      errored = retry.errored;
+      degenerated = retry.degenerated;
+      stalled = retry.stalled;
     }
 
     if (errored) {
@@ -249,7 +421,8 @@ export async function runAgent(
       useTools = false;
       toolsDisabled = true;
       history.pop();
-      ctx.emit({ kind: "notice", runId, level: "warn", text: `${ctx.model} returned no tool call — retrying without tools.` });
+      dbg.notes.push("empty → retry without tools");
+      ctx.emit({ kind: "notice", runId, level: "warn", text: `${activeModel} returned no tool call — retrying without tools.` });
       continue;
     }
 
@@ -262,10 +435,23 @@ export async function runAgent(
       if (decision.action === "nudge") {
         nudges++;
         // Drop the provisional/fabricated text from the UI so it never lingers
-        // above the corrected answer. (We keep it in history for the model's own
-        // context; the explicit nudge tells it those specifics were not real.)
+        // above the corrected answer.
         ctx.emit({ kind: "text_reset", runId });
-        history.push({ role: "user", content: decision.message });
+        // Crucially, do NOT keep the full fabricated draft in history — the model
+        // re-reading its own invented file names/sizes is what drove the
+        // self-correction spiral ("Wait, I see a mistake in my previous
+        // response…"). Replace it with a terse stub so the corrective nudge below
+        // stands on its own. Track the stub + nudge so a later "force" can drop
+        // the whole exchange.
+        const draft = history[history.length - 1];
+        if (draft && draft.role === "assistant") {
+          draft.content = WITHHELD_DRAFT;
+          draft.toolCalls = undefined;
+          nudgeExchanges.push(draft);
+        }
+        const nudgeMsg: LlmMessage = { role: "user", content: decision.message };
+        history.push(nudgeMsg);
+        nudgeExchanges.push(nudgeMsg);
         if (decision.notice) ctx.emit({ kind: "notice", runId, level: "info", text: decision.notice });
         continue;
       }
@@ -276,6 +462,16 @@ export async function runAgent(
         // persisted), then run the read-only tool ourselves and feed the real
         // result back so the model can phrase the answer strictly from it.
         history.pop();
+        // Also drop EARLIER nudge-cycle drafts + their nudge prompts (by
+        // reference, so real tool exchanges between nudges are preserved). This
+        // removes them in (assistant-stub, user-nudge) pairs, keeping role
+        // alternation valid for strict providers like Anthropic.
+        if (nudgeExchanges.length) {
+          for (let i = history.length - 1; i >= 0; i--) {
+            if (nudgeExchanges.includes(history[i])) history.splice(i, 1);
+          }
+          nudgeExchanges.length = 0;
+        }
         if (decision.notice) ctx.emit({ kind: "notice", runId, level: "warn", text: decision.notice });
         const forced: LlmToolCall = { id: ctx.newId("call_"), name: decision.call.name, args: decision.call.args };
         history.push({ role: "assistant", content: "", toolCalls: [forced] });
@@ -313,6 +509,7 @@ export async function runAgent(
   // answer). Tell the user we're wrapping up rather than ending silently, and
   // still return the best content gathered below.
   if (status === "done" && !reachedFinal && !ctx.signal.aborted) {
+    dbg.notes.push("step limit");
     ctx.emit({ kind: "notice", runId, level: "warn", text: "Reached the step limit — wrapping up with what's been gathered so far." });
   }
   // If the model never produced a final answer but we gathered real findings
@@ -322,7 +519,13 @@ export async function runAgent(
     finalText = fallbackFindings;
   }
   if (status === "done" && !finalText.trim()) {
+    dbg.notes.push("empty final");
     ctx.emit({ kind: "notice", runId, level: "warn", text: "The model returned an empty response. Try a tool-capable model (e.g. qwen2.5, llama3.1) or a cloud provider." });
+  }
+  if (ctx.debug) {
+    dbg.guardNudges = nudges;
+    dbg.status = status;
+    ctx.debug.push(dbg);
   }
   ctx.emit({ kind: "agent_end", runId, agent: spec.agent, status, summary: finalText });
   return { runId, text: finalText, status, facts };

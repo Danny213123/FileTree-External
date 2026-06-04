@@ -5,7 +5,7 @@
 // for cloud calls the renderer hands the key to Electron main over IPC, which
 // makes the HTTPS request. A localStorage fallback keeps plain-browser dev working.
 
-import type { LlmProvider } from "./llm";
+import { DEFAULT_LLM_OPTIONS, type LlmOptions, type LlmProvider } from "./llm";
 
 // One configured Model Context Protocol server. `transport` selects how Electron
 // main reaches it: a spawned process speaking newline-delimited JSON-RPC over
@@ -36,6 +36,16 @@ export interface AiSettings {
   rules: string;
   // Configured MCP servers whose tools are discovered + registered at run start.
   mcpServers: McpServerConfig[];
+  // Decoding / sampling controls applied to every provider request (anti-
+  // repetition defaults; see DEFAULT_LLM_OPTIONS in llm.ts). Persisted so they
+  // survive reloads; defaults are applied on load when a value is unset.
+  temperature: number;
+  topP: number;
+  repeatPenalty: number; // Ollama repeat_penalty
+  repeatLastN: number; // Ollama repeat_last_n
+  numCtx: number; // Ollama num_ctx context budget
+  numPredict: number; // Ollama num_predict max output tokens
+  maxTokens: number; // cloud (OpenAI/Anthropic) max output tokens
 }
 
 const KEY = "filetree.ai.settings";
@@ -53,7 +63,18 @@ const DEFAULTS: AiSettings = {
   allow: [],
   rules: "",
   mcpServers: [],
+  temperature: DEFAULT_LLM_OPTIONS.temperature,
+  topP: DEFAULT_LLM_OPTIONS.topP,
+  repeatPenalty: DEFAULT_LLM_OPTIONS.repeatPenalty,
+  repeatLastN: DEFAULT_LLM_OPTIONS.repeatLastN,
+  numCtx: DEFAULT_LLM_OPTIONS.numCtx,
+  numPredict: DEFAULT_LLM_OPTIONS.numPredict,
+  maxTokens: DEFAULT_LLM_OPTIONS.maxTokens,
 };
+
+function numOr(v: unknown, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
 
 /** safeStorage-backed secret store exposed by the Electron preload. */
 interface SecretStore {
@@ -92,6 +113,13 @@ export function loadAiSettings(): AiSettings {
     mcpServers: Array.isArray(parsed.mcpServers)
       ? parsed.mcpServers.filter((m): m is McpServerConfig => !!m && typeof (m as McpServerConfig).id === "string")
       : [],
+    temperature: numOr(parsed.temperature, DEFAULTS.temperature),
+    topP: numOr(parsed.topP, DEFAULTS.topP),
+    repeatPenalty: numOr(parsed.repeatPenalty, DEFAULTS.repeatPenalty),
+    repeatLastN: numOr(parsed.repeatLastN, DEFAULTS.repeatLastN),
+    numCtx: numOr(parsed.numCtx, DEFAULTS.numCtx),
+    numPredict: numOr(parsed.numPredict, DEFAULTS.numPredict),
+    maxTokens: numOr(parsed.maxTokens, DEFAULTS.maxTokens),
   };
 }
 
@@ -103,6 +131,13 @@ export function saveAiSettings(s: AiSettings): void {
       allow: s.allow,
       rules: s.rules,
       mcpServers: s.mcpServers,
+      temperature: s.temperature,
+      topP: s.topP,
+      repeatPenalty: s.repeatPenalty,
+      repeatLastN: s.repeatLastN,
+      numCtx: s.numCtx,
+      numPredict: s.numPredict,
+      maxTokens: s.maxTokens,
     };
     // Cloud keys belong in safeStorage when available; never persist them as
     // plaintext in localStorage. Only the plain-browser fallback writes them.
@@ -187,4 +222,19 @@ export function keyFor(s: AiSettings, provider: LlmProvider): string {
 
 export function isAllowed(s: AiSettings, tool: string): boolean {
   return s.allow.includes(tool);
+}
+
+/** Map the persisted sampling settings into the provider-agnostic LlmOptions
+ *  passed to llmStream. frequencyPenalty (OpenAI-only) is left to the provider
+ *  default in Electron main. */
+export function samplingOptions(s: AiSettings): LlmOptions {
+  return {
+    temperature: s.temperature,
+    topP: s.topP,
+    repeatPenalty: s.repeatPenalty,
+    repeatLastN: s.repeatLastN,
+    numCtx: s.numCtx,
+    numPredict: s.numPredict,
+    maxTokens: s.maxTokens,
+  };
 }

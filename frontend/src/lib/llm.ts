@@ -55,6 +55,51 @@ export type LlmEvent =
   | { type: "done" }
   | { type: "error"; value: string };
 
+// Decoding / sampling controls applied to every provider request. Camel-cased
+// here; each transport maps them to its own wire format (Ollama snake_case
+// `options`, OpenAI/Anthropic top-level fields). All optional — `resolveLlmOptions`
+// fills in the anti-repetition defaults when a value is unset.
+export interface LlmOptions {
+  temperature?: number;
+  topP?: number;
+  repeatPenalty?: number; // Ollama
+  repeatLastN?: number; // Ollama
+  numCtx?: number; // Ollama context-window budget
+  numPredict?: number; // Ollama max output tokens
+  frequencyPenalty?: number; // OpenAI analogue of repeat_penalty
+  maxTokens?: number; // cloud max output tokens
+}
+
+// Anti-repetition defaults — the core of the degeneration fix. A low temperature
+// plus a repeat penalty and a bounded context keep weak local models from
+// collapsing into repeated sentences / junk-token runs.
+export const DEFAULT_LLM_OPTIONS: Required<LlmOptions> = {
+  temperature: 0.3,
+  topP: 0.9,
+  repeatPenalty: 1.15,
+  repeatLastN: 256,
+  numCtx: 8192,
+  numPredict: 1024,
+  frequencyPenalty: 0.3,
+  maxTokens: 1536,
+};
+
+function cleanLlmOptions(o?: LlmOptions): LlmOptions {
+  if (!o) return {};
+  const out: LlmOptions = {};
+  for (const k of Object.keys(o) as (keyof LlmOptions)[]) {
+    const v = o[k];
+    if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+  }
+  return out;
+}
+
+// Merge caller-supplied options over the anti-repetition defaults, ignoring any
+// non-finite values so a bad setting can never disable a guard.
+export function resolveLlmOptions(o?: LlmOptions): Required<LlmOptions> {
+  return { ...DEFAULT_LLM_OPTIONS, ...cleanLlmOptions(o) };
+}
+
 export interface LlmRequest {
   provider: LlmProvider;
   model: string;
@@ -62,6 +107,9 @@ export interface LlmRequest {
   messages: LlmMessage[];
   tools?: ToolDef[];
   signal?: AbortSignal;
+  // Decoding controls (temperature/repeat penalty/context budget/etc.). When
+  // omitted the anti-repetition defaults above apply.
+  options?: LlmOptions;
 }
 
 // ── id helpers ───────────────────────────────────────────────
@@ -138,6 +186,16 @@ export const CLOUD_FALLBACK_MODELS: Record<LlmProvider, string[]> = {
   ],
 };
 
+// Pick an OPTIONAL fallback model for a persistent mid-stream failure (e.g. the
+// chosen cloud model keeps erroring / is rate-limited). Returns a sibling model
+// from the curated cloud list that differs from the current one, or undefined
+// for Ollama (local — no managed fallback) / when no distinct alternate exists.
+// The runtime only switches models when this returns a real alternate.
+export function fallbackModelFor(provider: LlmProvider, model: string): string | undefined {
+  if (provider === "ollama") return undefined;
+  return (CLOUD_FALLBACK_MODELS[provider] ?? []).find((m) => m && m !== model);
+}
+
 // Ollama families that reliably support tool-calling. Used to warn the user
 // when an agent run is started with a model that will silently ignore tools.
 const TOOL_CAPABLE_RE = /(llama3\.[123]|llama-3\.[123]|qwen2\.5|qwen2|qwen3|qwq|mistral|mixtral|command-r|firefunction|hermes|granite3|smollm2|cogito)/i;
@@ -186,6 +244,10 @@ function toOllamaMessages(messages: LlmMessage[]): unknown[] {
 
 async function* streamOllama(req: LlmRequest): AsyncGenerator<LlmEvent> {
   let res: Response;
+  // Anti-repetition + context-budget controls. The Rust /api/ai-chat proxy
+  // forwards this body verbatim to Ollama's /api/chat, so `options` needs no
+  // server-side change.
+  const o = resolveLlmOptions(req.options);
   try {
     res = await fetch("/api/ai-chat", {
       method: "POST",
@@ -195,6 +257,14 @@ async function* streamOllama(req: LlmRequest): AsyncGenerator<LlmEvent> {
         messages: toOllamaMessages(req.messages),
         tools: req.tools && req.tools.length ? req.tools : undefined,
         stream: true,
+        options: {
+          temperature: o.temperature,
+          top_p: o.topP,
+          repeat_penalty: o.repeatPenalty,
+          repeat_last_n: o.repeatLastN,
+          num_ctx: o.numCtx,
+          num_predict: o.numPredict,
+        },
       }),
       signal: req.signal,
     });
@@ -330,6 +400,9 @@ async function* streamCloud(req: LlmRequest): AsyncGenerator<LlmEvent> {
     apiKey: req.apiKey,
     messages: req.messages,
     tools: req.tools && req.tools.length ? req.tools : undefined,
+    // Camel-cased decoding controls; Electron main maps these to each cloud
+    // provider's wire format and applies its own defaults when unset.
+    options: req.options,
   });
 
   try {

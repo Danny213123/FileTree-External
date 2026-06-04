@@ -4254,6 +4254,20 @@ input:focus, select:focus {
 .chat-msg-text { white-space: pre-wrap; word-break: break-word; color: var(--text); }
 .chat-msg.assistant .chat-msg-text { white-space: normal; }
 .chat-msg-body { display: flex; flex-direction: column; gap: 8px; }
+/* Per-message hover controls: copy (user+assistant), edit-and-resend (user),
+   regenerate (last assistant turn). Hidden until the row is hovered/focused. */
+.chat-msg-actions { display: flex; gap: 2px; opacity: 0; transition: opacity .12s ease; }
+.chat-msg:hover .chat-msg-actions, .chat-msg-actions:focus-within { opacity: 1; }
+.chat-msg-action { width: 24px; height: 22px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid transparent; border-radius: 4px; color: var(--text-4); cursor: pointer; }
+.chat-msg-action:hover { background: var(--vsc-list-hover); color: var(--text); }
+.chat-msg-action:disabled { opacity: .4; cursor: default; background: transparent; color: var(--text-4); }
+/* Inline edit-and-resend textarea shown when a prior user message is edited. */
+.chat-msg.user.editing { gap: 6px; }
+.chat-edit-input { width: 100%; resize: vertical; min-height: 32px; background: var(--vsc-input-bg); border: 1px solid var(--vsc-focus); color: var(--text); font-family: var(--vsc-font); font-size: 13px; padding: 6px 8px; border-radius: 4px; }
+.chat-edit-actions { display: flex; gap: 6px; }
+.chat-edit-actions button { height: 24px; font-size: 12px; padding: 0 10px; }
+.agent-btn-ghost { background: transparent; border: 1px solid var(--vsc-border); color: var(--text-3); }
+.agent-btn-ghost:hover { background: var(--vsc-list-hover); color: var(--text); }
 .chat-cursor { display: inline-block; width: 7px; background: var(--accent); animation: blink 1s step-start infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 .chat-welcome { color: var(--muted); font-size: 13px; display: flex; flex-direction: column; gap: 10px; align-items: flex-start; padding: 10px 4px; }
@@ -4413,7 +4427,13 @@ input:focus, select:focus {
 .model-picker-item:hover { background: var(--vsc-list-hover); color: var(--text); }
 .model-picker-item.sel { color: var(--text); }
 .model-picker-check { width: 14px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; color: var(--accent); }
-.model-picker-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--vsc-mono); }
+.model-picker-item-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--vsc-mono); }
+/* Capability badges (tool-calling / vision) trailing each model row. */
+.model-picker-badges { flex: 0 0 auto; display: inline-flex; gap: 4px; }
+.model-badge { display: inline-flex; align-items: center; gap: 3px; font-size: 9px; text-transform: uppercase; letter-spacing: .03em; padding: 1px 5px; border-radius: 8px; line-height: 1.6; white-space: nowrap; }
+.model-badge .bi { flex: 0 0 auto; }
+.model-badge.tool { background: rgba(0,120,212,0.16); color: var(--accent); }
+.model-badge.vision { background: rgba(155,89,182,0.20); color: #c79cea; }
 
 /* ── Markdown rendering (assistant output) ────────────────────── */
 .md { white-space: normal; }
@@ -4437,6 +4457,12 @@ input:focus, select:focus {
 .md-quote { margin: 6px 0; padding: 2px 10px; border-left: 3px solid var(--vsc-border); color: var(--muted); }
 .md-link { color: var(--accent); text-decoration: none; }
 .md-link:hover { text-decoration: underline; }
+/* Clickable absolute Windows paths in assistant output → reveal in the tree. */
+.md-path { color: var(--accent); cursor: pointer; text-decoration: none; word-break: break-all; }
+a.md-path { font-family: var(--vsc-mono); font-size: .92em; }
+.md-path:hover { text-decoration: underline; }
+.md-path:focus-visible { outline: 1px solid var(--vsc-focus); outline-offset: 1px; border-radius: 2px; }
+code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 
 /* ── Live activity indicators ─────────────────────────────────── */
 @keyframes ai-spin { to { transform: rotate(360deg); } }
