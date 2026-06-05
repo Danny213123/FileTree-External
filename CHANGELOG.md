@@ -4,6 +4,23 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.8.0] - 2026-06-04
+
+### Added
+
+- **Expandable tool-call cards**: each tool call renders as a card with an icon, a human-readable title, its arguments, and its result.
+- **Live steps / plan checklist**: a running checklist with per-step pending, running, done, and error states.
+- **Path-specific live activity**: per-path status with an elapsed timer, plus "Thought for Ns" reasoning timing that auto-collapses when finished.
+- **Syntax-highlighted code blocks**: lazy-loaded `highlight.js` with language labels and a per-block Copy button, plus GitHub-flavored Markdown tables and task lists.
+- **Slash commands** in the composer: `/new`, `/clear`, `/model`, `/scan`, `/stop`, `/help`, and `/approve-all`.
+- **@-mentions** of files and folders from the tree to add context or scope work to a folder.
+- **Composer keyboard shortcuts**: Esc to stop, Up to edit the last message, arrow/Enter/Tab to navigate popups, and Ctrl+Enter to send.
+- **Context / token usage meter**, post-turn follow-up suggestions, and continue-after-stop.
+- **Clearer tool approvals**: Allow once / Always allow / Reject, with an affected-paths list and an improved diff preview.
+- **Chat-aware command palette** entries, plus session rename and pin.
+
+---
+
 ## [1.7.0] - 2026-06-03
 
 ### Fixed

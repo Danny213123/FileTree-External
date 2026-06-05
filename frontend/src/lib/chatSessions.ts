@@ -9,6 +9,11 @@ export interface ChatSessionMeta {
   title: string;
   ts: number;
   count: number;
+  /** Pinned sessions sort to the top of the history list and stay there. */
+  pinned?: boolean;
+  /** True once the user renamed the session, so auto-save stops overwriting the
+   *  title with the (derived-from-first-message) default. */
+  renamed?: boolean;
 }
 
 export interface ChatSessionBlob {
@@ -31,11 +36,27 @@ export function newChatSessionId(): string {
   return `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
 }
 
+// Pinned sessions float to the top (keeping recency order within each group).
+function sortIndex(list: ChatSessionMeta[]): ChatSessionMeta[] {
+  return list.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.ts - a.ts);
+}
+
 export function loadChatIndex(): ChatSessionMeta[] {
   try {
     const raw = localStorage.getItem(INDEX_KEY);
     const list = raw ? (JSON.parse(raw) as ChatSessionMeta[]) : [];
-    return Array.isArray(list) ? list.sort((a, b) => b.ts - a.ts) : [];
+    return Array.isArray(list) ? sortIndex(list) : [];
+  } catch {
+    return [];
+  }
+}
+
+// Read the raw (unsorted) index without throwing — used internally by mutators.
+function rawIndex(): ChatSessionMeta[] {
+  try {
+    const raw = localStorage.getItem(INDEX_KEY);
+    const list = raw ? (JSON.parse(raw) as ChatSessionMeta[]) : [];
+    return Array.isArray(list) ? list : [];
   } catch {
     return [];
   }
@@ -73,12 +94,23 @@ function pruneBlob(blob: ChatSessionBlob): ChatSessionBlob {
 export function saveChatSession(id: string, title: string, blob: ChatSessionBlob, count: number): void {
   try {
     localStorage.setItem(blobKey(id), JSON.stringify(pruneBlob(blob)));
-    const index = loadChatIndex().filter((s) => s.id !== id);
-    index.unshift({ id, title: title || "New chat", ts: Date.now(), count });
-    const trimmed = index.slice(0, MAX_SESSIONS);
+    const all = rawIndex();
+    const prev = all.find((s) => s.id === id);
+    const index = all.filter((s) => s.id !== id);
+    // Preserve a user-set (renamed) title + the pinned flag across auto-saves.
+    index.unshift({
+      id,
+      title: prev?.renamed ? prev.title : (title || "New chat"),
+      ts: Date.now(),
+      count,
+      pinned: prev?.pinned,
+      renamed: prev?.renamed,
+    });
+    const ordered = sortIndex(index);
+    const trimmed = ordered.slice(0, MAX_SESSIONS);
     localStorage.setItem(INDEX_KEY, JSON.stringify(trimmed));
     // Drop blobs that fell out of the index so storage doesn't grow forever.
-    for (const stale of index.slice(MAX_SESSIONS)) localStorage.removeItem(blobKey(stale.id));
+    for (const stale of ordered.slice(MAX_SESSIONS)) localStorage.removeItem(blobKey(stale.id));
   } catch {
     // Ignore quota / serialization errors — chat still works in-memory.
   }
@@ -87,7 +119,29 @@ export function saveChatSession(id: string, title: string, blob: ChatSessionBlob
 export function deleteChatSession(id: string): void {
   try {
     localStorage.removeItem(blobKey(id));
-    const index = loadChatIndex().filter((s) => s.id !== id);
+    const index = rawIndex().filter((s) => s.id !== id);
+    localStorage.setItem(INDEX_KEY, JSON.stringify(index));
+  } catch {
+    // ignore
+  }
+}
+
+// Rename a session and mark it `renamed` so later auto-saves keep the new title.
+export function renameChatSession(id: string, title: string): void {
+  try {
+    const clean = title.trim().slice(0, 80);
+    if (!clean) return;
+    const index = rawIndex().map((s) => (s.id === id ? { ...s, title: clean, renamed: true } : s));
+    localStorage.setItem(INDEX_KEY, JSON.stringify(index));
+  } catch {
+    // ignore
+  }
+}
+
+// Pin / unpin a session (pinned sessions sort to the top of the history list).
+export function pinChatSession(id: string, pinned: boolean): void {
+  try {
+    const index = rawIndex().map((s) => (s.id === id ? { ...s, pinned } : s));
     localStorage.setItem(INDEX_KEY, JSON.stringify(index));
   } catch {
     // ignore

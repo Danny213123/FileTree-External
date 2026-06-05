@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, createContext, useContext } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, createContext, useContext, forwardRef, useImperativeHandle, Fragment } from "react";
 import { type AgentApi, readFileWindow, underPath } from "../lib/agent";
 import { buildMcpRuntime } from "../lib/agents/mcp";
 import {
@@ -19,13 +19,21 @@ import type { AgentEvent } from "../lib/agents";
 import { ALWAYS_APPROVE_TOOLS } from "../lib/agents/runtime";
 import type { AgentDebugEntry, AgentKind, RunStatus, StepStatus, ToolCallView } from "../lib/agents/types";
 import { loadAiSettings, saveAiSettings, loadAiKeys, saveAiKey, keyFor, samplingOptions, type AiSettings, type McpServerConfig } from "../lib/aiSettings";
-import { loadChatSession, saveChatSession, loadChatIndex, deleteChatSession, type ChatSessionBlob, type ChatSessionMeta } from "../lib/chatSessions";
+import { loadChatSession, saveChatSession, loadChatIndex, deleteChatSession, renameChatSession, pinChatSession, type ChatSessionBlob, type ChatSessionMeta } from "../lib/chatSessions";
 import { scanStreamUrl, fetchDupesV2Bounded } from "../api/client";
 import { getCached, setCached } from "../lib/scanCache";
 import { readNdjsonStream } from "../hooks/useScan";
 import type { NodeRecord, ScanResult, ExtensionStat } from "../api/types";
-import { Icon } from "./Icon";
+import { Icon, type IconName } from "./Icon";
 import { Markdown } from "./Markdown";
+
+// Imperative handle the command palette uses to drive the chat (Chat: Stop /
+// Clear / Switch session) from outside the panel.
+export interface ChatPanelController {
+  stop: () => void;
+  clear: () => void;
+  openHistory: () => void;
+}
 
 interface ChatPanelProps {
   getAgentApi: () => AgentApi | null;
@@ -40,6 +48,10 @@ interface ChatPanelProps {
   /** Scan settings used when pre-scanning attached folders for an isolated scope. */
   includeHidden?: boolean;
   threads?: number;
+  /** Populated by the panel so the command palette can drive it (stop/clear/…). */
+  controllerRef?: React.MutableRefObject<ChatPanelController | null>;
+  /** Bumped by the palette's "Chat: Switch session" to open the history view. */
+  openHistoryNonce?: number;
 }
 
 // A reference to past context (a message in this chat or a whole past chat),
@@ -51,6 +63,22 @@ interface RefItem {
   label: string;
   text: string;
 }
+
+// A slash command shown in the composer's "/" menu.
+interface SlashCommand {
+  id: string;
+  label: string;
+  hint: string;
+  icon: IconName;
+  run: () => void;
+}
+
+// One selectable row in either composer popup (mention or slash), used for the
+// shared Arrow/Enter/Tab keyboard navigation.
+type PopupItem =
+  | { kind: "ref"; ref: RefItem }
+  | { kind: "file"; node: NodeRecord }
+  | { kind: "slash"; cmd: SlashCommand };
 
 // Memory tuning: once the running history exceeds SUMMARY_THRESHOLD messages,
 // everything older than the most recent RECENT_WINDOW is folded into a rolling
@@ -116,6 +144,11 @@ interface RunState {
   order: OrderItem[];
   tools: Record<string, ToolState>;
   notices: { level: "info" | "warn" | "error"; text: string }[];
+  // Reasoning timing: when the first thinking delta arrived and the finalized
+  // thinking duration (ms), captured when the answer starts (or the run ends).
+  // Drives the "Thought for Ns" label + auto-collapse on the ThinkingBlock.
+  thinkStart?: number;
+  thinkMs?: number;
 }
 type AttachKind = "path" | "image" | "video";
 interface AttachedView { kind: AttachKind; name: string }
@@ -256,7 +289,7 @@ function buildScopedApi(base: AgentApi, dirs: string[], scans: ScanResult[]): Ag
 // through every intermediate component. Undefined outside a ChatPanel.
 const RevealPathContext = createContext<((path: string) => void) | undefined>(undefined);
 
-export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewSession, onRestoreSession, includeHidden = false, threads }: ChatPanelProps) {
+export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewSession, onRestoreSession, includeHidden = false, threads, controllerRef, openHistoryNonce }: ChatPanelProps) {
   const [ai, setAi] = useState<AiSettings>(() => loadAiSettings());
   const [groups, setGroups] = useState<ModelGroup[]>([]);
   const [modelStatus, setModelStatus] = useState<"unknown" | "ok" | "offline">("unknown");
@@ -274,6 +307,14 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
   // The input value at which the user pressed Escape to dismiss the @-mention
   // popup; the popup re-opens once the input changes again.
   const [mentionDismissed, setMentionDismissed] = useState<string | null>(null);
+  // Same idea for the "/" slash-command popup.
+  const [slashDismissed, setSlashDismissed] = useState<string | null>(null);
+  // Highlighted row in whichever popup (mention or slash) is open, for keyboard
+  // navigation (Arrow Up/Down + Enter/Tab to select).
+  const [activeIdx, setActiveIdx] = useState(0);
+  // True after the user Stops a run, so the last turn can offer a "Continue"
+  // affordance (cleared on the next send / clear / edit).
+  const [justStopped, setJustStopped] = useState(false);
   // Per-message edit-and-resend: the user message currently being edited inline
   // (null = none) plus its working draft.
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -297,6 +338,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
   const panelRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const modelPickerRef = useRef<ModelPickerHandle>(null);
   const dragDepthRef = useRef(0);
   const loadedSessionRef = useRef("");
   const saveTimerRef = useRef<number | null>(null);
@@ -488,9 +530,22 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
       }
       case "thinking":
         queueDelta(ev.runId, "thinking", ev.delta);
+        // Stamp the moment reasoning began (first thinking delta only).
+        setRuns((prev) => {
+          const r = prev[ev.runId];
+          if (!r || r.thinkStart != null) return prev;
+          return { ...prev, [ev.runId]: { ...r, thinkStart: Date.now() } };
+        });
         break;
       case "text":
         queueDelta(ev.runId, "text", ev.delta);
+        // First answer token after some reasoning: freeze the thinking duration
+        // so the ThinkingBlock can relabel to "Thought for Ns" and collapse.
+        setRuns((prev) => {
+          const r = prev[ev.runId];
+          if (!r || r.thinkStart == null || r.thinkMs != null || !ev.delta) return prev;
+          return { ...prev, [ev.runId]: { ...r, thinkMs: Date.now() - r.thinkStart } };
+        });
         break;
       case "text_reset":
         // A final-answer guard rejected the streamed text (e.g. a fabricated
@@ -540,7 +595,14 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
         // notices (retry/force/step-limit/empty-response, guard nudges, …) that
         // were only useful as live activity and otherwise pile up forever. Keep
         // level "error" so genuine failures stay visible after the turn ends.
-        setRuns((prev) => { const r = prev[ev.runId]; return r ? { ...prev, [ev.runId]: { ...r, status: ev.status, text: r.text || ev.summary || "", notices: r.notices.filter((n) => n.level === "error") } } : prev; });
+        setRuns((prev) => {
+          const r = prev[ev.runId];
+          if (!r) return prev;
+          // Finalize thinking duration for tool-only / no-stream-text runs that
+          // never tripped the first-token stamp above.
+          const thinkMs = r.thinkMs ?? (r.thinkStart != null ? Date.now() - r.thinkStart : undefined);
+          return { ...prev, [ev.runId]: { ...r, status: ev.status, text: r.text || ev.summary || "", notices: r.notices.filter((n) => n.level === "error"), thinkMs } };
+        });
         // If a top-level run ended (one tracked directly in the chat list, i.e.
         // the orchestrator) the whole turn is done — sweep any standalone
         // info/warn notice lines from this turn too, keeping errors. Sub-agent
@@ -755,6 +817,8 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     setAttached([]);
     setReferences([]);
     setMentionDismissed(null);
+    setSlashDismissed(null);
+    setJustStopped(false);
     setBusy(true);
     // Fresh turn → require approval again (clears any prior "approve all").
     runAutoApproveRef.current = false;
@@ -937,6 +1001,8 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     abortRef.current?.abort();
     resolveAllApprovals(false);
     setBusy(false);
+    // Mark the turn as user-stopped so the last run can offer "Continue".
+    setJustStopped(true);
   }, [resolveAllApprovals]);
 
   const clear = useCallback(() => {
@@ -950,7 +1016,21 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     setAttached([]);
     setReferences([]);
     setEditingId(null);
+    setJustStopped(false);
   }, [busy]);
+
+  // Expose stop / clear / openHistory to the command palette (App) via the
+  // shared controller ref while this panel is mounted.
+  useEffect(() => {
+    if (!controllerRef) return;
+    controllerRef.current = { stop, clear, openHistory: () => setShowHistory(true) };
+    return () => { controllerRef.current = null; };
+  }, [controllerRef, stop, clear]);
+
+  // Palette "Chat: Switch session" bumps this nonce to open the history view.
+  useEffect(() => {
+    if (openHistoryNonce) setShowHistory(true);
+  }, [openHistoryNonce]);
 
   // Reveal a Windows path (clicked in assistant markdown) in Explorer via the
   // tab's AgentApi facade. Best-effort: ignored if no tab/api is available.
@@ -1035,7 +1115,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     return null;
   }, [provider, modelStatus, apiKey, selectedModel]);
 
-  // ── @-mention popup (reference past messages / chats) ───────
+  // ── @-mention popup (messages / chats / files & folders) ────
   const mentionQuery = useMemo(() => {
     const m = input.match(/(?:^|\s)@([\w.-]*)$/);
     return m ? m[1].toLowerCase() : null;
@@ -1059,7 +1139,41 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     return { thisChat: thisChat.filter(match).reverse().slice(0, 6), past: past.filter(match).slice(0, 6) };
   }, [mentionQuery, items, runs, sessionId]);
 
-  const showMentions = mentionQuery !== null && mentionDismissed !== input && mentions.thisChat.length + mentions.past.length > 0;
+  // Files & folders from the active tab's scan tree, fuzzy-matched on name/path
+  // (Cursor's @file feel). Only computed once at least one char follows the @,
+  // so the popup keeps showing messages/chats on a bare "@".
+  const fileMentions = useMemo<NodeRecord[]>(() => {
+    if (mentionQuery === null || mentionQuery.length < 1) return [];
+    const nodes = getAgentApi()?.getNodes() ?? [];
+    const q = mentionQuery;
+    const scored: { n: NodeRecord; rank: number }[] = [];
+    for (const n of nodes) {
+      if (!n.path || n.id === 0) continue;
+      const name = n.name.toLowerCase();
+      let s = -1;
+      if (name === q) s = 0;
+      else if (name.startsWith(q)) s = 1;
+      else if (name.includes(q)) s = 2;
+      else if (n.path.toLowerCase().includes(q)) s = 3;
+      if (s < 0) continue;
+      // Slight preference for directories (the @file/@folder scope feel).
+      scored.push({ n, rank: s * 10 + (n.dir ? 0 : 1) });
+      if (scored.length > 400) break; // bound work on very large scans
+    }
+    scored.sort((a, b) => a.rank - b.rank || a.n.name.length - b.n.name.length);
+    return scored.slice(0, 8).map((x) => x.n);
+  }, [mentionQuery, getAgentApi]);
+
+  const mentionItems = useMemo<PopupItem[]>(() => {
+    if (mentionQuery === null) return [];
+    return [
+      ...mentions.thisChat.map((ref): PopupItem => ({ kind: "ref", ref })),
+      ...fileMentions.map((node): PopupItem => ({ kind: "file", node })),
+      ...mentions.past.map((ref): PopupItem => ({ kind: "ref", ref })),
+    ];
+  }, [mentionQuery, mentions, fileMentions]);
+
+  const showMentions = mentionQuery !== null && mentionDismissed !== input && mentionItems.length > 0;
 
   const selectMention = useCallback((ref: RefItem) => {
     setInput((prev) => prev.replace(/@[\w.-]*$/, ""));
@@ -1071,7 +1185,98 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
     requestAnimationFrame(() => textareaRef.current?.focus());
   }, []);
 
+  // Selecting a file/folder node adds it as a context chip; addPaths also feeds
+  // directories into the folder-scope set (chips with isDir) so an @folder
+  // scopes the turn like a dragged-in folder.
+  const selectFileNode = useCallback((node: NodeRecord) => {
+    setInput((prev) => prev.replace(/@[\w.-]*$/, ""));
+    addPaths([node.path]);
+    setMentionDismissed(null);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, [addPaths]);
+
+  // ── Slash-command popup (Cursor/Claude-style "/" menu) ──────
+  const slashQuery = useMemo(() => {
+    const m = input.match(/^\/([a-z-]*)$/i);
+    return m ? m[1].toLowerCase() : null;
+  }, [input]);
+
+  // A short, persistent help notice listing the commands + key shortcuts.
+  const showHelp = useCallback(() => {
+    applyEvent({
+      kind: "notice", level: "info",
+      text: "Commands: /new /clear /model /scan /stop /approve-all · @ to add a message, chat, file or folder · Shortcuts: Enter send, Shift+Enter newline, Ctrl+Enter send, Esc stop, ↑ on an empty box edits your last message.",
+    });
+  }, [applyEvent]);
+
+  const slashItems = useMemo<PopupItem[]>(() => {
+    if (slashQuery === null) return [];
+    const cmds: SlashCommand[] = [
+      { id: "new", label: "/new", hint: "Start a new chat", icon: "plus", run: () => onNewSession?.() },
+      { id: "clear", label: "/clear", hint: "Clear this conversation", icon: "trash", run: () => clear() },
+      { id: "model", label: "/model", hint: "Choose the model", icon: "robot", run: () => modelPickerRef.current?.open() },
+      { id: "scan", label: "/scan", hint: "Rescan the current folder", icon: "hdd", run: () => {
+        const api = getAgentApi();
+        if (api) { void api.refresh(); applyEvent({ kind: "notice", level: "info", text: "Rescanning the current folder…" }); }
+        else applyEvent({ kind: "notice", level: "warn", text: "No folder is scanned in the active tab." });
+      } },
+      { id: "stop", label: "/stop", hint: "Stop the current run", icon: "stop-fill", run: () => stop() },
+      { id: "help", label: "/help", hint: "Show commands & shortcuts", icon: "info-circle", run: showHelp },
+      { id: "approve-all", label: "/approve-all", hint: "Auto-approve file actions", icon: "check", run: () => setAutoApprove(true) },
+    ];
+    const q = slashQuery;
+    return cmds.filter((c) => !q || c.id.includes(q)).map((cmd): PopupItem => ({ kind: "slash", cmd }));
+  }, [slashQuery, onNewSession, clear, getAgentApi, stop, applyEvent, showHelp]);
+
+  const showSlash = slashQuery !== null && slashDismissed !== input && slashItems.length > 0;
+
+  const runSlashItem = useCallback((cmd: SlashCommand) => {
+    setInput("");
+    setSlashDismissed(null);
+    cmd.run();
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, []);
+
+  // The currently-open popup's flat item list (slash takes precedence — the two
+  // are mutually exclusive in practice) and a unified selector for keyboard nav.
+  const popupOpen = showSlash || showMentions;
+  const popupItems = showSlash ? slashItems : showMentions ? mentionItems : [];
+  const selectPopupItem = useCallback((item: PopupItem | undefined) => {
+    if (!item) return;
+    if (item.kind === "slash") runSlashItem(item.cmd);
+    else if (item.kind === "file") selectFileNode(item.node);
+    else selectMention(item.ref);
+  }, [runSlashItem, selectFileNode, selectMention]);
+
+  // Reset the highlighted row whenever the active query changes.
+  useEffect(() => { setActiveIdx(0); }, [mentionQuery, slashQuery]);
+  // Keep the highlight in range as the filtered list shrinks/grows.
+  useEffect(() => {
+    setActiveIdx((i) => (popupItems.length === 0 ? 0 : Math.min(i, popupItems.length - 1)));
+  }, [popupItems.length]);
+
   const canSend = (!!input.trim() || attached.length > 0 || references.length > 0) && !!selectedModel;
+
+  // Continue after a user Stop: resume the last intent as a fresh turn (the
+  // partial answer is already in convoRef as context). Distinct from regenerate.
+  const continueAfterStop = useCallback(() => {
+    if (busy) return;
+    setJustStopped(false);
+    void send("Please continue from where you left off.");
+  }, [busy, send]);
+
+  // Context/token meter: a rough ~4-chars/token estimate of the prior
+  // conversation (convoRef) plus the live draft, against the active model's
+  // window. Recomputed as the conversation/draft grows (items/runs/input deps).
+  const ctxWindow = providerCtxTokens(provider, ai.numCtx);
+  const ctxUsed = useMemo(() => {
+    let chars = input.length;
+    for (const m of convoRef.current) chars += (m.content?.length ?? 0) + 16;
+    if (convoSummaryRef.current) chars += convoSummaryRef.current.length;
+    return Math.round(chars / 4);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [input, items, runs]);
+  const ctxPct = Math.min(100, Math.round((ctxUsed / Math.max(1, ctxWindow)) * 100));
 
   return (
     <div
@@ -1178,7 +1383,10 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
               runs={runs}
               isLast={mi === items.length - 1}
               busy={busy}
+              canContinue={justStopped}
               onRegenerate={regenerate}
+              onContinue={continueAfterStop}
+              onFollowup={(t) => send(t)}
               onCopy={copyText}
               onApprove={(c) => resolveApproval(c, true)}
               onReject={(c) => resolveApproval(c, false)}
@@ -1212,28 +1420,57 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
             <button onClick={() => setAutoApprove(false)} title="Require approval again">Turn off</button>
           </div>
         )}
+        {showSlash && (
+          <div className="mention-popup slash-popup" role="listbox">
+            <div className="mention-group-label">Commands</div>
+            {slashItems.map((item, i) => item.kind === "slash" && (
+              <button
+                key={item.cmd.id}
+                type="button"
+                role="option"
+                aria-selected={activeIdx === i}
+                className={`mention-item slash-item${activeIdx === i ? " active" : ""}`}
+                onMouseDown={(e) => { e.preventDefault(); runSlashItem(item.cmd); }}
+                onMouseEnter={() => setActiveIdx(i)}
+              >
+                <Icon name={item.cmd.icon} size={12} />
+                <span className="mention-item-label">{item.cmd.label}</span>
+                <span className="slash-item-hint">{item.cmd.hint}</span>
+              </button>
+            ))}
+          </div>
+        )}
         {showMentions && (
-          <div className="mention-popup">
-            {mentions.thisChat.length > 0 && (
-              <div className="mention-group">
-                <div className="mention-group-label">This chat</div>
-                {mentions.thisChat.map((r) => (
-                  <button key={r.id} type="button" className="mention-item" onMouseDown={(e) => { e.preventDefault(); selectMention(r); }}>
-                    <Icon name="chat" size={12} /><span className="mention-item-label">{r.label}</span>
+          <div className="mention-popup" role="listbox">
+            {mentionItems.map((item, i) => {
+              const showLabel = i === 0 || popupGroupLabel(mentionItems[i - 1]) !== popupGroupLabel(item);
+              return (
+                <Fragment key={popupItemKey(item)}>
+                  {showLabel && <div className="mention-group-label">{popupGroupLabel(item)}</div>}
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={activeIdx === i}
+                    className={`mention-item${activeIdx === i ? " active" : ""}`}
+                    onMouseDown={(e) => { e.preventDefault(); selectPopupItem(item); }}
+                    onMouseEnter={() => setActiveIdx(i)}
+                  >
+                    {item.kind === "file" ? (
+                      <>
+                        <Icon name={item.node.dir ? "folder" : "file-text"} size={12} />
+                        <span className="mention-item-label">{item.node.name}</span>
+                        <span className="mention-item-path">{item.node.path}</span>
+                      </>
+                    ) : item.kind === "ref" ? (
+                      <>
+                        <Icon name={item.ref.kind === "session" ? "clock-history" : "chat"} size={12} />
+                        <span className="mention-item-label">{item.ref.label}</span>
+                      </>
+                    ) : null}
                   </button>
-                ))}
-              </div>
-            )}
-            {mentions.past.length > 0 && (
-              <div className="mention-group">
-                <div className="mention-group-label">Past chats</div>
-                {mentions.past.map((r) => (
-                  <button key={r.id} type="button" className="mention-item" onMouseDown={(e) => { e.preventDefault(); selectMention(r); }}>
-                    <Icon name="clock-history" size={12} /><span className="mention-item-label">{r.label}</span>
-                  </button>
-                ))}
-              </div>
-            )}
+                </Fragment>
+              );
+            })}
           </div>
         )}
         <div className="composer">
@@ -1263,21 +1500,31 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
-              if (showMentions && e.key === "Escape") { e.preventDefault(); setMentionDismissed(input); return; }
-              if (showMentions && e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                const first = mentions.thisChat[0] ?? mentions.past[0];
-                if (first) selectMention(first);
-                return;
+              // Popup navigation (slash or mention) takes priority.
+              if (popupOpen) {
+                if (e.key === "ArrowDown") { e.preventDefault(); setActiveIdx((i) => Math.min(i + 1, popupItems.length - 1)); return; }
+                if (e.key === "ArrowUp") { e.preventDefault(); setActiveIdx((i) => Math.max(i - 1, 0)); return; }
+                if (e.key === "Escape") { e.preventDefault(); if (showSlash) setSlashDismissed(input); else setMentionDismissed(input); return; }
+                if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) { e.preventDefault(); selectPopupItem(popupItems[activeIdx]); return; }
               }
-              if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); }
+              // Esc stops an in-flight run when no popup is open.
+              if (e.key === "Escape" && busy) { e.preventDefault(); stop(); return; }
+              // Up-arrow on an empty composer edits the last user message.
+              if (e.key === "ArrowUp" && !input && !busy) {
+                for (let k = items.length - 1; k >= 0; k--) {
+                  if (items[k].type === "user") { e.preventDefault(); startEdit(items[k].id, (items[k] as { text: string }).text); return; }
+                }
+              }
+              // Ctrl/Cmd+Enter always sends; plain Enter sends unless Shift (newline).
+              if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(input); return; }
+              if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); return; }
             }}
             onPaste={onPaste}
-            placeholder="Ask, instruct, or drop files & images for context…  (Enter to send, @ to reference)"
+            placeholder="Ask, instruct, or drop files for context…  (Enter to send · / for commands · @ for context)"
             rows={1}
           />
           <div className="composer-toolbar">
-            <ModelPicker groups={groups} provider={provider} model={selectedModel} disabled={busy} onPick={pickModel} />
+            <ModelPicker ref={modelPickerRef} groups={groups} provider={provider} model={selectedModel} disabled={busy} onPick={pickModel} />
             <button
               className={`composer-tool${(showKeys || autoApprove) ? " on" : ""}`}
               title="Model settings — API keys & auto-approve"
@@ -1286,6 +1533,7 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
               <Icon name="three-dots" size={15} />
             </button>
             <span className="composer-spacer" />
+            {items.length > 0 && <ContextMeter pct={ctxPct} used={ctxUsed} window={ctxWindow} />}
             <button className="composer-tool" title="Attach images or videos" onClick={() => fileInputRef.current?.click()} disabled={busy}>
               <Icon name="paperclip" size={15} />
             </button>
@@ -1309,8 +1557,34 @@ export function ChatPanel({ getAgentApi, onClose, width = 360, sessionId, onNewS
   );
 }
 
+// Group header for a mention popup row (drives the section labels).
+function popupGroupLabel(item: PopupItem): string {
+  if (item.kind === "file") return "Files & folders";
+  if (item.kind === "ref") return item.ref.kind === "session" ? "Past chats" : "This chat";
+  return "Commands";
+}
+// Stable React key for a mention popup row.
+function popupItemKey(item: PopupItem): string {
+  if (item.kind === "file") return "f:" + item.node.path;
+  if (item.kind === "ref") return "r:" + item.ref.kind + ":" + item.ref.id;
+  return "s:" + item.cmd.id;
+}
+
+// Compact context-window usage meter near the composer: a thin bar + percent,
+// with the rough token estimate in the tooltip. Turns amber as it fills up.
+function ContextMeter({ pct, used, window: windowTokens }: { pct: number; used: number; window: number }) {
+  const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n));
+  const level = pct >= 90 ? " danger" : pct >= 75 ? " warn" : "";
+  return (
+    <div className={`ctx-meter${level}`} title={`Context: ~${fmt(used)} / ${fmt(windowTokens)} tokens (${pct}%)`}>
+      <span className="ctx-meter-bar"><span className="ctx-meter-fill" style={{ width: `${Math.max(2, pct)}%` }} /></span>
+      <span className="ctx-meter-pct">{pct}%</span>
+    </div>
+  );
+}
+
 // ── Run timeline ─────────────────────────────────────────────
-function RunView({ runId, runs, isLast, busy, onRegenerate, onCopy, onApprove, onReject, onApproveAll, onAllowlist }: { runId: string; runs: Record<string, RunState>; isLast?: boolean; busy?: boolean; onRegenerate?: () => void; onCopy?: (text: string) => void; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
+function RunView({ runId, runs, isLast, busy, canContinue, onRegenerate, onContinue, onFollowup, onCopy, onApprove, onReject, onApproveAll, onAllowlist }: { runId: string; runs: Record<string, RunState>; isLast?: boolean; busy?: boolean; canContinue?: boolean; onRegenerate?: () => void; onContinue?: () => void; onFollowup?: (text: string) => void; onCopy?: (text: string) => void; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
   const run = runs[runId];
   const onRevealPath = useContext(RevealPathContext);
   if (!run) return null;
@@ -1319,7 +1593,8 @@ function RunView({ runId, runs, isLast, busy, onRegenerate, onCopy, onApprove, o
 
   const body = (
     <>
-      {run.thinking.trim() && <ThinkingBlock text={run.thinking} open={streaming && !run.text} live={streaming && !run.text} />}
+      {isOrch && <PlanChecklist run={run} runs={runs} />}
+      {run.thinking.trim() && <ThinkingBlock text={run.thinking} open={streaming && !run.text} live={streaming && !run.text} durationMs={run.thinkMs} />}
       <StepList run={run} runs={runs} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />
       {run.text.trim() && (
         <div className="chat-msg-text">
@@ -1328,11 +1603,14 @@ function RunView({ runId, runs, isLast, busy, onRegenerate, onCopy, onApprove, o
         </div>
       )}
       {run.notices.map((n, i) => <NoticeLine key={i} level={n.level} text={n.text} />)}
-      {streaming && <LiveStatus label={currentActivity(run, runs)} />}
+      {streaming && <LiveStatus label={currentActivity(run, runs)} showElapsed />}
     </>
   );
 
   if (isOrch) {
+    // Post-turn follow-up chips: only on the last finished turn with an answer.
+    const showFollowups = !streaming && isLast && !canContinue && run.text.trim() && onFollowup;
+    const followups = showFollowups ? buildFollowups(run, runs) : [];
     return (
       <div className="chat-msg assistant orchestrator">
         <div className="chat-msg-role"><Icon name="robot" size={12} /> Assistant</div>
@@ -1345,12 +1623,44 @@ function RunView({ runId, runs, isLast, busy, onRegenerate, onCopy, onApprove, o
             {isLast && onRegenerate && (
               <button className="chat-msg-action" title="Regenerate response" onClick={onRegenerate} disabled={busy}><Icon name="arrow-repeat" size={12} /></button>
             )}
+            {isLast && canContinue && onContinue && (
+              <button className="chat-msg-action continue" title="Continue from where it stopped" onClick={onContinue} disabled={busy}><Icon name="arrow-repeat" size={12} /> Continue</button>
+            )}
+          </div>
+        )}
+        {followups.length > 0 && onFollowup && (
+          <div className="chat-followups">
+            {followups.map((s) => (
+              <button key={s} type="button" className="chat-followup" onClick={() => onFollowup(s)} disabled={busy}>{s}</button>
+            ))}
           </div>
         )}
       </div>
     );
   }
   return body; // sub-agents render their own card via SubAgentCard
+}
+
+// Contextual next-action chips after a finished turn: a couple of generic
+// follow-ups plus an op-specific one inferred from the tools the turn ran
+// (search → "what's biggest", duplicates → "what can I delete", …). Reuses the
+// empty-state SUGGESTIONS chip styling.
+function buildFollowups(run: RunState, runs: Record<string, RunState>): string[] {
+  const tools = new Set<string>();
+  const collect = (r: RunState) => {
+    for (const o of r.order) {
+      if (o.kind === "tool") { const t = r.tools[o.callId]; if (t) tools.add(t.tool); }
+      else { const c = runs[o.childId]; if (c) collect(c); }
+    }
+  };
+  collect(run);
+  const out: string[] = [];
+  if (tools.has("find_duplicates")) out.push("Which of these can I safely delete?");
+  if (tools.has("list_largest") || tools.has("get_stats") || tools.has("scan_folder") || tools.has("list_by_extension")) out.push("What's taking up the most space?");
+  if (tools.has("read_file") || tools.has("grep")) out.push("Summarize what you found");
+  out.push("Show more detail");
+  if (out.length < 2) out.push("What can I safely delete?");
+  return [...new Set(out)].slice(0, 3);
 }
 
 // Renders a run's ordered timeline: child sub-agents, the Tier-1 plan card for
@@ -1366,6 +1676,87 @@ function StepList({ run, runs, onApprove, onReject, onApproveAll, onAllowlist }:
       })}
     </>
   );
+}
+
+type ChecklistState = "pending" | "running" | "done" | "error" | "rejected";
+interface ChecklistRow { key: string; label: string; icon: IconName; state: ChecklistState }
+
+// Map a tool's StepStatus to a checklist state (rejected = user-skipped).
+function stepState(status: StepStatus): ChecklistState {
+  return status === "done" ? "done" : status === "error" ? "error" : status === "rejected" ? "rejected" : status === "pending" ? "pending" : "running";
+}
+
+// Derive a Claude-Code-style step list from the orchestrator's run.order: one
+// row per child delegation (Search/Action agent) and per significant tool, each
+// carrying a live state. delegate_to_search has no ToolState (it's represented
+// by its child card), so only real tools + children appear. No agent-loop change.
+function buildChecklist(run: RunState, runs: Record<string, RunState>): ChecklistRow[] {
+  const rows: ChecklistRow[] = [];
+  for (const o of run.order) {
+    if (o.kind === "child") {
+      const c = runs[o.childId];
+      const isSearch = c?.agent === "search";
+      rows.push({
+        key: o.childId,
+        label: isSearch ? "Search agent" : "Action agent",
+        icon: isSearch ? "search" : "folder-open",
+        state: !c ? "pending" : c.status === "running" ? "running" : c.status === "error" ? "error" : "done",
+      });
+    } else {
+      const t = run.tools[o.callId];
+      if (!t) continue;
+      rows.push({
+        key: o.callId,
+        label: t.tool === "delegate_to_action" ? "Apply proposed changes" : toolCardTitle(t),
+        icon: toolCardIcon(t.tool),
+        state: stepState(t.status),
+      });
+    }
+  }
+  return rows;
+}
+
+// Live, collapsible "Steps" checklist rendered near the top of an orchestrator
+// turn. A lightweight summary of the timeline; the detailed cards remain below.
+function PlanChecklist({ run, runs }: { run: RunState; runs: Record<string, RunState> }) {
+  const [open, setOpen] = useState(true);
+  const rows = useMemo(() => buildChecklist(run, runs), [run, runs]);
+  // Only worth showing when there's a real plan: a delegation, or 2+ steps.
+  const hasChild = run.order.some((o) => o.kind === "child");
+  if (!rows.length || (rows.length < 2 && !hasChild)) return null;
+  const done = rows.filter((r) => r.state === "done").length;
+  return (
+    <div className="plan-checklist">
+      <div className="plan-checklist-head" onClick={() => setOpen((v) => !v)}>
+        <Icon name="list-task" size={12} />
+        <span className="plan-checklist-title">Steps</span>
+        <span className="plan-checklist-count">{done}/{rows.length}</span>
+        <span className="spacer" />
+        <Icon name={open ? "chevron-down" : "chevron-right"} size={11} />
+      </div>
+      {open && (
+        <ol className="plan-checklist-body">
+          {rows.map((r) => (
+            <li key={r.key} className={`plan-step ${r.state}`}>
+              <StepStateIcon state={r.state} />
+              <Icon name={r.icon} size={12} className="plan-step-glyph" />
+              <span className="plan-step-label">{r.label}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+// State glyph for a checklist row: dim circle (pending), spinner (running),
+// check (done), x (error), or a muted dash (user-skipped).
+function StepStateIcon({ state }: { state: ChecklistState }) {
+  if (state === "running") return <span className="ai-spinner plan-step-icon" aria-hidden />;
+  if (state === "done") return <span className="plan-step-icon ok"><Icon name="check" size={11} /></span>;
+  if (state === "error") return <span className="plan-step-icon err"><Icon name="x" size={11} /></span>;
+  if (state === "rejected") return <span className="plan-step-icon rej"><Icon name="x" size={10} /></span>;
+  return <span className="plan-step-icon pending" aria-hidden />;
 }
 
 function SubAgentCard({ runId, runs, onApprove, onReject, onApproveAll, onAllowlist }: { runId: string; runs: Record<string, RunState>; onApprove: (c: string) => void; onReject: (c: string) => void; onApproveAll: (c: string) => void; onAllowlist: (c: string, tool: string) => void }) {
@@ -1390,11 +1781,11 @@ function SubAgentCard({ runId, runs, onApprove, onReject, onApproveAll, onAllowl
       {!collapsed && (
         <div className="subagent-body">
           {run.task && <div className="subagent-task">{String(run.task)}</div>}
-          {run.thinking.trim() && <ThinkingBlock text={run.thinking} open={streaming && !run.text} live={streaming && !run.text} />}
+          {run.thinking.trim() && <ThinkingBlock text={run.thinking} open={streaming && !run.text} live={streaming && !run.text} durationMs={run.thinkMs} />}
           <StepList run={run} runs={runs} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />
           {run.text.trim() && <div className="subagent-summary"><Markdown text={run.text} onPathClick={onRevealPath} />{streaming && <span className="chat-cursor">{"\u258B"}</span>}</div>}
           {run.notices.map((n, i) => <NoticeLine key={i} level={n.level} text={n.text} />)}
-          {streaming && <LiveStatus label={currentActivity(run, runs)} />}
+          {streaming && <LiveStatus label={currentActivity(run, runs)} showElapsed />}
         </div>
       )}
     </div>
@@ -1469,7 +1860,7 @@ function PlanCard({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { to
       {pending && (
         <div className="approval-card-actions">
           <button className="agent-btn-approve" onClick={() => onApprove(tool.callId)}>Approve plan</button>
-          <button className="agent-btn-reject" onClick={() => onReject(tool.callId)}>Skip</button>
+          <button className="agent-btn-reject" onClick={() => onReject(tool.callId)}>Reject</button>
           <span className="approval-actions-spacer" />
           <AllowMenu callId={tool.callId} tool="delegate_to_action" label="Always allow action plans" onAllowlist={onAllowlist} onApproveAll={onApproveAll} />
         </div>
@@ -1484,18 +1875,41 @@ function ToolStep({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { to
   // approval (git/web/side-effecting MCP) — render as the richer Tier-2 card so
   // the user actually gets Approve/Skip buttons.
   if (tool.mutating || tool.requiresApproval) return <ActionCard tool={tool} onApprove={onApprove} onReject={onReject} onApproveAll={onApproveAll} onAllowlist={onAllowlist} />;
-  // Read-only search steps stay as a compact one-liner.
+  // Read-only search steps render as an expandable rich card (Cursor/Claude
+  // style): a per-tool icon + human title + compact args hint + status dot in the
+  // collapsed header, with the full args and any result output in the body.
   const argLine = compactArgs(tool);
   const dotClass = tool.status === "error" ? "err" : tool.status === "rejected" ? "rej" : tool.status === "done" ? "ok" : tool.status === "pending" ? "wait" : "run";
+  const argEntries = toolArgEntries(tool.args);
   return (
-    <div className={`tool-step ${tool.status}`}>
-      <div className="tool-step-head">
+    <details className={`tool-step tool-card ${tool.status}`}>
+      <summary className="tool-step-head">
         <span className={`tool-dot ${dotClass}`} />
-        <span className="tool-name">{tool.tool}</span>
+        <Icon name={toolCardIcon(tool.tool)} size={12} className="tool-card-icon" />
+        <span className="tool-card-title">{toolCardTitle(tool)}</span>
         {argLine && <span className="tool-args">{argLine}</span>}
-        {tool.summary && <span className={`tool-summary ${tool.status === "error" ? "err" : ""}`}>{tool.summary}</span>}
+        <span className="tool-card-meta">
+          {tool.summary && <span className={`tool-summary ${tool.status === "error" ? "err" : ""}`}>{tool.summary}</span>}
+          <Icon name="chevron-right" size={11} className="tool-card-caret" />
+        </span>
+      </summary>
+      <div className="tool-step-detail">
+        {argEntries.length > 0 ? (
+          <div className="tool-card-args">
+            {argEntries.map(([k, v]) => (
+              <div className="tool-card-arg-row" key={k}>
+                <span className="tool-card-arg-key">{k}</span>
+                <span className="tool-card-arg-val">{v}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="tool-card-summary-full">No arguments.</div>
+        )}
+        {tool.summary && !tool.output && <div className="tool-card-summary-full">Result: {tool.summary}</div>}
+        {tool.output && <pre className="tool-card-output">{tool.output}</pre>}
       </div>
-    </div>
+    </details>
   );
 }
 
@@ -1531,27 +1945,41 @@ function ActionCard({ tool, onApprove, onReject, onApproveAll, onAllowlist }: { 
         {newName && <div className="approval-meta">New name: <code>{newName}</code></div>}
         {isEdit && <DiffPreview tool={tool} />}
         {paths.length > 0 && !isEdit && (
-          <ul className="agent-card-paths">
-            {paths.slice(0, 10).map((p, i) => <li key={i} title={p}>{p}</li>)}
-            {paths.length > 10 && <li>…and {paths.length - 10} more</li>}
-          </ul>
+          <div className="approval-paths">
+            <div className="approval-paths-label">{paths.length === 1 ? "Affected path" : `Affected paths (${paths.length})`}</div>
+            <ul className="agent-card-paths">
+              {paths.slice(0, 10).map((p, i) => <li key={i} title={p}>{p}</li>)}
+              {paths.length > 10 && <li>…and {paths.length - 10} more</li>}
+            </ul>
+          </div>
         )}
         {tool.output && <pre className="approval-output">{tool.output}</pre>}
       </div>
       {pending && (
         <div className="approval-card-actions">
-          <button className="agent-btn-approve" onClick={() => onApprove(tool.callId)}>Approve</button>
-          <button className="agent-btn-reject" onClick={() => onReject(tool.callId)}>Skip</button>
+          <button className="agent-btn-approve" onClick={() => onApprove(tool.callId)} title="Run this action once">Allow once</button>
+          <button className="agent-btn-reject" onClick={() => onReject(tool.callId)} title="Don't run this action">Reject</button>
           {canAllow && (
             <>
               <span className="approval-actions-spacer" />
-              <AllowMenu callId={tool.callId} tool={tool.tool} label={`Always allow ${tool.tool}`} onAllowlist={onAllowlist} onApproveAll={onApproveAll} />
+              <AllowMenu callId={tool.callId} tool={tool.tool} label={`Always allow ${actionVerb(tool.tool)}`} onAllowlist={onAllowlist} onApproveAll={onApproveAll} />
             </>
           )}
         </div>
       )}
     </div>
   );
+}
+
+// Short, friendly verb for a tool used in "Always allow <verb>" menu labels.
+function actionVerb(tool: string): string {
+  const map: Record<string, string> = {
+    move_items: "moving items", recycle_items: "recycling items", rename_item: "renaming",
+    create_folder: "creating folders", write_file: "writing files", edit_file: "editing files",
+    delegate_to_action: "action plans", git_status: "git status", git_diff: "git diff",
+    git_log: "git log", web_fetch: "web fetches", web_search: "web searches",
+  };
+  return map[tool] ?? tool.replace(/^mcp__/, "").replace(/__/g, " · ");
 }
 
 // Best-effort coercion of a delegate task into display text.
@@ -1618,25 +2046,32 @@ function humanizeCommand(tool: ToolState): string {
 // shows the (bounded) new content being created/overwritten.
 function DiffPreview({ tool }: { tool: ToolState }) {
   const clip = (s: string, n = 1200) => (s.length > n ? s.slice(0, n) + "\n… (truncated)" : s);
+  const path = String(tool.args.path ?? "");
   if (tool.tool === "edit_file") {
-    const oldStr = String(tool.args.old_string ?? "");
-    const newStr = String(tool.args.new_string ?? "");
+    const oldLines = clip(String(tool.args.old_string ?? "")).split("\n");
+    const newLines = clip(String(tool.args.new_string ?? "")).split("\n");
     return (
       <div className="approval-diff">
-        <div className="approval-diff-path"><code>{String(tool.args.path ?? "")}</code></div>
+        <div className="approval-diff-head">
+          <code className="approval-diff-path">{path}</code>
+          <span className="approval-diff-stat"><span className="del">-{oldLines.length}</span> <span className="add">+{newLines.length}</span></span>
+        </div>
         <pre className="approval-diff-block">
-          {clip(oldStr).split("\n").map((l, i) => <div key={"o" + i} className="diff-line del">- {l}</div>)}
-          {clip(newStr).split("\n").map((l, i) => <div key={"n" + i} className="diff-line add">+ {l}</div>)}
+          {oldLines.map((l, i) => <div key={"o" + i} className="diff-line del">- {l}</div>)}
+          {newLines.map((l, i) => <div key={"n" + i} className="diff-line add">+ {l}</div>)}
         </pre>
       </div>
     );
   }
-  const content = String(tool.args.content ?? "");
+  const contentLines = clip(String(tool.args.content ?? "")).split("\n");
   return (
     <div className="approval-diff">
-      <div className="approval-diff-path"><code>{String(tool.args.path ?? "")}</code> · new content</div>
+      <div className="approval-diff-head">
+        <code className="approval-diff-path">{path}</code>
+        <span className="approval-diff-stat new">new file · <span className="add">+{contentLines.length}</span></span>
+      </div>
       <pre className="approval-diff-block">
-        {clip(content).split("\n").map((l, i) => <div key={"n" + i} className="diff-line add">+ {l}</div>)}
+        {contentLines.map((l, i) => <div key={"n" + i} className="diff-line add">+ {l}</div>)}
       </pre>
     </div>
   );
@@ -1655,13 +2090,95 @@ function compactArgs(tool: ToolState): string {
   }
 }
 
-function ThinkingBlock({ text, open, live }: { text: string; open: boolean; live?: boolean }) {
+// Per-tool glyph for the rich read-only tool card and the plan checklist rows,
+// following the inlined-Bootstrap icon set in Icon.tsx.
+function toolCardIcon(tool: string): IconName {
+  switch (tool) {
+    case "list_dir": return "folder";
+    case "list_largest": return "bar-chart";
+    case "find":
+    case "grep": return "search";
+    case "read_file": return "file-text";
+    case "scan_folder": return "hdd";
+    case "find_duplicates": return "duplicates";
+    case "reveal": return "explorer";
+    case "list_by_extension": return "list-ul";
+    case "get_stats": return "bar-chart";
+    case "remember": return "bookmark";
+    case "delegate_to_action": return "folder-open";
+    case "delegate_to_search": return "search";
+    case "run_command": return "terminal";
+    case "write_file":
+    case "edit_file":
+    case "rename_item": return "pencil-square";
+    case "recycle_items": return "trash";
+    case "move_items": return "folder-open";
+    case "create_folder": return "folder-plus";
+    case "web_fetch":
+    case "web_search": return "search";
+    default: return "tools";
+  }
+}
+
+// Human-readable, past-tense title for a read-only tool card, derived from the
+// tool name + its args (e.g. list_dir → "Listed Downloads", find → 'Searched
+// for "report"'). Falls back to a humanized MCP name or the raw tool name.
+function toolCardTitle(tool: ToolState): string {
+  const a = tool.args;
+  const s = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : "");
+  switch (tool.tool) {
+    case "list_dir": { const p = s(a.path); return p ? `Listed ${basename(p)}` : "Listed folder"; }
+    case "list_largest": return a.files_only ? "Found largest files" : "Found largest items";
+    case "find": {
+      const q = s(a.query); if (q) return `Searched for "${q}"`;
+      const g = s(a.glob); if (g) return `Searched for ${g}`;
+      const d = s(a.dir); return d ? `Searched ${basename(d)}` : "Searched files";
+    }
+    case "grep": { const q = s(a.query); return q ? `Searched contents for "${q}"` : "Searched file contents"; }
+    case "read_file": { const p = s(a.path); return p ? `Read ${basename(p)}` : "Read file"; }
+    case "scan_folder": { const p = s(a.path); return p ? `Scanned ${basename(p)}` : "Scanned folder"; }
+    case "find_duplicates": return a.min_size_mb ? `Found duplicates ≥ ${a.min_size_mb} MB` : "Found duplicate files";
+    case "reveal": { const p = s(a.path); return p ? `Revealed ${basename(p)}` : "Revealed in Explorer"; }
+    case "list_by_extension": return "Grouped files by type";
+    case "get_stats": return "Read folder stats";
+    case "remember": return "Noted a detail";
+    default: return tool.tool.startsWith("mcp__") ? tool.tool.replace(/^mcp__/, "").replace(/__/g, " · ") : tool.tool;
+  }
+}
+
+// Flatten a tool's args into [key, value] rows for the expandable card body,
+// dropping empties and bounding very long values so the body stays compact.
+function toolArgEntries(args: Record<string, unknown>): [string, string][] {
+  const out: [string, string][] = [];
+  for (const [k, v] of Object.entries(args)) {
+    if (v === undefined || v === null || v === "") continue;
+    let val = typeof v === "string" ? v : (() => { try { return JSON.stringify(v); } catch { return String(v); } })();
+    if (val.length > 400) val = val.slice(0, 400) + "…";
+    out.push([k, val]);
+  }
+  return out;
+}
+
+function ThinkingBlock({ text, open, live, durationMs }: { text: string; open: boolean; live?: boolean; durationMs?: number }) {
+  // While reasoning is live, label "Thinking…"; once the answer begins (or the
+  // run ends) relabel to "Thought for Ns" and let the parent collapse it.
+  const label = !live && durationMs != null && durationMs >= 500 ? `Thought for ${formatThoughtDuration(durationMs)}` : "Thinking";
   return (
     <details className="thinking" open={open}>
-      <summary>Thinking{live && <Dots />}</summary>
+      <summary>{label}{live && <Dots />}</summary>
       <div className="thinking-body">{text}</div>
     </details>
   );
+}
+
+// Compact human duration for the reasoning summary: seconds up to a minute,
+// then "Nm Ns". Rounds to the nearest second (floor at 1s).
+function formatThoughtDuration(ms: number): string {
+  const total = Math.max(1, Math.round(ms / 1000));
+  if (total < 60) return `${total}s`;
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return s ? `${m}m ${s}s` : `${m}m`;
 }
 
 // Describes, in plain language, what an agent is doing right now — surfaced as
@@ -1675,7 +2192,7 @@ function currentActivity(run: RunState, runs: Record<string, RunState>): string 
     } else {
       const t = run.tools[o.callId];
       if (t?.status === "pending") return "Waiting for your approval";
-      if (t?.status === "running") return `Running ${t.tool}`;
+      if (t?.status === "running") return runningActivity(t);
     }
   }
   if (run.text.trim()) return "Writing response";
@@ -1683,11 +2200,58 @@ function currentActivity(run: RunState, runs: Record<string, RunState>): string 
   return "Thinking";
 }
 
-function LiveStatus({ label }: { label: string }) {
+// Path-specific present-tense phrase for a tool that is currently running, used
+// by the live status line (e.g. "Searching E:\Downloads", "Reading config.json")
+// instead of a bare "Running list_dir". Directory targets show the full path;
+// file targets show the basename. The elapsed timer is appended by LiveStatus.
+function runningActivity(tool: ToolState): string {
+  const a = tool.args;
+  const s = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : "");
+  switch (tool.tool) {
+    case "list_dir": { const p = s(a.path); return p ? `Listing ${basename(p)}` : "Listing folder"; }
+    case "list_largest": return a.files_only ? "Finding largest files" : "Finding largest items";
+    case "find": {
+      const q = s(a.query); if (q) return `Searching for "${q}"`;
+      const g = s(a.glob); if (g) return `Searching for ${g}`;
+      const d = s(a.dir); return d ? `Searching ${d}` : "Searching files";
+    }
+    case "grep": { const q = s(a.query); return q ? `Searching contents for "${q}"` : "Searching file contents"; }
+    case "read_file": { const p = s(a.path); return p ? `Reading ${basename(p)}` : "Reading file"; }
+    case "scan_folder": { const p = s(a.path); return p ? `Scanning ${p}` : "Scanning folder"; }
+    case "find_duplicates": return "Finding duplicate files";
+    case "reveal": { const p = s(a.path); return p ? `Revealing ${basename(p)}` : "Revealing in Explorer"; }
+    case "list_by_extension": return "Grouping files by type";
+    case "get_stats": return "Reading folder stats";
+    case "run_command": { const c = s(a.command); return c ? `Running ${c.split(/\s+/)[0]}` : "Running command"; }
+    case "write_file":
+    case "edit_file": { const p = s(a.path); return p ? `Editing ${basename(p)}` : "Editing file"; }
+    case "move_items": return "Moving items";
+    case "recycle_items": return "Recycling items";
+    case "rename_item": return "Renaming item";
+    case "create_folder": return "Creating folder";
+    case "web_fetch": return "Fetching web page";
+    case "web_search": { const q = s(a.query); return q ? `Searching the web for "${q}"` : "Searching the web"; }
+    default: return tool.tool.startsWith("mcp__") ? `Running ${tool.tool.replace(/^mcp__/, "").replace(/__/g, " · ")}` : `Running ${tool.tool}`;
+  }
+}
+
+function LiveStatus({ label, showElapsed }: { label: string; showElapsed?: boolean }) {
+  // Elapsed timer for the active run/step: counts seconds since `label` last
+  // changed (each new activity resets it). The 1s interval is torn down on
+  // unmount and re-armed whenever the activity changes — so it never leaks.
+  const [secs, setSecs] = useState(0);
+  useEffect(() => {
+    if (!showElapsed) return;
+    setSecs(0);
+    const start = Date.now();
+    const id = window.setInterval(() => setSecs(Math.floor((Date.now() - start) / 1000)), 1000);
+    return () => window.clearInterval(id);
+  }, [label, showElapsed]);
   return (
     <div className="agent-live">
       <span className="ai-spinner" aria-hidden />
-      <span>{label}</span>
+      <span className="agent-live-label" title={label}>{label}</span>
+      {showElapsed && secs > 0 && <span className="agent-live-elapsed">({secs}s)</span>}
       <Dots />
     </div>
   );
@@ -1715,12 +2279,31 @@ function HistoryView({ sessionId, onOpen, onNew, onClose }: {
 }) {
   const [q, setQ] = useState("");
   const [list, setList] = useState<ChatSessionMeta[]>(() => loadChatIndex());
+  // Inline rename: the session being edited + its working title draft.
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
   const needle = q.trim().toLowerCase();
   const filtered = needle ? list.filter((s) => (s.title || "").toLowerCase().includes(needle)) : list;
+  const refresh = () => setList(loadChatIndex());
   const remove = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
     deleteChatSession(id);
-    setList(loadChatIndex());
+    refresh();
+  };
+  const togglePin = (e: React.MouseEvent, s: ChatSessionMeta) => {
+    e.stopPropagation();
+    pinChatSession(s.id, !s.pinned);
+    refresh();
+  };
+  const beginRename = (e: React.MouseEvent, s: ChatSessionMeta) => {
+    e.stopPropagation();
+    setRenamingId(s.id);
+    setDraft(s.title || "");
+  };
+  const commitRename = (id: string) => {
+    if (draft.trim()) renameChatSession(id, draft);
+    setRenamingId(null);
+    refresh();
   };
   return (
     <div className="chat-history">
@@ -1738,22 +2321,47 @@ function HistoryView({ sessionId, onOpen, onNew, onClose }: {
         {filtered.length === 0 && (
           <div className="chat-history-empty">{needle ? "No chats match your search." : "No saved chats yet."}</div>
         )}
-        {filtered.map((s) => (
-          <div
-            key={s.id}
-            className={`chat-history-item${s.id === sessionId ? " active" : ""}`}
-            onClick={() => onOpen(s.id)}
-            title={s.title}
-          >
-            <Icon name="chat" size={13} />
-            <div className="chat-history-item-main">
-              <span className="chat-history-item-title">{s.title || "New chat"}</span>
-              <span className="chat-history-item-meta">{relativeTime(s.ts)} · {s.count} msg{s.count === 1 ? "" : "s"}</span>
+        {filtered.map((s) => {
+          const renaming = renamingId === s.id;
+          return (
+            <div
+              key={s.id}
+              className={`chat-history-item${s.id === sessionId ? " active" : ""}${s.pinned ? " pinned" : ""}`}
+              onClick={() => { if (!renaming) onOpen(s.id); }}
+              title={s.title}
+            >
+              <Icon name={s.pinned ? "star-fill" : "chat"} size={13} />
+              <div className="chat-history-item-main">
+                {renaming ? (
+                  <input
+                    className="chat-history-rename"
+                    value={draft}
+                    autoFocus
+                    spellCheck={false}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onBlur={() => commitRename(s.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") { e.preventDefault(); commitRename(s.id); }
+                      else if (e.key === "Escape") { e.preventDefault(); setRenamingId(null); }
+                    }}
+                  />
+                ) : (
+                  <span className="chat-history-item-title">{s.title || "New chat"}</span>
+                )}
+                <span className="chat-history-item-meta">{relativeTime(s.ts)} · {s.count} msg{s.count === 1 ? "" : "s"}</span>
+              </div>
+              {s.id === sessionId && !renaming && <span className="chat-history-current">current</span>}
+              {!renaming && (
+                <div className="chat-history-actions">
+                  <button className="chat-history-act" title={s.pinned ? "Unpin" : "Pin to top"} onClick={(e) => togglePin(e, s)}><Icon name={s.pinned ? "star-fill" : "star"} size={12} /></button>
+                  <button className="chat-history-act" title="Rename" onClick={(e) => beginRename(e, s)}><Icon name="pencil-square" size={12} /></button>
+                  <button className="chat-history-act del" title="Delete chat" onClick={(e) => remove(e, s.id)}><Icon name="trash" size={12} /></button>
+                </div>
+              )}
             </div>
-            {s.id === sessionId && <span className="chat-history-current">current</span>}
-            <button className="chat-history-del" title="Delete chat" onClick={(e) => remove(e, s.id)}><Icon name="trash" size={12} /></button>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -1835,18 +2443,22 @@ function relativeTime(ts: number): string {
   return `${Math.round(d / 7)}w ago`;
 }
 
+// Imperative handle so the composer's "/model" slash command can pop the menu.
+export interface ModelPickerHandle { open: () => void }
+
 // Custom, fully-themed model dropdown. Replaces a native <select> so the closed
 // control hugs its label (no far-away arrow) and the open menu always uses the
 // app's dark theme instead of the OS-drawn list.
-function ModelPicker({ groups, provider, model, disabled, onPick }: {
+const ModelPicker = forwardRef<ModelPickerHandle, {
   groups: ModelGroup[];
   provider: LlmProvider;
   model: string;
   disabled?: boolean;
   onPick: (provider: LlmProvider, model: string) => void;
-}) {
+}>(function ModelPicker({ groups, provider, model, disabled, onPick }, handleRef) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  useImperativeHandle(handleRef, () => ({ open: () => setOpen(true) }), []);
 
   useEffect(() => {
     if (!open) return;
@@ -1900,7 +2512,7 @@ function ModelPicker({ groups, provider, model, disabled, onPick }: {
       )}
     </div>
   );
-}
+});
 
 function SettingsMenu({ ai, autoApprove, onChange, onToggleAuto, onRemoveAllow, onChangeRules, onChangeMcp, onClose }: {
   ai: AiSettings;

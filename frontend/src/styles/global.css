@@ -2477,6 +2477,11 @@ input:focus, select:focus {
   --hover: rgba(255,255,255,0.05);
   --bar: rgba(76,166,240,0.22);
   --bar-2: rgba(86,196,90,0.18);
+  /* highlight.js token palette (VS Code Dark+ style) */
+  --hl-comment: #6a9955; --hl-keyword: #569cd6; --hl-string: #ce9178;
+  --hl-number: #b5cea8; --hl-title: #dcdcaa; --hl-type: #4ec9b0;
+  --hl-attr: #9cdcfe; --hl-built: #4ec9b0; --hl-meta: #c586c0;
+  --hl-tag: #569cd6; --hl-name: #569cd6; --hl-deletion: #e05c4c; --hl-addition: #56c45a;
 
   /* ── VS Code workbench (dark theme chrome) ── */
   --vsc-titlebar-bg: #181818;
@@ -4464,6 +4469,52 @@ a.md-path { font-family: var(--vsc-mono); font-size: .92em; }
 .md-path:focus-visible { outline: 1px solid var(--vsc-focus); outline-offset: 1px; border-radius: 2px; }
 code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 
+/* GFM tables (assistant output) */
+.md-table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 12px; display: block; overflow-x: auto; }
+.md-table th, .md-table td { border: 1px solid var(--vsc-border); padding: 4px 8px; text-align: left; vertical-align: top; }
+.md-table th { background: var(--bg-4); color: var(--text); font-weight: 600; }
+.md-table td { color: var(--text-2); }
+.md-table tr:nth-child(even) td { background: var(--bg-3); }
+
+/* GFM task lists (checkbox bullets) */
+.md-tasklist { list-style: none; padding-left: 4px; }
+.md-task { display: flex; align-items: flex-start; gap: 7px; }
+.md-task input[type="checkbox"] { margin: 3px 0 0; flex: 0 0 auto; accent-color: var(--accent); }
+
+/* ── Fenced code block: language bar + Copy + highlight.js theme ── */
+.md-codeblock { margin: 8px 0; border: 1px solid var(--vsc-border); border-radius: 6px; overflow: hidden; background: var(--bg-4); }
+.md-codeblock-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 6px 3px 10px; background: var(--bg-3); border-bottom: 1px solid var(--vsc-border); }
+.md-codeblock-lang { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted-2); font-weight: 600; }
+.md-codeblock-copy { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 7px; font-size: 10.5px; background: transparent; border: 1px solid transparent; border-radius: 4px; color: var(--text-4); cursor: pointer; }
+.md-codeblock-copy:hover { background: var(--vsc-list-hover); color: var(--text); }
+.md-codeblock-copy .bi { flex: 0 0 auto; }
+.md-codeblock .md-pre { margin: 0; border: 0; border-radius: 0; background: transparent; }
+
+/* highlight.js token theme — theme-aware via CSS vars (VS Code-style palette).
+   Defaults are the light values; the dark overrides live in the dark block. */
+:root {
+  --hl-comment: #008000; --hl-keyword: #0000ff; --hl-string: #a31515;
+  --hl-number: #098658; --hl-title: #795e26; --hl-type: #267f99;
+  --hl-attr: #001080; --hl-built: #267f99; --hl-meta: #808000;
+  --hl-tag: #800000; --hl-name: #800000; --hl-deletion: #b3261e; --hl-addition: #107c10;
+}
+.hljs { color: var(--text); background: transparent; }
+.hljs-comment, .hljs-quote { color: var(--hl-comment); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-doctag { color: var(--hl-keyword); }
+.hljs-string, .hljs-regexp, .hljs-meta .hljs-string { color: var(--hl-string); }
+.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-link { color: var(--hl-number); }
+.hljs-title, .hljs-title.function_, .hljs-function .hljs-title { color: var(--hl-title); }
+.hljs-type, .hljs-class .hljs-title, .hljs-title.class_, .hljs-built_in { color: var(--hl-type); }
+.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable, .hljs-property, .hljs-params { color: var(--hl-attr); }
+.hljs-built_in, .hljs-builtin-name { color: var(--hl-built); }
+.hljs-meta, .hljs-meta .hljs-keyword { color: var(--hl-meta); }
+.hljs-tag { color: var(--text-2); }
+.hljs-name, .hljs-selector-id, .hljs-selector-class { color: var(--hl-name); }
+.hljs-deletion { color: var(--hl-deletion); }
+.hljs-addition { color: var(--hl-addition); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }
+
 /* ── Live activity indicators ─────────────────────────────────── */
 @keyframes ai-spin { to { transform: rotate(360deg); } }
 .ai-spinner {
@@ -4502,12 +4553,16 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 .chatpanel .subagent-badge,
 .chatpanel .tool-step,
 .chatpanel .tool-step-actions button,
+.chatpanel .plan-checklist,
+.chatpanel .tool-card-output,
 .chatpanel .agent-card,
 .chatpanel .agent-card-actions button,
 .chatpanel .thinking,
 .chatpanel .chat-notice,
 .chatpanel .md-code,
 .chatpanel .md-pre,
+.chatpanel .md-codeblock,
+.chatpanel .md-codeblock-copy,
 .chatpanel .model-picker-btn,
 .chatpanel .model-picker-menu,
 .chatpanel .model-picker-item,
@@ -4546,6 +4601,52 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 .tool-step-detail code { font-family: var(--vsc-mono); color: var(--text-2); }
 .tool-step-actions { display: flex; gap: 8px; margin-top: 7px; }
 .tool-step-actions button { height: 24px; font-size: 11px; padding: 0 12px; border-radius: 4px; }
+
+/* ── Expandable read-only tool cards (Cursor/Claude style) ───── */
+.tool-card { padding: 0; }
+.tool-card > summary { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 5px 8px; cursor: pointer; list-style: none; }
+.tool-card > summary::-webkit-details-marker { display: none; }
+.tool-card > summary:hover { background: var(--vsc-list-hover); }
+.tool-card-icon { color: var(--text-4); flex: 0 0 auto; }
+.tool-card-title { color: var(--text); font-weight: 500; }
+.tool-card-meta { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.tool-card-meta .tool-summary { margin-left: 0; }
+.tool-card-caret { color: var(--text-4); flex: 0 0 auto; transition: transform .15s ease; }
+.tool-card[open] > summary .tool-card-caret { transform: rotate(90deg); }
+.tool-card .tool-step-detail { margin-top: 0; border-top: 1px solid var(--vsc-border); padding: 7px 9px; display: flex; flex-direction: column; gap: 6px; }
+.tool-card-args { display: flex; flex-direction: column; gap: 3px; }
+.tool-card-arg-row { display: flex; gap: 8px; align-items: baseline; }
+.tool-card-arg-key { flex: 0 0 auto; min-width: 54px; color: var(--muted-2); font-family: var(--vsc-mono); font-size: 11px; }
+.tool-card-arg-val { color: var(--text-2); font-family: var(--vsc-mono); font-size: 11px; word-break: break-all; }
+.tool-card-summary-full { font-size: 11.5px; color: var(--text-3); }
+.tool-card-output { margin: 0; max-height: 220px; overflow: auto; background: var(--bg-4); border: 1px solid var(--vsc-border); border-radius: 5px; padding: 6px 8px; font-family: var(--vsc-mono); font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: var(--text-2); }
+
+/* ── Live plan / steps checklist (orchestrator turn) ─────────── */
+.plan-checklist { border: 1px solid var(--vsc-border); border-radius: 6px; background: var(--bg-3); overflow: hidden; align-self: stretch; }
+.plan-checklist-head { display: flex; align-items: center; gap: 6px; padding: 6px 9px; font-size: 12px; cursor: pointer; user-select: none; color: var(--text); }
+.plan-checklist-head .spacer { flex: 1; }
+.plan-checklist-head > .bi:first-child { color: var(--accent); flex: 0 0 auto; }
+.plan-checklist-head > .bi:last-child { color: var(--text-4); flex: 0 0 auto; }
+.plan-checklist-title { font-weight: 600; }
+.plan-checklist-count { font-size: 10px; color: var(--muted-2); font-variant-numeric: tabular-nums; }
+.plan-checklist-body { list-style: none; margin: 0; padding: 2px 9px 8px; display: flex; flex-direction: column; gap: 5px; }
+.plan-step { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-2); }
+.plan-step.pending { color: var(--muted-2); }
+.plan-step.rejected .plan-step-label { color: var(--muted-2); text-decoration: line-through; }
+.plan-step.error .plan-step-label { color: var(--danger); }
+.plan-step-glyph { color: var(--text-4); flex: 0 0 auto; }
+.plan-step-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plan-step-icon { width: 14px; height: 14px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; }
+.plan-step-icon.ok { color: var(--accent-2); }
+.plan-step-icon.err { color: var(--danger); }
+.plan-step-icon.rej { color: var(--muted-2); }
+.plan-step-icon.pending { width: 10px; height: 10px; margin: 0 2px; border: 1.5px solid var(--muted-2); border-radius: 50%; opacity: .55; }
+.ai-spinner.plan-step-icon { width: 12px; height: 12px; border-width: 1.5px; }
+
+/* Path-specific live status: ellipsize the target, keep the elapsed timer. */
+.agent-live { min-width: 0; }
+.agent-live-label { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-live-elapsed { flex: 0 0 auto; color: var(--muted-2); font-variant-numeric: tabular-nums; }
 
 .thinking { font-size: 11px; border: 1px dashed var(--vsc-border); border-radius: 5px; background: var(--bg-2); padding: 2px 8px; }
 .thinking > summary { cursor: pointer; color: var(--muted); padding: 3px 0; list-style: none; font-style: italic; }
@@ -4641,11 +4742,51 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 .mention-group + .mention-group { margin-top: 2px; border-top: 1px solid var(--vsc-border); padding-top: 2px; }
 .mention-group-label { padding: 6px 8px 3px; font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted-2); }
 .mention-item { display: flex; align-items: center; gap: 7px; width: 100%; padding: 6px 8px; background: transparent; border: 0; border-radius: 5px; color: var(--text-2); font-size: 12px; text-align: left; cursor: pointer; }
-.mention-item:hover { background: var(--vsc-list-hover); color: var(--text); }
+.mention-item:hover, .mention-item.active { background: var(--vsc-list-hover); color: var(--text); }
+.mention-item.active { box-shadow: inset 2px 0 0 var(--accent); }
 .mention-item .bi { color: var(--text-4); flex: 0 0 auto; }
-.mention-item-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mention-item-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; }
+/* File/folder mention rows: name + a dimmed, ellipsized full path. */
+.mention-item-path { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; font-family: var(--vsc-mono); font-size: 10.5px; color: var(--muted-2); }
+/* Slash-command rows: command + a right-aligned hint. */
+.slash-item .mention-item-label { font-family: var(--vsc-mono); color: var(--text); flex: 0 0 auto; }
+.slash-item-hint { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; font-size: 11px; color: var(--muted-2); }
 .composer-chip.ref { background: rgba(0,120,212,0.10); border-color: rgba(0,120,212,0.35); color: var(--text-2); }
 .composer-chip.ref .bi { color: var(--accent); }
+
+/* ── Context/token usage meter (composer toolbar) ────────────── */
+.ctx-meter { display: inline-flex; align-items: center; gap: 5px; padding: 0 4px; cursor: default; flex: 0 0 auto; }
+.ctx-meter-bar { width: 34px; height: 4px; border-radius: 3px; background: var(--bg-5); overflow: hidden; }
+.ctx-meter-fill { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .25s ease; }
+.ctx-meter-pct { font-size: 10px; color: var(--muted-2); font-variant-numeric: tabular-nums; }
+.ctx-meter.warn .ctx-meter-fill { background: var(--warn); }
+.ctx-meter.warn .ctx-meter-pct { color: var(--warn); }
+.ctx-meter.danger .ctx-meter-fill { background: var(--danger); }
+.ctx-meter.danger .ctx-meter-pct { color: var(--danger); }
+
+/* ── Post-turn follow-up chips + Continue affordance ─────────── */
+.chat-followups { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 2px; }
+.chat-followup { display: inline-flex; align-items: center; height: auto; padding: 4px 10px; font-size: 11.5px; background: var(--surface); border: 1px solid var(--vsc-border); border-radius: 12px; color: var(--text-2); text-align: left; cursor: pointer; }
+.chat-followup:hover:not(:disabled) { background: var(--vsc-list-hover); border-color: var(--vsc-focus); color: var(--text); }
+.chat-followup:disabled { opacity: .5; cursor: default; }
+.chat-msg-action.continue { width: auto; gap: 4px; padding: 0 8px; font-size: 11px; color: var(--accent); }
+.chat-msg-action.continue:hover:not(:disabled) { color: var(--accent); background: var(--vsc-list-hover); }
+
+/* ── Affected-paths block + write/edit diff (approval cards) ─── */
+.approval-paths { display: flex; flex-direction: column; gap: 3px; }
+.approval-paths-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted-2); }
+.approval-diff { display: flex; flex-direction: column; gap: 4px; }
+.approval-diff-head { display: flex; align-items: center; gap: 8px; }
+.approval-diff-path { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--vsc-mono); font-size: 11px; color: var(--text-2); }
+.approval-diff-stat { flex: 0 0 auto; font-size: 10.5px; font-family: var(--vsc-mono); color: var(--muted-2); }
+.approval-diff-stat .del { color: var(--danger); }
+.approval-diff-stat .add { color: var(--accent-2); }
+.approval-diff-block { margin: 0; max-height: 220px; overflow: auto; background: var(--bg-4); border: 1px solid var(--vsc-border); border-radius: 5px; padding: 6px 8px; font-family: var(--vsc-mono); font-size: 11px; line-height: 1.5; }
+.diff-line { white-space: pre-wrap; word-break: break-word; }
+.diff-line.del { color: var(--danger); background: rgba(196,43,28,0.10); }
+.diff-line.add { color: var(--accent-2); background: rgba(16,124,16,0.10); }
+[data-theme="dark"] .diff-line.del { background: rgba(224,92,76,0.12); }
+[data-theme="dark"] .diff-line.add { background: rgba(86,196,90,0.12); }
 
 /* ── VS Code scrollbars ────────────────────────────────────── */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
@@ -5126,5 +5267,11 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
   .xfer-panel,
   .tag-popover {
     animation: none !important;
+  }
+  /* New chat motion: the tool-card disclosure caret rotates on expand, and the
+     context-usage meter bar animates its width as the conversation grows. */
+  .tool-card-caret,
+  .ctx-meter-fill {
+    transition: none !important;
   }
 }

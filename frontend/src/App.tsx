@@ -46,6 +46,9 @@ import { LazyView } from "./components/LazyView";
 // wrapped in <LazyView> (Suspense + error boundary). Named exports are mapped to
 // the default export shape React.lazy expects.
 const ChatPanel = lazy(() => import("./components/ChatPanel").then((m) => ({ default: m.ChatPanel })));
+// Type-only import (erased at build, so it doesn't pull ChatPanel into the main
+// bundle) for the command-palette → chat controller handle.
+import type { ChatPanelController } from "./components/ChatPanel";
 const TerminalPanel = lazy(() => import("./components/TerminalPanel").then((m) => ({ default: m.TerminalPanel })));
 const ReportsView = lazy(() => import("./components/ReportsView").then((m) => ({ default: m.ReportsView })));
 const DuplicatesResults = lazy(() => import("./components/DuplicatesResults").then((m) => ({ default: m.DuplicatesResults })));
@@ -209,6 +212,10 @@ export default function App() {
   const [chatOpen, setChatOpen] = useState(false);
   const [chatWidth, setChatWidth] = useState(360);
   const [chatSessionId, setChatSessionId] = useState<string>(() => newChatSessionId());
+  // Lets the command palette drive the chat (Stop / Clear) while it's mounted,
+  // plus a nonce the palette bumps to pop the session-history view.
+  const chatControllerRef = useRef<ChatPanelController | null>(null);
+  const [chatHistoryReq, setChatHistoryReq] = useState(0);
   // Right-side inspector: Preview and Details panes (independently toggleable).
   const [previewOpen, setPreviewOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -1315,13 +1322,17 @@ export default function App() {
       { id: "save-smart-folder", title: "Save Smart Folder\u2026", keywords: "search filter", run: () => { void handleSaveSmartFolder(); } },
       { id: "sidebar", title: "Toggle Side Bar", hint: "Ctrl+B", keywords: "panel", run: () => handleToggleSidebar() },
       { id: "assistant", title: "Toggle AI Assistant", hint: "Ctrl+Alt+B", keywords: "chat", run: () => handleToggleChat() },
+      { id: "chat-new", title: "Chat: New Session", keywords: "ai assistant conversation start", run: () => handleNewAgentSession() },
+      { id: "chat-stop", title: "Chat: Stop", keywords: "ai assistant cancel abort generation", run: () => { setChatOpen(true); chatControllerRef.current?.stop(); } },
+      { id: "chat-clear", title: "Chat: Clear", keywords: "ai assistant reset empty", run: () => { setChatOpen(true); chatControllerRef.current?.clear(); } },
+      { id: "chat-switch", title: "Chat: Switch Session\u2026", keywords: "ai assistant history sessions open", run: () => { setChatOpen(true); setChatHistoryReq((n) => n + 1); } },
       { id: "low-space", title: "Toggle Low-space Alerts", keywords: "disk monitor", run: () => setLowSpaceAlerts((v) => !v) },
       ...views.map((v) => ({
         id: `view:${v.id}`, title: `Go to ${v.label}`, hint: "View", keywords: "switch open",
         run: () => handleSelectView(v.id),
       })),
     ];
-  }, [getActiveRef, handleToggleTerminal, handleUndo, handleSaveSmartFolder, handleToggleSidebar, handleToggleChat, handleSelectView]);
+  }, [getActiveRef, handleToggleTerminal, handleUndo, handleSaveSmartFolder, handleToggleSidebar, handleToggleChat, handleSelectView, handleNewAgentSession]);
 
   return (
     <div className="vscode">
@@ -1555,6 +1566,8 @@ export default function App() {
                 onClose={() => setChatOpen(false)}
                 onNewSession={handleNewAgentSession}
                 onRestoreSession={handleRestoreSession}
+                controllerRef={chatControllerRef}
+                openHistoryNonce={chatHistoryReq}
               />
             </LazyView>
           </>

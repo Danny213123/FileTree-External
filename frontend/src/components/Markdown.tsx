@@ -1,10 +1,16 @@
-import { Fragment, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { Icon } from "./Icon";
+import type { HighlightResult } from "../lib/highlight";
 
-// Minimal, dependency-free Markdown renderer for assistant output. It builds
-// React nodes directly (never dangerouslySetInnerHTML), so model text can never
-// inject markup. Covers the subset LLMs actually emit: headings, **bold**,
-// *italic*, `inline code`, fenced ``` code blocks, links, blockquotes, and
-// ordered / unordered lists.
+// Minimal Markdown renderer for assistant output. It builds React nodes directly
+// so model text can never inject markup. Covers the subset LLMs actually emit:
+// headings, **bold**, *italic*, `inline code`, fenced ``` code blocks (with
+// lazy syntax highlighting + a Copy button), links, blockquotes, GFM tables,
+// task-list checkboxes, and ordered / unordered lists.
+//
+// The ONE place markup is injected is the highlighted fenced-code body, which
+// uses dangerouslySetInnerHTML on highlight.js output — safe because hljs always
+// HTML-escapes the source text and only adds its own <span class="hljs-…"> tags.
 export interface MarkdownProps {
   text: string;
   // When provided, absolute Windows paths (in plain text or a `code` span) are
@@ -35,6 +41,11 @@ const RE_HEAD = /^(#{1,6})\s+(.*)$/;
 const RE_QUOTE = /^>\s?/;
 const RE_UL = /^\s*[-*+]\s+/;
 const RE_OL = /^\s*\d+[.)]\s+/;
+// A GFM table delimiter row: pipe-separated runs of dashes with optional `:`
+// alignment markers, e.g. `| :--- | :---: | ---: |`.
+const RE_TABLE_DELIM = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/;
+// A task-list item marker at the start of a list item: `[ ]`, `[x]`, or `[X]`.
+const RE_TASK = /^\[([ xX])\]\s+(.*)$/;
 
 function isStructural(line: string): boolean {
   return RE_FENCE.test(line) || RE_HEAD.test(line) || RE_QUOTE.test(line) || RE_UL.test(line) || RE_OL.test(line);
@@ -49,14 +60,41 @@ function renderBlocks(src: string, opts: InlineOpts = {}): ReactNode[] {
   while (i < lines.length) {
     const line = lines[i];
 
-    // Fenced code block
+    // Fenced code block → highlighted card with a language label + Copy button.
     const fence = line.match(/^```(\w*)\s*$/);
     if (fence) {
       const buf: string[] = [];
       i++;
       while (i < lines.length && !/^```\s*$/.test(lines[i])) { buf.push(lines[i]); i++; }
       i++; // consume closing fence (if present)
-      out.push(<pre key={key++} className="md-pre"><code>{buf.join("\n")}</code></pre>);
+      out.push(<CodeBlock key={key++} code={buf.join("\n")} lang={fence[1]} />);
+      continue;
+    }
+
+    // GFM table: a header row of `| a | b |` immediately followed by a
+    // `| --- | --- |` delimiter row. Parsed defensively; anything that doesn't
+    // match the delimiter shape falls through to normal paragraph handling.
+    if (line.includes("|") && i + 1 < lines.length && RE_TABLE_DELIM.test(lines[i + 1])) {
+      const header = splitTableRow(line);
+      const aligns = splitTableRow(lines[i + 1]).map(cellAlign);
+      i += 2;
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
+        rows.push(splitTableRow(lines[i]));
+        i++;
+      }
+      out.push(
+        <table key={key++} className="md-table">
+          <thead>
+            <tr>{header.map((c, j) => <th key={j} style={alignStyle(aligns[j])}>{renderInline(c, opts)}</th>)}</tr>
+          </thead>
+          <tbody>
+            {rows.map((r, ri) => (
+              <tr key={ri}>{header.map((_, ci) => <td key={ci} style={alignStyle(aligns[ci])}>{renderInline(r[ci] ?? "", opts)}</td>)}</tr>
+            ))}
+          </tbody>
+        </table>,
+      );
       continue;
     }
 
@@ -77,11 +115,27 @@ function renderBlocks(src: string, opts: InlineOpts = {}): ReactNode[] {
       continue;
     }
 
-    // Unordered list
+    // Unordered list (with GFM task-list checkbox support)
     if (RE_UL.test(line)) {
       const items: string[] = [];
       while (i < lines.length && RE_UL.test(lines[i])) { items.push(lines[i].replace(RE_UL, "")); i++; }
-      out.push(<ul key={key++} className="md-ul">{items.map((it, j) => <li key={j}>{renderInline(it, opts)}</li>)}</ul>);
+      const isTaskList = items.some((it) => RE_TASK.test(it));
+      out.push(
+        <ul key={key++} className={isTaskList ? "md-ul md-tasklist" : "md-ul"}>
+          {items.map((it, j) => {
+            const task = it.match(RE_TASK);
+            if (task) {
+              return (
+                <li key={j} className="md-task">
+                  <input type="checkbox" checked={task[1] !== " "} disabled readOnly />
+                  <span>{renderInline(task[2], opts)}</span>
+                </li>
+              );
+            }
+            return <li key={j}>{renderInline(it, opts)}</li>;
+          })}
+        </ul>,
+      );
       continue;
     }
 
@@ -216,4 +270,94 @@ function pushText(text: string, push: (n: ReactNode) => void): void {
     if (idx > 0) push(<br />);
     if (p) push(p);
   });
+}
+
+// ── Fenced code block ────────────────────────────────────────
+// A header bar (language label + Copy button) over a <pre>. Highlighting is
+// applied lazily: the block renders as plain text immediately, then swaps in
+// highlight.js token markup once the (code-split) highlighter chunk loads — so
+// an unknown/unsupported language or a load failure simply stays plain.
+function CodeBlock({ code, lang }: { code: string; lang: string }) {
+  const [hl, setHl] = useState<HighlightResult | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setHl(null);
+    if (!code.trim()) return;
+    void import("../lib/highlight")
+      .then((m) => { if (!cancelled) setHl(m.highlightCode(code, lang)); })
+      .catch(() => { /* highlighting is best-effort; plain text already shown */ });
+    return () => { cancelled = true; };
+  }, [code, lang]);
+
+  const copy = useCallback(() => {
+    if (!navigator.clipboard) return;
+    navigator.clipboard.writeText(code).then(() => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    }).catch(() => {});
+  }, [code]);
+
+  return (
+    <div className="md-codeblock">
+      <div className="md-codeblock-bar">
+        <span className="md-codeblock-lang">{displayLang(lang, hl?.language)}</span>
+        <button type="button" className="md-codeblock-copy" onClick={copy} title="Copy code">
+          <Icon name={copied ? "check" : "duplicates"} size={11} />
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <pre className="md-pre">
+        {hl
+          ? <code className="hljs" dangerouslySetInnerHTML={{ __html: hl.html }} />
+          : <code>{code}</code>}
+      </pre>
+    </div>
+  );
+}
+
+// Friendly label for a fence language token (falls back to the resolved
+// highlight.js language, then the raw token, then "Code").
+const LANG_LABELS: Record<string, string> = {
+  bash: "Bash", sh: "Bash", shell: "Bash", zsh: "Bash", console: "Bash",
+  json: "JSON", js: "JavaScript", javascript: "JavaScript", jsx: "JavaScript",
+  ts: "TypeScript", typescript: "TypeScript", tsx: "TSX",
+  python: "Python", py: "Python", rust: "Rust", rs: "Rust",
+  powershell: "PowerShell", ps1: "PowerShell", pwsh: "PowerShell", ps: "PowerShell",
+  diff: "Diff", patch: "Diff", html: "HTML", xml: "XML", css: "CSS",
+  plaintext: "Text", text: "Text", txt: "Text",
+};
+function displayLang(raw: string, resolved?: string): string {
+  const r = (raw || "").toLowerCase().trim();
+  if (LANG_LABELS[r]) return LANG_LABELS[r];
+  if (r) return r;
+  if (resolved && LANG_LABELS[resolved]) return LANG_LABELS[resolved];
+  return "Code";
+}
+
+// ── GFM table helpers ────────────────────────────────────────
+// Split a `| a | b |` row into trimmed cell strings, dropping the empty edges
+// produced by leading / trailing pipes. A `\|` escapes a literal pipe.
+function splitTableRow(line: string): string[] {
+  const cells = line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split(/(?<!\\)\|/)
+    .map((c) => c.replace(/\\\|/g, "|").trim());
+  return cells;
+}
+
+type CellAlign = "left" | "center" | "right" | "";
+function cellAlign(delim: string): CellAlign {
+  const left = delim.startsWith(":");
+  const right = delim.endsWith(":");
+  if (left && right) return "center";
+  if (right) return "right";
+  if (left) return "left";
+  return "";
+}
+function alignStyle(align: CellAlign): CSSProperties | undefined {
+  return align ? { textAlign: align } : undefined;
 }
