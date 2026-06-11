@@ -303,6 +303,13 @@ export default function App() {
     return tab?.ref.current ?? null;
   }, [tabs, groups, focusedGroupId]);
 
+  // Live mirror of getActiveRef so mount-once IPC effects (externalDrop) can read
+  // the current active pane without taking getActiveRef as a dependency (which
+  // changes identity on every tab/group/focus change and would re-register the
+  // listener, stacking duplicates).
+  const getActiveRefRef = useRef(getActiveRef);
+  useEffect(() => { getActiveRefRef.current = getActiveRef; }, [getActiveRef]);
+
   // Keep the workbench store pointed at the focused pane: republish synchronously
   // (before paint) whenever the focused-tab identity changes (focus switch, tab
   // open / close / move), so the shared side bar / status bar reflect the new
@@ -728,13 +735,14 @@ export default function App() {
 
   useEffect(() => {
     type ElectronAPI = {
-      onExternalDrop?: (cb: (paths: string[]) => void) => void;
+      onExternalDrop?: (cb: (paths: string[]) => void) => void | (() => void);
       getPathForFile?: (file: File) => string;
     };
     const eAPI = (window as unknown as { electronAPI?: ElectronAPI }).electronAPI;
-    if (eAPI?.onExternalDrop) {
-      eAPI.onExternalDrop((paths) => paths.forEach((p) => handleOpenInNewTab(p)));
-    }
+    // Real Explorer drag-in still flows through externalDrop. Capture the
+    // unsubscribe so cleanup removes exactly this listener — keeping the count at
+    // 1 even under StrictMode double-mount.
+    const unsubExternalDrop = eAPI?.onExternalDrop?.((paths) => paths.forEach((p) => handleOpenInNewTab(p)));
     const pathForFile = (file: File) => {
       try {
         return eAPI?.getPathForFile?.(file) || (file as unknown as { path?: string }).path || "";
@@ -760,7 +768,7 @@ export default function App() {
       const folderRow = el?.closest<HTMLElement>('.row[data-node-dir="1"]');
       const destFolder = folderRow?.dataset.nodePath;
       if (destFolder) {
-        void getActiveRef()?.dropExternalInto(paths, destFolder);
+        void getActiveRefRef.current()?.dropExternalInto(paths, destFolder);
         return;
       }
       paths.forEach((p) => handleOpenInNewTab(p));
@@ -770,8 +778,9 @@ export default function App() {
     return () => {
       window.removeEventListener("dragover", onDragOver);
       window.removeEventListener("drop", onDrop);
+      unsubExternalDrop?.();
     };
-  }, [handleOpenInNewTab, getActiveRef]);
+  }, [handleOpenInNewTab]);
 
   useEffect(() => {
     type ElectronAPI = {
@@ -782,10 +791,11 @@ export default function App() {
       if (action === "rename") getActiveRef()?.doRenamePath(message);
       else if (action === "delete") getActiveRef()?.doDeletePaths([message]);
       else if (action === "refresh") getActiveRef()?.doScan();
+      else if (action === "open-new-tab") handleOpenInNewTab(message);
       else if (action === "error") toast.error(message);
     });
     return typeof cleanup === "function" ? cleanup : undefined;
-  }, [getActiveRef]);
+  }, [getActiveRef, handleOpenInNewTab]);
 
   // Phase 6 in-app undo: reverse the most recent reversible file op (move back,
   // rename back, restore from the Recycle Bin) and toast the outcome in the

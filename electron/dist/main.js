@@ -335,7 +335,10 @@ function handleFileTreeContextAction(win, filePath, action) {
             }
             break;
         case "open-new-tab":
-            win?.webContents.send("externalDrop", [filePath]);
+            // Route through the contextMenuAction channel (same path as rename/delete/
+            // refresh) instead of externalDrop, which is reserved for real Explorer
+            // drag-in. The renderer's onContextMenuAction handler opens exactly one tab.
+            win?.webContents.send("contextMenuAction", "open-new-tab", filePath);
             break;
         case "show-in-explorer":
             electron_1.shell.showItemInFolder(filePath);
@@ -358,7 +361,7 @@ function showFallbackContextMenu(win, filePath, x, y) {
         return false;
     } })();
     const fileTreeSubmenu = [
-        { label: "Open in new tab", enabled: isDir, click: () => win?.webContents.send("externalDrop", [filePath]) },
+        { label: "Open in new tab", enabled: isDir, click: () => win?.webContents.send("contextMenuAction", "open-new-tab", filePath) },
         { label: "Show in Explorer", click: () => electron_1.shell.showItemInFolder(filePath) },
         { type: "separator" },
         { label: "Copy full path", click: () => electron_1.clipboard.writeText(filePath) },

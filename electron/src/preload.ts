@@ -88,17 +88,26 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("readFileBase64", filePath),
 
   // Register a callback for folders dropped onto the window from Explorer.
+  // Returns an unsubscribe fn (mirrors onContextMenuAction) so the renderer can
+  // remove exactly this listener and avoid stacking duplicates.
   onExternalDrop: (cb: (paths: string[]) => void) => {
-    ipcRenderer.on("externalDrop", (_evt, paths: string[]) => cb(paths));
+    const listener = (_evt: Electron.IpcRendererEvent, paths: string[]) => cb(paths);
+    ipcRenderer.on("externalDrop", listener);
+    return () => ipcRenderer.removeListener("externalDrop", listener);
   },
 
   // During a native drag, main process polls cursor position and sends updates.
   // Use this to track where the user is hovering so tab bar can react.
+  // Both return an unsubscribe fn so the tab bar can clean up on re-render.
   onNativeDragMove: (cb: (x: number, y: number, path: string) => void) => {
-    ipcRenderer.on("nativeDragMove", (_evt, x: number, y: number, path: string) => cb(x, y, path));
+    const listener = (_evt: Electron.IpcRendererEvent, x: number, y: number, path: string) => cb(x, y, path);
+    ipcRenderer.on("nativeDragMove", listener);
+    return () => ipcRenderer.removeListener("nativeDragMove", listener);
   },
   onNativeDragEnd: (cb: () => void) => {
-    ipcRenderer.on("nativeDragEnd", (_evt) => cb());
+    const listener = (_evt: Electron.IpcRendererEvent) => cb();
+    ipcRenderer.on("nativeDragEnd", listener);
+    return () => ipcRenderer.removeListener("nativeDragEnd", listener);
   },
 
   // A native drag-out ended with the pointer back over a FileTree window. The

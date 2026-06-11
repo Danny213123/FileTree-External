@@ -45,13 +45,13 @@ export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, on
   // Listen for native drag move/end events from Electron main process.
   useEffect(() => {
     type EAPI = {
-      onNativeDragMove?: (cb: (x: number, y: number, path: string) => void) => void;
-      onNativeDragEnd?: (cb: () => void) => void;
+      onNativeDragMove?: (cb: (x: number, y: number, path: string) => void) => void | (() => void);
+      onNativeDragEnd?: (cb: () => void) => void | (() => void);
     };
     const eAPI = (window as unknown as { electronAPI?: EAPI }).electronAPI;
     if (!eAPI?.onNativeDragMove) return;
 
-    eAPI.onNativeDragMove((cx, cy, dragPath) => {
+    const unsubMove = eAPI.onNativeDragMove((cx, cy, dragPath) => {
       const bar = barRef.current;
       if (!bar) return;
       const rect = bar.getBoundingClientRect();
@@ -72,7 +72,7 @@ export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, on
       setFolderInsertIdx(insertIdx);
     });
 
-    eAPI.onNativeDragEnd?.(() => {
+    const unsubEnd = eAPI.onNativeDragEnd?.(() => {
       const path = nativeDragPathRef.current;
       const idx = folderInsertIdx;
       nativeDragPathRef.current = null;
@@ -82,6 +82,13 @@ export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, on
         onFolderDrop(path, beforeTab?.id);
       }
     });
+
+    // Remove exactly these listeners on each re-run / unmount so they don't
+    // stack on every `tabs` change (multiplied across split panes).
+    return () => {
+      unsubMove?.();
+      unsubEnd?.();
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabs, onFolderDrop]);
 

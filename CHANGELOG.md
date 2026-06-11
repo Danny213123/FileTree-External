@@ -4,6 +4,15 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.8.1] - 2026-06-10
+
+### Fixed
+
+- **Right-click "Open in new tab" opening many tabs at once**: after switching, opening, or closing tabs, the context-menu action could spawn multiple tabs at once because of leaked/duplicated `externalDrop` IPC listeners. The context-menu action now uses the dedicated action channel and its IPC listeners are properly unsubscribed.
+- **Related IPC listener leaks**: native drag listeners (`drag-move`/`drag-end`) and tab-bar drag listeners that accumulated on tab changes are now cleaned up.
+
+---
+
 ## [1.8.0] - 2026-06-04
 
 ### Added
