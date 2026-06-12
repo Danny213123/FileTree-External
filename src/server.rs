@@ -135,7 +135,10 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
         let base = std::env::var("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
-        base.join("FileTree").join("hash_cache.json")
+        // `_v2`: the content-hash algorithm changed (FNV-1a -> FxHash-style), so
+        // a new filename cleanly retires any v1 cache rather than mixing
+        // incompatible hashes (which would cause false non-matches).
+        base.join("FileTree").join("hash_cache_v2.json")
     };
     // Load the persistent hash cache. `should_compact` is set when the on-disk
     // file accumulated incremental-append duplicate rows (or was capped); rewrite
@@ -3937,6 +3940,19 @@ fn deflate_store_zlib(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Cap on simultaneous thumbnail generations across all connections. Each miss
+/// spawns a Shell/STA worker thread; without a ceiling, a burst of misses could
+/// spawn dozens at once and starve the box. Small enough to stay responsive,
+/// large enough to keep the cache filling under normal hover/scroll loads.
+const THUMBNAIL_MAX_CONCURRENT: usize = 4;
+
+/// Process-wide thumbnail-generation semaphore (lazily initialized). Returns the
+/// `Arc` by reference so `acquire(self: &Arc<Self>)` can be called directly.
+fn thumbnail_gate() -> &'static Arc<ConnLimiter> {
+    static GATE: OnceLock<Arc<ConnLimiter>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(ConnLimiter::new(THUMBNAIL_MAX_CONCURRENT)))
+}
+
 fn serve_thumbnail(stream: &mut TcpStream, path: &str, state: &AppState) -> sio::Result<()> {
     // Server-side thumbnail cache cap. Generating a thumbnail round-trips through
     // the (slow) Windows Shell API on a dedicated COM/STA thread, so we keep the
@@ -3993,6 +4009,12 @@ fn serve_thumbnail(stream: &mut TcpStream, path: &str, state: &AppState) -> sio:
         // Server connection threads are plain OS threads with no pump, so we
         // spawn a dedicated thread, join it, and return the PNG bytes (or 404).
         // The cache lock is NOT held across this slow call.
+        //
+        // Bound concurrent generations with a global gate so a flood of cache
+        // misses (e.g. fast-scrolling a folder of fresh images) can't spawn an
+        // unbounded number of simultaneous Shell/STA threads and saturate the
+        // machine. Held only for the duration of the generation (RAII release).
+        let _thumb_permit = thumbnail_gate().acquire();
         let path_owned = path.to_string();
         let png = std::thread::spawn(move || {
             #[cfg(windows)]

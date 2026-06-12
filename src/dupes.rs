@@ -48,40 +48,102 @@ pub(crate) struct DupeGroupV2 {
     pub(crate) waste: u64,             // size * (count - 1)
 }
 
-// ── FNV-1a file hash ────────────────────────────────────────────────────────
+// ── Fast content hash (FxHash-style, 8 bytes/step) ───────────────────────────
+//
+// Replaces the old byte-serial FNV-1a with a multiply-rotate hash that consumes
+// 8 bytes per step (~8× fewer multiplies), so full-file hashing of large dupe
+// candidates is markedly faster. Not cryptographic — exact mode still does a
+// byte-wise confirm — but the 64-bit space makes accidental collisions
+// astronomically rare, matching the previous behavior.
+//
+// Determinism note: `FastHasher` carries leftover (<8) bytes between `write`
+// calls so the 8-byte word boundaries are fixed to absolute byte offsets,
+// independent of how `File::read` chops the stream. Identical content therefore
+// always yields the same hash regardless of read chunking.
 
 const SAMPLE_BYTES: usize = 256 * 1024;
 
-fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
-    for byte in bytes {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(0x100000001b3);
+/// Multiplier from the FxHash/SeaHash family (a large odd constant with good
+/// avalanche behavior).
+const HASH_K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+struct FastHasher {
+    hash: u64,
+    carry: [u8; 8],
+    carry_len: usize,
+}
+
+impl FastHasher {
+    fn new(seed: u64) -> Self {
+        FastHasher { hash: seed ^ 0xcbf2_9ce4_8422_2325, carry: [0u8; 8], carry_len: 0 }
+    }
+
+    #[inline]
+    fn add_word(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(HASH_K);
+    }
+
+    fn write(&mut self, mut bytes: &[u8]) {
+        // Top up a pending partial word first.
+        if self.carry_len > 0 {
+            let need = 8 - self.carry_len;
+            let take = need.min(bytes.len());
+            self.carry[self.carry_len..self.carry_len + take].copy_from_slice(&bytes[..take]);
+            self.carry_len += take;
+            bytes = &bytes[take..];
+            if self.carry_len == 8 {
+                let w = u64::from_le_bytes(self.carry);
+                self.add_word(w);
+                self.carry_len = 0;
+            }
+        }
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let w = u64::from_le_bytes(c.try_into().unwrap());
+            self.add_word(w);
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            self.carry[..rem.len()].copy_from_slice(rem);
+            self.carry_len = rem.len();
+        }
+    }
+
+    fn finish(mut self) -> u64 {
+        if self.carry_len > 0 {
+            for b in self.carry.iter_mut().skip(self.carry_len) {
+                *b = 0;
+            }
+            let w = u64::from_le_bytes(self.carry);
+            self.add_word(w);
+        }
+        // Final mix.
+        let mut h = self.hash;
+        h ^= h >> 32;
+        h = h.wrapping_mul(HASH_K);
+        h ^= h >> 29;
+        h
     }
 }
 
-fn fnv1a_update_u64(hash: &mut u64, value: u64) {
-    fnv1a_update(hash, &value.to_le_bytes());
-}
-
-pub(crate) fn fnv1a_file(path: &Path) -> io::Result<u64> {
+pub(crate) fn content_hash_file(path: &Path) -> io::Result<u64> {
     let mut file = File::open(path)?;
     let mut buffer = [0u8; 1024 * 1024];
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hasher = FastHasher::new(0);
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
-        fnv1a_update(&mut hash, &buffer[..read]);
+        hasher.write(&buffer[..read]);
     }
-    Ok(hash)
+    Ok(hasher.finish())
 }
 
-fn fnv1a_file_sample(path: &Path, size: u64) -> io::Result<u64> {
+fn content_hash_file_sample(path: &Path, size: u64) -> io::Result<u64> {
     let mut file = File::open(path)?;
     let mut buffer = [0u8; SAMPLE_BYTES];
-    let mut hash = 0xcbf29ce484222325u64;
-    fnv1a_update_u64(&mut hash, size);
+    let mut hasher = FastHasher::new(size);
 
     if size <= (SAMPLE_BYTES as u64).saturating_mul(2) {
         loop {
@@ -89,19 +151,19 @@ fn fnv1a_file_sample(path: &Path, size: u64) -> io::Result<u64> {
             if read == 0 {
                 break;
             }
-            fnv1a_update(&mut hash, &buffer[..read]);
+            hasher.write(&buffer[..read]);
         }
-        return Ok(hash);
+        return Ok(hasher.finish());
     }
 
     let read = file.read(&mut buffer)?;
-    fnv1a_update(&mut hash, &buffer[..read]);
+    hasher.write(&buffer[..read]);
 
     file.seek(SeekFrom::End(-(SAMPLE_BYTES as i64)))?;
     let read = file.read(&mut buffer)?;
-    fnv1a_update(&mut hash, &buffer[..read]);
+    hasher.write(&buffer[..read]);
 
-    Ok(hash)
+    Ok(hasher.finish())
 }
 
 // ── Candidate-list hash engine (POST /api/dupes-hash) ───────────────────────
@@ -272,7 +334,7 @@ pub(crate) fn hash_candidate_groups(
     let sample_done: Vec<AtomicBool> = (0..files.len()).map(|_| AtomicBool::new(false)).collect();
     parallel_for(uncached.len(), threads, cancel, |k| {
         let i = uncached[k];
-        match fnv1a_file_sample(&files[i].path, files[i].size) {
+        match content_hash_file_sample(&files[i].path, files[i].size) {
             Ok(fp) => {
                 sample_fp[i].store(fp, Ordering::Relaxed);
                 sample_done[i].store(true, Ordering::Relaxed);
@@ -319,7 +381,7 @@ pub(crate) fn hash_candidate_groups(
     let computed: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
     parallel_for(need_full.len(), threads, cancel, |k| {
         let i = need_full[k];
-        match fnv1a_file(&files[i].path) {
+        match content_hash_file(&files[i].path) {
             Ok(h) => computed.lock().expect("computed lock").push((i, h)),
             Err(e) => errors
                 .lock()

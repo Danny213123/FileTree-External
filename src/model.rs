@@ -169,7 +169,7 @@ pub(crate) struct DupesProgress {
 /// One persistent content-hash cache entry. Keyed by file path; the
 /// `(size, mtime)` pair is the validity stamp — a cached `hash` is reused only
 /// when both still match, so a changed file is re-hashed. `hash` is the full
-/// FNV-1a content hash produced by `dupes::fnv1a_file`.
+/// content hash produced by `dupes::content_hash_file`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HashCacheEntry {
     pub(crate) size: u64,
