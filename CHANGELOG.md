@@ -4,6 +4,18 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.10.1] - 2026-06-12
+
+### Fixed
+
+- **Invisible Compression page buttons**: the Start / Select all / Clear / Stop toolbar buttons on the Compression page were rendered invisible by a CSS class-name collision with the new per-row "Compress" button (both used `.compress-btn`, whose hover-revealed `opacity: 0` leaked onto the page buttons). The row button now uses a dedicated `.row-compress-btn` class, so the page's controls are reliably visible again.
+
+### Changed
+
+- **Scoped Compression view**: launching the Compression page from the table (the row "Compress" button or right-click "Compress…") now scopes the file list to only the launched selection -- with a "Compressing N selected items" header and a "Show all files" escape hatch -- instead of listing the whole scan and merely pre-checking the selection. Opening the page from the activity bar still shows every compressible file in the scan.
+
+---
+
 ## [1.10.0] - 2026-06-11
 
 ### Added

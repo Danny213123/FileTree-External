@@ -898,7 +898,7 @@ function TreeTableInner({
                   )}
                   {!isBundle && node.path && onCompress && (
                     <button
-                      className="compress-btn"
+                      className="row-compress-btn"
                       title={node.dir ? "Compress files in this folder" : "Compress"}
                       onClick={(e) => { e.stopPropagation(); onCompress(node.id); }}
                     >

@@ -132,6 +132,13 @@ function baseName(p: string): string {
   return parts.length ? parts[parts.length - 1] : p;
 }
 
+/** Case-insensitive, separator- and trailing-slash-normalized path key, so the
+ *  selection passed from the table matches the scan tree's reconstructed paths
+ *  regardless of slash direction or drive-letter casing on Windows. */
+function normPath(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
 export function CompressView({
   scanPath,
   nodeById,
@@ -150,6 +157,11 @@ export function CompressView({
   const [installing, setInstalling] = useState<"handbrake" | "image" | null>(null);
   // Non-blocking notice when some right-click-selected paths aren't in the scan.
   const [preselectNotice, setPreselectNotice] = useState("");
+  // Scoped mode: when launched from the table ("Compress…" / row button), the
+  // file list is restricted to just the launched selection (a set of normalized
+  // file paths). null = unscoped (opened from the activity bar) → show every
+  // compressible file in the scan. Cleared via the "Show all files" escape hatch.
+  const [scopePaths, setScopePaths] = useState<Set<string> | null>(null);
 
   const [runStatus, setRunStatus] = useState<RunStatus>("idle");
   const [progress, setProgress] = useState<Map<number, FileProg>>(new Map());
@@ -180,10 +192,15 @@ export function CompressView({
   }, []);
 
   // ── Source files (derived from the scan tree) ───────────────────────────────
+  // In scoped mode only the launched selection's files are visible; otherwise
+  // every compressible file in the scan is listed. Everything downstream
+  // (counts, groups, select-all, totals) keys off this list, so scoping here is
+  // enough to make the whole view reflect just the selection.
   const files = useMemo(() => {
     const out: CompressFile[] = [];
     for (const node of nodeById.values()) {
       if (node.dir || node.id < 0 || !node.path) continue;
+      if (scopePaths && !scopePaths.has(normPath(node.path))) continue;
       out.push({
         id: node.id,
         path: node.path,
@@ -193,35 +210,49 @@ export function CompressView({
       });
     }
     return out;
-  }, [nodeById]);
+  }, [nodeById, scopePaths]);
 
-  // Pre-check the files passed from the table's right-click "Compress..." action.
-  // Maps each requested path to its id in the current scan; paths outside the
-  // scan can't be checked, so we surface a small non-blocking notice. Applied
-  // once per request (parent clears `initialSelectedPaths` via onInitialApplied),
-  // so manual edits afterward stick. Waits until `files` is populated.
+  // Launch from the table ("Compress…" / row button): scope the view to just the
+  // launched selection and pre-check it. The incoming paths are already concrete
+  // files (WorkspaceTab BFS-expands folders to their descendants before sending),
+  // so we map each to its id in the FULL scan, build the scope from the ones we
+  // found, and surface a non-blocking notice for any that aren't in the scan.
+  // Applied once per request — the parent clears `initialSelectedPaths` via
+  // onInitialApplied, so manual edits (and the "Show all files" escape hatch)
+  // stick afterward. Matches against the unscoped tree so it's idempotent.
   useEffect(() => {
     if (!initialSelectedPaths || initialSelectedPaths.length === 0) return;
-    if (files.length === 0) return;
-    const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    if (nodeById.size === 0) return; // wait until the tree is loaded
     const idByPath = new Map<string, number>();
-    for (const f of files) idByPath.set(norm(f.path), f.id);
+    for (const node of nodeById.values()) {
+      if (node.dir || node.id < 0 || !node.path) continue;
+      idByPath.set(normPath(node.path), node.id);
+    }
+    const scope = new Set<string>();
     const ids: number[] = [];
     let missing = 0;
     for (const p of initialSelectedPaths) {
-      const id = idByPath.get(norm(p));
-      if (id !== undefined) ids.push(id);
-      else missing += 1;
+      const n = normPath(p);
+      const id = idByPath.get(n);
+      if (id !== undefined) {
+        scope.add(n);
+        ids.push(id);
+      } else {
+        missing += 1;
+      }
     }
+    // Only enter scoped mode when at least one selected file is in the scan;
+    // if none matched, fall back to the full list and just show the notice.
+    setScopePaths(scope.size > 0 ? scope : null);
     if (ids.length > 0) setSelected(new Set(ids));
     setPreselectNotice(
       missing > 0
-        ? `${missing} selected file${missing === 1 ? "" : "s"} ${missing === 1 ? "isn't" : "aren't"} in the current scan and couldn't be pre-selected.`
+        ? `${missing} selected file${missing === 1 ? "" : "s"} ${missing === 1 ? "isn't" : "aren't"} in the current scan and couldn't be included.`
         : "",
     );
     setTab("compress");
     onInitialApplied?.();
-  }, [initialSelectedPaths, files, onInitialApplied]);
+  }, [initialSelectedPaths, nodeById, onInitialApplied]);
 
   const counts = useMemo(() => {
     let video = 0, image = 0, other = 0;
@@ -696,6 +727,21 @@ export function CompressView({
         />
       ) : (
       <>
+      {scopePaths && !inRun && (
+        <div className="compress-notice scoped">
+          <span className="ct-ico"><Icon name="funnel" size={14} /></span>
+          <span>
+            Compressing <b>{files.length.toLocaleString()}</b> selected item{files.length === 1 ? "" : "s"}.
+          </span>
+          <button
+            className="compress-scope-clear"
+            onClick={() => { setScopePaths(null); setPreselectNotice(""); }}
+            title="Show every compressible file in the scan instead"
+          >
+            Show all files
+          </button>
+        </div>
+      )}
       {preselectNotice && (
         <div className="compress-notice">
           <span className="ct-ico"><Icon name="info-circle" size={14} /></span>
