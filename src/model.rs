@@ -382,6 +382,11 @@ pub(crate) struct AppState {
     /// to only when a new root is scanned), so an `RwLock` keeps those checks
     /// concurrent.
     pub(crate) scan_roots: RwLock<Vec<PathBuf>>,
+    /// Live compression-job registry, keyed by job id. Each job owns its worker
+    /// thread, per-file state, cancel flag, active child handle, and live NDJSON
+    /// event buffer (see [`crate::compress_job::CompressJob`]). The `Mutex` is
+    /// held only to look up / insert an `Arc`, never across an encode.
+    pub(crate) compress_jobs: Mutex<HashMap<String, Arc<crate::compress_job::CompressJob>>>,
 }
 
 #[derive(Debug)]

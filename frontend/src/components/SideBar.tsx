@@ -20,6 +20,7 @@ const VIEW_TITLES: Record<ViewId, string> = {
   cleanup: "Cleanup",
   snapshots: "Snapshots",
   gallery: "Gallery",
+  compress: "Compress",
   bookmarks: "Bookmarks",
   errors: "Problems",
 };
@@ -430,7 +431,8 @@ export function SideBar(props: SideBarProps) {
   // folder tree stay available while their main panel shows in the editor area.
   const showExplorerBody =
     view === "explorer" || view === "treemap" || view === "reports" ||
-    view === "cleanup" || view === "snapshots" || view === "gallery";
+    view === "cleanup" || view === "snapshots" || view === "gallery" ||
+    view === "compress";
   const showFolderActions = showExplorerBody;
 
   return (

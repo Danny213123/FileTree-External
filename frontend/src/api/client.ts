@@ -18,6 +18,11 @@ import type {
   CompressResult,
   ExtractResult,
   ChecksumResult,
+  CompressTools,
+  CompressInstallResult,
+  CompressJob,
+  CompressJobRequest,
+  CompressEvent,
 } from "./types";
 
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -1253,6 +1258,134 @@ export async function checksum(path: string, algo: "sha256" | "md5" = "sha256"):
     return { algo, hash: "", error: data.error ?? `HTTP ${res.status}` };
   }
   return { algo: data.algo ?? algo, hash: data.hash };
+}
+
+// ── Compression page (media re-encode + zip, with live jobs) ────────────────
+// A first-class job layer: POST starts a job (mutation → token-authed), an
+// NDJSON stream reports per-file + overall progress, and cancel/retry mutate the
+// running job. Reads (tools detect + poll fallback) are plain GETs. Everything
+// soft-degrades: a 404/offline backend yields all-tools-missing and an empty
+// job rather than throwing, so the page renders even before the backend lands.
+
+/** Default "nothing available" tools shape, used when detection fails/404s. */
+const COMPRESS_TOOLS_NONE: CompressTools = {
+  handbrake: { found: false },
+  image: { found: false, kind: null },
+  zip: { found: true },
+};
+
+/**
+ * Detect which compression tools are installed. Never throws — on any failure
+ * (endpoint missing, offline, malformed body) it reports everything but the
+ * built-in zip as not-found so the page degrades to "zip only".
+ */
+export async function fetchCompressTools(signal?: AbortSignal): Promise<CompressTools> {
+  try {
+    const res = await fetch("/api/compress-tools", { signal });
+    if (!res.ok) return COMPRESS_TOOLS_NONE;
+    const data = (await res.json()) as Partial<CompressTools>;
+    return {
+      handbrake: data.handbrake ?? { found: false },
+      image: data.image ?? { found: false, kind: null },
+      zip: { found: true },
+    };
+  } catch {
+    return COMPRESS_TOOLS_NONE;
+  }
+}
+
+/**
+ * Ask the backend to download/install a missing tool (hybrid provisioning). On
+ * success returns `{ok:true, path}`; if in-app install isn't possible the
+ * backend may return a `downloadUrl` the caller opens instead.
+ */
+export async function installCompressTool(
+  tool: "handbrake" | "image",
+): Promise<CompressInstallResult> {
+  const r = await postMutation("/api/compress-tools/install", { tool });
+  if (!r.ok) return { ok: false, error: mutateErrorText(r) };
+  const d = (r.data ?? {}) as Partial<CompressInstallResult>;
+  return {
+    ok: d.ok ?? false,
+    path: d.path,
+    error: d.ok ? undefined : (d.error ?? "Install failed"),
+    downloadUrl: d.downloadUrl,
+  };
+}
+
+/** Start a compression job. Returns the new job id (throws on failure so the
+ *  caller can surface why the job couldn't start). */
+export async function startCompressJob(body: CompressJobRequest): Promise<string> {
+  const r = await postMutation("/api/compress-jobs", body);
+  if (!r.ok) throw new Error(mutateErrorText(r));
+  const id = (r.data as { jobId?: string } | null)?.jobId;
+  if (!id) throw new Error("Server did not return a job id");
+  return id;
+}
+
+/** Hard-cancel a running job (kills the active encoder child server-side). */
+export async function cancelCompressJob(id: string): Promise<{ ok: boolean; error?: string }> {
+  const r = await postMutation("/api/compress-jobs/cancel", { id });
+  if (r.ok) return { ok: true };
+  return { ok: false, error: mutateErrorText(r) };
+}
+
+/** Resume a job from its manifest (skips files already `done`). Returns the
+ *  (possibly new) job id to re-attach the stream to. */
+export async function retryCompressJob(id: string): Promise<string> {
+  const r = await postMutation("/api/compress-jobs/retry", { id });
+  if (!r.ok) throw new Error(mutateErrorText(r));
+  const jobId = (r.data as { jobId?: string } | null)?.jobId;
+  if (!jobId) throw new Error("Server did not return a job id");
+  return jobId;
+}
+
+/** Poll a job's full snapshot (fallback when the NDJSON stream errors). Returns
+ *  null when the job can't be read (endpoint missing / 404). */
+export async function fetchCompressJob(
+  id: string,
+  signal?: AbortSignal,
+): Promise<CompressJob | null> {
+  try {
+    const res = await fetch(`/api/compress-jobs/${encodeURIComponent(id)}`, { signal });
+    if (!res.ok) return null;
+    return (await res.json()) as CompressJob;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Open the job's NDJSON progress stream and dispatch one parsed event per line,
+ * mirroring `readNdjsonStream` in hooks/useScan.ts. Resolves when the stream
+ * ends (or the signal aborts); rejects on a network/HTTP error so the caller
+ * can fall back to {@link fetchCompressJob} polling. Each line is a small JSON
+ * object, so JSON.parse never sees a giant string.
+ */
+export async function streamCompressJob(
+  id: string,
+  onEvent: (ev: CompressEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`/api/compress-jobs/stream?id=${encodeURIComponent(id)}`, { signal });
+  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let ev: CompressEvent | null = null;
+      try { ev = JSON.parse(trimmed) as CompressEvent; } catch { ev = null; }
+      if (ev) onEvent(ev);
+    }
+  }
 }
 
 /** Copy arbitrary text to the clipboard (Electron `copyText`, else /api/copy-path). */

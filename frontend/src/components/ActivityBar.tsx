@@ -4,7 +4,7 @@ import { Icon, type IconName } from "./Icon";
 
 export type ViewId =
   | "explorer" | "search" | "treemap" | "reports" | "duplicates"
-  | "cleanup" | "snapshots" | "gallery" | "bookmarks" | "errors";
+  | "cleanup" | "snapshots" | "gallery" | "compress" | "bookmarks" | "errors";
 
 const ITEMS: { id: ViewId; label: string; icon: IconName }[] = [
   { id: "explorer", label: "Explorer", icon: "explorer" },
@@ -15,6 +15,7 @@ const ITEMS: { id: ViewId; label: string; icon: IconName }[] = [
   { id: "cleanup", label: "Cleanup", icon: "trash" },
   { id: "snapshots", label: "Snapshots", icon: "clock-history" },
   { id: "gallery", label: "Gallery", icon: "image" },
+  { id: "compress", label: "Compress", icon: "file-zip" },
   { id: "bookmarks", label: "Bookmarks", icon: "bookmark" },
   { id: "errors", label: "Problems", icon: "warning" },
 ];

@@ -3,6 +3,8 @@ mod archive;
 mod audit;
 mod cleanup;
 mod cli;
+mod compress_job;
+mod compress_tools;
 mod diff;
 mod dupes;
 mod export;

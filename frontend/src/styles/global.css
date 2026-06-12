@@ -3724,6 +3724,128 @@ input:focus, select:focus {
 .gallery-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
 .gallery-size { flex: 0 0 auto; color: var(--text-5); font-variant-numeric: tabular-nums; }
 
+/* ── Compression page (media re-encode + zip, with live jobs) ─────────────── */
+.compress-editor { flex: 1 1 0; min-width: 0; display: flex; overflow: hidden; }
+.compress-view {
+  flex: 1; min-width: 0; display: flex; flex-direction: column;
+  height: 100%; background: var(--bg); color: var(--text); overflow: hidden;
+}
+
+/* Tool-status banner */
+.compress-tools-banner {
+  display: flex; align-items: center; gap: 10px; flex: 0 0 auto; flex-wrap: wrap;
+  padding: 8px 12px; font-size: 12px; border-bottom: 1px solid var(--vsc-border);
+  background: rgba(245, 158, 11, 0.1); color: var(--text);
+}
+.compress-tools-banner.ok { background: rgba(0, 120, 212, 0.08); }
+.compress-tools-banner .ct-ico { flex: 0 0 auto; color: var(--warn); display: inline-flex; }
+.compress-tools-banner.ok .ct-ico { color: var(--accent); }
+.compress-tools-text { flex: 1 1 auto; min-width: 0; }
+.compress-tools-text b { color: var(--text); }
+.compress-tools-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+
+/* Toolbar (presets + options + run controls) */
+.compress-toolbar {
+  display: flex; align-items: center; gap: 10px; flex: 0 0 auto; flex-wrap: wrap;
+  padding: 8px 12px; border-bottom: 1px solid var(--vsc-border); background: var(--panel);
+}
+.compress-group { display: flex; align-items: center; gap: 4px; }
+.compress-group-label { font-size: 11px; color: var(--text-5); margin-right: 2px; }
+.compress-toolbar-spacer { flex: 1; }
+.compress-chip {
+  appearance: none; border: 1px solid var(--vsc-border); background: var(--surface);
+  color: var(--text-5); cursor: pointer; font-size: 12px; padding: 4px 10px; border-radius: 12px;
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.compress-chip:hover:not(:disabled) { color: var(--text); background: var(--vsc-list-hover); }
+.compress-chip.active { color: var(--text); border-color: var(--accent); }
+.compress-chip:disabled { opacity: 0.45; cursor: default; }
+.compress-toggle {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text);
+  cursor: pointer; user-select: none;
+}
+.compress-toggle input { accent-color: var(--accent); cursor: pointer; }
+.compress-btn {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 14px;
+  font-size: 12.5px; background: var(--surface); border: 1px solid var(--vsc-border);
+  color: var(--text); border-radius: 4px; cursor: pointer; white-space: nowrap;
+}
+.compress-btn:hover:not(:disabled) { background: var(--vsc-list-hover); }
+.compress-btn:disabled { opacity: 0.5; cursor: default; }
+.compress-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.compress-btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
+.compress-btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+.compress-btn.danger:hover:not(:disabled) { filter: brightness(1.08); }
+
+/* Overall progress strip */
+.compress-overall {
+  display: flex; align-items: center; gap: 12px; flex: 0 0 auto;
+  padding: 8px 12px; border-bottom: 1px solid var(--vsc-border); background: var(--surface);
+}
+.compress-overall-text { font-size: 12px; color: var(--text-5); white-space: nowrap; }
+.compress-overall-text b { color: var(--text); font-variant-numeric: tabular-nums; }
+.compress-saved { color: var(--accent-2, var(--accent)); font-weight: 600; }
+
+/* Generic progress bar (overall + per-file) */
+.compress-bar {
+  position: relative; flex: 1 1 auto; min-width: 60px; height: 8px;
+  background: var(--panel-2); border-radius: 6px; overflow: hidden;
+}
+.compress-bar.slim { height: 6px; }
+.compress-bar-fill {
+  position: absolute; inset: 0 auto 0 0; height: 100%; width: 0;
+  background: var(--accent); border-radius: 6px; transition: width 180ms ease;
+}
+.compress-bar-fill.done { background: var(--accent-2, #2ea043); }
+.compress-bar-fill.error { background: var(--danger); }
+.compress-bar-fill.skipped { background: var(--text-8); }
+
+/* File list */
+.compress-body { flex: 1 1 0; min-height: 0; overflow: auto; position: relative; }
+.compress-summary {
+  display: flex; align-items: baseline; gap: 6px; min-width: 0; margin-right: auto;
+}
+.compress-total { font-size: 14px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+.compress-total-label { font-size: 12px; color: var(--text-5); }
+.compress-selected {
+  margin-left: 8px; font-size: 12px; color: var(--accent); font-weight: 600;
+  padding-left: 10px; border-left: 1px solid var(--vsc-border);
+}
+.compress-group-row {
+  display: flex; align-items: center; gap: 8px; padding: 0 14px;
+  background: var(--surface); border-bottom: 1px solid var(--vsc-border); box-sizing: border-box;
+}
+.compress-group-label-row { font-size: 12px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 8px; }
+.compress-group-count { font-size: 11px; font-weight: 400; color: var(--text-5); }
+.compress-group-size { margin-left: auto; font-size: 12px; color: var(--text-5); font-variant-numeric: tabular-nums; }
+.compress-row {
+  display: flex; align-items: center; gap: 8px; padding: 0 14px 0 30px; font-size: 12px;
+  border-bottom: 1px solid var(--border-4); box-sizing: border-box;
+}
+.compress-row:hover { background: var(--vsc-list-hover); }
+.compress-row.on { background: rgba(0, 120, 212, 0.08); }
+.compress-check { cursor: pointer; flex: 0 0 auto; accent-color: var(--accent); }
+.compress-row-name {
+  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--text);
+}
+.compress-row-prog { flex: 0 0 140px; display: flex; align-items: center; gap: 6px; }
+.compress-row-size { flex: 0 0 84px; text-align: right; color: var(--text-5); font-variant-numeric: tabular-nums; }
+.compress-chip-status {
+  flex: 0 0 auto; display: inline-block; padding: 1px 7px; border-radius: 10px;
+  font-size: 10.5px; font-weight: 600; text-transform: capitalize;
+  background: var(--panel-2); color: var(--text-5);
+}
+.compress-chip-status.running { background: rgba(0, 120, 212, 0.16); color: var(--accent); }
+.compress-chip-status.done { background: rgba(46, 160, 67, 0.16); color: var(--accent-2, #2ea043); }
+.compress-chip-status.error { background: rgba(196, 43, 28, 0.16); color: var(--danger); }
+.compress-chip-status.skipped { background: rgba(148, 148, 148, 0.16); color: var(--text-5); }
+.compress-row-saved { flex: 0 0 96px; text-align: right; color: var(--accent-2, var(--accent)); font-variant-numeric: tabular-nums; }
+.compress-loading {
+  display: flex; align-items: center; gap: 10px; padding: 24px 16px;
+  color: var(--text-5); font-size: 13px;
+}
+
 /* Sidebar config panel: fills + scrolls, footer sticks to the bottom. */
 .df-config {
   flex: 1 1 auto; min-height: 0; overflow-y: auto;
@@ -5073,7 +5195,8 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 .dupes-editor,
 .cleanup-editor,
 .snapshots-editor,
-.gallery-editor { animation: ft-view-fade 150ms ease; }
+.gallery-editor,
+.compress-editor { animation: ft-view-fade 150ms ease; }
 
 /* ══════════════════════════════════════════════════════════════════════════
    F3–F10 feature surfaces: command palette, transfer manager, tags, smart
@@ -5258,6 +5381,8 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
   .cleanup-editor,
   .snapshots-editor,
   .gallery-editor,
+  .compress-editor,
+  .compress-bar-fill,
   .scan-overlay,
   .skeleton-bar,
   .scan-overlay .df-scanning-spinner,
@@ -5271,7 +5396,8 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
   /* New chat motion: the tool-card disclosure caret rotates on expand, and the
      context-usage meter bar animates its width as the conversation grows. */
   .tool-card-caret,
-  .ctx-meter-fill {
+  .ctx-meter-fill,
+  .compress-bar-fill {
     transition: none !important;
   }
 }

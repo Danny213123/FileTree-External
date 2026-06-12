@@ -399,3 +399,136 @@ export interface ChecksumResult {
   hash: string;
   error?: string;
 }
+
+// ── Compression page (media re-encode + zip, with live jobs) ────────────────
+// Mirrors the backend compress-job layer (built in parallel against the same
+// contract). A job re-encodes video (HandBrake) + images (ffmpeg/ImageMagick)
+// and lossless-zips other files through quality presets, streaming per-file and
+// overall progress over NDJSON, then tags + recycles the originals. Every type
+// here matches the POST /api/compress-jobs* + GET /api/compress-tools contract.
+
+/** Quality preset. Labels: max → "Maximum savings", balanced → "Balanced",
+ *  high → "High quality". */
+export type CompressPreset = "max" | "balanced" | "high";
+
+/** Detection state of one external compression tool. */
+export interface CompressToolInfo {
+  found: boolean;
+  version?: string;
+  path?: string;
+}
+
+/** The image encoder additionally reports which backend was detected. */
+export interface CompressImageToolInfo extends CompressToolInfo {
+  kind: "ffmpeg" | "imagemagick" | null;
+}
+
+/** GET /api/compress-tools — which encoders are available. Zip is built-in so
+ *  it is always `found`. */
+export interface CompressTools {
+  handbrake: CompressToolInfo;
+  image: CompressImageToolInfo;
+  zip: { found: true };
+}
+
+/** POST /api/compress-tools/install response. */
+export interface CompressInstallResult {
+  ok: boolean;
+  path?: string;
+  error?: string;
+  /** When in-app install isn't available, a one-click official download URL. */
+  downloadUrl?: string;
+}
+
+/** The kind of pipeline a file runs through (drives the type grouping/labels). */
+export type CompressKind = "video" | "image" | "other";
+
+/** Per-file status in a polled job snapshot. */
+export type CompressFileStatus =
+  | "pending" | "running" | "done" | "error" | "skipped";
+
+/** One file's progress within a job (GET /api/compress-jobs/<id> `files` row). */
+export interface CompressJobFile {
+  index: number;
+  path: string;
+  kind: CompressKind;
+  status: CompressFileStatus;
+  /** 0..100 encode progress. */
+  pct: number;
+  origBytes: number;
+  newBytes: number;
+  error?: string;
+}
+
+/** Overall job status from the poll-fallback endpoint. */
+export type CompressJobStatus = "running" | "done" | "cancelled" | "error";
+
+/** GET /api/compress-jobs/<id> — full job snapshot (poll fallback). */
+export interface CompressJob {
+  id: string;
+  status: CompressJobStatus;
+  total: number;
+  savedBytes: number;
+  files: CompressJobFile[];
+}
+
+/** Body for POST /api/compress-jobs. */
+export interface CompressJobRequest {
+  paths: string[];
+  preset: CompressPreset;
+  recycleOriginals: boolean;
+  tagFilename: boolean;
+}
+
+// NDJSON stream events from GET /api/compress-jobs/stream?id=<jobId>, one JSON
+// object per line. The `type` discriminates the union.
+export interface CompressJobStartEvent {
+  type: "job_start";
+  jobId: string;
+  total: number;
+}
+export interface CompressFileStartEvent {
+  type: "file_start";
+  index: number;
+  path: string;
+  kind: CompressKind;
+  origBytes: number;
+}
+export interface CompressProgressEvent {
+  type: "progress";
+  index: number;
+  /** 0..100. */
+  pct: number;
+}
+export interface CompressFileDoneEvent {
+  type: "file_done";
+  index: number;
+  outPath: string;
+  origBytes: number;
+  newBytes: number;
+  savedBytes: number;
+  recycled: boolean;
+  status: "done" | "skipped_no_gain";
+}
+export interface CompressErrorEvent {
+  type: "error";
+  index: number;
+  path: string;
+  error: string;
+}
+export interface CompressDoneEvent {
+  type: "done";
+  jobId: string;
+  done: number;
+  errors: number;
+  savedBytes: number;
+}
+
+/** Discriminated union of every NDJSON line a compress job streams. */
+export type CompressEvent =
+  | CompressJobStartEvent
+  | CompressFileStartEvent
+  | CompressProgressEvent
+  | CompressFileDoneEvent
+  | CompressErrorEvent
+  | CompressDoneEvent;

@@ -187,6 +187,7 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
         hash_cache_path,
         auth_token,
         scan_roots: RwLock::new(Vec::new()),
+        compress_jobs: Mutex::new(std::collections::HashMap::new()),
     });
 
     // Seed the allowed-read roots with the launch directory so previews of files
@@ -1004,6 +1005,13 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         "/api/extract",
         "/api/snapshots-save",
         "/api/snapshots-delete",
+        // Compression jobs: cancel kills an encoder child, retry resumes a job,
+        // tool-install writes to the app tools dir — all POST-only + token-gated.
+        // (`POST /api/compress-jobs` itself is gated via `writes_on_post` below,
+        // because its GET sibling must stay readable for the job list.)
+        "/api/compress-jobs/cancel",
+        "/api/compress-jobs/retry",
+        "/api/compress-tools/install",
         "/api/exit",
     ];
     let is_destructive = DESTRUCTIVE_ROUTES.contains(&route.as_str());
@@ -1020,6 +1028,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         // 10-feature backend dual-mode stores: GET reads (open), POST writes
         // (token-gated via `writes_on_post`).
         "/api/tags", "/api/smart-folders",
+        // Compression: GET lists jobs, POST creates one (token-gated via
+        // `writes_on_post`).
+        "/api/compress-jobs",
     ];
     let method_allowed = if is_destructive {
         // No GET fall-through for destructive routes.
@@ -1050,6 +1061,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 | "/api/snapshots"
                 | "/api/tags"
                 | "/api/smart-folders"
+                | "/api/compress-jobs"
         );
 
     // Token gate: enforced on every destructive route and on the write (POST)
@@ -2869,6 +2881,187 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 }
             } else {
                 respond_json(&mut stream, 200, "OK", &crate::smartfolders::load_json())
+            }
+        }
+        // ── Compression jobs (media re-encode + lossless zip) ──────────────
+        // GET lists active jobs; POST (token-gated) creates one and returns its
+        // id immediately — the encode runs on a dedicated worker thread.
+        "/api/compress-jobs" => {
+            if request.method == "POST" {
+                let body_str = String::from_utf8_lossy(&request.body);
+                let root = crate::json::parse(&body_str);
+                let paths = extract_json_str_array(&body_str, "paths");
+                let preset = extract_json_str(&body_str, "preset")
+                    .unwrap_or_else(|| "balanced".to_string());
+                let recycle = root
+                    .as_ref()
+                    .and_then(|v| v.get("recycleOriginals"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let tag = root
+                    .as_ref()
+                    .and_then(|v| v.get("tagFilename"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if paths.is_empty() {
+                    return respond_text(&mut stream, 400, "Bad request", "Missing paths");
+                }
+                for p in &paths {
+                    if !path_within_scan_root(&state, Path::new(p)) {
+                        return respond_json(
+                            &mut stream,
+                            403,
+                            "Forbidden",
+                            "{\"error\":\"A source path is outside the scanned directories\"}",
+                        );
+                    }
+                }
+                let job = crate::compress_job::create_job(&paths, &preset, recycle, tag);
+                let id = job.id.clone();
+                state
+                    .compress_jobs
+                    .lock()
+                    .expect("compress_jobs lock")
+                    .insert(id.clone(), Arc::clone(&job));
+                crate::compress_job::spawn_job(Arc::clone(&state), job);
+                let mut body = String::from("{\"jobId\":");
+                push_json_string(&mut body, &id);
+                body.push('}');
+                respond_json(&mut stream, 200, "OK", &body)
+            } else {
+                let jobs = state.compress_jobs.lock().expect("compress_jobs lock");
+                let mut body = String::from("{\"jobs\":[");
+                for (i, job) in jobs.values().enumerate() {
+                    if i > 0 {
+                        body.push(',');
+                    }
+                    body.push_str(&crate::compress_job::job_summary_json(job));
+                }
+                body.push_str("]}");
+                respond_json(&mut stream, 200, "OK", &body)
+            }
+        }
+        // Live NDJSON progress stream for one job. Replays the job's full event
+        // history then tails new events, so a stream opened slightly after the
+        // job started still sees everything.
+        "/api/compress-jobs/stream" => {
+            let id = query.get("id").cloned().unwrap_or_default();
+            let job = state
+                .compress_jobs
+                .lock()
+                .expect("compress_jobs lock")
+                .get(&id)
+                .map(Arc::clone);
+            let Some(job) = job else {
+                return respond_text(&mut stream, 404, "Not found", "Unknown job");
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut idx = 0usize;
+            loop {
+                let batch: Vec<String>;
+                {
+                    let mut guard = job.events.lock().expect("events lock");
+                    while idx >= guard.len() && !job.finished.load(Ordering::SeqCst) {
+                        let (g, _timeout) = job
+                            .events_cv
+                            .wait_timeout(guard, Duration::from_millis(1000))
+                            .expect("events cv");
+                        guard = g;
+                    }
+                    if idx >= guard.len() && job.finished.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    batch = guard[idx..].to_vec();
+                    idx = guard.len();
+                }
+                for line in &batch {
+                    if write_chunk(&mut stream, line.as_bytes()).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            write_final_chunk(&mut stream)
+        }
+        // Hard-cancel a job: set its cancel flag and kill the active encoder
+        // child. The worker deletes partial output and leaves originals in place.
+        "/api/compress-jobs/cancel" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let id = extract_json_str(&body_str, "id").unwrap_or_default();
+            let job = state
+                .compress_jobs
+                .lock()
+                .expect("compress_jobs lock")
+                .get(&id)
+                .map(Arc::clone);
+            if let Some(job) = job {
+                job.cancel.store(true, Ordering::SeqCst);
+                if let Some(child) = job.child.lock().expect("child lock").as_mut() {
+                    let _ = child.kill();
+                }
+                job.events_cv.notify_all();
+            }
+            respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
+        }
+        // Resume a job from its persisted manifest, skipping files already done.
+        "/api/compress-jobs/retry" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let id = extract_json_str(&body_str, "id").unwrap_or_default();
+            match crate::compress_job::job_from_manifest(&id) {
+                Some(job) => {
+                    let jid = job.id.clone();
+                    state
+                        .compress_jobs
+                        .lock()
+                        .expect("compress_jobs lock")
+                        .insert(jid.clone(), Arc::clone(&job));
+                    crate::compress_job::spawn_job(Arc::clone(&state), job);
+                    let mut body = String::from("{\"jobId\":");
+                    push_json_string(&mut body, &jid);
+                    body.push('}');
+                    respond_json(&mut stream, 200, "OK", &body)
+                }
+                None => respond_json(
+                    &mut stream,
+                    404,
+                    "Not found",
+                    "{\"error\":\"No resumable manifest for that job id\"}",
+                ),
+            }
+        }
+        // Detect HandBrake / image encoder / built-in zip availability.
+        "/api/compress-tools" => {
+            respond_json(&mut stream, 200, "OK", &crate::compress_tools::tools_json())
+        }
+        // Hybrid provision: re-detect (picks up a binary dropped in the tools
+        // dir) or return the official download URL (see compress_tools docs).
+        "/api/compress-tools/install" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let tool = extract_json_str(&body_str, "tool").unwrap_or_default();
+            respond_json(&mut stream, 200, "OK", &crate::compress_tools::install_json(&tool))
+        }
+        // Poll fallback: full job JSON for `GET /api/compress-jobs/<id>`. Placed
+        // after the exact compress-jobs sub-routes so they match first.
+        r if r.starts_with("/api/compress-jobs/") => {
+            let id = &r["/api/compress-jobs/".len()..];
+            let job = state
+                .compress_jobs
+                .lock()
+                .expect("compress_jobs lock")
+                .get(id)
+                .map(Arc::clone);
+            match job {
+                Some(job) => {
+                    respond_json(&mut stream, 200, "OK", &crate::compress_job::job_full_json(&job))
+                }
+                None => respond_json(
+                    &mut stream,
+                    404,
+                    "Not found",
+                    "{\"error\":\"Unknown job\"}",
+                ),
             }
         }
         // F5: zip a selection of files/folders into `dest`.

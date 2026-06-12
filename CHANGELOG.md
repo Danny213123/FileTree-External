@@ -4,6 +4,18 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.9.0] - 2026-06-11
+
+### Added
+
+- **Compression page**: a dedicated activity-bar view to shrink videos, images, and other files.
+- **Smart re-encoding**: re-encodes video/audio via HandBrake and images via ffmpeg/ImageMagick, and losslessly zips other file types, with quality presets (Maximum savings / Balanced / High quality).
+- **Job queue with live progress**: per-file and overall progress, plus hard-cancel of a running job and restart/resume that skips already-completed files.
+- **Safe, verified outputs**: outputs are tagged `[COMPRESSED]` in the filename and metadata, and originals are sent to the Recycle Bin only after real size savings are verified -- files that would not shrink are skipped.
+- **Tool detection**: hybrid detection with an in-app status banner and a download/install prompt when HandBrake or the image encoder is missing (zip is always available).
+
+---
+
 ## [1.8.1] - 2026-06-10
 
 ### Fixed

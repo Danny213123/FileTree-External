@@ -55,13 +55,14 @@ const DuplicatesResults = lazy(() => import("./components/DuplicatesResults").th
 const CleanupView = lazy(() => import("./components/CleanupView").then((m) => ({ default: m.CleanupView })));
 const SnapshotsView = lazy(() => import("./components/SnapshotsView").then((m) => ({ default: m.SnapshotsView })));
 const GalleryView = lazy(() => import("./components/GalleryView").then((m) => ({ default: m.GalleryView })));
+const CompressView = lazy(() => import("./components/CompressView").then((m) => ({ default: m.CompressView })));
 
 const SETTINGS_DEBOUNCE_MS = 700;
 
 // Views that take over the whole editor area (replacing the workspace tabs),
 // each rendered from its own dedicated editor block below.
 const FULL_EDITOR_VIEWS = new Set<ViewId>([
-  "duplicates", "reports", "cleanup", "snapshots", "gallery",
+  "duplicates", "reports", "cleanup", "snapshots", "gallery", "compress",
 ]);
 
 let nextTabId = 1;
@@ -487,7 +488,7 @@ export default function App() {
       }
       if (settings.decimals !== undefined) setDecimals(settings.decimals);
       // Layout
-      if (settings.activeView && ["explorer", "search", "treemap", "reports", "duplicates", "cleanup", "snapshots", "gallery", "bookmarks", "errors"].includes(settings.activeView)) {
+      if (settings.activeView && ["explorer", "search", "treemap", "reports", "duplicates", "cleanup", "snapshots", "gallery", "compress", "bookmarks", "errors"].includes(settings.activeView)) {
         setActiveView(settings.activeView as ViewId);
       }
       if (settings.sidebarOpen !== undefined) setSidebarOpen(settings.sidebarOpen);
@@ -1302,6 +1303,7 @@ export default function App() {
       { id: "cleanup", label: "Cleanup" },
       { id: "snapshots", label: "Snapshots" },
       { id: "gallery", label: "Gallery" },
+      { id: "compress", label: "Compress" },
       { id: "bookmarks", label: "Bookmarks" },
       { id: "errors", label: "Problems" },
     ];
@@ -1541,6 +1543,14 @@ export default function App() {
           <div className="gallery-editor">
             <LazyView>
               <WorkbenchGallery store={workbenchStore} />
+            </LazyView>
+          </div>
+        )}
+
+        {activeView === "compress" && (
+          <div className="compress-editor">
+            <LazyView>
+              <WorkbenchCompress store={workbenchStore} />
             </LazyView>
           </div>
         )}
@@ -1794,4 +1804,19 @@ function WorkbenchSnapshots({ store, onAfterNavigate }: { store: WorkbenchStore;
 function WorkbenchGallery({ store }: { store: WorkbenchStore }) {
   const { sidebar: m } = useWorkbench(store);
   return <GalleryView nodeById={m.nodeById} onNavigate={m.onNavigate} />;
+}
+
+// Compression page: derives compressible files from the focused pane's scan
+// tree, runs a live job, then rescans (invalidate cache + refresh) so the
+// [COMPRESSED] outputs appear and recycled originals disappear.
+function WorkbenchCompress({ store }: { store: WorkbenchStore }) {
+  const { sidebar: m } = useWorkbench(store);
+  return (
+    <CompressView
+      scanPath={m.scanPath}
+      nodeById={m.nodeById}
+      onNavigate={m.onNavigate}
+      onRescan={m.onRefresh}
+    />
+  );
 }
