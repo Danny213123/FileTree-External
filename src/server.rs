@@ -319,6 +319,58 @@ fn path_within_scan_root(state: &AppState, requested: &Path) -> bool {
     roots.iter().any(|root| canon.starts_with(root))
 }
 
+/// Snapshot the registered scan roots as display strings, for diagnostics.
+fn scan_roots_snapshot(state: &AppState) -> Vec<String> {
+    state
+        .scan_roots
+        .read()
+        .expect("scan_roots lock poisoned")
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Longest common directory prefix of a set of submitted paths. Each path is
+/// reduced to its containing directory (the path itself when it is a directory),
+/// then the components shared by all of them form the ancestor. Returns `None`
+/// for an empty input or when the paths share no common prefix (e.g. different
+/// drives on Windows). Used to (re-)register a legitimate selection's root on the
+/// token-gated compress route so a cache-served tree doesn't fail containment.
+fn common_ancestor_dir(paths: &[String]) -> Option<PathBuf> {
+    let mut common: Option<Vec<std::ffi::OsString>> = None;
+    for p in paths {
+        let pb = PathBuf::from(p);
+        let dir = if pb.is_dir() {
+            pb.clone()
+        } else {
+            pb.parent().map(|d| d.to_path_buf()).unwrap_or(pb)
+        };
+        // Own each component (the borrowed `Component` can't outlive `dir`).
+        let comps: Vec<std::ffi::OsString> =
+            dir.components().map(|c| c.as_os_str().to_os_string()).collect();
+        common = Some(match common {
+            None => comps,
+            Some(prev) => {
+                let n = prev
+                    .iter()
+                    .zip(comps.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                prev.into_iter().take(n).collect()
+            }
+        });
+    }
+    let comps = common?;
+    if comps.is_empty() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for c in comps {
+        out.push(c);
+    }
+    Some(out)
+}
+
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     match (fs::canonicalize(left), fs::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
@@ -1334,6 +1386,33 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 .unwrap_or(500)
                 .min(10_000);
             let body = crate::compress_log::read_rows_json(limit);
+            respond_json(&mut stream, 200, "OK", &body)
+        }
+        // ── Compression verbose debug log ──────────────────────────────────
+        // Download the append-only verbose diagnostic log as a plain-text
+        // attachment. Mirrors `/api/compress-log.csv`: the file may not exist yet
+        // (nothing compressed, or logging disabled), in which case an empty 200
+        // is returned so a download still succeeds.
+        "/api/compress-debug.log" => {
+            let path = crate::compress_debug::log_path();
+            let body = std::fs::read(&path).unwrap_or_default();
+            respond_bytes(
+                &mut stream,
+                200,
+                "OK",
+                "text/plain; charset=utf-8",
+                &body,
+                &[(
+                    "Content-Disposition",
+                    "attachment; filename=\"filetree-compress-debug.log\"",
+                )],
+            )
+        }
+        // Reveal target: the absolute path of the verbose debug log file.
+        "/api/compress-debug/path" => {
+            let mut body = String::from("{\"path\":");
+            push_json_string(&mut body, &crate::compress_debug::log_path().to_string_lossy());
+            body.push('}');
             respond_json(&mut stream, 200, "OK", &body)
         }
         // Scheduled scans (#10). List is a read-only GET; create/delete are
@@ -2968,14 +3047,38 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         }
                     }
                 }
+                // Robustness: register the common-ancestor directory of the
+                // submitted paths as an allowed root. This route is already
+                // token-gated, and `register_scan_root` only records a directory
+                // that canonicalizes to a real on-disk path, so this can't widen
+                // access beyond a directory the caller demonstrably has files in
+                // — it just stops legitimate selections from a cache-served tree
+                // (no `/api/scan` this session) from failing the check below.
+                if let Some(ancestor) = common_ancestor_dir(&paths) {
+                    register_scan_root(&state, &ancestor);
+                }
                 for p in &paths {
                     if !path_within_scan_root(&state, Path::new(p)) {
-                        return respond_json(
-                            &mut stream,
-                            403,
-                            "Forbidden",
-                            "{\"error\":\"A source path is outside the scanned directories\"}",
+                        // Diagnose the rejection: log the offending path, its
+                        // canonicalize result and the registered roots, and name
+                        // the path in the 403 body so the UI can be specific.
+                        let canonical = match fs::canonicalize(Path::new(p)) {
+                            Ok(c) => c.to_string_lossy().into_owned(),
+                            Err(e) => format!("<canonicalize failed: {e}>"),
+                        };
+                        let roots = scan_roots_snapshot(&state);
+                        crate::compress_debug::log(&format!(
+                            "[authz] POST /api/compress-jobs rejected path={p:?} canonical={canonical:?} roots={roots:?}"
+                        ));
+                        let mut body = String::from("{\"error\":");
+                        push_json_string(
+                            &mut body,
+                            &format!("Source path is outside the scanned directories: {p}"),
                         );
+                        body.push_str(",\"path\":");
+                        push_json_string(&mut body, p);
+                        body.push('}');
+                        return respond_json(&mut stream, 403, "Forbidden", &body);
                     }
                 }
                 let job = crate::compress_job::create_job(&paths, &preset, recycle, tag);

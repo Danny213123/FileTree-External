@@ -369,8 +369,25 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     let hb = compress_tools::detect_handbrake();
     let (img, img_kind) = compress_tools::detect_image();
 
+    // Job-start diagnostics: preset, options, file count and which encoders were
+    // detected (path + version) so a "tool missing" outcome later is unambiguous.
+    if crate::compress_debug::enabled() {
+        let mut l = format!(
+            "[job_start] job={} preset={} recycle={} tag={} files={}",
+            job.id, job.preset, job.recycle_originals, job.tag_filename, job.total
+        );
+        l.push_str(&format!(" handbrake={}", tool_desc(&hb)));
+        l.push_str(&format!(" image={}", tool_desc(&img)));
+        if let Some(k) = img_kind {
+            l.push_str(&format!(" imageKind={}", k.as_str()));
+        }
+        l.push_str(" zip=built-in");
+        crate::compress_debug::log(&l);
+    }
+
     let mut done_count = 0usize;
     let mut error_count = 0usize;
+    let mut skipped_count = 0usize;
 
     for i in 0..job.files.len() {
         if job.cancel.load(Ordering::SeqCst) {
@@ -403,8 +420,15 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
         let (tool, codec_params) = pipeline_params(f.kind, &job.preset, img_kind);
         let name = file_name_of(&f.path);
         let kind_str = f.kind.as_str();
+        // The detected version string of whichever tool this file's kind uses,
+        // recorded in the CSV so the exact encoder build is captured.
+        let tool_version = match f.kind {
+            FileKind::Video => hb.version.as_deref().unwrap_or(""),
+            FileKind::Image => img.version.as_deref().unwrap_or(""),
+            FileKind::Other => "built-in",
+        };
         match outcome {
-            FileOutcome::Done { out_path, new_bytes, recycled } => {
+            FileOutcome::Done { out_path, new_bytes, recycled, recycle_error, tagged, diag } => {
                 f.new_bytes.store(new_bytes, Ordering::Relaxed);
                 f.recycled.store(recycled, Ordering::Relaxed);
                 *f.out_path.lock().expect("out lock") = out_path.clone();
@@ -432,13 +456,24 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
                     out_path: &out_path,
                     recycled,
                     error: "",
+                    reason: Reason::Success.as_str(),
+                    exit_code: diag.exit_code,
+                    tool_version,
+                    command: &diag.command,
+                    stderr_excerpt: &diag.stderr_tail,
                 });
+                log_file_debug(
+                    &job.id, i, &f.path, kind_str, orig, tool, &diag, &out_path, new_bytes,
+                    "compressed", Reason::Success.as_str(), duration_ms, recycled,
+                    recycle_error.as_deref(), Some(tagged),
+                );
                 job.emit(ev_file_done(i, &out_path, orig, new_bytes, saved, recycled, "done"));
             }
-            FileOutcome::Skipped { new_bytes } => {
+            FileOutcome::Skipped { new_bytes, diag } => {
                 f.new_bytes.store(new_bytes, Ordering::Relaxed);
                 *f.status.lock().expect("status lock") = "skipped".to_string();
                 f.pct.store(100, Ordering::Relaxed);
+                skipped_count += 1;
                 crate::compress_log::append_row(&crate::compress_log::Row {
                     job_id: &job.id,
                     index: i,
@@ -458,11 +493,20 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
                     out_path: "",
                     recycled: false,
                     error: "",
+                    reason: Reason::SkippedNoGain.as_str(),
+                    exit_code: diag.exit_code,
+                    tool_version,
+                    command: &diag.command,
+                    stderr_excerpt: &diag.stderr_tail,
                 });
+                log_file_debug(
+                    &job.id, i, &f.path, kind_str, orig, tool, &diag, "", new_bytes,
+                    "skipped", Reason::SkippedNoGain.as_str(), duration_ms, false, None, None,
+                );
                 job.emit(ev_file_done(i, "", orig, new_bytes, 0, false, "skipped_no_gain"));
             }
-            FileOutcome::Error(msg) => {
-                *f.error.lock().expect("err lock") = Some(msg.clone());
+            FileOutcome::Error { reason, message, diag } => {
+                *f.error.lock().expect("err lock") = Some(message.clone());
                 *f.status.lock().expect("status lock") = "error".to_string();
                 error_count += 1;
                 crate::compress_log::append_row(&crate::compress_log::Row {
@@ -483,9 +527,18 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
                     duration_ms,
                     out_path: "",
                     recycled: false,
-                    error: &msg,
+                    error: &message,
+                    reason: reason.as_str(),
+                    exit_code: diag.exit_code,
+                    tool_version,
+                    command: &diag.command,
+                    stderr_excerpt: &diag.stderr_tail,
                 });
-                job.emit(ev_error(i, &f.path, &msg));
+                log_file_debug(
+                    &job.id, i, &f.path, kind_str, orig, tool, &diag, "", 0,
+                    "error", reason.as_str(), duration_ms, false, None, None,
+                );
+                job.emit(ev_error(i, &f.path, &message));
             }
             FileOutcome::Cancelled => {
                 *f.status.lock().expect("status lock") = "pending".to_string();
@@ -510,17 +563,137 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     write_manifest(&job);
 
     let total_saved = job.saved_bytes.load(Ordering::Relaxed);
+    crate::compress_debug::log(&format!(
+        "[job_end] job={} done={done_count} skipped={skipped_count} error={error_count} saved={total_saved} status={status}",
+        job.id
+    ));
     job.emit(ev_done(&job.id, done_count, error_count, total_saved));
     job.finished.store(true, Ordering::SeqCst);
     job.events_cv.notify_all();
 }
 
-/// Result of one file's pipeline.
-enum FileOutcome {
-    Done { out_path: String, new_bytes: u64, recycled: bool },
+/// One-line description of a detected tool for the job-start debug entry:
+/// `"<path> (<version>)"` when found, else `not found`.
+fn tool_desc(info: &compress_tools::ToolInfo) -> String {
+    match (&info.path, &info.version) {
+        (Some(p), Some(v)) => format!("{:?} ({v})", p.to_string_lossy()),
+        (Some(p), None) => format!("{:?}", p.to_string_lossy()),
+        _ => "not found".to_string(),
+    }
+}
+
+/// Append one richly-detailed per-file entry to the verbose debug log: the
+/// command, exit code, decision + reason, sizes, timing, recycle/tag results and
+/// (when present) the captured stderr tail. A no-op when debug logging is off.
+#[allow(clippy::too_many_arguments)]
+fn log_file_debug(
+    job_id: &str,
+    index: usize,
+    path: &str,
+    kind: &str,
+    orig: u64,
+    tool: &str,
+    diag: &EncodeDiag,
+    out_path: &str,
+    out_size: u64,
+    decision: &str,
+    reason: &str,
+    duration_ms: u64,
+    recycled: bool,
+    recycle_error: Option<&str>,
+    tagged: Option<bool>,
+) {
+    if !crate::compress_debug::enabled() {
+        return;
+    }
+    let exit = diag
+        .exit_code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let mut line = format!(
+        "[file] job={job_id} #{index} path={path:?} kind={kind} size={orig} tool={tool} exit={exit} decision={decision} reason={reason} duration_ms={duration_ms} recycled={recycled}"
+    );
+    if !out_path.is_empty() {
+        line.push_str(&format!(" out={out_path:?} outSize={out_size}"));
+    }
+    if let Some(t) = tagged {
+        line.push_str(&format!(" tag={}", if t { "added" } else { "off" }));
+    }
+    if let Some(e) = recycle_error {
+        line.push_str(&format!(" recycle_error={e:?}"));
+    }
+    if !diag.command.is_empty() {
+        line.push_str(&format!(" cmd={:?}", diag.command));
+    }
+    let tail = diag.stderr_tail.trim();
+    if !tail.is_empty() {
+        line.push_str("\n    stderr_tail:");
+        for l in tail.lines() {
+            line.push_str("\n    | ");
+            line.push_str(l);
+        }
+    }
+    crate::compress_debug::log(&line);
+}
+
+/// Precise, machine-readable classification of why a file compressed, was
+/// skipped, or errored. Threaded into the per-file status, the human error
+/// message, the CSV `reason` column and the verbose debug log so every outcome
+/// is explainable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reason {
+    /// Output was smaller; original replaced/recycled.
+    Success,
     /// Output produced but not smaller than the original (deleted, original kept).
-    Skipped { new_bytes: u64 },
-    Error(String),
+    SkippedNoGain,
+    /// The required external encoder (HandBrake / ffmpeg / ImageMagick) is missing.
+    ErrorToolMissing,
+    /// The file kind has no supported pipeline. Reserved in the taxonomy; the
+    /// current pipelines route every kind (other files always zip).
+    #[allow(dead_code)]
+    ErrorUnsupported,
+    /// The encoder ran but exited non-zero (carries exit code + stderr tail).
+    ErrorEncoder,
+    /// The encoder reported success but produced a missing/empty output.
+    ErrorOutputEmpty,
+    /// The source file no longer exists (commonly recycled by a prior run).
+    ErrorSourceMissing,
+    /// The encoder process could not be spawned at all.
+    ErrorSpawn,
+}
+
+impl Reason {
+    /// Stable snake_case code used in the CSV `reason` column, the debug log and
+    /// the UI badge/tooltip mapping.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Reason::Success => "success",
+            Reason::SkippedNoGain => "skipped_no_gain",
+            Reason::ErrorToolMissing => "error_tool_missing",
+            Reason::ErrorUnsupported => "error_unsupported",
+            Reason::ErrorEncoder => "error_encoder",
+            Reason::ErrorOutputEmpty => "error_output_empty",
+            Reason::ErrorSourceMissing => "error_source_missing",
+            Reason::ErrorSpawn => "error_spawn",
+        }
+    }
+}
+
+/// Result of one file's pipeline. Every terminal arm carries the [`EncodeDiag`]
+/// captured during the encode (empty for outcomes that never spawned a tool, e.g.
+/// a missing source or a missing encoder) plus, for errors, the precise reason.
+enum FileOutcome {
+    Done {
+        out_path: String,
+        new_bytes: u64,
+        recycled: bool,
+        recycle_error: Option<String>,
+        tagged: bool,
+        diag: EncodeDiag,
+    },
+    /// Output produced but not smaller than the original (deleted, original kept).
+    Skipped { new_bytes: u64, diag: EncodeDiag },
+    Error { reason: Reason, message: String, diag: EncodeDiag },
     /// Job cancelled mid-encode; partial output deleted, original untouched.
     Cancelled,
 }
@@ -539,7 +712,12 @@ fn process_file(
     };
     let input = PathBuf::from(&input_str);
     if !input.is_file() {
-        return FileOutcome::Error("source file no longer exists".to_string());
+        return FileOutcome::Error {
+            reason: Reason::ErrorSourceMissing,
+            message: "source no longer exists - may have been recycled by a prior run"
+                .to_string(),
+            diag: EncodeDiag::default(),
+        };
     }
     let orig = job.files[index].orig_bytes.load(Ordering::Relaxed);
     let out = output_path(&input, kind);
@@ -548,9 +726,12 @@ fn process_file(
     let encode = match kind {
         FileKind::Video => match hb.path.as_ref() {
             Some(p) => run_handbrake(job, index, p, &input, &out, &job.preset),
-            None => return FileOutcome::Error(
-                "HandBrakeCLI not found — install it to compress video".to_string(),
-            ),
+            None => return FileOutcome::Error {
+                reason: Reason::ErrorToolMissing,
+                message: "HandBrake not installed - install HandBrakeCLI to compress video"
+                    .to_string(),
+                diag: EncodeDiag::default(),
+            },
         },
         FileKind::Image => match (img.path.as_ref(), img_kind) {
             (Some(p), Some(ImageKind::Ffmpeg)) => {
@@ -559,40 +740,58 @@ fn process_file(
             (Some(p), Some(ImageKind::ImageMagick)) => {
                 run_magick_image(job, index, p, &input, &out, &job.preset)
             }
-            _ => return FileOutcome::Error(
-                "No image encoder (ffmpeg/ImageMagick) found".to_string(),
-            ),
+            _ => return FileOutcome::Error {
+                reason: Reason::ErrorToolMissing,
+                message: "no image encoder installed - install ffmpeg or ImageMagick to compress images"
+                    .to_string(),
+                diag: EncodeDiag::default(),
+            },
         },
         FileKind::Other => run_zip(job, index, &input, &out),
     };
 
-    match encode {
+    let diag = match encode {
         EncodeResult::Cancelled => {
             let _ = std::fs::remove_file(&out);
             return FileOutcome::Cancelled;
         }
-        EncodeResult::Spawn(e) => return FileOutcome::Error(e),
-        EncodeResult::Done(success) => {
+        EncodeResult::Spawn { error, command } => {
+            return FileOutcome::Error {
+                reason: Reason::ErrorSpawn,
+                message: error,
+                diag: EncodeDiag { command, exit_code: None, stderr_tail: String::new() },
+            };
+        }
+        EncodeResult::Done { success, diag } => {
             if !success {
                 let _ = std::fs::remove_file(&out);
-                return FileOutcome::Error("encoder exited with an error".to_string());
+                return FileOutcome::Error {
+                    reason: Reason::ErrorEncoder,
+                    message: encoder_error_message(&diag),
+                    diag,
+                };
             }
+            diag
         }
-    }
+    };
 
     // Verify the output exists and is non-empty.
     let new_bytes = match std::fs::metadata(&out) {
         Ok(m) if m.len() > 0 => m.len(),
         _ => {
             let _ = std::fs::remove_file(&out);
-            return FileOutcome::Error("output missing or empty after encode".to_string());
+            return FileOutcome::Error {
+                reason: Reason::ErrorOutputEmpty,
+                message: "output missing or empty after encode".to_string(),
+                diag,
+            };
         }
     };
 
     // No gain → discard output, keep the original (never recycle).
     if new_bytes >= orig && orig > 0 {
         let _ = std::fs::remove_file(&out);
-        return FileOutcome::Skipped { new_bytes };
+        return FileOutcome::Skipped { new_bytes, diag };
     }
 
     let out_str = out.to_string_lossy().into_owned();
@@ -600,7 +799,8 @@ fn process_file(
     // [COMPRESSED] sidecar metadata tag keyed to the new path (the filename
     // already carries the [COMPRESSED] suffix; media re-encodes also embed a
     // container comment where the tool supports it).
-    if job.tag_filename {
+    let tagged = job.tag_filename;
+    if tagged {
         add_compressed_tag(&out_str);
     }
 
@@ -615,6 +815,7 @@ fn process_file(
     });
 
     let mut recycled = false;
+    let mut recycle_error: Option<String> = None;
     if job.recycle_originals {
         match crate::recycle::recycle_path(&input) {
             Ok(()) => {
@@ -628,6 +829,7 @@ fn process_file(
                 });
             }
             Err(e) => {
+                recycle_error = Some(e.to_string());
                 crate::audit::record(crate::audit::Entry {
                     op: "recycle",
                     disposition: "recycle",
@@ -649,7 +851,36 @@ fn process_file(
             .invalidate(&parent.to_string_lossy());
     }
 
-    FileOutcome::Done { out_path: out_str, new_bytes, recycled }
+    FileOutcome::Done { out_path: out_str, new_bytes, recycled, recycle_error, tagged, diag }
+}
+
+/// Build a human error message for a non-zero encoder exit from its diagnostics:
+/// the exit code, a trimmed tail of stderr (the part most likely to name the
+/// real failure), and the full command line for reproduction.
+fn encoder_error_message(diag: &EncodeDiag) -> String {
+    let code = match diag.exit_code {
+        Some(c) => format!("encoder exited with code {c}"),
+        None => "encoder terminated without an exit code".to_string(),
+    };
+    let mut msg = code;
+    let tail = diag.stderr_tail.trim();
+    if !tail.is_empty() {
+        // Surface the last ~400 chars of stderr inline; the full tail still goes
+        // to the CSV `stderr_excerpt` column and the verbose debug log.
+        let snippet = if tail.len() > 400 {
+            let start = tail.len() - 400;
+            format!("…{}", &tail[start..])
+        } else {
+            tail.to_string()
+        };
+        let snippet = snippet.replace(['\r', '\n'], " ");
+        msg.push_str(" — ");
+        msg.push_str(snippet.trim());
+    }
+    if !diag.command.is_empty() {
+        msg.push_str(&format!(" [command: {}]", diag.command));
+    }
+    msg
 }
 
 /// Output path beside the original: `name [COMPRESSED].ext` (zip → `.zip`).
@@ -676,14 +907,26 @@ fn output_path(input: &Path, kind: FileKind) -> PathBuf {
 
 // ── Pipelines ──────────────────────────────────────────────────────────────
 
+/// Diagnostics captured while running an encoder (or the built-in zip): the full
+/// command line, the real process exit code (when one was produced), and a
+/// bounded tail of the encoder's stderr. Threaded all the way out to the CSV log
+/// and the verbose debug log so a failure is explainable.
+#[derive(Default, Clone)]
+pub(crate) struct EncodeDiag {
+    pub(crate) command: String,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) stderr_tail: String,
+}
+
 /// Outcome of running an external encoder child.
 enum EncodeResult {
-    /// Child ran to completion; `true` when it exited 0.
-    Done(bool),
+    /// Child ran to completion; `success` is true when it exited 0. `diag`
+    /// carries the command line, exit code and captured stderr tail.
+    Done { success: bool, diag: EncodeDiag },
     /// Job was cancelled; the child was killed.
     Cancelled,
-    /// The child could not be spawned.
-    Spawn(String),
+    /// The child could not be spawned. `command` is the line we tried to run.
+    Spawn { error: String, command: String },
 }
 
 /// HandBrake video pipeline. Presets map to a quality (RF) + optional downscale;
@@ -772,14 +1015,36 @@ fn run_zip(job: &Arc<CompressJob>, index: usize, input: &Path, out: &Path) -> En
     let f = &job.files[index];
     f.pct.store(10, Ordering::Relaxed);
     job.emit(ev_progress(index, 10));
+    let command = format!("zip (deflate, built-in) {} -> {}", input.display(), out.display());
     match crate::archive::compress(&[input.to_string_lossy().into_owned()], out) {
         Ok(()) => {
             f.pct.store(100, Ordering::Relaxed);
             job.emit(ev_progress(index, 100));
-            EncodeResult::Done(true)
+            EncodeResult::Done {
+                success: true,
+                diag: EncodeDiag { command, exit_code: Some(0), stderr_tail: String::new() },
+            }
         }
-        Err(e) => EncodeResult::Spawn(e),
+        Err(e) => EncodeResult::Spawn { error: e, command },
     }
+}
+
+/// Render a [`Command`] as a readable single-line string for the logs (program
+/// plus each argument, quoting any argument that contains whitespace).
+fn command_to_string(cmd: &Command) -> String {
+    let mut s = cmd.get_program().to_string_lossy().into_owned();
+    for arg in cmd.get_args() {
+        let a = arg.to_string_lossy();
+        s.push(' ');
+        if a.is_empty() || a.contains(char::is_whitespace) {
+            s.push('"');
+            s.push_str(&a);
+            s.push('"');
+        } else {
+            s.push_str(&a);
+        }
+    }
+    s
 }
 
 /// Spawn `cmd` as the job's active child, drain stdout silently, parse `%`
@@ -788,11 +1053,19 @@ fn run_zip(job: &Arc<CompressJob>, index: usize, input: &Path, out: &Path) -> En
 fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeResult {
     use std::process::Stdio;
     compress_tools::no_window(&mut cmd);
+    // Capture the full command line before spawning so it is available for the
+    // logs whether the child runs, fails, or can't even be spawned.
+    let command = command_to_string(&cmd);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return EncodeResult::Spawn(format!("failed to start encoder: {e}")),
+        Err(e) => {
+            return EncodeResult::Spawn {
+                error: format!("failed to start encoder: {e}"),
+                command,
+            };
+        }
     };
 
     let stdout = child.stdout.take();
@@ -808,34 +1081,40 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
         })
     });
 
-    // Parse percentage from stderr (HandBrake/ffmpeg both report there).
+    // Parse percentage from stderr (HandBrake/ffmpeg both report there) and
+    // accumulate a bounded tail of the non-progress lines so a failure can be
+    // explained. The thread returns the captured tail when it finishes.
     let err_handle = stderr.map(|pipe| {
         let job = Arc::clone(job);
         std::thread::spawn(move || read_progress(pipe, &job, index))
     });
 
-    // Poll for completion / cancellation.
-    let result = loop {
+    // Poll for completion / cancellation. Track the real exit status so the exit
+    // code can be recorded.
+    let mut cancelled = false;
+    let exit_status: Option<std::process::ExitStatus> = loop {
         if job.cancel.load(Ordering::SeqCst) {
             if let Some(c) = job.child.lock().expect("child lock").as_mut() {
                 let _ = c.kill();
             }
-            break EncodeResult::Cancelled;
+            cancelled = true;
+            break None;
         }
         let poll = {
             let mut guard = job.child.lock().expect("child lock");
             match guard.as_mut() {
                 // None means the handle vanished unexpectedly — treat as failure.
-                None => Some(false),
+                None => break None,
                 Some(c) => match c.try_wait() {
-                    Ok(Some(st)) => Some(st.success()),
+                    Ok(Some(st)) => Some(st),
                     Ok(None) => None,
-                    Err(_) => Some(false),
+                    // try_wait errored — treat as failure with no code.
+                    Err(_) => break None,
                 },
             }
         };
         match poll {
-            Some(success) => break EncodeResult::Done(success),
+            Some(st) => break Some(st),
             None => std::thread::sleep(std::time::Duration::from_millis(60)),
         }
     };
@@ -847,19 +1126,62 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     if let Some(h) = out_handle {
         let _ = h.join();
     }
-    if let Some(h) = err_handle {
-        let _ = h.join();
+    let stderr_tail = err_handle
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+
+    if cancelled {
+        return EncodeResult::Cancelled;
     }
-    result
+    let (success, exit_code) = match exit_status {
+        Some(st) => (st.success(), st.code()),
+        None => (false, None),
+    };
+    EncodeResult::Done {
+        success,
+        diag: EncodeDiag { command, exit_code, stderr_tail },
+    }
 }
 
+/// Maximum number of non-progress stderr lines kept in the failure tail.
+const STDERR_TAIL_LINES: usize = 50;
+/// Maximum byte budget for the captured stderr tail (~8 KB).
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
+
 /// Read encoder stderr, emitting a `progress` event each time the integer
-/// percentage advances. Reads raw bytes and splits on `\r`/`\n` because
-/// HandBrake rewrites its progress line with carriage returns.
-fn read_progress<R: std::io::Read>(mut pipe: R, job: &Arc<CompressJob>, index: usize) {
+/// percentage advances, while keeping a bounded tail (last ~50 non-progress
+/// lines / ~8 KB) of everything else so a non-zero exit can be explained.
+/// Returns the captured tail (newline-joined). Reads raw bytes and splits on
+/// `\r`/`\n` because HandBrake rewrites its progress line with carriage returns.
+fn read_progress<R: std::io::Read>(mut pipe: R, job: &Arc<CompressJob>, index: usize) -> String {
+    use std::collections::VecDeque;
     let mut buf = [0u8; 4096];
     let mut line = String::new();
     let mut last_pct: i64 = -1;
+    let mut tail: VecDeque<String> = VecDeque::new();
+    let mut tail_bytes = 0usize;
+
+    let commit = |line: &str, tail: &mut VecDeque<String>, tail_bytes: &mut usize| {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            return;
+        }
+        // Progress lines are pure noise in a failure tail — they are emitted live
+        // and excluded here so genuine error text survives the bound.
+        if parse_percent(line).is_some() {
+            return;
+        }
+        *tail_bytes += trimmed.len() + 1;
+        tail.push_back(trimmed.to_string());
+        while tail.len() > STDERR_TAIL_LINES || *tail_bytes > STDERR_TAIL_BYTES {
+            if let Some(removed) = tail.pop_front() {
+                *tail_bytes = tail_bytes.saturating_sub(removed.len() + 1);
+            } else {
+                break;
+            }
+        }
+    };
+
     loop {
         let n = match pipe.read(&mut buf) {
             Ok(0) | Err(_) => break,
@@ -875,15 +1197,23 @@ fn read_progress<R: std::io::Read>(mut pipe: R, job: &Arc<CompressJob>, index: u
                         job.emit(ev_progress(index, pi as u64));
                     }
                 }
+                commit(&line, &mut tail, &mut tail_bytes);
                 line.clear();
             } else {
                 line.push(b as char);
                 if line.len() > 4096 {
+                    // Over-long line with no terminator: commit what we have so a
+                    // pathological stream can't grow `line` without bound.
+                    commit(&line, &mut tail, &mut tail_bytes);
                     line.clear();
                 }
             }
         }
     }
+    // Flush any trailing partial line.
+    commit(&line, &mut tail, &mut tail_bytes);
+
+    tail.into_iter().collect::<Vec<_>>().join("\n")
 }
 
 /// Extract a percentage from a line like `Encoding: task 1 of 1, 42.53 %`.

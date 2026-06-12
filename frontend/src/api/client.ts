@@ -1435,6 +1435,22 @@ export async function compressLogPath(): Promise<string> {
   }
 }
 
+/** URL of the verbose compress debug log (a plain-text attachment download). */
+export function compressDebugLogUrl(): string {
+  return "/api/compress-debug.log";
+}
+
+/** Resolve the absolute path of the verbose compress debug log (for
+ *  reveal/open). Returns an empty string if it can't be read. */
+export async function compressDebugPath(): Promise<string> {
+  try {
+    const r = await getJson<{ path?: string }>("/api/compress-debug/path");
+    return r.path ?? "";
+  } catch {
+    return "";
+  }
+}
+
 /** Copy arbitrary text to the clipboard (Electron `copyText`, else /api/copy-path). */
 export async function copyText(text: string): Promise<void> {
   if (eAPI().copyText) {

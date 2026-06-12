@@ -15,7 +15,13 @@
 //! ## Columns
 //! `ts, job_id, index, path, name, kind, preset, status, orig_bytes,
 //!  new_bytes, saved_bytes, pct_saved, ratio, tool, codec_params, duration_ms,
-//!  out_path, recycled, error`
+//!  out_path, recycled, error, reason, exit_code, tool_version, command,
+//!  stderr_excerpt`
+//!
+//! The last five columns were added for the diagnostics work; they are appended
+//! (never reordered) so older logs and any external readers keying off the
+//! original columns keep working. A pre-existing file simply gains the new
+//! columns from the next row written (the parser tolerates short rows).
 //!
 //! ## Guarantees
 //! Logging is best-effort: any failure (missing APPDATA, I/O error, …) is
@@ -30,7 +36,7 @@ use crate::export::push_json_string;
 
 /// CSV header, also used to detect a freshly-created file. Column order MUST
 /// match [`format_row`] and the JSON mapping in [`read_rows_json`].
-const HEADER: &str = "ts,job_id,index,path,name,kind,preset,status,orig_bytes,new_bytes,saved_bytes,pct_saved,ratio,tool,codec_params,duration_ms,out_path,recycled,error\n";
+const HEADER: &str = "ts,job_id,index,path,name,kind,preset,status,orig_bytes,new_bytes,saved_bytes,pct_saved,ratio,tool,codec_params,duration_ms,out_path,recycled,error,reason,exit_code,tool_version,command,stderr_excerpt\n";
 
 /// One compressed-file record. All fields borrow so this is cheap to build at
 /// the call site (see `run_job`'s outcome arms).
@@ -54,6 +60,17 @@ pub(crate) struct Row<'a> {
     pub out_path: &'a str,
     pub recycled: bool,
     pub error: &'a str,
+    /// Precise outcome code (see `compress_job::Reason`): `success`,
+    /// `skipped_no_gain`, `error_tool_missing`, `error_encoder`, …
+    pub reason: &'a str,
+    /// Encoder process exit code, when one was produced.
+    pub exit_code: Option<i32>,
+    /// Detected version string of the tool used (or `built-in` for zip).
+    pub tool_version: &'a str,
+    /// Full command line spawned (empty when no tool ran).
+    pub command: &'a str,
+    /// Bounded tail of the encoder's stderr (empty on success/no tool).
+    pub stderr_excerpt: &'a str,
 }
 
 /// Resolve `%APPDATA%\FileTree\compress-log.csv` (or the same non-Windows
@@ -127,8 +144,13 @@ fn format_row(r: &Row) -> String {
     push_field(&mut s, &r.duration_ms.to_string());
     push_field(&mut s, r.out_path);
     push_field(&mut s, if r.recycled { "true" } else { "false" });
+    push_field(&mut s, r.error);
+    push_field(&mut s, r.reason);
+    push_field(&mut s, &r.exit_code.map(|c| c.to_string()).unwrap_or_default());
+    push_field(&mut s, r.tool_version);
+    push_field(&mut s, r.command);
     // Last column: no trailing comma, then the row terminator.
-    s.push_str(&csv_escape(r.error));
+    s.push_str(&csv_escape(r.stderr_excerpt));
     s.push('\n');
     s
 }
@@ -233,6 +255,20 @@ fn push_record_json(s: &mut String, rec: &[String]) {
     s.push_str(if col(rec, 17) == "true" { "true" } else { "false" });
     s.push_str(",\"error\":");
     push_json_string(s, col(rec, 18));
+    // Diagnostics columns (appended; absent in older rows → sensible defaults).
+    // `reason` falls back to the legacy `status` so pre-upgrade rows still map
+    // to a badge in the UI.
+    let reason = col(rec, 19);
+    s.push_str(",\"reason\":");
+    push_json_string(s, if reason.is_empty() { col(rec, 7) } else { reason });
+    s.push_str(",\"exitCode\":");
+    s.push_str(&inum(col(rec, 20)));
+    s.push_str(",\"toolVersion\":");
+    push_json_string(s, col(rec, 21));
+    s.push_str(",\"command\":");
+    push_json_string(s, col(rec, 22));
+    s.push_str(",\"stderrExcerpt\":");
+    push_json_string(s, col(rec, 23));
     s.push('}');
 }
 
@@ -240,6 +276,15 @@ fn push_record_json(s: &mut String, rec: &[String]) {
 /// the body is always valid JSON.
 fn num(cell: &str) -> String {
     cell.trim().parse::<u64>().map(|n| n.to_string()).unwrap_or_else(|_| "0".to_string())
+}
+
+/// Emit a JSON integer (possibly negative) or `null` from a CSV cell. Used for
+/// the optional `exit_code` column, which is blank when no process ran.
+fn inum(cell: &str) -> String {
+    match cell.trim().parse::<i64>() {
+        Ok(n) => n.to_string(),
+        Err(_) => "null".to_string(),
+    }
 }
 
 /// Emit a JSON number (float) from a CSV cell, defaulting to `0`.

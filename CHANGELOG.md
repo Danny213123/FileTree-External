@@ -4,6 +4,22 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.11.2] - 2026-06-12
+
+### Added
+
+- **Comprehensive compression diagnostics**: every per-file compression outcome is now explainable. The pipeline captures the encoder's exit code and a tail of its stderr, and classifies each result with a precise reason code (`success`, `skipped_no_gain`, `error_tool_missing`, `error_encoder`, `error_output_empty`, `error_source_missing`, `error_spawn`).
+- **Verbose debug log**: a new append-only, size-capped log at `%APPDATA%\FileTree\compress-debug.log` records, per file, the tool + full command line, exit code, stderr tail, decision + reason, original/output sizes, duration, and recycle/tag results, plus job start/end and authorization-rejection lines. Gated by `FILETREE_COMPRESS_DEBUG` (on by default). New endpoints `GET /api/compress-debug.log` and `GET /api/compress-debug/path`, with Open / Reveal buttons in the History tab.
+- **Richer compression CSV**: the per-file CSV log gained trailing columns `reason`, `exit_code`, `tool_version`, `command`, and `stderr_excerpt`.
+- **Reason badges in the UI**: progress rows and the History tab now show human-readable status badges with tooltips (e.g. "Skipped - output not smaller", "Error - HandBrake not installed", "Error - source missing (recycled?)").
+
+### Fixed
+
+- **Compression rejected as "outside the scanned directories"**: the token-gated compress endpoint now registers the common-ancestor directory of the submitted files before validating, so legitimate folder/file selections are no longer rejected when the tree was served from cache or after a restart. Rejections now return a diagnostic message naming the offending path and are logged with the registered roots.
+- **Confusing re-compress path errors**: starting a job now drops paths that no longer exist (e.g. originals recycled by a prior run) or are already `[COMPRESSED]` outputs, refreshes the tree, and shows a pre-flight notice instead of failing opaquely.
+
+---
+
 ## [1.11.1] - 2026-06-12
 
 ### Fixed

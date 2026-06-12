@@ -25,6 +25,8 @@ import {
   fetchCompressLog,
   compressLogPath,
   compressLogCsvUrl,
+  compressDebugPath,
+  compressDebugLogUrl,
 } from "../api/client";
 import { invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import { formatBytes } from "../utils/formatBytes";
@@ -167,6 +169,10 @@ export function CompressView({
   const [installing, setInstalling] = useState<"handbrake" | "image" | null>(null);
   // Non-blocking notice when some right-click-selected paths aren't in the scan.
   const [preselectNotice, setPreselectNotice] = useState("");
+  // Pre-flight notice listing files dropped before a run started because they no
+  // longer exist in the (refreshed) tree or are already [COMPRESSED] outputs —
+  // so a re-compress over a recycled folder doesn't look like a random error.
+  const [preflightNotice, setPreflightNotice] = useState("");
   // Scoped mode: when launched from the table ("Compress…" / row button), the
   // file list is restricted to just the launched selection (a set of normalized
   // file paths). null = unscoped (opened from the activity bar) → show every
@@ -589,8 +595,61 @@ export function CompressView({
 
   // ── Run controls ────────────────────────────────────────────────────────────
   const handleStart = useCallback(async () => {
-    const runnable = selectedFiles.filter((f) => kindAvailable(f.kind));
-    if (runnable.length === 0) return;
+    const encoderRunnable = selectedFiles.filter((f) => kindAvailable(f.kind));
+    if (encoderRunnable.length === 0) return;
+
+    // Pre-flight stale-path guard: a previous run recycles originals and writes
+    // `name [COMPRESSED].ext`, so a stale selection can still point at originals
+    // that no longer exist, or at the [COMPRESSED] outputs themselves. Drop both
+    // up front and explain it, instead of letting the backend emit a row of
+    // confusing per-file "source missing" errors.
+    //   - missing: the path is no longer present in the current scan tree
+    //     (`nodeById`, the same source `files` is derived from).
+    //   - already-compressed: the file name carries the `[COMPRESSED]` marker.
+    const livePaths = new Set<string>();
+    for (const node of nodeById.values()) {
+      if (node.dir || node.id < 0 || !node.path) continue;
+      livePaths.add(normPath(node.path));
+    }
+    const COMPRESSED_RE = /\[COMPRESSED\]/i;
+    const missing = encoderRunnable.filter((f) => !livePaths.has(normPath(f.path)));
+    const alreadyCompressed = encoderRunnable.filter(
+      (f) => livePaths.has(normPath(f.path)) && COMPRESSED_RE.test(f.name),
+    );
+    const dropped = new Set<number>([
+      ...missing.map((f) => f.id),
+      ...alreadyCompressed.map((f) => f.id),
+    ]);
+    const runnable = encoderRunnable.filter((f) => !dropped.has(f.id));
+
+    if (dropped.size > 0) {
+      const parts: string[] = [];
+      if (missing.length > 0) {
+        parts.push(
+          `${missing.length} no longer exist${missing.length === 1 ? "s" : ""} (recycled by a prior run?)`,
+        );
+      }
+      if (alreadyCompressed.length > 0) {
+        parts.push(
+          `${alreadyCompressed.length} already-compressed output${alreadyCompressed.length === 1 ? "" : "s"}`,
+        );
+      }
+      const sample = [...missing, ...alreadyCompressed].slice(0, 3).map((f) => f.name).join(", ");
+      setPreflightNotice(
+        `Skipped ${dropped.size} file${dropped.size === 1 ? "" : "s"} before starting: ${parts.join(", ")}${sample ? ` — e.g. ${sample}` : ""}.`,
+      );
+      // Refresh the tree so the next derived selection reflects reality.
+      invalidateAllScanCache();
+      onRescan();
+    } else {
+      setPreflightNotice("");
+    }
+
+    if (runnable.length === 0) {
+      setRunStatus("idle");
+      toast.info("Nothing to compress — all selected files were missing or already compressed.");
+      return;
+    }
 
     abortRef.current?.abort();
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
@@ -614,7 +673,7 @@ export function CompressView({
     setProgress(init);
     setRunStatus("running");
 
-    const skipped = selectedFiles.length - runnable.length;
+    const skipped = selectedFiles.length - encoderRunnable.length;
     if (skipped > 0) {
       toast.info(`Skipping ${skipped} file${skipped === 1 ? "" : "s"} whose encoder isn't installed.`);
     }
@@ -642,7 +701,7 @@ export function CompressView({
       setRunError(e instanceof Error ? e.message : String(e));
       toast.error(`Could not start compression: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [selectedFiles, kindAvailable, preset, recycleOriginals, tagFilename, attachStream, scanPath, scannedRoot]);
+  }, [selectedFiles, kindAvailable, preset, recycleOriginals, tagFilename, attachStream, scanPath, scannedRoot, nodeById, onRescan]);
 
   const handleStop = useCallback(async () => {
     abortRef.current?.abort();
@@ -792,6 +851,13 @@ export function CompressView({
           <span className="ct-ico"><Icon name="info-circle" size={14} /></span>
           <span>{preselectNotice}</span>
           <button className="compress-notice-x" onClick={() => setPreselectNotice("")} title="Dismiss">×</button>
+        </div>
+      )}
+      {preflightNotice && (
+        <div className="compress-notice">
+          <span className="ct-ico"><Icon name="info-circle" size={14} /></span>
+          <span>{preflightNotice}</span>
+          <button className="compress-notice-x" onClick={() => setPreflightNotice("")} title="Dismiss">×</button>
         </div>
       )}
       {showBanner && (
@@ -1034,6 +1100,7 @@ export function CompressView({
 
               // run file row
               const rf = row.rf;
+              const badge = progBadge(rf);
               return (
                 <div key={row.key} className="compress-row" style={common} title={rf.error || rf.path}>
                   <span className="compress-row-name" title={rf.path}>{rf.name}</span>
@@ -1045,8 +1112,8 @@ export function CompressView({
                       />
                     </div>
                   </div>
-                  <span className={`compress-chip-status ${rf.status}`}>
-                    {rf.status === "skipped" ? "no gain" : rf.status}
+                  <span className={`compress-chip-status ${rf.status}`} title={badge.title}>
+                    {badge.label}
                   </span>
                   <span className="compress-row-saved">
                     {rf.savedBytes > 0 ? `−${formatBytes(rf.savedBytes)}` : rf.status === "done" ? "—" : ""}
@@ -1068,6 +1135,56 @@ const STATUS_LABEL: Record<string, string> = {
   skipped_no_gain: "No gain",
   error: "Error",
 };
+
+// Human-readable label + tooltip for each precise reason code the backend
+// produces (compress_job::Reason). Used in the progress rows and History tab so
+// any per-file outcome is explained rather than a bare "skipped"/"error".
+const REASON_LABEL: Record<string, string> = {
+  success: "Saved",
+  skipped_no_gain: "Skipped — not smaller",
+  error_tool_missing: "Error — tool missing",
+  error_unsupported: "Error — unsupported",
+  error_encoder: "Error — encoder failed",
+  error_output_empty: "Error — empty output",
+  error_source_missing: "Error — source missing",
+  error_spawn: "Error — couldn't start",
+};
+
+const REASON_TOOLTIP: Record<string, string> = {
+  success: "Output was smaller; original replaced.",
+  skipped_no_gain: "The re-encoded output wasn't smaller than the original, so it was discarded and the original kept.",
+  error_tool_missing: "The required encoder (HandBrake for video, ffmpeg/ImageMagick for images) isn't installed.",
+  error_unsupported: "This file type has no supported compression pipeline.",
+  error_encoder: "The encoder ran but exited with an error. See the debug log / stderr excerpt for details.",
+  error_output_empty: "The encoder reported success but produced a missing or empty output file.",
+  error_source_missing: "The source file no longer exists — it may have been recycled by a prior run.",
+  error_spawn: "The encoder process could not be started.",
+};
+
+/** CSS status class for a History row, derived from the precise reason (falls
+ *  back to the coarse status). */
+function reasonClass(reason: string, status: string): string {
+  if (reason === "success" || status === "success") return "done";
+  if (reason === "skipped_no_gain" || status === "skipped_no_gain") return "skipped";
+  return "error";
+}
+
+/** Badge label + tooltip for a live per-file progress row. */
+function progBadge(rf: FileProg): { label: string; title: string } {
+  switch (rf.status) {
+    case "pending":
+      return { label: "Pending", title: "Waiting to start" };
+    case "running":
+      return { label: `${Math.round(rf.pct)}%`, title: "Encoding…" };
+    case "skipped":
+      return { label: "No gain", title: REASON_TOOLTIP.skipped_no_gain };
+    case "error":
+      return { label: "Error", title: rf.error || REASON_TOOLTIP.error_encoder };
+    case "done":
+    default:
+      return { label: "Done", title: REASON_TOOLTIP.success };
+  }
+}
 
 /** Derive a display badge from a job summary's live/resumable/status flags. */
 function jobBadge(j: CompressJobSummary): { label: string; cls: string } {
@@ -1275,13 +1392,19 @@ function CompressHistory() {
   const [rows, setRows] = useState<CompressLogRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [csvPath, setCsvPath] = useState("");
+  const [debugPath, setDebugPath] = useState("");
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
-    const [r, p] = await Promise.all([fetchCompressLog(1000, signal), compressLogPath()]);
+    const [r, p, dp] = await Promise.all([
+      fetchCompressLog(1000, signal),
+      compressLogPath(),
+      compressDebugPath(),
+    ]);
     if (signal?.aborted) return;
     setRows(r);
     setCsvPath(p);
+    setDebugPath(dp);
     setLoading(false);
   }, []);
 
@@ -1350,6 +1473,31 @@ function CompressHistory() {
         >
           <Icon name="arrow-up" size={13} /> Download
         </a>
+        <span className="compress-toolbar-divider" aria-hidden="true" />
+        <button
+          className="compress-btn"
+          onClick={() => debugPath && void openPath(debugPath)}
+          disabled={!debugPath}
+          title="Open the verbose diagnostic log (per-file command, exit code, stderr, decision + reason)"
+        >
+          <Icon name="file-text" size={13} /> Open debug log
+        </button>
+        <button
+          className="compress-btn"
+          onClick={() => debugPath && void revealPath(debugPath)}
+          disabled={!debugPath}
+          title="Show the debug log in Explorer"
+        >
+          <Icon name="folder-open" size={13} /> Reveal
+        </button>
+        <a
+          className="compress-btn"
+          href={compressDebugLogUrl()}
+          download="filetree-compress-debug.log"
+          title="Download the full verbose debug log"
+        >
+          <Icon name="arrow-up" size={13} /> Debug log
+        </a>
       </div>
 
       <div className="compress-body">
@@ -1389,11 +1537,14 @@ function CompressHistory() {
                   <td className="num">
                     {r.status === "success" ? `${r.pctSaved.toFixed(1)}%` : "—"}
                   </td>
-                  <td title={r.codecParams}>{r.tool || "—"}</td>
+                  <td title={[r.tool, r.toolVersion].filter(Boolean).join(" ") + (r.codecParams ? ` · ${r.codecParams}` : "")}>{r.tool || "—"}</td>
                   <td className="num">{formatDuration(r.durationMs)}</td>
                   <td>
-                    <span className={`compress-chip-status ${r.status === "success" ? "done" : r.status === "skipped_no_gain" ? "skipped" : "error"}`}>
-                      {STATUS_LABEL[r.status] ?? r.status}
+                    <span
+                      className={`compress-chip-status ${reasonClass(r.reason, r.status)}`}
+                      title={r.error || REASON_TOOLTIP[r.reason] || REASON_TOOLTIP[r.status] || ""}
+                    >
+                      {REASON_LABEL[r.reason] ?? STATUS_LABEL[r.status] ?? r.status}
                     </span>
                   </td>
                   <td className="clog-ts" title={r.ts}>{formatTs(r.ts)}</td>
