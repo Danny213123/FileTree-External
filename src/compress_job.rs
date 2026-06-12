@@ -1057,32 +1057,195 @@ pub(crate) fn job_full_json(job: &CompressJob) -> String {
     s
 }
 
-/// Compact summary for the list endpoint (`GET /api/compress-jobs`).
-pub(crate) fn job_summary_json(job: &CompressJob) -> String {
-    let mut done = 0usize;
-    let mut errors = 0usize;
+/// One row for the list endpoint (`GET /api/compress-jobs`), derived from either
+/// a live registry job or a persisted manifest.
+struct JobSummary {
+    id: String,
+    status: String,
+    preset: String,
+    total: usize,
+    done: usize,
+    errors: usize,
+    skipped: usize,
+    pending: usize,
+    saved_bytes: u64,
+    created_at: u64,
+    updated_at: u64,
+    /// Currently tracked + not finished in THIS process (i.e. encoding now).
+    active: bool,
+    /// Has remaining (non-`done`) work and isn't actively running — covers
+    /// cancelled, errored, and "running" manifests orphaned by a restart.
+    resumable: bool,
+}
+
+/// Job ids are `<unixMs>-<counter>`; the prefix is the creation time.
+fn created_at_from_id(id: &str) -> u64 {
+    id.split('-').next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
+}
+
+/// Manifest file's last-modified time in epoch ms (0 when unavailable). Doubles
+/// as the job's "last updated" since the worker rewrites it after every file.
+fn manifest_mtime_ms(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn summary_from_live(job: &CompressJob) -> JobSummary {
+    let (mut done, mut errors, mut skipped) = (0usize, 0usize, 0usize);
     for f in &job.files {
         match f.status.lock().expect("status lock").as_str() {
             "done" => done += 1,
             "error" => errors += 1,
+            "skipped" => skipped += 1,
             _ => {}
         }
     }
-    let mut s = String::with_capacity(192);
+    let total = job.total;
+    let pending = total.saturating_sub(done + errors + skipped);
+    let active = !job.finished.load(Ordering::SeqCst);
+    // On resume the worker re-runs everything that isn't `done` (skipped/error/
+    // pending all re-run), so remaining work = total - done.
+    let remaining = total.saturating_sub(done);
+    let created = created_at_from_id(&job.id);
+    let mtime = manifest_mtime_ms(&job.manifest_path);
+    JobSummary {
+        id: job.id.clone(),
+        status: job.status.lock().expect("status lock").clone(),
+        preset: job.preset.clone(),
+        total,
+        done,
+        errors,
+        skipped,
+        pending,
+        saved_bytes: job.saved_bytes.load(Ordering::Relaxed),
+        created_at: created,
+        updated_at: if mtime > 0 { mtime } else { created },
+        active,
+        resumable: !active && remaining > 0,
+    }
+}
+
+fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let root = crate::json::parse(&text)?;
+    let status = root.get("status").and_then(|v| v.as_str()).unwrap_or("error").to_string();
+    let preset = root.get("preset").and_then(|v| v.as_str()).unwrap_or("balanced").to_string();
+    let saved_bytes = root.get("savedBytes").and_then(|v| v.as_u64()).unwrap_or(0);
+    let files = root.get("files").and_then(|v| v.as_array());
+    let total = root
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or_else(|| files.map(|a| a.len()).unwrap_or(0));
+    let (mut done, mut errors, mut skipped) = (0usize, 0usize, 0usize);
+    if let Some(files) = files {
+        for f in files {
+            match f.get("status").and_then(|v| v.as_str()).unwrap_or("pending") {
+                "done" => done += 1,
+                "error" => errors += 1,
+                "skipped" => skipped += 1,
+                _ => {}
+            }
+        }
+    }
+    let pending = total.saturating_sub(done + errors + skipped);
+    let remaining = total.saturating_sub(done);
+    Some(JobSummary {
+        id: id.to_string(),
+        status,
+        preset,
+        total,
+        done,
+        errors,
+        skipped,
+        pending,
+        saved_bytes,
+        created_at: created_at_from_id(id),
+        updated_at: manifest_mtime_ms(path),
+        // Not in this process's registry ⇒ never actively encoding here; it is
+        // resumable whenever any file still needs work.
+        active: false,
+        resumable: remaining > 0,
+    })
+}
+
+fn push_summary_json(s: &mut String, j: &JobSummary) {
     s.push_str("{\"id\":");
-    push_json_string(&mut s, &job.id);
+    push_json_string(s, &j.id);
     s.push_str(",\"status\":");
-    push_json_string(&mut s, &job.status.lock().expect("status lock"));
+    push_json_string(s, &j.status);
+    s.push_str(",\"preset\":");
+    push_json_string(s, &j.preset);
     s.push_str(",\"total\":");
-    s.push_str(&job.total.to_string());
+    s.push_str(&j.total.to_string());
     s.push_str(",\"done\":");
-    s.push_str(&done.to_string());
+    s.push_str(&j.done.to_string());
     s.push_str(",\"errors\":");
-    s.push_str(&errors.to_string());
+    s.push_str(&j.errors.to_string());
+    s.push_str(",\"skipped\":");
+    s.push_str(&j.skipped.to_string());
+    s.push_str(",\"pending\":");
+    s.push_str(&j.pending.to_string());
     s.push_str(",\"savedBytes\":");
-    s.push_str(&job.saved_bytes.load(Ordering::Relaxed).to_string());
+    s.push_str(&j.saved_bytes.to_string());
+    s.push_str(",\"createdAt\":");
+    s.push_str(&j.created_at.to_string());
+    s.push_str(",\"updatedAt\":");
+    s.push_str(&j.updated_at.to_string());
+    s.push_str(",\"active\":");
+    s.push_str(if j.active { "true" } else { "false" });
+    s.push_str(",\"resumable\":");
+    s.push_str(if j.resumable { "true" } else { "false" });
     s.push('}');
-    s
+}
+
+/// List every job for `GET /api/compress-jobs`: the live in-memory registry
+/// (authoritative for jobs running in this process) merged with on-disk
+/// manifests under `%APPDATA%\FileTree\jobs\` (so jobs left over from a previous
+/// session show up as interrupted/resumable). Newest first.
+pub(crate) fn list_jobs_json(state: &AppState) -> String {
+    let mut summaries: Vec<JobSummary> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    {
+        let jobs = state.compress_jobs.lock().expect("compress_jobs lock");
+        for job in jobs.values() {
+            seen.insert(job.id.clone());
+            summaries.push(summary_from_live(job));
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(jobs_dir()) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            if !is_safe_job_id(stem) || seen.contains(stem) {
+                continue;
+            }
+            if let Some(sum) = summary_from_manifest(stem, &path) {
+                summaries.push(sum);
+            }
+        }
+    }
+    summaries.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then(b.updated_at.cmp(&a.updated_at))
+    });
+    let mut body = String::from("{\"jobs\":[");
+    for (i, j) in summaries.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        push_summary_json(&mut body, j);
+    }
+    body.push_str("]}");
+    body
 }
 
 // ── NDJSON event builders (one JSON object per line) ──────────────────────────

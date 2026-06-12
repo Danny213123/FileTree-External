@@ -7,6 +7,7 @@ import type {
   CompressKind,
   CompressEvent,
   CompressJob,
+  CompressJobSummary,
   CompressLogRow,
 } from "../api/types";
 import {
@@ -17,6 +18,8 @@ import {
   retryCompressJob,
   fetchCompressJob,
   streamCompressJob,
+  listCompressJobs,
+  shellContextMenu,
   openPath,
   revealPath,
   fetchCompressLog,
@@ -88,7 +91,7 @@ type Row =
   | { type: "file"; key: string; file: CompressFile }
   | { type: "runfile"; key: string; rf: FileProg };
 
-type CompressTab = "compress" | "history";
+type CompressTab = "compress" | "progress" | "history";
 
 interface CompressViewProps {
   /** Current scan root (for the empty state + nocache rescan). */
@@ -383,6 +386,26 @@ export function CompressView({
   }, [filteredFiles]);
 
   const clearSelection = useCallback(() => setSelected(new Set()), []);
+
+  // ── Native shell context menu (mirrors the main table) ──────────────────────
+  // Right-clicking a file row opens the same Windows shell menu the file table
+  // uses. If the clicked row is part of a multi-selection, the menu acts on the
+  // whole selection (scoped to the files currently visible here); otherwise just
+  // the clicked row. Returned verbs (rename / delete / reveal / open-new-tab /
+  // compress) are dispatched by the app-level handler in App.tsx, which rescans
+  // the focused pane on a mutation — and since `files` is derived from that
+  // pane's tree, this view stays in sync without any extra bookkeeping.
+  const handleRowContextMenu = useCallback(
+    (file: CompressFile, e: React.MouseEvent) => {
+      e.preventDefault();
+      const paths =
+        selected.has(file.id) && selected.size > 1
+          ? selectedFiles.map((f) => f.path)
+          : [file.path];
+      void shellContextMenu(paths, e.clientX, e.clientY);
+    },
+    [selected, selectedFiles],
+  );
 
   // ── Job event handling ──────────────────────────────────────────────────────
   const finalize = useCallback(
@@ -698,7 +721,7 @@ export function CompressView({
 
   return (
     <div className="compress-view">
-      <div className="compress-tabs" role="tablist" aria-label="Compress / History">
+      <div className="compress-tabs" role="tablist" aria-label="Compress / In Progress / History">
         <button
           role="tab"
           aria-selected={tab === "compress"}
@@ -706,6 +729,14 @@ export function CompressView({
           onClick={() => setTab("compress")}
         >
           Compress
+        </button>
+        <button
+          role="tab"
+          aria-selected={tab === "progress"}
+          className={`compress-tab${tab === "progress" ? " active" : ""}`}
+          onClick={() => setTab("progress")}
+        >
+          In Progress
         </button>
         <button
           role="tab"
@@ -717,7 +748,9 @@ export function CompressView({
         </button>
       </div>
 
-      {tab === "history" ? (
+      {tab === "progress" ? (
+        <CompressInProgress />
+      ) : tab === "history" ? (
         <CompressHistory />
       ) : !scanPath ? (
         <EmptyState
@@ -972,6 +1005,7 @@ export function CompressView({
                     className={`compress-row${isChecked ? " on" : ""}`}
                     style={common}
                     onDoubleClick={() => onNavigate(f.id)}
+                    onContextMenu={(e) => handleRowContextMenu(f, e)}
                   >
                     <input
                       type="checkbox"
@@ -1022,6 +1056,190 @@ const STATUS_LABEL: Record<string, string> = {
   skipped_no_gain: "No gain",
   error: "Error",
 };
+
+/** Derive a display badge from a job summary's live/resumable/status flags. */
+function jobBadge(j: CompressJobSummary): { label: string; cls: string } {
+  if (j.active) return { label: "Running", cls: "running" };
+  if (j.resumable) {
+    if (j.status === "cancelled") return { label: "Cancelled", cls: "skipped" };
+    if (j.status === "running") return { label: "Interrupted", cls: "error" };
+    if (j.status === "error") return { label: "Failed", cls: "error" };
+    return { label: "Incomplete", cls: "skipped" };
+  }
+  return { label: "Done", cls: "done" };
+}
+
+// In Progress tab: every compression job that's still running in this session or
+// left unfinished on disk (interrupted by an app restart, cancelled, or errored
+// with remaining work). Polls the list endpoint every 1.5s so running jobs show
+// live progress and resumable jobs appear after a restart. Each job can be
+// resumed (skips already-done files), cancelled, or have its output revealed.
+function CompressInProgress() {
+  const [jobs, setJobs] = useState<CompressJobSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const refresh = useCallback(async (signal?: AbortSignal) => {
+    const all = await listCompressJobs(signal);
+    if (signal?.aborted) return;
+    setJobs(all.filter((j) => j.active || j.resumable));
+    setLoading(false);
+  }, []);
+
+  // Poll on a 1.5s cadence while mounted; abort + clear on unmount.
+  useEffect(() => {
+    const ac = new AbortController();
+    let stopped = false;
+    const tick = async () => {
+      await refresh(ac.signal);
+      if (stopped || ac.signal.aborted) return;
+      timerRef.current = setTimeout(() => void tick(), 1500);
+    };
+    void tick();
+    return () => {
+      stopped = true;
+      ac.abort();
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, [refresh]);
+
+  const onResume = useCallback(
+    async (id: string) => {
+      setBusy(id);
+      try {
+        await retryCompressJob(id);
+        toast.success("Resuming job — skipping files already done.");
+        await refresh();
+      } catch (e) {
+        toast.error(`Could not resume: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setBusy(null);
+      }
+    },
+    [refresh],
+  );
+
+  const onCancel = useCallback(
+    async (id: string) => {
+      setBusy(id);
+      const res = await cancelCompressJob(id);
+      if (!res.ok) toast.error(res.error ?? "Could not cancel the job.");
+      await refresh();
+      setBusy(null);
+    },
+    [refresh],
+  );
+
+  // Reveal a produced output in Explorer. Only live jobs expose a full snapshot,
+  // so interrupted/manifest-only jobs fall back to a soft notice.
+  const onReveal = useCallback(async (id: string) => {
+    const snap = await fetchCompressJob(id);
+    const out =
+      snap?.files.find((f) => f.status === "done" && f.newBytes > 0) ??
+      snap?.files.find((f) => f.path);
+    if (out?.path) void revealPath(out.path);
+    else toast.info("No output to reveal yet for this job.");
+  }, []);
+
+  return (
+    <div className="compress-progress">
+      <div className="compress-toolbar">
+        <div className="compress-summary">
+          {jobs.length > 0 ? (
+            <>
+              <span className="compress-total">{jobs.length.toLocaleString()}</span>
+              <span className="compress-total-label">
+                active / resumable job{jobs.length === 1 ? "" : "s"}
+              </span>
+            </>
+          ) : (
+            <span className="compress-total-label">No jobs in progress</span>
+          )}
+        </div>
+        <div className="compress-toolbar-spacer" />
+        <button className="compress-btn" onClick={() => void refresh()} disabled={loading}>
+          <Icon name="arrow-repeat" size={13} /> Refresh
+        </button>
+      </div>
+
+      <div className="compress-body">
+        {loading && jobs.length === 0 ? (
+          <EmptyState icon="clock-history" title="Loading jobs…" hint="Checking running and saved jobs." />
+        ) : jobs.length === 0 ? (
+          <EmptyState
+            icon="file-zip"
+            title="Nothing in progress"
+            hint="Running jobs appear here live, and jobs interrupted by a restart show up as resumable."
+          />
+        ) : (
+          <div className="compress-jobs">
+            {jobs.map((j) => {
+              const badge = jobBadge(j);
+              const completed = j.done + j.errors + j.skipped;
+              const pct = j.total > 0 ? Math.round((completed / j.total) * 100) : 0;
+              const isBusy = busy === j.id;
+              return (
+                <div key={j.id} className="compress-job">
+                  <div className="compress-job-head">
+                    <span className={`compress-chip-status ${badge.cls}`}>{badge.label}</span>
+                    <span className="compress-job-preset">{j.preset}</span>
+                    <span className="compress-job-when" title={`Created ${formatTs(new Date(j.createdAt).toISOString())}`}>
+                      {j.createdAt ? formatTs(new Date(j.createdAt).toISOString()) : "—"}
+                    </span>
+                    <div className="compress-toolbar-spacer" />
+                    {j.savedBytes > 0 && (
+                      <span className="compress-job-saved">saved {formatBytes(j.savedBytes)}</span>
+                    )}
+                  </div>
+                  <div className="compress-job-prog">
+                    <div className="compress-bar" title={`${pct}%`}>
+                      <div
+                        className={`compress-bar-fill${j.active ? "" : " skipped"}`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <span className="compress-job-counts">
+                      {completed.toLocaleString()} / {j.total.toLocaleString()} · {pct}%
+                      {j.errors > 0 ? ` · ${j.errors.toLocaleString()} error${j.errors === 1 ? "" : "s"}` : ""}
+                    </span>
+                  </div>
+                  <div className="compress-job-actions">
+                    {j.active ? (
+                      <button
+                        className="compress-btn danger"
+                        onClick={() => void onCancel(j.id)}
+                        disabled={isBusy}
+                      >
+                        <Icon name="stop-fill" size={13} /> Cancel
+                      </button>
+                    ) : (
+                      <button
+                        className="compress-btn primary"
+                        onClick={() => void onResume(j.id)}
+                        disabled={isBusy}
+                        title="Resume this job, skipping files already compressed"
+                      >
+                        <Icon name="arrow-repeat" size={13} /> {isBusy ? "Resuming…" : "Resume"}
+                      </button>
+                    )}
+                    <button
+                      className="compress-btn"
+                      onClick={() => void onReveal(j.id)}
+                      title="Show a produced output in Explorer"
+                    >
+                      <Icon name="folder-open" size={13} /> Reveal
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function formatDuration(ms: number): string {
   if (!ms || ms < 0) return "—";

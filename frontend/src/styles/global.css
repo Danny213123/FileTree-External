@@ -3907,6 +3907,23 @@ input:focus, select:focus {
 }
 .compress-scope-clear:hover { background: var(--vsc-list-hover); }
 
+/* In Progress tab */
+.compress-progress { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
+.compress-jobs { display: flex; flex-direction: column; gap: 10px; padding: 4px 0; }
+.compress-job {
+  border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px;
+  background: var(--vsc-input-bg, rgba(255, 255, 255, 0.02));
+  display: flex; flex-direction: column; gap: 8px;
+}
+.compress-job-head { display: flex; align-items: center; gap: 10px; }
+.compress-job-preset { font-size: 12px; color: var(--text-5); text-transform: capitalize; }
+.compress-job-when { font-size: 11px; color: var(--text-8); }
+.compress-job-saved { font-size: 12px; color: var(--accent-2, #2ea043); font-weight: 600; }
+.compress-job-prog { display: flex; align-items: center; gap: 10px; }
+.compress-job-prog .compress-bar { flex: 1 1 0; }
+.compress-job-counts { font-size: 12px; color: var(--text-5); white-space: nowrap; }
+.compress-job-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
 /* History tab */
 .compress-history { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
 .compress-history a.compress-btn { text-decoration: none; }

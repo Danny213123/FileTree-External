@@ -472,6 +472,29 @@ export interface CompressJob {
   files: CompressJobFile[];
 }
 
+/** One row from `GET /api/compress-jobs` — a compact summary of every job,
+ *  merging live in-memory jobs with persisted manifests (interrupted/resumable
+ *  jobs from a previous session). Powers the Compress page "In Progress" tab. */
+export interface CompressJobSummary {
+  id: string;
+  status: CompressJobStatus;
+  preset: CompressPreset;
+  total: number;
+  done: number;
+  errors: number;
+  skipped: number;
+  pending: number;
+  savedBytes: number;
+  /** Epoch ms the job was created (parsed from its id). */
+  createdAt: number;
+  /** Epoch ms of the last manifest write (last progress). */
+  updatedAt: number;
+  /** Currently encoding in this server process. */
+  active: boolean;
+  /** Has remaining (non-done) work and isn't actively running. */
+  resumable: boolean;
+}
+
 /** Body for POST /api/compress-jobs. */
 export interface CompressJobRequest {
   paths: string[];

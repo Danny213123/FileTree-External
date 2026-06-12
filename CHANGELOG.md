@@ -4,6 +4,15 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.11.0] - 2026-06-12
+
+### Added
+
+- **Right-click context menu on Compress page file rows**: file rows in the Compression page now open the native Windows shell context menu (reusing the same integration as the main file table). It is multi-selection aware -- right-clicking a row that's part of the current selection acts on the whole selection, otherwise just the clicked row.
+- **"In Progress" tab on the Compression page**: a new tab listing running compressions with live progress, plus interrupted/resumable jobs (including ones orphaned by an app restart), each with Resume / Cancel / Reveal actions. Backed by a rewritten `GET /api/compress-jobs` list endpoint that merges the live in-memory job registry with persisted job manifests under `%APPDATA%\FileTree\jobs\`.
+
+---
+
 ## [1.10.1] - 2026-06-12
 
 ### Fixed

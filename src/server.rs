@@ -2985,15 +2985,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 body.push('}');
                 respond_json(&mut stream, 200, "OK", &body)
             } else {
-                let jobs = state.compress_jobs.lock().expect("compress_jobs lock");
-                let mut body = String::from("{\"jobs\":[");
-                for (i, job) in jobs.values().enumerate() {
-                    if i > 0 {
-                        body.push(',');
-                    }
-                    body.push_str(&crate::compress_job::job_summary_json(job));
-                }
-                body.push_str("]}");
+                let body = crate::compress_job::list_jobs_json(&state);
                 respond_json(&mut stream, 200, "OK", &body)
             }
         }

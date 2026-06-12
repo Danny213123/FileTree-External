@@ -22,6 +22,7 @@ import type {
   CompressInstallResult,
   CompressJob,
   CompressJobRequest,
+  CompressJobSummary,
   CompressEvent,
   CompressLogRow,
 } from "./types";
@@ -1339,6 +1340,19 @@ export async function retryCompressJob(id: string): Promise<string> {
   const jobId = (r.data as { jobId?: string } | null)?.jobId;
   if (!jobId) throw new Error("Server did not return a job id");
   return jobId;
+}
+
+/** List every compression job (live + persisted manifests) for the "In Progress"
+ *  tab. Returns [] on any error so the tab degrades gracefully. */
+export async function listCompressJobs(signal?: AbortSignal): Promise<CompressJobSummary[]> {
+  try {
+    const res = await fetch("/api/compress-jobs", { signal });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { jobs?: CompressJobSummary[] } | null;
+    return Array.isArray(data?.jobs) ? data!.jobs : [];
+  } catch {
+    return [];
+  }
 }
 
 /** Poll a job's full snapshot (fallback when the NDJSON stream errors). Returns
