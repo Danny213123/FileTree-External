@@ -4,6 +4,14 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.11.1] - 2026-06-12
+
+### Fixed
+
+- **"compression failed: a source path is outside the scanned directories" when compressing a folder/selection**: the Compression page started jobs with the path-input value (`scanPath`) as the asserted scan root, which can point somewhere that doesn't actually contain the selected files (for example after navigating into a subfolder), so a cache-served or post-restart session re-registered the wrong directory and the server rejected valid source paths. The page now asserts the genuine scanned root (`data.rootPath`), which is guaranteed to be the ancestor of every file in the list. The containment guard is unchanged -- it still only ever registers a real on-disk directory the user actually scanned, and paths genuinely outside a scanned root are still rejected.
+
+---
+
 ## [1.11.0] - 2026-06-12
 
 ### Added

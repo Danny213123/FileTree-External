@@ -291,7 +291,10 @@ fn generate_session_token() -> String {
 /// file-content reads. Stored canonicalized (symlinks/`..` resolved) so the
 /// read-time containment check compares like-for-like. Bounded to avoid growth.
 fn register_scan_root(state: &AppState, path: &Path) {
-    let Ok(canon) = fs::canonicalize(path) else { return };
+    let canon = match fs::canonicalize(path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
     let mut roots = state.scan_roots.write().expect("scan_roots lock poisoned");
     if roots.iter().any(|existing| existing == &canon) {
         return;
@@ -308,7 +311,10 @@ fn register_scan_root(state: &AppState, path: &Path) {
 /// symlink escapes outside every scan root are rejected. A path that can't be
 /// canonicalized (missing, or no root recorded yet) is rejected.
 fn path_within_scan_root(state: &AppState, requested: &Path) -> bool {
-    let Ok(canon) = fs::canonicalize(requested) else { return false };
+    let canon = match fs::canonicalize(requested) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
     let roots = state.scan_roots.read().expect("scan_roots lock poisoned");
     roots.iter().any(|root| canon.starts_with(root))
 }

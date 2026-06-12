@@ -1884,6 +1884,7 @@ function WorkbenchCompress({
   return (
     <CompressView
       scanPath={m.scanPath}
+      scannedRoot={m.data?.rootPath}
       nodeById={m.nodeById}
       onNavigate={m.onNavigate}
       onRescan={m.onRefresh}

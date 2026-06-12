@@ -96,6 +96,12 @@ type CompressTab = "compress" | "progress" | "history";
 interface CompressViewProps {
   /** Current scan root (for the empty state + nocache rescan). */
   scanPath: string;
+  /** The actual scanned root the file tree was built from (`data.rootPath`).
+   *  This is the genuine ancestor of every file in `nodeById`, so it is the
+   *  correct directory to re-assert as an allowed scan root when starting a
+   *  job — unlike `scanPath`, which is the path-input/current-location value
+   *  and can point somewhere that doesn't contain the selected files. */
+  scannedRoot?: string;
   /** The focused pane's scan tree — the source of compressible files. */
   nodeById: Map<number, NodeRecord>;
   /** Reveal + select a node in the tree. */
@@ -144,6 +150,7 @@ function normPath(p: string): string {
 
 export function CompressView({
   scanPath,
+  scannedRoot,
   nodeById,
   onNavigate,
   onRescan,
@@ -619,8 +626,13 @@ export function CompressView({
         recycleOriginals,
         tagFilename,
         // Re-assert the scan root so a cache-served tree (no /api/scan this
-        // session) still passes the server's scan-root containment check.
-        scanRoot: scanPath || undefined,
+        // session) still passes the server's scan-root containment check. Use
+        // the genuine scanned root (`data.rootPath`), which is guaranteed to be
+        // the ancestor of every file in the list; `scanPath` is only the
+        // path-input value and may not contain the selected files (e.g. after
+        // navigating into a subfolder), which caused valid folder/file
+        // selections to be rejected as "outside the scanned directories".
+        scanRoot: scannedRoot || scanPath || undefined,
       });
       setJobId(id);
       void attachStream(id);
@@ -630,7 +642,7 @@ export function CompressView({
       setRunError(e instanceof Error ? e.message : String(e));
       toast.error(`Could not start compression: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [selectedFiles, kindAvailable, preset, recycleOriginals, tagFilename, attachStream, scanPath]);
+  }, [selectedFiles, kindAvailable, preset, recycleOriginals, tagFilename, attachStream, scanPath, scannedRoot]);
 
   const handleStop = useCallback(async () => {
     abortRef.current?.abort();
