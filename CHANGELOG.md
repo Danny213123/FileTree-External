@@ -4,6 +4,24 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.12.0] - 2026-06-12
+
+### Added
+
+- **Parallel compression with global load balancing**: a compression job now encodes multiple files at once via a bounded worker pool (scheduled largest-first), instead of one-at-a-time. A new global gate caps total concurrent encoders across all jobs and splits them into separate workload lanes (video CPU, GPU sessions, image, zip), so simultaneous jobs no longer oversubscribe the machine and a queue of large videos no longer blocks quick image/zip work. Cancelling a job now kills every active encoder child.
+- **Hardware-accelerated video (GPU) through HandBrake**: FileTree detects available hardware encoders (NVIDIA NVENC, Intel QSV, AMD AMF/VCE for H.264/H.265) from HandBrake and the inferred GPU vendor, exposed on `GET /api/compress-tools`. A new **Performance** panel on the Compress page lets you pick the encoder (Auto / x264 / NVENC / QSV / AMF-VCE), codec (H.264/H.265), GPU on/off, parallel-file count, and zip level — capability-gated so unavailable encoders can't be chosen, with hardware-derived defaults. **Auto** picks the best available GPU encoder and falls back to CPU x264 per file on a GPU failure (logged). Settings persist across sessions.
+- **Zip throughput**: the Deflate level is configurable, and already-compressed inputs (e.g. media, archives) are stored instead of wastefully re-compressed. A pre-skip heuristic avoids spawning encoders for inputs unlikely to shrink.
+- **In Progress tab overhaul**: the run cards became a table (status, preset, created, progress, saved, actions) covering running, completed, and interrupted runs. Each row expands to a lazy-loaded, virtualized per-file outcome table — outcome badge, original→new size, saved bytes + %, throughput (MB/s), duration, and reason/error — with an outcome filter (passed/failed/skipped). Active runs refresh live; loaded detail is cached on collapse.
+- **Per-file throughput + enriched outcomes**: the job manifest, the `/api/compress-jobs/<id>` snapshot, and the debug log now record each file's precise reason, saved bytes/percent, duration, and MB/s/fps, so even interrupted or restored runs show exact outcomes.
+
+### Changed
+
+- **Faster duplicate hashing**: the content hash used by the Duplicates finder switched from byte-serial FNV-1a to an 8-bytes-per-step FxHash-style hash, markedly speeding up full-file hashing of large candidates. The on-disk hash cache moved to `hash_cache_v2.json` (the old cache is retired automatically).
+- **Bounded thumbnail generation**: a global limit caps how many Windows Shell thumbnails are generated at once, so fast-scrolling a folder of fresh images can't spawn an unbounded number of worker threads.
+- **Lower renderer memory**: the client scan cache is now byte-capped (~256 MB) with least-recently-used eviction, so holding several large scans no longer pins unbounded heap.
+
+---
+
 ## [1.11.2] - 2026-06-12
 
 ### Added
