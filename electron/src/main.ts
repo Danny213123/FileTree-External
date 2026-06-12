@@ -367,6 +367,13 @@ function handleFileTreeContextAction(win: BrowserWindow | null, filePath: string
     case "show-in-explorer":
       shell.showItemInFolder(filePath);
       break;
+    case "compress":
+      // Route to the renderer's Compress view. The native path sends the full
+      // multi-file JSON list directly (see shellContextMenu); the fallback /
+      // hybrid paths only know a single path, so wrap it as a one-element list
+      // for the same JSON-array payload contract the renderer parses.
+      win?.webContents.send("contextMenuAction", "compress", JSON.stringify([filePath]));
+      break;
     case "copy-path":
       clipboard.writeText(filePath);
       break;
@@ -384,6 +391,7 @@ function showFallbackContextMenu(win: BrowserWindow | null, filePath: string, x:
   const fileTreeSubmenu: Electron.MenuItemConstructorOptions[] = [
     { label: "Open in new tab", enabled: isDir, click: () => win?.webContents.send("contextMenuAction", "open-new-tab", filePath) },
     { label: "Show in Explorer", click: () => shell.showItemInFolder(filePath) },
+    { label: "Compress...", enabled: !isDir, click: () => win?.webContents.send("contextMenuAction", "compress", JSON.stringify([filePath])) },
     { type: "separator" },
     { label: "Copy full path", click: () => clipboard.writeText(filePath) },
     { label: "Copy name", click: () => clipboard.writeText(path.basename(filePath)) },
@@ -1584,6 +1592,11 @@ ipcMain.handle("shellContextMenu", async (event, paths: string[] | string, x: nu
         // Reveal the right-clicked item in Explorer with it selected.
         case "show-in-explorer":
           shell.showItemInFolder(list[0]);
+          break;
+        // Open the Compress view pre-loaded with the whole selection. The
+        // payload is the full JSON path list so multi-file selections survive.
+        case "compress":
+          win?.webContents.send("contextMenuAction", "compress", JSON.stringify(list));
           break;
         // "" → the shell already performed the command (Open, Cut, Copy, Delete,
         // Properties, Send to, third-party verbs); the fs watcher reflects any

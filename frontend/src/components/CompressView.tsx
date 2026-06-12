@@ -7,6 +7,7 @@ import type {
   CompressKind,
   CompressEvent,
   CompressJob,
+  CompressLogRow,
 } from "../api/types";
 import {
   fetchCompressTools,
@@ -17,6 +18,10 @@ import {
   fetchCompressJob,
   streamCompressJob,
   openPath,
+  revealPath,
+  fetchCompressLog,
+  compressLogPath,
+  compressLogCsvUrl,
 } from "../api/client";
 import { invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import { formatBytes } from "../utils/formatBytes";
@@ -83,6 +88,8 @@ type Row =
   | { type: "file"; key: string; file: CompressFile }
   | { type: "runfile"; key: string; rf: FileProg };
 
+type CompressTab = "compress" | "history";
+
 interface CompressViewProps {
   /** Current scan root (for the empty state + nocache rescan). */
   scanPath: string;
@@ -92,6 +99,11 @@ interface CompressViewProps {
   onNavigate: (id: number) => void;
   /** Refresh the focused pane's tree (used after a run completes). */
   onRescan: () => void;
+  /** Paths to pre-check when opened from the table's "Compress..." action. */
+  initialSelectedPaths?: string[];
+  /** Called once the initial paths have been applied so the parent can clear
+   *  them (keeps manual edits sticky across re-renders / view switches). */
+  onInitialApplied?: () => void;
 }
 
 // Pipeline classification MUST mirror the backend `classify()` in
@@ -120,7 +132,15 @@ function baseName(p: string): string {
   return parts.length ? parts[parts.length - 1] : p;
 }
 
-export function CompressView({ scanPath, nodeById, onNavigate, onRescan }: CompressViewProps) {
+export function CompressView({
+  scanPath,
+  nodeById,
+  onNavigate,
+  onRescan,
+  initialSelectedPaths,
+  onInitialApplied,
+}: CompressViewProps) {
+  const [tab, setTab] = useState<CompressTab>("compress");
   const [tools, setTools] = useState<CompressTools | null>(null);
   const [preset, setPreset] = useState<CompressPreset>("balanced");
   const [recycleOriginals, setRecycleOriginals] = useState(true);
@@ -128,6 +148,8 @@ export function CompressView({ scanPath, nodeById, onNavigate, onRescan }: Compr
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [installing, setInstalling] = useState<"handbrake" | "image" | null>(null);
+  // Non-blocking notice when some right-click-selected paths aren't in the scan.
+  const [preselectNotice, setPreselectNotice] = useState("");
 
   const [runStatus, setRunStatus] = useState<RunStatus>("idle");
   const [progress, setProgress] = useState<Map<number, FileProg>>(new Map());
@@ -172,6 +194,34 @@ export function CompressView({ scanPath, nodeById, onNavigate, onRescan }: Compr
     }
     return out;
   }, [nodeById]);
+
+  // Pre-check the files passed from the table's right-click "Compress..." action.
+  // Maps each requested path to its id in the current scan; paths outside the
+  // scan can't be checked, so we surface a small non-blocking notice. Applied
+  // once per request (parent clears `initialSelectedPaths` via onInitialApplied),
+  // so manual edits afterward stick. Waits until `files` is populated.
+  useEffect(() => {
+    if (!initialSelectedPaths || initialSelectedPaths.length === 0) return;
+    if (files.length === 0) return;
+    const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    const idByPath = new Map<string, number>();
+    for (const f of files) idByPath.set(norm(f.path), f.id);
+    const ids: number[] = [];
+    let missing = 0;
+    for (const p of initialSelectedPaths) {
+      const id = idByPath.get(norm(p));
+      if (id !== undefined) ids.push(id);
+      else missing += 1;
+    }
+    if (ids.length > 0) setSelected(new Set(ids));
+    setPreselectNotice(
+      missing > 0
+        ? `${missing} selected file${missing === 1 ? "" : "s"} ${missing === 1 ? "isn't" : "aren't"} in the current scan and couldn't be pre-selected.`
+        : "",
+    );
+    setTab("compress");
+    onInitialApplied?.();
+  }, [initialSelectedPaths, files, onInitialApplied]);
 
   const counts = useMemo(() => {
     let video = 0, image = 0, other = 0;
@@ -514,6 +564,9 @@ export function CompressView({ scanPath, nodeById, onNavigate, onRescan }: Compr
         preset,
         recycleOriginals,
         tagFilename,
+        // Re-assert the scan root so a cache-served tree (no /api/scan this
+        // session) still passes the server's scan-root containment check.
+        scanRoot: scanPath || undefined,
       });
       setJobId(id);
       void attachStream(id);
@@ -523,7 +576,7 @@ export function CompressView({ scanPath, nodeById, onNavigate, onRescan }: Compr
       setRunError(e instanceof Error ? e.message : String(e));
       toast.error(`Could not start compression: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [selectedFiles, kindAvailable, preset, recycleOriginals, tagFilename, attachStream]);
+  }, [selectedFiles, kindAvailable, preset, recycleOriginals, tagFilename, attachStream, scanPath]);
 
   const handleStop = useCallback(async () => {
     abortRef.current?.abort();
@@ -600,19 +653,6 @@ export function CompressView({ scanPath, nodeById, onNavigate, onRescan }: Compr
     }
   }, [refreshTools]);
 
-  // ── Empty states ────────────────────────────────────────────────────────────
-  if (!scanPath) {
-    return (
-      <div className="compress-view">
-        <EmptyState
-          icon="file-zip"
-          title="No scan loaded"
-          hint="Scan a folder or drive in the Explorer side bar, then return here to compress media and other files."
-        />
-      </div>
-    );
-  }
-
   // Tool banner: which types are blocked by a missing encoder.
   const videoMissing = !!tools && !tools.handbrake.found && counts.video > 0;
   const imageMissing = !!tools && !tools.image.found && counts.image > 0;
@@ -627,6 +667,42 @@ export function CompressView({ scanPath, nodeById, onNavigate, onRescan }: Compr
 
   return (
     <div className="compress-view">
+      <div className="compress-tabs" role="tablist" aria-label="Compress / History">
+        <button
+          role="tab"
+          aria-selected={tab === "compress"}
+          className={`compress-tab${tab === "compress" ? " active" : ""}`}
+          onClick={() => setTab("compress")}
+        >
+          Compress
+        </button>
+        <button
+          role="tab"
+          aria-selected={tab === "history"}
+          className={`compress-tab${tab === "history" ? " active" : ""}`}
+          onClick={() => setTab("history")}
+        >
+          History
+        </button>
+      </div>
+
+      {tab === "history" ? (
+        <CompressHistory />
+      ) : !scanPath ? (
+        <EmptyState
+          icon="file-zip"
+          title="No scan loaded"
+          hint="Scan a folder or drive in the Explorer side bar, then return here to compress media and other files."
+        />
+      ) : (
+      <>
+      {preselectNotice && (
+        <div className="compress-notice">
+          <span className="ct-ico"><Icon name="info-circle" size={14} /></span>
+          <span>{preselectNotice}</span>
+          <button className="compress-notice-x" onClick={() => setPreselectNotice("")} title="Dismiss">×</button>
+        </div>
+      )}
       {showBanner && (
         <div className="compress-tools-banner">
           <span className="ct-ico"><Icon name="warning" size={15} /></span>
@@ -887,6 +963,168 @@ export function CompressView({ scanPath, nodeById, onNavigate, onRescan }: Compr
               );
             })}
           </div>
+        )}
+      </div>
+      </>
+      )}
+    </div>
+  );
+}
+
+const STATUS_LABEL: Record<string, string> = {
+  success: "Saved",
+  skipped_no_gain: "No gain",
+  error: "Error",
+};
+
+function formatDuration(ms: number): string {
+  if (!ms || ms < 0) return "—";
+  if (ms < 1000) return `${ms} ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)} s`;
+  const m = Math.floor(s / 60);
+  const rem = Math.round(s % 60);
+  return `${m}m ${rem}s`;
+}
+
+function formatTs(ts: string): string {
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString();
+}
+
+// History tab: the persistent append-only CSV log of every compressed file,
+// across all sessions. Loads the last N rows from the backend, shows running
+// totals, and offers open / reveal / download of the underlying CSV file.
+function CompressHistory() {
+  const [rows, setRows] = useState<CompressLogRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [csvPath, setCsvPath] = useState("");
+
+  const load = useCallback(async (signal?: AbortSignal) => {
+    setLoading(true);
+    const [r, p] = await Promise.all([fetchCompressLog(1000, signal), compressLogPath()]);
+    if (signal?.aborted) return;
+    setRows(r);
+    setCsvPath(p);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    const ac = new AbortController();
+    void load(ac.signal);
+    return () => ac.abort();
+  }, [load]);
+
+  const totals = useMemo(() => {
+    let orig = 0, neu = 0, saved = 0, success = 0;
+    for (const r of rows) {
+      orig += r.origBytes;
+      neu += r.newBytes;
+      saved += r.savedBytes;
+      if (r.status === "success") success += 1;
+    }
+    const pct = orig > 0 ? (saved / orig) * 100 : 0;
+    return { orig, neu, saved, success, pct, count: rows.length };
+  }, [rows]);
+
+  // Newest first for display (the backend returns oldest→newest).
+  const display = useMemo(() => [...rows].reverse(), [rows]);
+
+  return (
+    <div className="compress-history">
+      <div className="compress-toolbar">
+        <div className="compress-summary">
+          {totals.count > 0 ? (
+            <>
+              <span className="compress-total">{formatBytes(totals.saved)}</span>
+              <span className="compress-total-label">saved total</span>
+              <span className="compress-selected">
+                {totals.success.toLocaleString()} compressed · {totals.pct.toFixed(1)}%
+              </span>
+            </>
+          ) : (
+            <span className="compress-total-label">No compression history yet</span>
+          )}
+        </div>
+        <div className="compress-toolbar-spacer" />
+        <button className="compress-btn" onClick={() => void load()} disabled={loading}>
+          <Icon name="arrow-repeat" size={13} /> Refresh
+        </button>
+        <button
+          className="compress-btn"
+          onClick={() => csvPath && void openPath(csvPath)}
+          disabled={!csvPath || totals.count === 0}
+          title="Open the CSV in its default application"
+        >
+          <Icon name="file-text" size={13} /> Open CSV
+        </button>
+        <button
+          className="compress-btn"
+          onClick={() => csvPath && void revealPath(csvPath)}
+          disabled={!csvPath || totals.count === 0}
+          title="Show the CSV in Explorer"
+        >
+          <Icon name="folder-open" size={13} /> Reveal in Explorer
+        </button>
+        <a
+          className="compress-btn"
+          href={compressLogCsvUrl()}
+          download="filetree-compress-log.csv"
+          title="Download the full CSV log"
+        >
+          <Icon name="arrow-up" size={13} /> Download
+        </a>
+      </div>
+
+      <div className="compress-body">
+        {loading && rows.length === 0 ? (
+          <EmptyState icon="clock-history" title="Loading history…" hint="Reading the compression log." />
+        ) : totals.count === 0 ? (
+          <EmptyState
+            icon="clock-history"
+            title="No compression history"
+            hint="Compress some files and each one will be logged here (and to compress-log.csv)."
+          />
+        ) : (
+          <table className="compress-log-table">
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>Kind</th>
+                <th>Preset</th>
+                <th>Original → New</th>
+                <th className="num">Saved</th>
+                <th>Tool</th>
+                <th className="num">Duration</th>
+                <th>Status</th>
+                <th>When</th>
+              </tr>
+            </thead>
+            <tbody>
+              {display.map((r, i) => (
+                <tr key={`${r.ts}-${r.jobId}-${r.index}-${i}`} className={`clog-${r.status}`}>
+                  <td className="clog-name" title={r.path}>{r.name || r.path}</td>
+                  <td>{r.kind}</td>
+                  <td>{r.preset}</td>
+                  <td className="clog-sizes">
+                    {formatBytes(r.origBytes)} <span className="clog-arrow">→</span>{" "}
+                    {r.status === "error" ? "—" : formatBytes(r.newBytes)}
+                  </td>
+                  <td className="num">
+                    {r.status === "success" ? `${r.pctSaved.toFixed(1)}%` : "—"}
+                  </td>
+                  <td title={r.codecParams}>{r.tool || "—"}</td>
+                  <td className="num">{formatDuration(r.durationMs)}</td>
+                  <td>
+                    <span className={`compress-chip-status ${r.status === "success" ? "done" : r.status === "skipped_no_gain" ? "skipped" : "error"}`}>
+                      {STATUS_LABEL[r.status] ?? r.status}
+                    </span>
+                  </td>
+                  <td className="clog-ts" title={r.ts}>{formatTs(r.ts)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
       </div>
     </div>

@@ -1246,6 +1246,31 @@ input:focus, select:focus {
 .bookmark-btn.bookmarked { color: #F5C542; }
 .bookmark-btn:hover { color: #F5C542; opacity: 1; transform: none; box-shadow: none; }
 
+/* Quick "Compress" row action — sits to the right of the bookmark/tag
+   buttons, hover-revealed like them, themed with the accent on hover. */
+.compress-btn {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  padding: 0 2px;
+  height: 16px;
+  min-height: 0;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 0.1s;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.bookmark-btn + .compress-btn,
+.tag-btn + .compress-btn { margin-left: 4px; }
+.row:hover .compress-btn { opacity: 1; }
+.compress-btn:hover { color: var(--accent); opacity: 1; transform: none; box-shadow: none; }
+
 .percent-cell {
   position: relative;
   height: 14px;
@@ -3845,6 +3870,57 @@ input:focus, select:focus {
   display: flex; align-items: center; gap: 10px; padding: 24px 16px;
   color: var(--text-5); font-size: 13px;
 }
+
+/* Compress / History tab toggle */
+.compress-tabs {
+  display: flex; align-items: center; gap: 2px; flex: 0 0 auto;
+  padding: 6px 12px 0; border-bottom: 1px solid var(--vsc-border); background: var(--panel);
+}
+.compress-tab {
+  appearance: none; border: none; background: transparent; cursor: pointer;
+  color: var(--text-5); font-size: 12.5px; padding: 6px 12px; border-bottom: 2px solid transparent;
+}
+.compress-tab:hover { color: var(--text); }
+.compress-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+/* One-shot pre-selection notice (some paths weren't in the current scan) */
+.compress-notice {
+  display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
+  padding: 6px 12px; font-size: 12px; color: var(--text);
+  background: rgba(0, 120, 212, 0.08); border-bottom: 1px solid var(--vsc-border);
+}
+.compress-notice .ct-ico { flex: 0 0 auto; color: var(--accent); display: inline-flex; }
+.compress-notice-x {
+  margin-left: auto; appearance: none; border: none; background: transparent;
+  color: var(--text-5); cursor: pointer; font-size: 15px; line-height: 1; padding: 0 4px;
+}
+.compress-notice-x:hover { color: var(--text); }
+
+/* History tab */
+.compress-history { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
+.compress-history a.compress-btn { text-decoration: none; }
+.compress-log-table {
+  width: 100%; border-collapse: collapse; font-size: 12px; color: var(--text);
+}
+.compress-log-table thead th {
+  position: sticky; top: 0; z-index: 1; text-align: left; font-weight: 600;
+  color: var(--text-5); background: var(--surface); padding: 6px 10px;
+  border-bottom: 1px solid var(--vsc-border); white-space: nowrap;
+}
+.compress-log-table th.num, .compress-log-table td.num {
+  text-align: right; font-variant-numeric: tabular-nums;
+}
+.compress-log-table tbody td {
+  padding: 5px 10px; border-bottom: 1px solid var(--border-4); vertical-align: middle;
+}
+.compress-log-table tbody tr:hover { background: var(--vsc-list-hover); }
+.compress-log-table .clog-name {
+  max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.compress-log-table .clog-sizes { white-space: nowrap; color: var(--text-5); }
+.compress-log-table .clog-arrow { color: var(--text-8); }
+.compress-log-table .clog-ts { color: var(--text-5); white-space: nowrap; }
+.compress-log-table tr.clog-error .clog-name { color: var(--danger); }
 
 /* Sidebar config panel: fills + scrolls, footer sticks to the bottom. */
 .df-config {

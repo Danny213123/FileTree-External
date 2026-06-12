@@ -224,6 +224,11 @@ export default function App() {
   // Scheduled-scan wizard (#10) — a modal over the workbench.
   const [scheduleOpen, setScheduleOpen] = useState(false);
 
+  // Files to pre-check when the Compress view opens from the table's right-click
+  // "Compress..." action. One-shot: CompressView applies them then signals back
+  // via onInitialApplied so this clears and manual edits stick across re-renders.
+  const [compressInitialPaths, setCompressInitialPaths] = useState<string[]>([]);
+
   // Integrated terminal (global bottom panel). Mounted lazily on first open and
   // kept mounted thereafter so sessions survive hiding the panel.
   const [terminalMounted, setTerminalMounted] = useState(false);
@@ -783,6 +788,57 @@ export default function App() {
     };
   }, [handleOpenInNewTab]);
 
+  // Right-click "Compress..." from the table: parse the (multi-file) payload,
+  // drop anything the focused pane's tree knows to be a directory, stash the
+  // file paths, and switch to the Compress view (which pre-checks them).
+  // Load `filePaths` into the Compress page and switch to it. Shared by the
+  // native right-click "Compress…" action and the in-app quick "Compress"
+  // button so both routes behave identically.
+  const openCompressWith = useCallback((filePaths: string[]) => {
+    if (filePaths.length === 0) return;
+    setCompressInitialPaths(filePaths);
+    // Open the Compress activity view (mirrors handleSelectView, inlined to
+    // avoid a forward reference since this is declared earlier in the file).
+    setActiveView("compress");
+    setSidebarOpen(true);
+  }, []);
+
+  const handleCompressFromContext = useCallback((payload: string) => {
+    let paths: string[];
+    try {
+      const parsed: unknown = JSON.parse(payload);
+      paths = Array.isArray(parsed)
+        ? parsed.filter((p): p is string => typeof p === "string")
+        : typeof parsed === "string"
+          ? [parsed]
+          : [];
+    } catch {
+      // Not JSON — treat the payload as a single plain path.
+      paths = payload ? [payload] : [];
+    }
+    if (paths.length === 0) return;
+
+    // Filter out paths we can positively identify as folders in the current
+    // scan. Unknown paths are kept so CompressView can surface a "not found"
+    // notice rather than silently dropping them.
+    const nodeById = getActiveRef()?.getNodeById();
+    const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    const dirSet = new Set<string>();
+    if (nodeById) {
+      for (const node of nodeById.values()) {
+        if (node.dir && node.path) dirSet.add(norm(node.path));
+      }
+    }
+    const filePaths = paths.filter((p) => !dirSet.has(norm(p)));
+    openCompressWith(filePaths.length > 0 ? filePaths : paths);
+  }, [getActiveRef, openCompressWith]);
+
+  // Quick "Compress" button (TreeTable row action): WorkspaceTab has already
+  // expanded folders/selections to concrete file paths, so just load them.
+  const handleCompressPaths = useCallback((filePaths: string[]) => {
+    openCompressWith(filePaths);
+  }, [openCompressWith]);
+
   useEffect(() => {
     type ElectronAPI = {
       onContextMenuAction?: (cb: (action: string, path: string) => void) => void | (() => void);
@@ -793,10 +849,11 @@ export default function App() {
       else if (action === "delete") getActiveRef()?.doDeletePaths([message]);
       else if (action === "refresh") getActiveRef()?.doScan();
       else if (action === "open-new-tab") handleOpenInNewTab(message);
+      else if (action === "compress") handleCompressFromContext(message);
       else if (action === "error") toast.error(message);
     });
     return typeof cleanup === "function" ? cleanup : undefined;
-  }, [getActiveRef, handleOpenInNewTab]);
+  }, [getActiveRef, handleOpenInNewTab, handleCompressFromContext]);
 
   // Phase 6 in-app undo: reverse the most recent reversible file op (move back,
   // rename back, restore from the Recycle Bin) and toast the outcome in the
@@ -1489,6 +1546,7 @@ export default function App() {
                         onDecimalsChange={setDecimals}
                         onClose3D={handleClose3D}
                         onToggleBookmark={handleToggleBookmark}
+                        onCompress={handleCompressPaths}
                         onScanPath={handleScanPath}
                         onStateChange={notifyState}
                         onWorkbenchChange={publishWorkbench}
@@ -1550,7 +1608,11 @@ export default function App() {
         {activeView === "compress" && (
           <div className="compress-editor">
             <LazyView>
-              <WorkbenchCompress store={workbenchStore} />
+              <WorkbenchCompress
+                store={workbenchStore}
+                initialSelectedPaths={compressInitialPaths}
+                onInitialApplied={() => setCompressInitialPaths([])}
+              />
             </LazyView>
           </div>
         )}
@@ -1809,7 +1871,15 @@ function WorkbenchGallery({ store }: { store: WorkbenchStore }) {
 // Compression page: derives compressible files from the focused pane's scan
 // tree, runs a live job, then rescans (invalidate cache + refresh) so the
 // [COMPRESSED] outputs appear and recycled originals disappear.
-function WorkbenchCompress({ store }: { store: WorkbenchStore }) {
+function WorkbenchCompress({
+  store,
+  initialSelectedPaths,
+  onInitialApplied,
+}: {
+  store: WorkbenchStore;
+  initialSelectedPaths?: string[];
+  onInitialApplied?: () => void;
+}) {
   const { sidebar: m } = useWorkbench(store);
   return (
     <CompressView
@@ -1817,6 +1887,8 @@ function WorkbenchCompress({ store }: { store: WorkbenchStore }) {
       nodeById={m.nodeById}
       onNavigate={m.onNavigate}
       onRescan={m.onRefresh}
+      initialSelectedPaths={initialSelectedPaths}
+      onInitialApplied={onInitialApplied}
     />
   );
 }

@@ -127,8 +127,9 @@ fn append_line(path: &Path, line: &str) -> io::Result<()> {
 }
 
 /// Current time as an ISO-8601 UTC string with millisecond precision, computed
-/// from the Unix epoch with no external date crate.
-fn now_iso8601() -> String {
+/// from the Unix epoch with no external date crate. Shared with the compress
+/// CSV log (`compress_log.rs`) so every store stamps time identically.
+pub(crate) fn now_iso8601() -> String {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use crate::compress_tools::{self, ImageKind};
 use crate::export::push_json_string;
@@ -277,6 +278,83 @@ fn normalize_preset(p: &str) -> String {
     }
 }
 
+/// The encoder + a human-readable codec parameter string for one file, derived
+/// from its kind, the job preset and which image encoder was detected. Mirrors
+/// the actual quality/scale knobs the `run_*` pipelines pass to each tool so the
+/// CSV log records exactly how a file was (or would have been) encoded.
+fn pipeline_params(
+    kind: FileKind,
+    preset: &str,
+    img_kind: Option<ImageKind>,
+) -> (&'static str, String) {
+    match kind {
+        FileKind::Video => {
+            let (q, h) = match preset {
+                "max" => ("30", Some("480")),
+                "high" => ("20", None),
+                _ => ("24", Some("1080")),
+            };
+            let mut s = format!("x264 rf={q}");
+            if let Some(h) = h {
+                s.push_str(&format!(" maxHeight={h}"));
+            }
+            ("handbrake", s)
+        }
+        FileKind::Image => match img_kind {
+            Some(ImageKind::Ffmpeg) => {
+                let (q, scale) = match preset {
+                    "max" => ("12", Some("1280")),
+                    "high" => ("3", None),
+                    _ => ("6", Some("1920")),
+                };
+                let mut s = format!("q:v={q}");
+                if let Some(edge) = scale {
+                    s.push_str(&format!(" scale={edge}"));
+                }
+                ("ffmpeg", s)
+            }
+            Some(ImageKind::ImageMagick) => {
+                let (q, resize) = match preset {
+                    "max" => ("60", Some("1280000@")),
+                    "high" => ("92", None),
+                    _ => ("80", Some("3686400@")),
+                };
+                let mut s = format!("quality={q}");
+                if let Some(area) = resize {
+                    s.push_str(&format!(" resize={area}"));
+                }
+                ("imagemagick", s)
+            }
+            None => ("", String::new()),
+        },
+        FileKind::Other => ("zip", "deflate".to_string()),
+    }
+}
+
+/// Last path component (file name) for the CSV `name` column.
+fn file_name_of(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// Percentage of the original size saved (0 when the original size is unknown).
+fn pct_saved(orig: u64, new_bytes: u64) -> f64 {
+    if orig == 0 {
+        return 0.0;
+    }
+    (orig.saturating_sub(new_bytes) as f64 / orig as f64) * 100.0
+}
+
+/// New/original size ratio (0 when the original size is unknown).
+fn ratio(orig: u64, new_bytes: u64) -> f64 {
+    if orig == 0 {
+        return 0.0;
+    }
+    new_bytes as f64 / orig as f64
+}
+
 // ── Worker thread ──────────────────────────────────────────────────────────
 
 /// Spawn the dedicated worker thread for `job`. Returns immediately; the encode
@@ -313,9 +391,18 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
             job.emit(ev_file_start(i, &f.path, f.kind, orig));
         }
 
+        // Time the whole per-file pipeline so the CSV log can record duration_ms.
+        let file_start = Instant::now();
         let outcome = process_file(&state, &job, i, &hb, &img, img_kind);
+        let duration_ms = file_start.elapsed().as_millis() as u64;
         let f = &job.files[i];
         let orig = f.orig_bytes.load(Ordering::Relaxed);
+        // The tool + codec params are fully determined by the file kind, the
+        // chosen preset and which image encoder was detected — compute them here
+        // so every outcome arm (including errors) logs consistently.
+        let (tool, codec_params) = pipeline_params(f.kind, &job.preset, img_kind);
+        let name = file_name_of(&f.path);
+        let kind_str = f.kind.as_str();
         match outcome {
             FileOutcome::Done { out_path, new_bytes, recycled } => {
                 f.new_bytes.store(new_bytes, Ordering::Relaxed);
@@ -326,18 +413,78 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
                 let saved = orig.saturating_sub(new_bytes);
                 job.saved_bytes.fetch_add(saved, Ordering::Relaxed);
                 done_count += 1;
+                crate::compress_log::append_row(&crate::compress_log::Row {
+                    job_id: &job.id,
+                    index: i,
+                    path: &f.path,
+                    name: &name,
+                    kind: kind_str,
+                    preset: &job.preset,
+                    status: "success",
+                    orig_bytes: orig,
+                    new_bytes,
+                    saved_bytes: saved,
+                    pct_saved: pct_saved(orig, new_bytes),
+                    ratio: ratio(orig, new_bytes),
+                    tool,
+                    codec_params: &codec_params,
+                    duration_ms,
+                    out_path: &out_path,
+                    recycled,
+                    error: "",
+                });
                 job.emit(ev_file_done(i, &out_path, orig, new_bytes, saved, recycled, "done"));
             }
             FileOutcome::Skipped { new_bytes } => {
                 f.new_bytes.store(new_bytes, Ordering::Relaxed);
                 *f.status.lock().expect("status lock") = "skipped".to_string();
                 f.pct.store(100, Ordering::Relaxed);
+                crate::compress_log::append_row(&crate::compress_log::Row {
+                    job_id: &job.id,
+                    index: i,
+                    path: &f.path,
+                    name: &name,
+                    kind: kind_str,
+                    preset: &job.preset,
+                    status: "skipped_no_gain",
+                    orig_bytes: orig,
+                    new_bytes,
+                    saved_bytes: 0,
+                    pct_saved: 0.0,
+                    ratio: ratio(orig, new_bytes),
+                    tool,
+                    codec_params: &codec_params,
+                    duration_ms,
+                    out_path: "",
+                    recycled: false,
+                    error: "",
+                });
                 job.emit(ev_file_done(i, "", orig, new_bytes, 0, false, "skipped_no_gain"));
             }
             FileOutcome::Error(msg) => {
                 *f.error.lock().expect("err lock") = Some(msg.clone());
                 *f.status.lock().expect("status lock") = "error".to_string();
                 error_count += 1;
+                crate::compress_log::append_row(&crate::compress_log::Row {
+                    job_id: &job.id,
+                    index: i,
+                    path: &f.path,
+                    name: &name,
+                    kind: kind_str,
+                    preset: &job.preset,
+                    status: "error",
+                    orig_bytes: orig,
+                    new_bytes: 0,
+                    saved_bytes: 0,
+                    pct_saved: 0.0,
+                    ratio: 0.0,
+                    tool,
+                    codec_params: &codec_params,
+                    duration_ms,
+                    out_path: "",
+                    recycled: false,
+                    error: &msg,
+                });
                 job.emit(ev_error(i, &f.path, &msg));
             }
             FileOutcome::Cancelled => {

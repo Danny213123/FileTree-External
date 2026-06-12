@@ -23,6 +23,7 @@ import type {
   CompressJob,
   CompressJobRequest,
   CompressEvent,
+  CompressLogRow,
 } from "./types";
 
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -1385,6 +1386,38 @@ export async function streamCompressJob(
       try { ev = JSON.parse(trimmed) as CompressEvent; } catch { ev = null; }
       if (ev) onEvent(ev);
     }
+  }
+}
+
+/** Fetch the last `limit` rows of the persistent compress CSV log (newest last)
+ *  for the History tab. Returns `[]` if no compression has run yet or the
+ *  endpoint is unavailable (never throws). */
+export async function fetchCompressLog(
+  limit = 500,
+  signal?: AbortSignal,
+): Promise<CompressLogRow[]> {
+  try {
+    const res = await fetch(`/api/compress-log?limit=${encodeURIComponent(limit)}`, { signal });
+    if (!res.ok) return [];
+    return (await res.json()) as CompressLogRow[];
+  } catch {
+    return [];
+  }
+}
+
+/** URL of the full compress log CSV (an attachment download). */
+export function compressLogCsvUrl(): string {
+  return "/api/compress-log.csv";
+}
+
+/** Resolve the absolute path of the compress log file (for reveal/open). Returns
+ *  an empty string if it can't be read. */
+export async function compressLogPath(): Promise<string> {
+  try {
+    const r = await getJson<{ path?: string }>("/api/compress-log/path");
+    return r.path ?? "";
+  } catch {
+    return "";
   }
 }
 

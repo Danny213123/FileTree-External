@@ -91,6 +91,9 @@ interface TreeTableProps {
   onContextMenu: (id: number, x: number, y: number) => void;
   onSortChange: (key: SortKey) => void;
   onToggleBookmark: (path: string) => void;
+  /** Quick-load this row (or the active multi-selection it belongs to) into the
+   *  Compress page. Folders are expanded to their contained files upstream. */
+  onCompress?: (id: number) => void;
   onCopySelected?: () => void;
   /** Called when the user drags rows from inside FileTree onto a folder row. */
   onMoveItems?: (sourcePaths: string[], destinationFolder: string) => Promise<MoveItemsResult | void> | MoveItemsResult | void;
@@ -221,6 +224,7 @@ function TreeTableInner({
   onContextMenu,
   onSortChange,
   onToggleBookmark,
+  onCompress,
   onCopySelected,
   onMoveItems,
   onOpenFolderInTab,
@@ -890,6 +894,15 @@ function TreeTableInner({
                       onClick={(e) => { e.stopPropagation(); onToggleBookmark(node.path); }}
                     >
                       <Icon name={bookmarks.has(node.path) ? "star-fill" : "star"} size={12} />
+                    </button>
+                  )}
+                  {!isBundle && node.path && onCompress && (
+                    <button
+                      className="compress-btn"
+                      title={node.dir ? "Compress files in this folder" : "Compress"}
+                      onClick={(e) => { e.stopPropagation(); onCompress(node.id); }}
+                    >
+                      <Icon name="file-zip" size={12} />
                     </button>
                   )}
                 </div>

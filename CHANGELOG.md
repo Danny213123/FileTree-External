@@ -4,6 +4,20 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.10.0] - 2026-06-11
+
+### Added
+
+- **Right-click "Compress…" from the table**: selecting one or more files and choosing "Compress…" from the context menu opens the Compression page pre-loaded with exactly those files, ready to encode.
+- **Quick "Compress" row button**: a hover action on every file/folder/[X files] row, sitting next to "Add tags" and "Add bookmark". Folders expand to their contained files and multi-selections load all selected files into the Compression page in one click.
+- **Persistent compression log**: every compressed file is appended to a CSV at `%APPDATA%\FileTree\compress-log.csv` (timestamp, original/compressed sizes, bytes saved, compression %, ratio, tool, codec parameters, duration, status, and more). A new **History** tab in the Compression page renders the log with Open CSV / Reveal / Download actions, backed by `GET /api/compress-log.csv`, `GET /api/compress-log?limit=N`, and `GET /api/compress-log/path`.
+
+### Fixed
+
+- **"compression failed: a source path is outside the scanned directories"**: the compress request now sends and re-registers the active `scanRoot` (only when it is a real existing directory), so sessions whose tree was served from the renderer cache -- or that started after a server restart -- validate selected files correctly. The scan-root containment guard is unchanged: paths genuinely outside a scanned directory are still rejected.
+
+---
+
 ## [1.9.0] - 2026-06-11
 
 ### Added

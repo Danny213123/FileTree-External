@@ -539,6 +539,7 @@ pub struct ContextMenuResult {
     ///   "rename"       — start inline rename of the item
     ///   "new-folder"   — create a new folder in the target dir
     ///   "open-new-tab" — open the folder in a new tab
+    ///   "compress"     — open the Compress view pre-loaded with the selection
     /// Empty when the shell already handled the chosen command (Open, Copy, Cut,
     /// Delete, Properties, Send to, third-party verbs, …) or the menu was dismissed.
     pub verb: String,
@@ -1575,6 +1576,7 @@ mod windows_impl {
     const FT_NEW_FOLDER: u32 = 0x9001;
     const FT_OPEN_NEW_TAB: u32 = 0x9002;
     const FT_REVEAL: u32 = 0x9003;
+    const FT_COMPRESS: u32 = 0x9004;
 
     static MENU_CLASS_ONCE: std::sync::Once = std::sync::Once::new();
     const MENU_CLASS: PCWSTR = w!("FileTreeShellMenuHost");
@@ -1746,6 +1748,10 @@ mod windows_impl {
                 w!("Open containing folder"),
             );
             index += 1;
+            // Compress works for any selection (the renderer filters to files and
+            // opens the Compress view with exactly those pre-checked).
+            let _ = AppendMenuW(hmenu, MF_STRING, FT_COMPRESS as usize, w!("Compress..."));
+            index += 1;
             let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
             index += 1;
 
@@ -1814,6 +1820,9 @@ mod windows_impl {
         }
         if cmd == FT_REVEAL {
             return "show-in-explorer".to_string();
+        }
+        if cmd == FT_COMPRESS {
+            return "compress".to_string();
         }
 
         let offset = cmd - SHELL_ID_FIRST;

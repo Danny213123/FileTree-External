@@ -257,6 +257,10 @@ interface WorkspaceTabProps {
   onDecimalsChange: (d: number) => void;
   onClose3D: () => void;
   onToggleBookmark: (path: string) => void;
+  // Quick-load file(s) into the Compress page. Receives concrete file paths
+  // (folders already expanded to their contained files) and switches the
+  // activity view to Compress — same mechanism as the right-click "Compress…".
+  onCompress: (paths: string[]) => void;
   onScanPath: (path: string) => void;
   onStateChange: () => void;
   // Publish this pane's sidebar/status snapshot to the shared workbench store
@@ -282,7 +286,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     treemapDetail,
     tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
-    onClose3D, onToggleBookmark, onScanPath, onStateChange, onWorkbenchChange, onOpenTerminal,
+    onClose3D, onToggleBookmark, onCompress, onScanPath, onStateChange, onWorkbenchChange, onOpenTerminal,
     onOpenFolderInTab, onUndo,
   }: WorkspaceTabProps,
   ref,
@@ -659,6 +663,42 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       : [node.path];
     shellContextMenu(targets, x, y).catch(() => {});
   }, [handleSelectRow]);
+
+  // Quick "Compress" row action. Mirrors handleContextMenu's target rule: when
+  // the clicked row is part of a multi-selection, act on the whole selection;
+  // otherwise act on just that row. Folders are expanded to their contained
+  // files (BFS over nodeById children) so the Compress page receives concrete
+  // file paths — files only, deduped, order-stable.
+  const handleCompress = useCallback((id: number) => {
+    const t = treeRef.current;
+    const selIds = selectedIdsRef.current;
+    const targetIds = selIds.has(id) && selIds.size > 1 ? [...selIds] : [id];
+
+    const filePaths: string[] = [];
+    const seen = new Set<string>();
+    const pushFile = (node: NodeRecord) => {
+      if (node.dir || node.id < 0 || !node.path || seen.has(node.path)) return;
+      seen.add(node.path);
+      filePaths.push(node.path);
+    };
+    for (const tid of targetIds) {
+      const node = t.nodeById.get(tid);
+      if (!node) continue;
+      if (!node.dir) {
+        pushFile(node);
+        continue;
+      }
+      // Folder: walk descendants, collecting every file underneath it.
+      const queue = [node.id];
+      for (let qi = 0; qi < queue.length; qi++) {
+        const cur = t.nodeById.get(queue[qi]);
+        if (!cur) continue;
+        if (!cur.dir) { pushFile(cur); continue; }
+        for (const childId of cur.children) queue.push(childId);
+      }
+    }
+    if (filePaths.length > 0) onCompress(filePaths);
+  }, [onCompress]);
 
   const handleDblClick = useCallback((id: number) => {
     const node = treeRef.current.nodeById.get(id);
@@ -1619,6 +1659,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   tags={tagsByPath}
                   onEditTags={(path, x, y) => setTagPopover({ path, x, y })}
                   onToggleBookmark={onToggleBookmark}
+                  onCompress={handleCompress}
                   renamingId={renamingId}
                   onRenameCommit={commitRename}
                   onRenameCancel={cancelRename}

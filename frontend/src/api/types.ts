@@ -478,6 +478,14 @@ export interface CompressJobRequest {
   preset: CompressPreset;
   recycleOriginals: boolean;
   tagFilename: boolean;
+  /** Scan root the selected files belong to. Sent so the server can (re-)register
+   *  it as an allowed read root before validating the source paths — covers the
+   *  case where the tree was served from the renderer's cache and the current
+   *  server session never saw a `/api/scan` for that directory. The server still
+   *  verifies the directory exists and that every source path is genuinely
+   *  underneath a registered root, so this never widens access beyond what the
+   *  user actually scanned. */
+  scanRoot?: string;
 }
 
 // NDJSON stream events from GET /api/compress-jobs/stream?id=<jobId>, one JSON
@@ -532,3 +540,34 @@ export type CompressEvent =
   | CompressFileDoneEvent
   | CompressErrorEvent
   | CompressDoneEvent;
+
+/** One row of the persistent compress CSV log
+ *  (`%APPDATA%\FileTree\compress-log.csv`), as returned by
+ *  `GET /api/compress-log?limit=N`. One row per terminal file outcome. */
+export interface CompressLogRow {
+  /** ISO-8601 UTC timestamp the row was written. */
+  ts: string;
+  jobId: string;
+  index: number;
+  path: string;
+  name: string;
+  kind: CompressKind;
+  preset: CompressPreset;
+  /** "success" | "skipped_no_gain" | "error". */
+  status: "success" | "skipped_no_gain" | "error";
+  origBytes: number;
+  newBytes: number;
+  savedBytes: number;
+  /** Percentage of the original size saved (0..100). */
+  pctSaved: number;
+  /** New/original size ratio. */
+  ratio: number;
+  /** "handbrake" | "ffmpeg" | "imagemagick" | "zip" | "". */
+  tool: string;
+  /** Human-readable codec/quality parameters used. */
+  codecParams: string;
+  durationMs: number;
+  outPath: string;
+  recycled: boolean;
+  error: string;
+}

@@ -1292,6 +1292,44 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 )],
             )
         }
+        // ── Compression CSV log ────────────────────────────────────────────
+        // Download the full append-only compress log as a CSV attachment. Mirrors
+        // the /api/export.csv attachment-header pattern. The file may not exist
+        // yet (no compression has run); in that case return an empty 200 with the
+        // header row so a download still produces a well-formed CSV.
+        "/api/compress-log.csv" => {
+            let path = crate::compress_log::log_path();
+            let body = std::fs::read(&path).unwrap_or_default();
+            respond_bytes(
+                &mut stream,
+                200,
+                "OK",
+                "text/csv; charset=utf-8",
+                &body,
+                &[(
+                    "Content-Disposition",
+                    "attachment; filename=\"filetree-compress-log.csv\"",
+                )],
+            )
+        }
+        // Reveal target: the absolute path of the compress log file.
+        "/api/compress-log/path" => {
+            let mut body = String::from("{\"path\":");
+            push_json_string(&mut body, &crate::compress_log::log_path().to_string_lossy());
+            body.push('}');
+            respond_json(&mut stream, 200, "OK", &body)
+        }
+        // Last N rows of the compress log as JSON for the in-app History tab.
+        // Returns `[]` when no compression has run yet.
+        "/api/compress-log" => {
+            let limit = query
+                .get("limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(500)
+                .min(10_000);
+            let body = crate::compress_log::read_rows_json(limit);
+            respond_json(&mut stream, 200, "OK", &body)
+        }
         // Scheduled scans (#10). List is a read-only GET; create/delete are
         // POST-only and token-gated above (they shell out to PowerShell).
         "/api/schedules" => match crate::schedule::list_tasks() {
@@ -2905,6 +2943,24 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     .unwrap_or(true);
                 if paths.is_empty() {
                     return respond_text(&mut stream, 400, "Bad request", "Missing paths");
+                }
+                // Re-register the scan root the renderer says these files came
+                // from. `register_scan_root` canonicalizes and only records a
+                // directory that actually exists, so this is equivalent to the
+                // user having scanned it — it cannot widen access to anything
+                // not under a real, on-disk directory. This covers the case
+                // where the tree was served from the renderer's in-memory cache
+                // and this server session never saw a `/api/scan` for that root,
+                // which previously made every valid source path fail the
+                // containment check below.
+                if let Some(scan_root) = extract_json_str(&body_str, "scanRoot") {
+                    let trimmed = scan_root.trim();
+                    if !trimmed.is_empty() {
+                        let candidate = Path::new(trimmed);
+                        if candidate.is_dir() {
+                            register_scan_root(&state, candidate);
+                        }
+                    }
                 }
                 for p in &paths {
                     if !path_within_scan_root(&state, Path::new(p)) {
@@ -4677,6 +4733,7 @@ mod static_assets_tests {
         assert_eq!(content_type_for("noextension"), "application/octet-stream");
     }
 }
+
 
 fn ollama_stream_chat(stream: &mut TcpStream, body: &[u8], port: u16) -> sio::Result<()> {
     use std::io::{BufRead, Read, Write};
