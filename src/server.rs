@@ -3026,6 +3026,27 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     .and_then(|v| v.get("tagFilename"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
+                // Performance + encoder knobs (all optional; hardware-derived
+                // defaults are applied in create_job when absent/zero).
+                let concurrency = root
+                    .as_ref()
+                    .and_then(|v| v.get("concurrency"))
+                    .and_then(|v| v.as_f64())
+                    .map(|n| n.max(0.0) as usize)
+                    .unwrap_or(0);
+                let encoder = extract_json_str(&body_str, "encoder").unwrap_or_else(|| "auto".to_string());
+                let use_gpu = root
+                    .as_ref()
+                    .and_then(|v| v.get("useGpu"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let codec = extract_json_str(&body_str, "codec").unwrap_or_else(|| "h264".to_string());
+                let zip_level = root
+                    .as_ref()
+                    .and_then(|v| v.get("zipLevel"))
+                    .and_then(|v| v.as_f64())
+                    .map(|n| n as i64)
+                    .unwrap_or(-1);
                 if paths.is_empty() {
                     return respond_text(&mut stream, 400, "Bad request", "Missing paths");
                 }
@@ -3081,7 +3102,16 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         return respond_json(&mut stream, 403, "Forbidden", &body);
                     }
                 }
-                let job = crate::compress_job::create_job(&paths, &preset, recycle, tag);
+                let opts = crate::compress_job::CompressOptions {
+                    recycle_originals: recycle,
+                    tag_filename: tag,
+                    concurrency,
+                    encoder,
+                    use_gpu,
+                    codec,
+                    zip_level,
+                };
+                let job = crate::compress_job::create_job(&paths, &preset, &opts);
                 let id = job.id.clone();
                 state
                     .compress_jobs
@@ -3155,7 +3185,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 .map(Arc::clone);
             if let Some(job) = job {
                 job.cancel.store(true, Ordering::SeqCst);
-                if let Some(child) = job.child.lock().expect("child lock").as_mut() {
+                // Multiple files encode at once now — kill ALL active children.
+                for child in job.children.lock().expect("children lock").values_mut() {
                     let _ = child.kill();
                 }
                 job.events_cv.notify_all();
@@ -3213,12 +3244,17 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 Some(job) => {
                     respond_json(&mut stream, 200, "OK", &crate::compress_job::job_full_json(&job))
                 }
-                None => respond_json(
-                    &mut stream,
-                    404,
-                    "Not found",
-                    "{\"error\":\"Unknown job\"}",
-                ),
+                // Not live in this process — fall back to the persisted manifest so
+                // the In Progress tab can lazy-load detail for interrupted/old runs.
+                None => match crate::compress_job::job_full_json_from_manifest(id) {
+                    Some(json) => respond_json(&mut stream, 200, "OK", &json),
+                    None => respond_json(
+                        &mut stream,
+                        404,
+                        "Not found",
+                        "{\"error\":\"Unknown job\"}",
+                    ),
+                },
             }
         }
         // F5: zip a selection of files/folders into `dest`.

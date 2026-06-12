@@ -11,14 +11,16 @@
 //! `%APPDATA%\FileTree\jobs\<id>.json`, which `retry` reloads to skip files
 //! already `done`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use crate::compress_tools::{self, ImageKind};
+use crate::compress_tools::{self, HandbrakeCaps, ImageKind};
 use crate::export::push_json_string;
+use crate::io::{acquire_compress, CompressLane};
 use crate::model::AppState;
 
 /// Coarse file classification that selects a pipeline.
@@ -78,6 +80,11 @@ pub(crate) struct FileState {
     pub(crate) recycled: AtomicBool,
     pub(crate) out_path: Mutex<String>,
     pub(crate) error: Mutex<Option<String>>,
+    /// Precise outcome code (see [`Reason`]) so interrupted/old runs render an
+    /// exact per-file outcome in the In Progress tab. Empty until terminal.
+    pub(crate) reason: Mutex<String>,
+    /// Wall-clock encode time for this file in ms (0 until done/skipped/error).
+    pub(crate) duration_ms: AtomicU64,
 }
 
 impl FileState {
@@ -93,6 +100,8 @@ impl FileState {
             recycled: AtomicBool::new(false),
             out_path: Mutex::new(String::new()),
             error: Mutex::new(None),
+            reason: Mutex::new(String::new()),
+            duration_ms: AtomicU64::new(0),
         }
     }
 }
@@ -106,15 +115,30 @@ pub(crate) struct CompressJob {
     pub(crate) preset: String,
     pub(crate) recycle_originals: bool,
     pub(crate) tag_filename: bool,
+    /// Max files this job encodes at once (its worker-pool size). Clamped to a
+    /// hardware-derived default when not specified by the request.
+    pub(crate) concurrency: usize,
+    /// Encoder selection: `auto` | `x264` | `nvenc` | `qsv` | `vce`. `auto`
+    /// picks the best available HW encoder for the codec, else CPU x264/x265.
+    pub(crate) encoder: String,
+    /// Whether hardware acceleration is permitted at all (gates Auto/HW picks).
+    pub(crate) use_gpu: bool,
+    /// Target video codec: `h264` | `h265`.
+    pub(crate) codec: String,
+    /// Deflate level for the zip pipeline (0-9; 0 = store).
+    pub(crate) zip_level: i64,
     /// "running" | "done" | "cancelled" | "error"
     pub(crate) status: Mutex<String>,
     pub(crate) total: usize,
     pub(crate) files: Vec<FileState>,
     pub(crate) saved_bytes: AtomicU64,
     pub(crate) cancel: Arc<AtomicBool>,
-    /// Handle of the encoder child for the file currently being processed, so
-    /// `cancel` can `kill()` it. `None` between files / for the zip pipeline.
-    pub(crate) child: Mutex<Option<Child>>,
+    /// Handles of the encoder children currently running, keyed by file index,
+    /// so `cancel` can `kill()` ALL of them (multiple files encode at once).
+    /// Empty between files / for the inline zip pipeline.
+    pub(crate) children: Mutex<HashMap<usize, Child>>,
+    /// Serializes manifest rewrites so concurrent workers never tear the file.
+    pub(crate) manifest_lock: Mutex<()>,
     /// Live NDJSON event lines. The stream endpoint replays from index 0 then
     /// tails new lines; `finished` + the condvar wake any tailing reader.
     pub(crate) events: Mutex<Vec<String>>,
@@ -169,13 +193,77 @@ pub(crate) fn is_safe_job_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
+/// Performance + encoder options threaded from the POST body into the job and
+/// its persisted manifest. Each field has a hardware-derived default applied by
+/// [`CompressOptions::normalized`] so an older client (or resume) still works.
+#[derive(Clone, Debug)]
+pub(crate) struct CompressOptions {
+    pub(crate) recycle_originals: bool,
+    pub(crate) tag_filename: bool,
+    /// 0 ⇒ "auto" (hardware-derived); otherwise the requested worker count.
+    pub(crate) concurrency: usize,
+    pub(crate) encoder: String,
+    pub(crate) use_gpu: bool,
+    pub(crate) codec: String,
+    /// -1 ⇒ default; otherwise 0..=9 Deflate level.
+    pub(crate) zip_level: i64,
+}
+
+impl Default for CompressOptions {
+    fn default() -> Self {
+        CompressOptions {
+            recycle_originals: true,
+            tag_filename: true,
+            concurrency: 0,
+            encoder: "auto".to_string(),
+            use_gpu: true,
+            codec: "h264".to_string(),
+            zip_level: -1,
+        }
+    }
+}
+
+impl CompressOptions {
+    fn norm_encoder(e: &str) -> String {
+        match e {
+            "auto" | "x264" | "nvenc" | "qsv" | "vce" => e.to_string(),
+            _ => "auto".to_string(),
+        }
+    }
+    fn norm_codec(c: &str) -> String {
+        match c {
+            "h264" | "h265" => c.to_string(),
+            _ => "h264".to_string(),
+        }
+    }
+    /// Default worker count: roughly half the logical cores (each video encode is
+    /// itself multi-threaded), clamped to a sane range. The global CompressGate
+    /// still caps total concurrent encoders across jobs.
+    fn default_concurrency() -> usize {
+        std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(4)
+            .div_ceil(2)
+            .clamp(2, 8)
+    }
+    fn resolved_concurrency(&self) -> usize {
+        if self.concurrency == 0 {
+            Self::default_concurrency()
+        } else {
+            self.concurrency.clamp(1, 16)
+        }
+    }
+    fn resolved_zip_level(&self) -> i64 {
+        if self.zip_level < 0 { 6 } else { self.zip_level.clamp(0, 9) }
+    }
+}
+
 /// Build a fresh job from a create request. Each file is classified and sized
 /// (best-effort `metadata`) up front so `file_start` events carry `origBytes`.
 pub(crate) fn create_job(
     paths: &[String],
     preset: &str,
-    recycle_originals: bool,
-    tag_filename: bool,
+    opts: &CompressOptions,
 ) -> Arc<CompressJob> {
     let id = new_job_id();
     let files: Vec<FileState> = paths
@@ -192,14 +280,20 @@ pub(crate) fn create_job(
     Arc::new(CompressJob {
         id: id.clone(),
         preset: normalize_preset(preset),
-        recycle_originals,
-        tag_filename,
+        recycle_originals: opts.recycle_originals,
+        tag_filename: opts.tag_filename,
+        concurrency: opts.resolved_concurrency(),
+        encoder: CompressOptions::norm_encoder(&opts.encoder),
+        use_gpu: opts.use_gpu,
+        codec: CompressOptions::norm_codec(&opts.codec),
+        zip_level: opts.resolved_zip_level(),
         status: Mutex::new("running".to_string()),
         total,
         files,
         saved_bytes: AtomicU64::new(0),
         cancel: Arc::new(AtomicBool::new(false)),
-        child: Mutex::new(None),
+        children: Mutex::new(HashMap::new()),
+        manifest_lock: Mutex::new(()),
         events: Mutex::new(Vec::new()),
         events_cv: Condvar::new(),
         finished: AtomicBool::new(false),
@@ -224,6 +318,28 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     let tag_filename = root.get("tagFilename").and_then(|v| v.as_bool()).unwrap_or(true);
+    let concurrency = root
+        .get("concurrency")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(0);
+    let encoder = root.get("encoder").and_then(|v| v.as_str()).unwrap_or("auto").to_string();
+    let use_gpu = root.get("useGpu").and_then(|v| v.as_bool()).unwrap_or(true);
+    let codec = root.get("codec").and_then(|v| v.as_str()).unwrap_or("h264").to_string();
+    let zip_level = root
+        .get("zipLevel")
+        .and_then(|v| v.as_f64())
+        .map(|n| n as i64)
+        .unwrap_or(-1);
+    let opts = CompressOptions {
+        recycle_originals,
+        tag_filename,
+        concurrency,
+        encoder,
+        use_gpu,
+        codec,
+        zip_level,
+    };
     let files_arr = root.get("files").and_then(|v| v.as_array())?;
 
     let mut files = Vec::with_capacity(files_arr.len());
@@ -247,6 +363,12 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
             if let Some(op) = f.get("outPath").and_then(|v| v.as_str()) {
                 *state.out_path.lock().expect("out_path lock") = op.to_string();
             }
+            if let Some(r) = f.get("reason").and_then(|v| v.as_str()) {
+                *state.reason.lock().expect("reason lock") = r.to_string();
+            }
+            state
+                .duration_ms
+                .store(f.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0), Ordering::Relaxed);
             carried_saved = carried_saved.saturating_add(orig.saturating_sub(newb));
         }
         files.push(state);
@@ -258,12 +380,18 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         preset: normalize_preset(preset),
         recycle_originals,
         tag_filename,
+        concurrency: opts.resolved_concurrency(),
+        encoder: CompressOptions::norm_encoder(&opts.encoder),
+        use_gpu: opts.use_gpu,
+        codec: CompressOptions::norm_codec(&opts.codec),
+        zip_level: opts.resolved_zip_level(),
         status: Mutex::new("running".to_string()),
         total,
         files,
         saved_bytes: AtomicU64::new(carried_saved),
         cancel: Arc::new(AtomicBool::new(false)),
-        child: Mutex::new(None),
+        children: Mutex::new(HashMap::new()),
+        manifest_lock: Mutex::new(()),
         events: Mutex::new(Vec::new()),
         events_cv: Condvar::new(),
         finished: AtomicBool::new(false),
@@ -278,10 +406,105 @@ fn normalize_preset(p: &str) -> String {
     }
 }
 
+/// A resolved video encoder: the HandBrake `-e` token, the global gate lane it
+/// runs in, whether it is hardware-accelerated, and a short label for logs/CSV.
+#[derive(Clone, Debug)]
+pub(crate) struct VideoEncoder {
+    /// HandBrake `-e` value, e.g. `x264`, `x265`, `nvenc_h264`, `qsv_h265`.
+    pub(crate) hb: String,
+    pub(crate) lane: CompressLane,
+    pub(crate) is_gpu: bool,
+}
+
+/// Map the job's encoder choice + codec + detected capabilities to the concrete
+/// HandBrake encoder to use. `auto` prefers a hardware encoder for the codec
+/// (NVENC > QSV > VCE) when GPU use is allowed and available, otherwise the CPU
+/// software encoder (x265 for HEVC, x264 for H.264). An explicit HW encoder that
+/// isn't available silently falls back to CPU here (a runtime GPU failure is
+/// handled separately by the per-file CPU retry).
+pub(crate) fn select_video_encoder(
+    encoder: &str,
+    codec: &str,
+    use_gpu: bool,
+    caps: &HandbrakeCaps,
+) -> VideoEncoder {
+    let h265 = codec == "h265";
+    let cpu = || VideoEncoder {
+        hb: if h265 && caps.x265 { "x265".to_string() } else { "x264".to_string() },
+        lane: CompressLane::VideoCpu,
+        is_gpu: false,
+    };
+    let gpu = |hb: &str| VideoEncoder { hb: hb.to_string(), lane: CompressLane::Gpu, is_gpu: true };
+
+    if !use_gpu || encoder == "x264" {
+        return cpu();
+    }
+    // Pick a specific vendor encoder if requested + available.
+    match encoder {
+        "nvenc" => {
+            if h265 && caps.nvenc_h265 { return gpu("nvenc_h265"); }
+            if !h265 && caps.nvenc_h264 { return gpu("nvenc_h264"); }
+        }
+        "qsv" => {
+            if h265 && caps.qsv_h265 { return gpu("qsv_h265"); }
+            if !h265 && caps.qsv_h264 { return gpu("qsv_h264"); }
+        }
+        "vce" => {
+            if h265 && caps.vce_h265 { return gpu("vce_h265"); }
+            if !h265 && caps.vce_h264 { return gpu("vce_h264"); }
+        }
+        _ => {} // "auto" (and anything else) → preference order below
+    }
+    // Auto: prefer NVENC, then QSV, then VCE for the requested codec.
+    if h265 {
+        if caps.nvenc_h265 { return gpu("nvenc_h265"); }
+        if caps.qsv_h265 { return gpu("qsv_h265"); }
+        if caps.vce_h265 { return gpu("vce_h265"); }
+    } else {
+        if caps.nvenc_h264 { return gpu("nvenc_h264"); }
+        if caps.qsv_h264 { return gpu("qsv_h264"); }
+        if caps.vce_h264 { return gpu("vce_h264"); }
+    }
+    cpu()
+}
+
+/// Quality value + optional height cap for a video encoder at a preset. The
+/// quality scale differs per encoder family: x264/x265 use RF, NVENC uses CQ and
+/// QSV uses ICQ (all passed via HandBrake's `-q`), so the numbers are tuned per
+/// family to land at comparable visual quality. Also returns the
+/// `--encoder-preset` (speed/efficiency) appropriate to the family.
+fn video_quality(hb_encoder: &str, preset: &str) -> (String, Option<&'static str>, &'static str) {
+    let gpu = hb_encoder.starts_with("nvenc")
+        || hb_encoder.starts_with("qsv")
+        || hb_encoder.starts_with("vce");
+    // (quality, maxHeight) by preset; GPU CQ/ICQ runs a touch higher than RF for
+    // a similar size since hardware encoders are less efficient per quality step.
+    let (q, h): (&str, Option<&'static str>) = match (preset, gpu) {
+        ("max", false) => ("30", Some("480")),
+        ("max", true) => ("32", Some("480")),
+        ("high", false) => ("20", None),
+        ("high", true) => ("22", None),
+        (_, false) => ("24", Some("1080")),
+        (_, true) => ("26", Some("1080")),
+    };
+    let enc_preset = if gpu {
+        "quality"
+    } else {
+        match preset {
+            "max" => "veryfast",
+            "high" => "slow",
+            _ => "medium",
+        }
+    };
+    (q.to_string(), h, enc_preset)
+}
+
 /// The encoder + a human-readable codec parameter string for one file, derived
 /// from its kind, the job preset and which image encoder was detected. Mirrors
 /// the actual quality/scale knobs the `run_*` pipelines pass to each tool so the
-/// CSV log records exactly how a file was (or would have been) encoded.
+/// CSV log records exactly how a file was (or would have been) encoded. This is
+/// the fallback used for outcomes that never spawned an encoder; the live path
+/// records the genuine encoder via [`EncodeMeta`].
 fn pipeline_params(
     kind: FileKind,
     preset: &str,
@@ -363,193 +586,106 @@ pub(crate) fn spawn_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     std::thread::spawn(move || run_job(state, job));
 }
 
+/// Live outcome tallies shared across the parallel worker threads.
+#[derive(Default)]
+struct Counts {
+    done: AtomicUsize,
+    error: AtomicUsize,
+    skipped: AtomicUsize,
+}
+
 fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     job.emit(ev_job_start(&job.id, job.total));
 
     let hb = compress_tools::detect_handbrake();
     let (img, img_kind) = compress_tools::detect_image();
+    let caps = hb
+        .path
+        .as_ref()
+        .map(|p| compress_tools::detect_handbrake_caps(p))
+        .unwrap_or_default();
 
     // Job-start diagnostics: preset, options, file count and which encoders were
     // detected (path + version) so a "tool missing" outcome later is unambiguous.
     if crate::compress_debug::enabled() {
         let mut l = format!(
-            "[job_start] job={} preset={} recycle={} tag={} files={}",
-            job.id, job.preset, job.recycle_originals, job.tag_filename, job.total
+            "[job_start] job={} preset={} recycle={} tag={} files={} concurrency={} encoder={} codec={} useGpu={} zipLevel={}",
+            job.id, job.preset, job.recycle_originals, job.tag_filename, job.total,
+            job.concurrency, job.encoder, job.codec, job.use_gpu, job.zip_level
         );
         l.push_str(&format!(" handbrake={}", tool_desc(&hb)));
         l.push_str(&format!(" image={}", tool_desc(&img)));
         if let Some(k) = img_kind {
             l.push_str(&format!(" imageKind={}", k.as_str()));
         }
+        l.push_str(&format!(
+            " gpuCaps=[nvenc:{}/{} qsv:{}/{} vce:{}/{} x265:{}]",
+            caps.nvenc_h264, caps.nvenc_h265, caps.qsv_h264, caps.qsv_h265,
+            caps.vce_h264, caps.vce_h265, caps.x265
+        ));
         l.push_str(" zip=built-in");
         crate::compress_debug::log(&l);
     }
 
-    let mut done_count = 0usize;
-    let mut error_count = 0usize;
-    let mut skipped_count = 0usize;
+    // Per-job schedule: process the largest (longest-processing) files first for
+    // better tail latency, skipping anything a prior run already completed.
+    let already_done = job
+        .files
+        .iter()
+        .filter(|f| f.status.lock().expect("status lock").as_str() == "done")
+        .count();
+    let mut schedule: Vec<usize> = (0..job.files.len())
+        .filter(|&i| job.files[i].status.lock().expect("status lock").as_str() != "done")
+        .collect();
+    schedule.sort_by(|&a, &b| {
+        job.files[b]
+            .orig_bytes
+            .load(Ordering::Relaxed)
+            .cmp(&job.files[a].orig_bytes.load(Ordering::Relaxed))
+    });
 
-    for i in 0..job.files.len() {
-        if job.cancel.load(Ordering::SeqCst) {
-            break;
-        }
-        // Resume: files already completed in a prior run keep their result and
-        // are not re-encoded.
-        if job.files[i].status.lock().expect("status lock").as_str() == "done" {
-            done_count += 1;
-            continue;
-        }
+    let counts = Arc::new(Counts::default());
+    counts.done.store(already_done, Ordering::Relaxed);
+    let schedule = Arc::new(schedule);
+    let cursor = Arc::new(AtomicUsize::new(0));
 
-        {
-            let f = &job.files[i];
-            *f.status.lock().expect("status lock") = "running".to_string();
-            f.pct.store(0, Ordering::Relaxed);
-            let orig = f.orig_bytes.load(Ordering::Relaxed);
-            job.emit(ev_file_start(i, &f.path, f.kind, orig));
-        }
-
-        // Time the whole per-file pipeline so the CSV log can record duration_ms.
-        let file_start = Instant::now();
-        let outcome = process_file(&state, &job, i, &hb, &img, img_kind);
-        let duration_ms = file_start.elapsed().as_millis() as u64;
-        let f = &job.files[i];
-        let orig = f.orig_bytes.load(Ordering::Relaxed);
-        // The tool + codec params are fully determined by the file kind, the
-        // chosen preset and which image encoder was detected — compute them here
-        // so every outcome arm (including errors) logs consistently.
-        let (tool, codec_params) = pipeline_params(f.kind, &job.preset, img_kind);
-        let name = file_name_of(&f.path);
-        let kind_str = f.kind.as_str();
-        // The detected version string of whichever tool this file's kind uses,
-        // recorded in the CSV so the exact encoder build is captured.
-        let tool_version = match f.kind {
-            FileKind::Video => hb.version.as_deref().unwrap_or(""),
-            FileKind::Image => img.version.as_deref().unwrap_or(""),
-            FileKind::Other => "built-in",
-        };
-        match outcome {
-            FileOutcome::Done { out_path, new_bytes, recycled, recycle_error, tagged, diag } => {
-                f.new_bytes.store(new_bytes, Ordering::Relaxed);
-                f.recycled.store(recycled, Ordering::Relaxed);
-                *f.out_path.lock().expect("out lock") = out_path.clone();
-                *f.status.lock().expect("status lock") = "done".to_string();
-                f.pct.store(100, Ordering::Relaxed);
-                let saved = orig.saturating_sub(new_bytes);
-                job.saved_bytes.fetch_add(saved, Ordering::Relaxed);
-                done_count += 1;
-                crate::compress_log::append_row(&crate::compress_log::Row {
-                    job_id: &job.id,
-                    index: i,
-                    path: &f.path,
-                    name: &name,
-                    kind: kind_str,
-                    preset: &job.preset,
-                    status: "success",
-                    orig_bytes: orig,
-                    new_bytes,
-                    saved_bytes: saved,
-                    pct_saved: pct_saved(orig, new_bytes),
-                    ratio: ratio(orig, new_bytes),
-                    tool,
-                    codec_params: &codec_params,
-                    duration_ms,
-                    out_path: &out_path,
-                    recycled,
-                    error: "",
-                    reason: Reason::Success.as_str(),
-                    exit_code: diag.exit_code,
-                    tool_version,
-                    command: &diag.command,
-                    stderr_excerpt: &diag.stderr_tail,
-                });
-                log_file_debug(
-                    &job.id, i, &f.path, kind_str, orig, tool, &diag, &out_path, new_bytes,
-                    "compressed", Reason::Success.as_str(), duration_ms, recycled,
-                    recycle_error.as_deref(), Some(tagged),
-                );
-                job.emit(ev_file_done(i, &out_path, orig, new_bytes, saved, recycled, "done"));
+    // Bounded worker pool: `concurrency` threads draw the next scheduled index
+    // from the shared cursor. The global CompressGate further caps total
+    // concurrent encoders across all jobs (acquired per-file inside the pipeline).
+    let nthreads = job.concurrency.clamp(1, schedule.len().max(1));
+    let mut handles = Vec::with_capacity(nthreads);
+    for _ in 0..nthreads {
+        let state = Arc::clone(&state);
+        let job = Arc::clone(&job);
+        let schedule = Arc::clone(&schedule);
+        let cursor = Arc::clone(&cursor);
+        let counts = Arc::clone(&counts);
+        let hb = hb.clone();
+        let img = img.clone();
+        handles.push(std::thread::spawn(move || {
+            loop {
+                if job.cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+                let k = cursor.fetch_add(1, Ordering::Relaxed);
+                if k >= schedule.len() {
+                    break;
+                }
+                let i = schedule[k];
+                let stop = process_and_record(&state, &job, i, &hb, &img, img_kind, &caps, &counts);
+                if stop {
+                    break;
+                }
             }
-            FileOutcome::Skipped { new_bytes, diag } => {
-                f.new_bytes.store(new_bytes, Ordering::Relaxed);
-                *f.status.lock().expect("status lock") = "skipped".to_string();
-                f.pct.store(100, Ordering::Relaxed);
-                skipped_count += 1;
-                crate::compress_log::append_row(&crate::compress_log::Row {
-                    job_id: &job.id,
-                    index: i,
-                    path: &f.path,
-                    name: &name,
-                    kind: kind_str,
-                    preset: &job.preset,
-                    status: "skipped_no_gain",
-                    orig_bytes: orig,
-                    new_bytes,
-                    saved_bytes: 0,
-                    pct_saved: 0.0,
-                    ratio: ratio(orig, new_bytes),
-                    tool,
-                    codec_params: &codec_params,
-                    duration_ms,
-                    out_path: "",
-                    recycled: false,
-                    error: "",
-                    reason: Reason::SkippedNoGain.as_str(),
-                    exit_code: diag.exit_code,
-                    tool_version,
-                    command: &diag.command,
-                    stderr_excerpt: &diag.stderr_tail,
-                });
-                log_file_debug(
-                    &job.id, i, &f.path, kind_str, orig, tool, &diag, "", new_bytes,
-                    "skipped", Reason::SkippedNoGain.as_str(), duration_ms, false, None, None,
-                );
-                job.emit(ev_file_done(i, "", orig, new_bytes, 0, false, "skipped_no_gain"));
-            }
-            FileOutcome::Error { reason, message, diag } => {
-                *f.error.lock().expect("err lock") = Some(message.clone());
-                *f.status.lock().expect("status lock") = "error".to_string();
-                error_count += 1;
-                crate::compress_log::append_row(&crate::compress_log::Row {
-                    job_id: &job.id,
-                    index: i,
-                    path: &f.path,
-                    name: &name,
-                    kind: kind_str,
-                    preset: &job.preset,
-                    status: "error",
-                    orig_bytes: orig,
-                    new_bytes: 0,
-                    saved_bytes: 0,
-                    pct_saved: 0.0,
-                    ratio: 0.0,
-                    tool,
-                    codec_params: &codec_params,
-                    duration_ms,
-                    out_path: "",
-                    recycled: false,
-                    error: &message,
-                    reason: reason.as_str(),
-                    exit_code: diag.exit_code,
-                    tool_version,
-                    command: &diag.command,
-                    stderr_excerpt: &diag.stderr_tail,
-                });
-                log_file_debug(
-                    &job.id, i, &f.path, kind_str, orig, tool, &diag, "", 0,
-                    "error", reason.as_str(), duration_ms, false, None, None,
-                );
-                job.emit(ev_error(i, &f.path, &message));
-            }
-            FileOutcome::Cancelled => {
-                *f.status.lock().expect("status lock") = "pending".to_string();
-                f.pct.store(0, Ordering::Relaxed);
-                write_manifest(&job);
-                break;
-            }
-        }
-
-        write_manifest(&job);
+        }));
     }
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let done_count = counts.done.load(Ordering::Relaxed);
+    let error_count = counts.error.load(Ordering::Relaxed);
+    let skipped_count = counts.skipped.load(Ordering::Relaxed);
 
     let cancelled = job.cancel.load(Ordering::SeqCst);
     let status = if cancelled {
@@ -570,6 +706,201 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     job.emit(ev_done(&job.id, done_count, error_count, total_saved));
     job.finished.store(true, Ordering::SeqCst);
     job.events_cv.notify_all();
+}
+
+/// Process one file and record its outcome (FileState, CSV row, debug log, live
+/// event, manifest rewrite). Runs on a pool worker thread. Returns `true` when
+/// the worker should stop (the job was cancelled mid-file).
+fn process_and_record(
+    state: &Arc<AppState>,
+    job: &Arc<CompressJob>,
+    i: usize,
+    hb: &compress_tools::ToolInfo,
+    img: &compress_tools::ToolInfo,
+    img_kind: Option<ImageKind>,
+    caps: &HandbrakeCaps,
+    counts: &Counts,
+) -> bool {
+    {
+        let f = &job.files[i];
+        *f.status.lock().expect("status lock") = "running".to_string();
+        f.pct.store(0, Ordering::Relaxed);
+        let orig = f.orig_bytes.load(Ordering::Relaxed);
+        job.emit(ev_file_start(i, &f.path, f.kind, orig));
+    }
+
+    let file_start = Instant::now();
+    let outcome = process_file(state, job, i, hb, img, img_kind, caps);
+    let duration_ms = file_start.elapsed().as_millis() as u64;
+    let f = &job.files[i];
+    let orig = f.orig_bytes.load(Ordering::Relaxed);
+    let name = file_name_of(&f.path);
+    let kind_str = f.kind.as_str();
+    f.duration_ms.store(duration_ms, Ordering::Relaxed);
+
+    // Fallback tool/params for outcomes that never spawned an encoder; the live
+    // path overrides these from the genuine encoder via EncodeMeta.
+    let (fallback_tool, fallback_params) = pipeline_params(f.kind, &job.preset, img_kind);
+    let fallback_version = match f.kind {
+        FileKind::Video => hb.version.as_deref().unwrap_or(""),
+        FileKind::Image => img.version.as_deref().unwrap_or(""),
+        FileKind::Other => "built-in",
+    };
+
+    let mut stop = false;
+    match outcome {
+        FileOutcome::Done { out_path, new_bytes, recycled, recycle_error, tagged, diag, meta } => {
+            let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
+            let codec_params = if meta.codec_params.is_empty() { fallback_params.clone() } else { meta.codec_params.clone() };
+            let tool_version = if meta.tool_version.is_empty() { fallback_version } else { meta.tool_version.as_str() };
+            f.new_bytes.store(new_bytes, Ordering::Relaxed);
+            f.recycled.store(recycled, Ordering::Relaxed);
+            *f.out_path.lock().expect("out lock") = out_path.clone();
+            *f.status.lock().expect("status lock") = "done".to_string();
+            *f.reason.lock().expect("reason lock") = Reason::Success.as_str().to_string();
+            f.pct.store(100, Ordering::Relaxed);
+            let saved = orig.saturating_sub(new_bytes);
+            job.saved_bytes.fetch_add(saved, Ordering::Relaxed);
+            counts.done.fetch_add(1, Ordering::Relaxed);
+            crate::compress_log::append_row(&crate::compress_log::Row {
+                job_id: &job.id,
+                index: i,
+                path: &f.path,
+                name: &name,
+                kind: kind_str,
+                preset: &job.preset,
+                status: "success",
+                orig_bytes: orig,
+                new_bytes,
+                saved_bytes: saved,
+                pct_saved: pct_saved(orig, new_bytes),
+                ratio: ratio(orig, new_bytes),
+                tool,
+                codec_params: &codec_params,
+                duration_ms,
+                out_path: &out_path,
+                recycled,
+                error: "",
+                reason: Reason::Success.as_str(),
+                exit_code: diag.exit_code,
+                tool_version,
+                command: &diag.command,
+                stderr_excerpt: &diag.stderr_tail,
+            });
+            log_throughput_debug(&job.id, i, orig, new_bytes, duration_ms, meta.fps);
+            log_file_debug(
+                &job.id, i, &f.path, kind_str, orig, tool, &diag, &out_path, new_bytes,
+                "compressed", Reason::Success.as_str(), duration_ms, recycled,
+                recycle_error.as_deref(), Some(tagged),
+            );
+            job.emit(ev_file_done(i, &out_path, orig, new_bytes, saved, recycled, "done"));
+        }
+        FileOutcome::Skipped { new_bytes, diag, meta } => {
+            let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
+            let codec_params = if meta.codec_params.is_empty() { fallback_params.clone() } else { meta.codec_params.clone() };
+            let tool_version = if meta.tool_version.is_empty() { fallback_version } else { meta.tool_version.as_str() };
+            f.new_bytes.store(new_bytes, Ordering::Relaxed);
+            *f.status.lock().expect("status lock") = "skipped".to_string();
+            *f.reason.lock().expect("reason lock") = Reason::SkippedNoGain.as_str().to_string();
+            f.pct.store(100, Ordering::Relaxed);
+            counts.skipped.fetch_add(1, Ordering::Relaxed);
+            crate::compress_log::append_row(&crate::compress_log::Row {
+                job_id: &job.id,
+                index: i,
+                path: &f.path,
+                name: &name,
+                kind: kind_str,
+                preset: &job.preset,
+                status: "skipped_no_gain",
+                orig_bytes: orig,
+                new_bytes,
+                saved_bytes: 0,
+                pct_saved: 0.0,
+                ratio: ratio(orig, new_bytes),
+                tool,
+                codec_params: &codec_params,
+                duration_ms,
+                out_path: "",
+                recycled: false,
+                error: "",
+                reason: Reason::SkippedNoGain.as_str(),
+                exit_code: diag.exit_code,
+                tool_version,
+                command: &diag.command,
+                stderr_excerpt: &diag.stderr_tail,
+            });
+            log_file_debug(
+                &job.id, i, &f.path, kind_str, orig, tool, &diag, "", new_bytes,
+                "skipped", Reason::SkippedNoGain.as_str(), duration_ms, false, None, None,
+            );
+            job.emit(ev_file_done(i, "", orig, new_bytes, 0, false, "skipped_no_gain"));
+        }
+        FileOutcome::Error { reason, message, diag, meta } => {
+            let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
+            let codec_params = if meta.codec_params.is_empty() { fallback_params.clone() } else { meta.codec_params.clone() };
+            let tool_version = if meta.tool_version.is_empty() { fallback_version } else { meta.tool_version.as_str() };
+            *f.error.lock().expect("err lock") = Some(message.clone());
+            *f.status.lock().expect("status lock") = "error".to_string();
+            *f.reason.lock().expect("reason lock") = reason.as_str().to_string();
+            counts.error.fetch_add(1, Ordering::Relaxed);
+            crate::compress_log::append_row(&crate::compress_log::Row {
+                job_id: &job.id,
+                index: i,
+                path: &f.path,
+                name: &name,
+                kind: kind_str,
+                preset: &job.preset,
+                status: "error",
+                orig_bytes: orig,
+                new_bytes: 0,
+                saved_bytes: 0,
+                pct_saved: 0.0,
+                ratio: 0.0,
+                tool,
+                codec_params: &codec_params,
+                duration_ms,
+                out_path: "",
+                recycled: false,
+                error: &message,
+                reason: reason.as_str(),
+                exit_code: diag.exit_code,
+                tool_version,
+                command: &diag.command,
+                stderr_excerpt: &diag.stderr_tail,
+            });
+            log_file_debug(
+                &job.id, i, &f.path, kind_str, orig, tool, &diag, "", 0,
+                "error", reason.as_str(), duration_ms, false, None, None,
+            );
+            job.emit(ev_error(i, &f.path, &message));
+        }
+        FileOutcome::Cancelled => {
+            *f.status.lock().expect("status lock") = "pending".to_string();
+            f.pct.store(0, Ordering::Relaxed);
+            stop = true;
+        }
+    }
+
+    write_manifest(job);
+    stop
+}
+
+/// Per-file throughput line (MB/s + encode fps + wall time) for tuning and
+/// before/after benchmarking. No-op when debug logging is off.
+fn log_throughput_debug(job_id: &str, index: usize, orig: u64, new_bytes: u64, duration_ms: u64, fps: Option<f64>) {
+    if !crate::compress_debug::enabled() {
+        return;
+    }
+    let secs = (duration_ms as f64 / 1000.0).max(0.001);
+    let in_mbps = (orig as f64 / (1024.0 * 1024.0)) / secs;
+    let out_mbps = (new_bytes as f64 / (1024.0 * 1024.0)) / secs;
+    let mut l = format!(
+        "[throughput] job={job_id} #{index} in={in_mbps:.2}MB/s out={out_mbps:.2}MB/s wall_ms={duration_ms}"
+    );
+    if let Some(f) = fps {
+        l.push_str(&format!(" fps={f:.1}"));
+    }
+    crate::compress_debug::log(&l);
 }
 
 /// One-line description of a detected tool for the job-start debug entry:
@@ -679,6 +1010,18 @@ impl Reason {
     }
 }
 
+/// Encoder metadata for the CSV/debug record of a terminal file outcome: the
+/// genuine tool + codec-parameter string actually used (which may differ from
+/// the job default after a GPU→CPU fallback), its version, and (video) the
+/// average encode fps parsed from the encoder's progress output.
+#[derive(Default, Clone)]
+struct EncodeMeta {
+    tool: String,
+    codec_params: String,
+    tool_version: String,
+    fps: Option<f64>,
+}
+
 /// Result of one file's pipeline. Every terminal arm carries the [`EncodeDiag`]
 /// captured during the encode (empty for outcomes that never spawned a tool, e.g.
 /// a missing source or a missing encoder) plus, for errors, the precise reason.
@@ -690,12 +1033,30 @@ enum FileOutcome {
         recycle_error: Option<String>,
         tagged: bool,
         diag: EncodeDiag,
+        meta: EncodeMeta,
     },
     /// Output produced but not smaller than the original (deleted, original kept).
-    Skipped { new_bytes: u64, diag: EncodeDiag },
-    Error { reason: Reason, message: String, diag: EncodeDiag },
+    Skipped { new_bytes: u64, diag: EncodeDiag, meta: EncodeMeta },
+    Error { reason: Reason, message: String, diag: EncodeDiag, meta: EncodeMeta },
     /// Job cancelled mid-encode; partial output deleted, original untouched.
     Cancelled,
+}
+
+/// Extensions whose contents are already entropy-coded, so a re-zip/re-encode is
+/// very unlikely to shrink them. Used by the pre-skip heuristic and to choose
+/// zip "store" instead of wasting Deflate CPU.
+fn is_already_compressed_ext(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "zip" | "7z" | "rar" | "gz" | "bz2" | "xz" | "zst" | "lz4" | "cab" | "tgz"
+            | "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "heic"
+            | "mp4" | "mkv" | "mov" | "m4v" | "webm" | "m4a" | "aac" | "mp3" | "ogg" | "flac"
+            | "docx" | "xlsx" | "pptx"
+    )
 }
 
 fn process_file(
@@ -705,6 +1066,7 @@ fn process_file(
     hb: &compress_tools::ToolInfo,
     img: &compress_tools::ToolInfo,
     img_kind: Option<ImageKind>,
+    caps: &HandbrakeCaps,
 ) -> FileOutcome {
     let (input_str, kind) = {
         let f = &job.files[index];
@@ -717,27 +1079,50 @@ fn process_file(
             message: "source no longer exists - may have been recycled by a prior run"
                 .to_string(),
             diag: EncodeDiag::default(),
+            meta: EncodeMeta::default(),
         };
     }
     let orig = job.files[index].orig_bytes.load(Ordering::Relaxed);
     let out = output_path(&input, kind);
 
-    // Run the pipeline for this file kind.
+    // Pre-skip heuristic for the zip pipeline: a file whose container is already
+    // entropy-coded (zip/7z/jpg/mp4/office…) won't shrink under Deflate, so skip
+    // spawning the zip work entirely and record it as a no-gain skip.
+    if kind == FileKind::Other && is_already_compressed_ext(&input) {
+        let mut meta = EncodeMeta::default();
+        meta.tool = "zip".to_string();
+        meta.codec_params = "store (pre-skip: already compressed)".to_string();
+        meta.tool_version = "built-in".to_string();
+        return FileOutcome::Skipped {
+            new_bytes: orig,
+            diag: EncodeDiag { command: "pre-skip (already compressed)".to_string(), exit_code: Some(0), stderr_tail: String::new() },
+            meta,
+        };
+    }
+
+    // Resolve the genuine encoder (so logs/CSV reflect GPU vs CPU) + run it. For
+    // video a GPU encode failure falls back to CPU x264 (logged) on the same file.
+    let mut meta = EncodeMeta::default();
     let encode = match kind {
         FileKind::Video => match hb.path.as_ref() {
-            Some(p) => run_handbrake(job, index, p, &input, &out, &job.preset),
+            Some(p) => run_video(job, index, p, &input, &out, caps, hb, &mut meta),
             None => return FileOutcome::Error {
                 reason: Reason::ErrorToolMissing,
                 message: "HandBrake not installed - install HandBrakeCLI to compress video"
                     .to_string(),
                 diag: EncodeDiag::default(),
+                meta: EncodeMeta::default(),
             },
         },
         FileKind::Image => match (img.path.as_ref(), img_kind) {
             (Some(p), Some(ImageKind::Ffmpeg)) => {
+                meta.tool = "ffmpeg".to_string();
+                meta.tool_version = img.version.clone().unwrap_or_default();
                 run_ffmpeg_image(job, index, p, &input, &out, &job.preset)
             }
             (Some(p), Some(ImageKind::ImageMagick)) => {
+                meta.tool = "imagemagick".to_string();
+                meta.tool_version = img.version.clone().unwrap_or_default();
                 run_magick_image(job, index, p, &input, &out, &job.preset)
             }
             _ => return FileOutcome::Error {
@@ -745,9 +1130,15 @@ fn process_file(
                 message: "no image encoder installed - install ffmpeg or ImageMagick to compress images"
                     .to_string(),
                 diag: EncodeDiag::default(),
+                meta: EncodeMeta::default(),
             },
         },
-        FileKind::Other => run_zip(job, index, &input, &out),
+        FileKind::Other => {
+            meta.tool = "zip".to_string();
+            meta.tool_version = "built-in".to_string();
+            meta.codec_params = format!("deflate level={}", job.zip_level);
+            run_zip(job, index, &input, &out, job.zip_level)
+        }
     };
 
     let diag = match encode {
@@ -760,15 +1151,18 @@ fn process_file(
                 reason: Reason::ErrorSpawn,
                 message: error,
                 diag: EncodeDiag { command, exit_code: None, stderr_tail: String::new() },
+                meta,
             };
         }
-        EncodeResult::Done { success, diag } => {
+        EncodeResult::Done { success, diag, fps } => {
+            meta.fps = fps;
             if !success {
                 let _ = std::fs::remove_file(&out);
                 return FileOutcome::Error {
                     reason: Reason::ErrorEncoder,
                     message: encoder_error_message(&diag),
                     diag,
+                    meta,
                 };
             }
             diag
@@ -784,6 +1178,7 @@ fn process_file(
                 reason: Reason::ErrorOutputEmpty,
                 message: "output missing or empty after encode".to_string(),
                 diag,
+                meta,
             };
         }
     };
@@ -791,7 +1186,7 @@ fn process_file(
     // No gain → discard output, keep the original (never recycle).
     if new_bytes >= orig && orig > 0 {
         let _ = std::fs::remove_file(&out);
-        return FileOutcome::Skipped { new_bytes, diag };
+        return FileOutcome::Skipped { new_bytes, diag, meta };
     }
 
     let out_str = out.to_string_lossy().into_owned();
@@ -851,7 +1246,7 @@ fn process_file(
             .invalidate(&parent.to_string_lossy());
     }
 
-    FileOutcome::Done { out_path: out_str, new_bytes, recycled, recycle_error, tagged, diag }
+    FileOutcome::Done { out_path: out_str, new_bytes, recycled, recycle_error, tagged, diag, meta }
 }
 
 /// Build a human error message for a non-zero encoder exit from its diagnostics:
@@ -921,16 +1316,55 @@ pub(crate) struct EncodeDiag {
 /// Outcome of running an external encoder child.
 enum EncodeResult {
     /// Child ran to completion; `success` is true when it exited 0. `diag`
-    /// carries the command line, exit code and captured stderr tail.
-    Done { success: bool, diag: EncodeDiag },
+    /// carries the command line, exit code and captured stderr tail; `fps` is the
+    /// average encode rate parsed from the encoder output (video only).
+    Done { success: bool, diag: EncodeDiag, fps: Option<f64> },
     /// Job was cancelled; the child was killed.
     Cancelled,
     /// The child could not be spawned. `command` is the line we tried to run.
     Spawn { error: String, command: String },
 }
 
-/// HandBrake video pipeline. Presets map to a quality (RF) + optional downscale;
-/// progress is parsed from the encoder's `xx.x %` lines.
+/// Video pipeline entry: resolve the encoder (HW vs CPU), acquire the right
+/// global-budget lane, run HandBrake, and — on a GPU encode failure — fall back
+/// to CPU x264 on the same file (logged). Fills `meta` with the genuine encoder
+/// used and its codec-parameter string for the CSV/debug record.
+fn run_video(
+    job: &Arc<CompressJob>,
+    index: usize,
+    hb: &Path,
+    input: &Path,
+    out: &Path,
+    caps: &HandbrakeCaps,
+    hb_info: &compress_tools::ToolInfo,
+    meta: &mut EncodeMeta,
+) -> EncodeResult {
+    meta.tool = "handbrake".to_string();
+    meta.tool_version = hb_info.version.clone().unwrap_or_default();
+
+    let enc = select_video_encoder(&job.encoder, &job.codec, job.use_gpu, caps);
+    let result = run_handbrake(job, index, hb, input, out, &job.preset, &enc, meta);
+
+    // GPU encode failed → retry once on CPU x264, logged, so a flaky/maxed-out
+    // hardware session doesn't fail the file outright.
+    if enc.is_gpu {
+        if let EncodeResult::Done { success: false, .. } = &result {
+            crate::compress_debug::log(&format!(
+                "[gpu_fallback] job={} #{index} encoder={} failed → retrying on CPU x264",
+                job.id, enc.hb
+            ));
+            let _ = std::fs::remove_file(out);
+            let cpu = VideoEncoder { hb: "x264".to_string(), lane: CompressLane::VideoCpu, is_gpu: false };
+            return run_handbrake(job, index, hb, input, out, &job.preset, &cpu, meta);
+        }
+    }
+    result
+}
+
+/// HandBrake video pipeline for a resolved encoder. Presets map to a quality
+/// (RF/CQ/ICQ) + optional downscale + `--encoder-preset`; progress + fps are
+/// parsed from the encoder output. Acquires the encoder's global-budget lane for
+/// the duration of the encode (released on return).
 fn run_handbrake(
     job: &Arc<CompressJob>,
     index: usize,
@@ -938,16 +1372,34 @@ fn run_handbrake(
     input: &Path,
     out: &Path,
     preset: &str,
+    enc: &VideoEncoder,
+    meta: &mut EncodeMeta,
 ) -> EncodeResult {
-    // RF (lower = higher quality / larger), plus an optional height cap.
-    let (quality, max_height): (&str, Option<&str>) = match preset {
-        "max" => ("30", Some("480")),
-        "high" => ("20", None),
-        _ => ("24", Some("1080")), // balanced
+    let (quality, max_height, enc_preset) = video_quality(&enc.hb, preset);
+
+    let mut params = format!("{} q={quality} preset={enc_preset}", enc.hb);
+    if let Some(h) = max_height {
+        params.push_str(&format!(" maxHeight={h}"));
+    }
+    meta.codec_params = params;
+
+    // Acquire the lane permit (CPU video vs GPU session). Cancelled while queued
+    // ⇒ no work done.
+    let _permit = match acquire_compress(enc.lane, &job.cancel) {
+        Some(p) => p,
+        None => return EncodeResult::Cancelled,
     };
+
     let mut cmd = Command::new(hb);
     cmd.arg("-i").arg(input).arg("-o").arg(out);
-    cmd.args(["-e", "x264", "-q", quality, "-E", "av_aac", "-B", "160", "--optimize"]);
+    cmd.args(["-e", &enc.hb, "-q", &quality, "-E", "av_aac", "-B", "160", "--optimize"]);
+    cmd.args(["--encoder-preset", enc_preset]);
+    if !enc.is_gpu {
+        // CPU tuning: let x264/x265 use the box's threads for this encode (the
+        // lane cap bounds how many encodes run at once, so this won't oversubscribe).
+        let threads = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4);
+        cmd.args(["--encopts", &format!("threads={threads}")]);
+    }
     if let Some(h) = max_height {
         cmd.args(["--maxHeight", h, "--keep-display-aspect"]);
     }
@@ -970,6 +1422,10 @@ fn run_ffmpeg_image(
         "max" => ("12", Some("1280")),
         "high" => ("3", None),
         _ => ("6", Some("1920")), // balanced
+    };
+    let _permit = match acquire_compress(CompressLane::Image, &job.cancel) {
+        Some(p) => p,
+        None => return EncodeResult::Cancelled,
     };
     let mut cmd = Command::new(ff);
     cmd.arg("-y").arg("-i").arg(input);
@@ -999,6 +1455,10 @@ fn run_magick_image(
         "high" => ("92", None),
         _ => ("80", Some("3686400@")), // balanced (~1920x1920 area cap)
     };
+    let _permit = match acquire_compress(CompressLane::Image, &job.cancel) {
+        Some(p) => p,
+        None => return EncodeResult::Cancelled,
+    };
     let mut cmd = Command::new(magick);
     cmd.arg(input);
     if let Some(area) = resize {
@@ -1010,19 +1470,25 @@ fn run_magick_image(
 }
 
 /// Lossless zip pipeline for non-media files (built-in, no external tool). Runs
-/// inline (no child), so cancellation is observed between files rather than mid-zip.
-fn run_zip(job: &Arc<CompressJob>, index: usize, input: &Path, out: &Path) -> EncodeResult {
+/// inline (no child), so cancellation is observed between files rather than
+/// mid-zip. `level` is the Deflate level (0 stores). Acquires the zip lane.
+fn run_zip(job: &Arc<CompressJob>, index: usize, input: &Path, out: &Path, level: i64) -> EncodeResult {
+    let _permit = match acquire_compress(CompressLane::Zip, &job.cancel) {
+        Some(p) => p,
+        None => return EncodeResult::Cancelled,
+    };
     let f = &job.files[index];
     f.pct.store(10, Ordering::Relaxed);
     job.emit(ev_progress(index, 10));
-    let command = format!("zip (deflate, built-in) {} -> {}", input.display(), out.display());
-    match crate::archive::compress(&[input.to_string_lossy().into_owned()], out) {
+    let command = format!("zip (deflate level={level}, built-in) {} -> {}", input.display(), out.display());
+    match crate::archive::compress_with_level(&[input.to_string_lossy().into_owned()], out, level) {
         Ok(()) => {
             f.pct.store(100, Ordering::Relaxed);
             job.emit(ev_progress(index, 100));
             EncodeResult::Done {
                 success: true,
                 diag: EncodeDiag { command, exit_code: Some(0), stderr_tail: String::new() },
+                fps: None,
             }
         }
         Err(e) => EncodeResult::Spawn { error: e, command },
@@ -1070,7 +1536,9 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    *job.child.lock().expect("child lock") = Some(child);
+    // Track this child by file index so cancel can kill ALL active encoders
+    // (multiple files run in parallel now).
+    job.children.lock().expect("children lock").insert(index, child);
 
     // Drain stdout so the pipe can never fill and block the child.
     let out_handle = stdout.map(|mut pipe| {
@@ -1081,9 +1549,9 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
         })
     });
 
-    // Parse percentage from stderr (HandBrake/ffmpeg both report there) and
+    // Parse percentage + fps from stderr (HandBrake/ffmpeg both report there) and
     // accumulate a bounded tail of the non-progress lines so a failure can be
-    // explained. The thread returns the captured tail when it finishes.
+    // explained. The thread returns the captured tail + parsed fps.
     let err_handle = stderr.map(|pipe| {
         let job = Arc::clone(job);
         std::thread::spawn(move || read_progress(pipe, &job, index))
@@ -1094,16 +1562,16 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     let mut cancelled = false;
     let exit_status: Option<std::process::ExitStatus> = loop {
         if job.cancel.load(Ordering::SeqCst) {
-            if let Some(c) = job.child.lock().expect("child lock").as_mut() {
+            if let Some(c) = job.children.lock().expect("children lock").get_mut(&index) {
                 let _ = c.kill();
             }
             cancelled = true;
             break None;
         }
         let poll = {
-            let mut guard = job.child.lock().expect("child lock");
-            match guard.as_mut() {
-                // None means the handle vanished unexpectedly — treat as failure.
+            let mut guard = job.children.lock().expect("children lock");
+            match guard.get_mut(&index) {
+                // Missing means the handle vanished unexpectedly — treat as failure.
                 None => break None,
                 Some(c) => match c.try_wait() {
                     Ok(Some(st)) => Some(st),
@@ -1119,14 +1587,14 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
         }
     };
 
-    // Reap the child and clear the handle; readers finish once the pipes close.
-    if let Some(mut c) = job.child.lock().expect("child lock").take() {
+    // Reap the child and drop its handle; readers finish once the pipes close.
+    if let Some(mut c) = job.children.lock().expect("children lock").remove(&index) {
         let _ = c.wait();
     }
     if let Some(h) = out_handle {
         let _ = h.join();
     }
-    let stderr_tail = err_handle
+    let (stderr_tail, fps) = err_handle
         .map(|h| h.join().unwrap_or_default())
         .unwrap_or_default();
 
@@ -1140,6 +1608,7 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     EncodeResult::Done {
         success,
         diag: EncodeDiag { command, exit_code, stderr_tail },
+        fps,
     }
 }
 
@@ -1153,13 +1622,15 @@ const STDERR_TAIL_BYTES: usize = 8 * 1024;
 /// lines / ~8 KB) of everything else so a non-zero exit can be explained.
 /// Returns the captured tail (newline-joined). Reads raw bytes and splits on
 /// `\r`/`\n` because HandBrake rewrites its progress line with carriage returns.
-fn read_progress<R: std::io::Read>(mut pipe: R, job: &Arc<CompressJob>, index: usize) -> String {
+fn read_progress<R: std::io::Read>(mut pipe: R, job: &Arc<CompressJob>, index: usize) -> (String, Option<f64>) {
     use std::collections::VecDeque;
     let mut buf = [0u8; 4096];
     let mut line = String::new();
     let mut last_pct: i64 = -1;
     let mut tail: VecDeque<String> = VecDeque::new();
     let mut tail_bytes = 0usize;
+    // Last fps value seen (HandBrake `(NN.NN fps)`, ffmpeg `fps=NN`).
+    let mut last_fps: Option<f64> = None;
 
     let commit = |line: &str, tail: &mut VecDeque<String>, tail_bytes: &mut usize| {
         let trimmed = line.trim_end();
@@ -1197,6 +1668,9 @@ fn read_progress<R: std::io::Read>(mut pipe: R, job: &Arc<CompressJob>, index: u
                         job.emit(ev_progress(index, pi as u64));
                     }
                 }
+                if let Some(f) = parse_fps(&line) {
+                    last_fps = Some(f);
+                }
                 commit(&line, &mut tail, &mut tail_bytes);
                 line.clear();
             } else {
@@ -1213,7 +1687,38 @@ fn read_progress<R: std::io::Read>(mut pipe: R, job: &Arc<CompressJob>, index: u
     // Flush any trailing partial line.
     commit(&line, &mut tail, &mut tail_bytes);
 
-    tail.into_iter().collect::<Vec<_>>().join("\n")
+    (tail.into_iter().collect::<Vec<_>>().join("\n"), last_fps)
+}
+
+/// Extract an encode rate from an encoder progress line. HandBrake emits
+/// `... avg 24.50 fps` / `(24.50 fps)`; ffmpeg emits `fps=24`. Best-effort.
+fn parse_fps(line: &str) -> Option<f64> {
+    let lower = line.to_ascii_lowercase();
+    let pos = lower.find("fps")?;
+    // ffmpeg style: `fps=NN`
+    if let Some(eq) = lower[pos..].strip_prefix("fps=") {
+        let num: String = eq.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        return num.parse::<f64>().ok();
+    }
+    // HandBrake style: a number preceding `fps`. Scan backwards from `pos`.
+    let bytes = lower.as_bytes();
+    let mut end = pos;
+    while end > 0 && bytes[end - 1] == b' ' {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 {
+        let c = bytes[start - 1];
+        if c.is_ascii_digit() || c == b'.' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    if start == end {
+        return None;
+    }
+    lower[start..end].parse::<f64>().ok()
 }
 
 /// Extract a percentage from a line like `Encoding: task 1 of 1, 42.53 %`.
@@ -1311,6 +1816,9 @@ fn paths_eq(a: &str, b: &str) -> bool {
 // ── Manifest + JSON serialization ────────────────────────────────────────────
 
 fn write_manifest(job: &CompressJob) {
+    // Serialize concurrent rewrites (multiple files finish in parallel) so the
+    // manifest can never be torn; recover a poisoned lock — it guards only I/O.
+    let _guard = job.manifest_lock.lock().unwrap_or_else(|e| e.into_inner());
     let _ = std::fs::create_dir_all(jobs_dir());
     let mut s = String::with_capacity(256 + job.files.len() * 96);
     s.push_str("{\"id\":");
@@ -1323,6 +1831,16 @@ fn write_manifest(job: &CompressJob) {
     s.push_str(if job.recycle_originals { "true" } else { "false" });
     s.push_str(",\"tagFilename\":");
     s.push_str(if job.tag_filename { "true" } else { "false" });
+    s.push_str(",\"concurrency\":");
+    s.push_str(&job.concurrency.to_string());
+    s.push_str(",\"encoder\":");
+    push_json_string(&mut s, &job.encoder);
+    s.push_str(",\"useGpu\":");
+    s.push_str(if job.use_gpu { "true" } else { "false" });
+    s.push_str(",\"codec\":");
+    push_json_string(&mut s, &job.codec);
+    s.push_str(",\"zipLevel\":");
+    s.push_str(&job.zip_level.to_string());
     s.push_str(",\"total\":");
     s.push_str(&job.total.to_string());
     s.push_str(",\"savedBytes\":");
@@ -1362,6 +1880,19 @@ fn push_file_json(s: &mut String, f: &FileState) {
         Some(e) => push_json_string(s, e),
         None => s.push_str("null"),
     }
+    // Enriched per-file outcome fields so interrupted/old runs show precise
+    // results in the In Progress tab without re-reading the CSV log.
+    let orig = f.orig_bytes.load(Ordering::Relaxed);
+    let newb = f.new_bytes.load(Ordering::Relaxed);
+    let saved = orig.saturating_sub(newb);
+    s.push_str(",\"reason\":");
+    push_json_string(s, &f.reason.lock().expect("reason lock"));
+    s.push_str(",\"savedBytes\":");
+    s.push_str(&saved.to_string());
+    s.push_str(",\"pctSaved\":");
+    s.push_str(&format!("{:.2}", pct_saved(orig, newb)));
+    s.push_str(",\"durationMs\":");
+    s.push_str(&f.duration_ms.load(Ordering::Relaxed).to_string());
     s.push('}');
 }
 
@@ -1385,6 +1916,89 @@ pub(crate) fn job_full_json(job: &CompressJob) -> String {
     }
     s.push_str("]}");
     s
+}
+
+/// Full job JSON for the poll endpoint built from a persisted manifest, so the
+/// In Progress tab can lazy-load per-file detail for interrupted/old runs that
+/// are no longer live in this process. Preserves the manifest's recorded
+/// statuses + enriched fields (unlike `job_from_manifest`, which resets
+/// non-`done` files to `pending` for resume). Returns `None` when the manifest
+/// is missing/unreadable.
+pub(crate) fn job_full_json_from_manifest(id: &str) -> Option<String> {
+    if !is_safe_job_id(id) {
+        return None;
+    }
+    let path = jobs_dir().join(format!("{id}.json"));
+    let text = std::fs::read_to_string(&path).ok()?;
+    let root = crate::json::parse(&text)?;
+    let status = root.get("status").and_then(|v| v.as_str()).unwrap_or("error");
+    let saved = root.get("savedBytes").and_then(|v| v.as_u64()).unwrap_or(0);
+    let files = root.get("files").and_then(|v| v.as_array());
+    let total = root
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or_else(|| files.map(|a| a.len()).unwrap_or(0));
+
+    let mut s = String::with_capacity(256);
+    s.push_str("{\"id\":");
+    push_json_string(&mut s, id);
+    s.push_str(",\"status\":");
+    push_json_string(&mut s, status);
+    s.push_str(",\"total\":");
+    s.push_str(&total.to_string());
+    s.push_str(",\"savedBytes\":");
+    s.push_str(&saved.to_string());
+    s.push_str(",\"files\":[");
+    if let Some(files) = files {
+        for (i, f) in files.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            // Re-emit the manifest's file object directly (it already carries the
+            // enriched fields the UI needs: status, reason, savedBytes, etc.).
+            let idx = f.get("index").and_then(|v| v.as_u64()).unwrap_or(i as u64);
+            let path = f.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let kind = f.get("kind").and_then(|v| v.as_str()).unwrap_or("other");
+            let fstatus = f.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+            let pct = f.get("pct").and_then(|v| v.as_u64()).unwrap_or(0);
+            let orig = f.get("origBytes").and_then(|v| v.as_u64()).unwrap_or(0);
+            let newb = f.get("newBytes").and_then(|v| v.as_u64()).unwrap_or(0);
+            let reason = f.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            let duration = f.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0);
+            let saved_b = orig.saturating_sub(newb);
+            s.push_str("{\"index\":");
+            s.push_str(&idx.to_string());
+            s.push_str(",\"path\":");
+            push_json_string(&mut s, path);
+            s.push_str(",\"kind\":");
+            push_json_string(&mut s, kind);
+            s.push_str(",\"status\":");
+            push_json_string(&mut s, fstatus);
+            s.push_str(",\"pct\":");
+            s.push_str(&pct.to_string());
+            s.push_str(",\"origBytes\":");
+            s.push_str(&orig.to_string());
+            s.push_str(",\"newBytes\":");
+            s.push_str(&newb.to_string());
+            s.push_str(",\"error\":");
+            match f.get("error").and_then(|v| v.as_str()) {
+                Some(e) if !e.is_empty() => push_json_string(&mut s, e),
+                _ => s.push_str("null"),
+            }
+            s.push_str(",\"reason\":");
+            push_json_string(&mut s, reason);
+            s.push_str(",\"savedBytes\":");
+            s.push_str(&saved_b.to_string());
+            s.push_str(",\"pctSaved\":");
+            s.push_str(&format!("{:.2}", pct_saved(orig, newb)));
+            s.push_str(",\"durationMs\":");
+            s.push_str(&duration.to_string());
+            s.push('}');
+        }
+    }
+    s.push_str("]}");
+    Some(s)
 }
 
 /// One row for the list endpoint (`GET /api/compress-jobs`), derived from either

@@ -3,6 +3,7 @@ use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -175,6 +176,132 @@ pub(crate) fn acquire_scan_threads(requested: usize) -> ScanThreadPermit {
     }
     *available -= want;
     ScanThreadPermit { count: want }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Global compression budget (CompressGate)
+//
+// Mirrors `ScanGate` above, but for the compression pipeline. Within a single
+// job, multiple files now encode in parallel (a bounded worker pool); across
+// jobs there is no other coordination, so without a global cap N simultaneous
+// jobs would each spawn their own pool and oversubscribe the CPU/GPU. This gate
+// is a process-wide admission budget split into workload LANES so a queue of
+// heavy videos can't starve quick image/zip work, and so GPU sessions (which
+// consumer NVENC/AMF cap to 2-3) get a dedicated, smaller lane distinct from
+// the CPU lane. Each lane is a counting semaphore; a permit is acquired up
+// front for one file's encode and released (RAII) when that file finishes.
+// ──────────────────────────────────────────────────────────────────
+
+/// Workload lane a compression file runs in. The caps differ because the
+/// resources differ: CPU video encodes are heavy (x264 already multi-threads),
+/// GPU encodes are session-capped by the driver, and image/zip work is light /
+/// I/O bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompressLane {
+    /// CPU video encode (x264 / x265 software).
+    VideoCpu,
+    /// Hardware video encode (NVENC / QSV / AMF) — driver session limited.
+    Gpu,
+    /// Image re-encode (ffmpeg / ImageMagick).
+    Image,
+    /// Built-in zip / archive (I/O bound).
+    Zip,
+}
+
+struct CompressGate {
+    state: Mutex<GateInner>,
+    ready: Condvar,
+}
+
+#[derive(Debug)]
+struct GateInner {
+    video_cpu: usize,
+    gpu: usize,
+    image: usize,
+    zip: usize,
+}
+
+/// Per-lane caps derived from the logical core count. A lone job still gets
+/// healthy parallelism; concurrent jobs share these budgets and briefly queue
+/// for permits rather than thrashing.
+fn compress_lane_caps() -> GateInner {
+    let cores = thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(4);
+    GateInner {
+        // x264/x265 already use many threads per encode, so allow a few parallel
+        // CPU encodes but never the full core count (would oversubscribe).
+        video_cpu: (cores / 2).clamp(1, 8),
+        // Consumer NVENC/AMF cap concurrent sessions to ~2-3; QSV a bit more.
+        gpu: 3,
+        // Image encodes are short; allow one per core.
+        image: cores.clamp(2, 32),
+        // Zip is I/O bound; a handful keeps the disk busy without thrashing.
+        zip: (cores / 2).clamp(2, 16),
+    }
+}
+
+fn compress_gate() -> &'static CompressGate {
+    static GATE: OnceLock<CompressGate> = OnceLock::new();
+    GATE.get_or_init(|| CompressGate {
+        state: Mutex::new(compress_lane_caps()),
+        ready: Condvar::new(),
+    })
+}
+
+/// RAII permit for one in-flight encode in a given lane. Returns its slot to the
+/// global budget on drop, waking a queued worker.
+pub(crate) struct CompressPermit {
+    lane: CompressLane,
+}
+
+impl Drop for CompressPermit {
+    fn drop(&mut self) {
+        let gate = compress_gate();
+        let mut s = gate.state.lock().expect("compress gate poisoned");
+        match self.lane {
+            CompressLane::VideoCpu => s.video_cpu += 1,
+            CompressLane::Gpu => s.gpu += 1,
+            CompressLane::Image => s.image += 1,
+            CompressLane::Zip => s.zip += 1,
+        }
+        gate.ready.notify_all();
+    }
+}
+
+fn lane_slot(s: &mut GateInner, lane: CompressLane) -> &mut usize {
+    match lane {
+        CompressLane::VideoCpu => &mut s.video_cpu,
+        CompressLane::Gpu => &mut s.gpu,
+        CompressLane::Image => &mut s.image,
+        CompressLane::Zip => &mut s.zip,
+    }
+}
+
+/// Acquire one permit in `lane`, blocking until a slot is free. The cancel flag
+/// lets a queued worker give up promptly when its job is cancelled: it returns
+/// `None` without consuming a slot.
+pub(crate) fn acquire_compress(
+    lane: CompressLane,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<CompressPermit> {
+    let gate = compress_gate();
+    let mut s = gate.state.lock().expect("compress gate poisoned");
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        if *lane_slot(&mut s, lane) > 0 {
+            *lane_slot(&mut s, lane) -= 1;
+            return Some(CompressPermit { lane });
+        }
+        // Wait with a timeout so the cancel flag is re-checked periodically.
+        let (g, _to) = gate
+            .ready
+            .wait_timeout(s, std::time::Duration::from_millis(200))
+            .expect("compress gate poisoned");
+        s = g;
+    }
 }
 
 pub(crate) fn option_value(args: &[String], name: &str) -> Option<String> {

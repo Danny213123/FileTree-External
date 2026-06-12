@@ -24,18 +24,53 @@ use zip::CompressionMethod;
 /// hasher). 64 KiB keeps syscalls amortized without holding a whole file.
 const CHUNK: usize = 64 * 1024;
 
-/// Create `dest` (a `.zip`) containing every path in `paths`. Files are added
-/// under their base name; directories are added recursively with their name as
-/// the entry prefix. Errors are returned as display strings for the JSON body.
+/// Create `dest` (a `.zip`) containing every path in `paths` at the default
+/// Deflate level. Kept for the F5 zip endpoint; delegates to
+/// [`compress_with_level`].
 pub(crate) fn compress(paths: &[String], dest: &Path) -> Result<(), String> {
+    compress_with_level(paths, dest, 6)
+}
+
+/// Extensions whose contents are already entropy-coded: storing (no Deflate)
+/// avoids wasting CPU re-compressing data that won't shrink.
+fn is_precompressed(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "zip" | "7z" | "rar" | "gz" | "bz2" | "xz" | "zst" | "lz4" | "cab" | "tgz"
+            | "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "heic"
+            | "mp4" | "mkv" | "mov" | "m4v" | "webm" | "m4a" | "aac" | "mp3" | "ogg" | "flac"
+            | "docx" | "xlsx" | "pptx"
+    )
+}
+
+/// Per-entry options: store (level 0) for already-compressed inputs, otherwise
+/// Deflate at `level` (0..=9). Storing such files is both faster and avoids the
+/// pathological slight *growth* Deflate can add to incompressible data.
+fn entry_options(path: &Path, level: i64) -> SimpleFileOptions {
+    let base = SimpleFileOptions::default().unix_permissions(0o644);
+    if level <= 0 || is_precompressed(path) {
+        base.compression_method(CompressionMethod::Stored)
+    } else {
+        base.compression_method(CompressionMethod::Deflated)
+            .compression_level(Some(level.clamp(1, 9)))
+    }
+}
+
+/// Create `dest` (a `.zip`) containing every path in `paths` at Deflate `level`
+/// (0 = store everything). Files are added under their base name; directories
+/// are added recursively with their name as the entry prefix. Already-compressed
+/// inputs are stored (no-compress) regardless of `level`. Errors are returned as
+/// display strings for the JSON body.
+pub(crate) fn compress_with_level(paths: &[String], dest: &Path, level: i64) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let file = File::create(dest).map_err(|e| e.to_string())?;
     let mut zip = ZipWriter::new(file);
-    let options = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .unix_permissions(0o644);
     let mut buf = vec![0u8; CHUNK];
 
     for raw in paths {
@@ -48,9 +83,9 @@ pub(crate) fn compress(paths: &[String], dest: &Path) -> Result<(), String> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "entry".to_string());
         if md.is_dir() {
-            add_dir(&mut zip, src, &base, options, &mut buf)?;
+            add_dir(&mut zip, src, &base, level, &mut buf)?;
         } else if md.is_file() {
-            zip.start_file(base, options).map_err(|e| e.to_string())?;
+            zip.start_file(base, entry_options(src, level)).map_err(|e| e.to_string())?;
             stream_file(&mut zip, src, &mut buf)?;
         }
     }
@@ -64,10 +99,13 @@ fn add_dir<W: io::Write + io::Seek>(
     zip: &mut ZipWriter<W>,
     dir: &Path,
     prefix: &str,
-    options: SimpleFileOptions,
+    level: i64,
     buf: &mut [u8],
 ) -> Result<(), String> {
-    zip.add_directory(format!("{prefix}/"), options)
+    let dir_options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .unix_permissions(0o644);
+    zip.add_directory(format!("{prefix}/"), dir_options)
         .map_err(|e| e.to_string())?;
     let entries = fs::read_dir(dir).map_err(|e| e.to_string())?;
     for entry in entries.flatten() {
@@ -76,9 +114,9 @@ fn add_dir<W: io::Write + io::Seek>(
         let entry_name = format!("{prefix}/{name}");
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
-            add_dir(zip, &path, &entry_name, options, buf)?;
+            add_dir(zip, &path, &entry_name, level, buf)?;
         } else if ft.is_file() {
-            zip.start_file(entry_name, options).map_err(|e| e.to_string())?;
+            zip.start_file(entry_name, entry_options(&path, level)).map_err(|e| e.to_string())?;
             stream_file(zip, &path, buf)?;
         }
     }

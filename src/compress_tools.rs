@@ -150,6 +150,75 @@ fn capture_version(path: &Path, args: &[&str]) -> Option<String> {
         })
 }
 
+/// Hardware video encoders HandBrake reports as available on this machine,
+/// parsed from its encoder list. Drives the Auto encoder selection, the
+/// capability-gated UI picker, and per-file CPU fallback. `x265` (software HEVC)
+/// is tracked too so the H.265 codec can be offered without any GPU.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct HandbrakeCaps {
+    pub(crate) x265: bool,
+    pub(crate) nvenc_h264: bool,
+    pub(crate) nvenc_h265: bool,
+    pub(crate) qsv_h264: bool,
+    pub(crate) qsv_h265: bool,
+    pub(crate) vce_h264: bool,
+    pub(crate) vce_h265: bool,
+}
+
+impl HandbrakeCaps {
+    pub(crate) fn any_gpu(&self) -> bool {
+        self.nvenc_h264 || self.nvenc_h265 || self.qsv_h264 || self.qsv_h265 || self.vce_h264 || self.vce_h265
+    }
+}
+
+/// GPU vendors inferred to be present (from the HandBrake encoder list). On
+/// Windows the encoder set is a reliable signal: NVENC ⇒ NVIDIA, QSV ⇒ Intel,
+/// VCE/AMF ⇒ AMD. Surfaced on `/api/compress-tools` to drive the Auto pick + UI.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GpuVendors {
+    pub(crate) nvidia: bool,
+    pub(crate) intel: bool,
+    pub(crate) amd: bool,
+}
+
+impl GpuVendors {
+    fn from_caps(c: &HandbrakeCaps) -> GpuVendors {
+        GpuVendors {
+            nvidia: c.nvenc_h264 || c.nvenc_h265,
+            intel: c.qsv_h264 || c.qsv_h265,
+            amd: c.vce_h264 || c.vce_h265,
+        }
+    }
+}
+
+/// Parse HandBrake's encoder list (`HandBrakeCLI -h`) to discover which hardware
+/// encoders this build + machine actually expose. HandBrake only lists an
+/// encoder when the underlying driver/hardware is usable, so presence in the
+/// help text is an accurate capability signal. Best-effort: a failure to run or
+/// parse yields empty caps (so the pipeline simply stays on CPU x264).
+pub(crate) fn detect_handbrake_caps(path: &Path) -> HandbrakeCaps {
+    let mut cmd = Command::new(path);
+    cmd.arg("-h");
+    no_window(&mut cmd);
+    let Some(out) = cmd.output().ok() else {
+        return HandbrakeCaps::default();
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    let t = text.to_ascii_lowercase();
+    let has = |needle: &str| t.contains(needle);
+    HandbrakeCaps {
+        x265: has("x265"),
+        nvenc_h264: has("nvenc_h264"),
+        nvenc_h265: has("nvenc_h265"),
+        qsv_h264: has("qsv_h264"),
+        qsv_h265: has("qsv_h265"),
+        vce_h264: has("vce_h264"),
+        vce_h265: has("vce_h265"),
+    }
+}
+
 /// Detect `HandBrakeCLI` for the video pipeline.
 pub(crate) fn detect_handbrake() -> ToolInfo {
     let mut common = Vec::new();
@@ -204,13 +273,33 @@ pub(crate) fn tools_json() -> String {
     let hb = detect_handbrake();
     let (img, kind) = detect_image();
 
+    let caps = hb.path.as_ref().map(|p| detect_handbrake_caps(p)).unwrap_or_default();
+    let vendors = GpuVendors::from_caps(&caps);
+
     let mut s = String::with_capacity(512);
     s.push_str("{\"handbrake\":");
     push_tool(&mut s, &hb, None);
     s.push_str(",\"image\":");
     push_tool(&mut s, &img, Some(kind));
     // The built-in zip is always available (pure-Rust, compiled in).
-    s.push_str(",\"zip\":{\"found\":true}}");
+    s.push_str(",\"zip\":{\"found\":true}");
+    // Hardware-encoder capabilities + inferred GPU vendors for the encoder picker.
+    s.push_str(",\"caps\":{");
+    s.push_str(&format!("\"x265\":{}", caps.x265));
+    s.push_str(&format!(",\"nvencH264\":{}", caps.nvenc_h264));
+    s.push_str(&format!(",\"nvencH265\":{}", caps.nvenc_h265));
+    s.push_str(&format!(",\"qsvH264\":{}", caps.qsv_h264));
+    s.push_str(&format!(",\"qsvH265\":{}", caps.qsv_h265));
+    s.push_str(&format!(",\"vceH264\":{}", caps.vce_h264));
+    s.push_str(&format!(",\"vceH265\":{}", caps.vce_h265));
+    s.push_str(&format!(",\"anyGpu\":{}", caps.any_gpu()));
+    s.push('}');
+    s.push_str(",\"gpu\":{");
+    s.push_str(&format!("\"nvidia\":{}", vendors.nvidia));
+    s.push_str(&format!(",\"intel\":{}", vendors.intel));
+    s.push_str(&format!(",\"amd\":{}", vendors.amd));
+    s.push('}');
+    s.push('}');
     s
 }
 
