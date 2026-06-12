@@ -423,12 +423,35 @@ export interface CompressImageToolInfo extends CompressToolInfo {
   kind: "ffmpeg" | "imagemagick" | null;
 }
 
+/** Hardware-encoder capabilities parsed from HandBrake's encoder list. Each
+ *  flag is true only when that encoder is actually usable on this machine. */
+export interface CompressCaps {
+  x265: boolean;
+  nvencH264: boolean;
+  nvencH265: boolean;
+  qsvH264: boolean;
+  qsvH265: boolean;
+  vceH264: boolean;
+  vceH265: boolean;
+  /** Any hardware video encoder is available. */
+  anyGpu: boolean;
+}
+
+/** GPU vendors inferred from the available HandBrake encoders. */
+export interface CompressGpuVendors {
+  nvidia: boolean;
+  intel: boolean;
+  amd: boolean;
+}
+
 /** GET /api/compress-tools — which encoders are available. Zip is built-in so
- *  it is always `found`. */
+ *  it is always `found`. `caps`/`gpu` are absent on older servers. */
 export interface CompressTools {
   handbrake: CompressToolInfo;
   image: CompressImageToolInfo;
   zip: { found: true };
+  caps?: CompressCaps;
+  gpu?: CompressGpuVendors;
 }
 
 /** POST /api/compress-tools/install response. */
@@ -458,6 +481,15 @@ export interface CompressJobFile {
   origBytes: number;
   newBytes: number;
   error?: string;
+  /** Precise outcome code (e.g. `success`, `skipped_no_gain`, `skipped_precompressed`,
+   *  `error_encoder`, `error_tool_missing`). Empty until the file terminates. */
+  reason?: string;
+  /** origBytes - newBytes (never negative). */
+  savedBytes?: number;
+  /** Percentage of the original size saved (0..100). */
+  pctSaved?: number;
+  /** Wall-clock time spent on this file, in milliseconds. */
+  durationMs?: number;
 }
 
 /** Overall job status from the poll-fallback endpoint. */
@@ -495,12 +527,29 @@ export interface CompressJobSummary {
   resumable: boolean;
 }
 
+/** Video encoder selection. `auto` lets the server pick the best available
+ *  hardware encoder (falling back to x264 per-file when none works). */
+export type CompressEncoder = "auto" | "x264" | "nvenc" | "qsv" | "vce";
+
+/** Target video codec. */
+export type CompressCodec = "h264" | "h265";
+
 /** Body for POST /api/compress-jobs. */
 export interface CompressJobRequest {
   paths: string[];
   preset: CompressPreset;
   recycleOriginals: boolean;
   tagFilename: boolean;
+  /** Worker concurrency (parallel files). 0 / omitted ⇒ server hardware-default. */
+  concurrency?: number;
+  /** Video encoder selection (default `auto`). */
+  encoder?: CompressEncoder;
+  /** Allow hardware (GPU) encoding when available (default true). */
+  useGpu?: boolean;
+  /** Target video codec (default `h264`). */
+  codec?: CompressCodec;
+  /** Deflate level for the zip pipeline (0..9). -1 / omitted ⇒ server default. */
+  zipLevel?: number;
   /** Scan root the selected files belong to. Sent so the server can (re-)register
    *  it as an allowed read root before validating the source paths — covers the
    *  case where the tree was served from the renderer's cache and the current

@@ -3924,6 +3924,69 @@ input:focus, select:focus {
 .compress-job-counts { font-size: 12px; color: var(--text-5); white-space: nowrap; }
 .compress-job-actions { display: flex; gap: 8px; justify-content: flex-end; }
 
+/* Performance settings panel (Compress tab) */
+.compress-perf-panel {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+  padding: 10px 12px; margin: 0 0 4px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--vsc-input-bg, rgba(255, 255, 255, 0.02));
+}
+.compress-perf-field { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-5); }
+.compress-perf-field label { white-space: nowrap; }
+.compress-perf-field select,
+.compress-perf-field input[type="number"] {
+  background: var(--surface); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 3px 6px; font-size: 12px;
+}
+.compress-perf-field input[type="number"] { width: 64px; }
+.compress-perf-hint { font-size: 11px; color: var(--text-8); white-space: nowrap; }
+
+/* In Progress: table-style run list with expandable per-file detail */
+.compress-runs-table { width: 100%; border-collapse: collapse; font-size: 12px; color: var(--text); }
+.compress-runs-table thead th {
+  position: sticky; top: 0; z-index: 1; text-align: left; font-weight: 600;
+  color: var(--text-5); background: var(--surface); padding: 6px 10px;
+  border-bottom: 1px solid var(--vsc-border); white-space: nowrap;
+}
+.compress-runs-table th.num, .compress-runs-table td.num {
+  text-align: right; font-variant-numeric: tabular-nums;
+}
+.compress-runs-table th.cr-toggle, .compress-runs-table td.cr-toggle { width: 24px; text-align: center; color: var(--text-8); }
+.compress-runs-table th.cr-prog { width: 34%; }
+.compress-runs-table th.cr-actions { text-align: right; }
+.compress-run-row { cursor: pointer; }
+.compress-run-row > td { padding: 5px 10px; border-bottom: 1px solid var(--border-4); vertical-align: middle; }
+.compress-run-row:hover { background: var(--vsc-list-hover); }
+.compress-run-row.open { background: var(--vsc-list-hover); }
+.compress-run-preset { text-transform: capitalize; color: var(--text-5); }
+.compress-run-when { color: var(--text-5); white-space: nowrap; }
+.compress-run-prog { display: flex; align-items: center; gap: 8px; }
+.compress-run-prog .compress-bar { flex: 1 1 0; }
+.compress-run-counts { font-size: 11px; color: var(--text-5); white-space: nowrap; }
+.compress-run-saved { color: var(--accent-2, #2ea043); font-weight: 600; }
+.compress-run-row td.cr-actions { text-align: right; white-space: nowrap; }
+.compress-run-row td.cr-actions .compress-btn { margin-left: 6px; }
+.compress-bar-fill.done { background: var(--accent-2, #2ea043); }
+
+.compress-run-detail-row > td { padding: 0 10px 10px 34px; background: var(--vsc-input-bg, rgba(255, 255, 255, 0.02)); }
+.compress-jobfiles { display: flex; flex-direction: column; gap: 6px; padding-top: 6px; }
+.compress-jobfiles-empty { font-size: 12px; color: var(--text-8); padding: 10px 4px; }
+.compress-jobfiles-filter { display: flex; gap: 6px; flex-wrap: wrap; }
+.compress-jobfiles-head, .compress-jobfile-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 2fr) 60px 130px minmax(140px, 1.4fr) 120px 90px 80px;
+  align-items: center; gap: 8px; padding: 0 6px;
+}
+.compress-jobfiles-head { font-size: 11px; font-weight: 600; color: var(--text-8); padding-bottom: 4px; border-bottom: 1px solid var(--border-4); }
+.compress-jobfiles-body { max-height: 320px; overflow-y: auto; }
+.compress-jobfile-row { border-bottom: 1px solid var(--border-4); font-size: 12px; }
+.compress-jobfile-row:hover { background: var(--vsc-list-hover); }
+.compress-jobfiles .cjf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compress-jobfiles .cjf-kind { color: var(--text-5); text-transform: capitalize; }
+.compress-jobfiles .cjf-sizes { white-space: nowrap; color: var(--text-5); }
+.compress-jobfiles .num { text-align: right; font-variant-numeric: tabular-nums; }
+.compress-jobfiles .cjf-saved { color: var(--accent-2, #2ea043); }
+
 /* History tab */
 .compress-history { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
 .compress-history a.compress-btn { text-decoration: none; }
@@ -3949,6 +4012,27 @@ input:focus, select:focus {
 .compress-log-table .clog-arrow { color: var(--text-8); }
 .compress-log-table .clog-ts { color: var(--text-5); white-space: nowrap; }
 .compress-log-table tr.clog-error .clog-name { color: var(--danger); }
+
+/* History tab — virtualized row layout (grid mirrors the old table columns) */
+.compress-log-vtable { display: flex; flex-direction: column; min-height: 0; flex: 1 1 0; font-size: 12px; color: var(--text); }
+.compress-log-vhead, .compress-log-vrow {
+  display: grid;
+  grid-template-columns: minmax(160px, 2.2fr) 56px 72px minmax(150px, 1.4fr) 70px minmax(80px, 1fr) 80px 130px 150px;
+  align-items: center; gap: 10px; padding: 0 10px;
+}
+.compress-log-vhead {
+  font-weight: 600; color: var(--text-5); background: var(--surface);
+  border-bottom: 1px solid var(--vsc-border); padding-top: 6px; padding-bottom: 6px;
+}
+.compress-log-vbody { flex: 1 1 0; min-height: 0; overflow-y: auto; }
+.compress-log-vrow { border-bottom: 1px solid var(--border-4); }
+.compress-log-vrow:hover { background: var(--vsc-list-hover); }
+.compress-log-vtable .num { text-align: right; font-variant-numeric: tabular-nums; }
+.compress-log-vtable .clog-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compress-log-vtable .clog-sizes { white-space: nowrap; color: var(--text-5); }
+.compress-log-vtable .clog-arrow { color: var(--text-8); }
+.compress-log-vtable .clog-ts { color: var(--text-5); white-space: nowrap; }
+.compress-log-vrow.clog-error .clog-name { color: var(--danger); }
 
 /* Sidebar config panel: fills + scrolls, footer sticks to the bottom. */
 .df-config {

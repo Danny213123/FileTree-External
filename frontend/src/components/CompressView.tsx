@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type {
   NodeRecord,
@@ -7,8 +7,11 @@ import type {
   CompressKind,
   CompressEvent,
   CompressJob,
+  CompressJobFile,
   CompressJobSummary,
   CompressLogRow,
+  CompressEncoder,
+  CompressCodec,
 } from "../api/types";
 import {
   fetchCompressTools,
@@ -60,6 +63,77 @@ const PRESETS: { id: CompressPreset; label: string }[] = [
   { id: "balanced", label: "Balanced" },
   { id: "high", label: "High quality" },
 ];
+
+// ── Performance settings (Section D: persist-settings) ──────────────────────
+// User-tunable encoder/throughput knobs threaded into the job request. Persisted
+// in localStorage; hardware-derived defaults are applied from /api/compress-tools
+// the first time (encoder=auto, GPU on when any HW encoder is detected). The
+// encoder picker is capability-gated so unavailable encoders can't be selected.
+
+const PERF_KEY = "filetree.compress.perf";
+
+interface CompressPerfSettings {
+  /** 0 ⇒ let the server pick a hardware default (logical cores, lane-capped). */
+  concurrency: number;
+  encoder: CompressEncoder;
+  useGpu: boolean;
+  codec: CompressCodec;
+  /** -1 ⇒ server default Deflate level; otherwise 0..9. */
+  zipLevel: number;
+}
+
+const DEFAULT_PERF: CompressPerfSettings = {
+  concurrency: 0,
+  encoder: "auto",
+  useGpu: true,
+  codec: "h264",
+  zipLevel: -1,
+};
+
+function loadPerf(): CompressPerfSettings {
+  try {
+    const raw = localStorage.getItem(PERF_KEY);
+    if (!raw) return { ...DEFAULT_PERF };
+    const p = JSON.parse(raw) as Partial<CompressPerfSettings>;
+    return {
+      concurrency: typeof p.concurrency === "number" && p.concurrency >= 0 ? Math.min(64, Math.floor(p.concurrency)) : 0,
+      encoder: (["auto", "x264", "nvenc", "qsv", "vce"] as const).includes(p.encoder as CompressEncoder)
+        ? (p.encoder as CompressEncoder)
+        : "auto",
+      useGpu: typeof p.useGpu === "boolean" ? p.useGpu : true,
+      codec: p.codec === "h265" ? "h265" : "h264",
+      zipLevel: typeof p.zipLevel === "number" && p.zipLevel >= -1 && p.zipLevel <= 9 ? Math.floor(p.zipLevel) : -1,
+    };
+  } catch {
+    return { ...DEFAULT_PERF };
+  }
+}
+
+function savePerf(p: CompressPerfSettings): void {
+  try { localStorage.setItem(PERF_KEY, JSON.stringify(p)); } catch { /* ignore quota / private mode */ }
+}
+
+const ENCODER_OPTIONS: { id: CompressEncoder; label: string }[] = [
+  { id: "auto", label: "Auto (best available)" },
+  { id: "x264", label: "x264 (CPU)" },
+  { id: "nvenc", label: "NVENC (NVIDIA)" },
+  { id: "qsv", label: "QSV (Intel)" },
+  { id: "vce", label: "AMF/VCE (AMD)" },
+];
+
+/** Whether a hardware encoder is available for the chosen codec, given caps. */
+function encoderAvailable(id: CompressEncoder, tools: CompressTools | null, codec: CompressCodec): boolean {
+  if (id === "auto" || id === "x264") return true;
+  const caps = tools?.caps;
+  if (!caps) return false;
+  const h265 = codec === "h265";
+  switch (id) {
+    case "nvenc": return h265 ? caps.nvencH265 : caps.nvencH264;
+    case "qsv": return h265 ? caps.qsvH265 : caps.qsvH264;
+    case "vce": return h265 ? caps.vceH265 : caps.vceH264;
+    default: return false;
+  }
+}
 
 type TypeFilter = "all" | CompressKind;
 type RunStatus = "idle" | "running" | "done" | "cancelled" | "error";
@@ -164,6 +238,11 @@ export function CompressView({
   const [preset, setPreset] = useState<CompressPreset>("balanced");
   const [recycleOriginals, setRecycleOriginals] = useState(true);
   const [tagFilename, setTagFilename] = useState(true);
+  const [perf, setPerf] = useState<CompressPerfSettings>(() => loadPerf());
+  const [showPerf, setShowPerf] = useState(false);
+  // Apply hardware-derived defaults once, only when the user hasn't saved any
+  // preferences yet: turn GPU off when no hardware encoder was detected.
+  const perfDefaultedRef = useRef(false);
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [installing, setInstalling] = useState<"handbrake" | "image" | null>(null);
@@ -200,6 +279,24 @@ export function CompressView({
     void refreshTools(ac.signal);
     return () => ac.abort();
   }, [refreshTools]);
+
+  // Merge + persist a perf-settings change.
+  const updatePerf = useCallback((patch: Partial<CompressPerfSettings>) => {
+    setPerf((prev) => {
+      const next = { ...prev, ...patch };
+      savePerf(next);
+      return next;
+    });
+  }, []);
+
+  // Hardware-derived default: if no perf prefs were ever saved and the detected
+  // tools expose no GPU encoder, default GPU off (so Auto stays on CPU x264).
+  useEffect(() => {
+    if (perfDefaultedRef.current || !tools) return;
+    perfDefaultedRef.current = true;
+    if (localStorage.getItem(PERF_KEY)) return; // user has explicit prefs
+    if (!tools.caps?.anyGpu) setPerf((p) => ({ ...p, useGpu: false }));
+  }, [tools]);
 
   // Abort the stream + stop polling on unmount.
   useEffect(() => () => {
@@ -684,6 +781,13 @@ export function CompressView({
         preset,
         recycleOriginals,
         tagFilename,
+        // Performance + encoder knobs (Section D). Omitted-as-0/-1 lets the
+        // server apply hardware-derived defaults.
+        concurrency: perf.concurrency,
+        encoder: perf.encoder,
+        useGpu: perf.useGpu,
+        codec: perf.codec,
+        zipLevel: perf.zipLevel,
         // Re-assert the scan root so a cache-served tree (no /api/scan this
         // session) still passes the server's scan-root containment check. Use
         // the genuine scanned root (`data.rootPath`), which is guaranteed to be
@@ -701,7 +805,7 @@ export function CompressView({
       setRunError(e instanceof Error ? e.message : String(e));
       toast.error(`Could not start compression: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [selectedFiles, kindAvailable, preset, recycleOriginals, tagFilename, attachStream, scanPath, scannedRoot, nodeById, onRescan]);
+  }, [selectedFiles, kindAvailable, preset, recycleOriginals, tagFilename, perf, attachStream, scanPath, scannedRoot, nodeById, onRescan]);
 
   const handleStop = useCallback(async () => {
     abortRef.current?.abort();
@@ -928,6 +1032,15 @@ export function CompressView({
           />
           Add [COMPRESSED] tag
         </label>
+        <button
+          className={`compress-btn${showPerf ? " active" : ""}`}
+          onClick={() => setShowPerf((v) => !v)}
+          disabled={inRun}
+          aria-expanded={showPerf}
+          title="Encoder, GPU, concurrency, and zip settings"
+        >
+          <Icon name="tools" size={13} /> Performance
+        </button>
 
         <div className="compress-toolbar-spacer" />
 
@@ -969,6 +1082,81 @@ export function CompressView({
           </>
         )}
       </div>
+
+      {showPerf && !inRun && (
+        <div className="compress-perf-panel">
+          <div className="compress-perf-field">
+            <label htmlFor="cv-encoder">Video encoder</label>
+            <select
+              id="cv-encoder"
+              value={perf.encoder}
+              onChange={(e) => updatePerf({ encoder: e.target.value as CompressEncoder })}
+            >
+              {ENCODER_OPTIONS.map((o) => {
+                const avail = encoderAvailable(o.id, tools, perf.codec);
+                return (
+                  <option key={o.id} value={o.id} disabled={!avail}>
+                    {o.label}{!avail ? " — unavailable" : ""}
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+          <div className="compress-perf-field">
+            <label htmlFor="cv-codec">Codec</label>
+            <select
+              id="cv-codec"
+              value={perf.codec}
+              onChange={(e) => updatePerf({ codec: e.target.value as CompressCodec })}
+            >
+              <option value="h264">H.264 (compatible)</option>
+              <option value="h265" disabled={!!tools && !tools.caps?.x265 && !tools.caps?.nvencH265 && !tools.caps?.qsvH265 && !tools.caps?.vceH265}>
+                H.265 (smaller)
+              </option>
+            </select>
+          </div>
+          <label className="compress-toggle">
+            <input
+              type="checkbox"
+              checked={perf.useGpu}
+              disabled={!tools?.caps?.anyGpu}
+              onChange={(e) => updatePerf({ useGpu: e.target.checked })}
+            />
+            Use GPU when available
+            {tools && !tools.caps?.anyGpu && <span className="compress-perf-hint"> (no GPU encoder detected)</span>}
+          </label>
+          <div className="compress-perf-field">
+            <label htmlFor="cv-concurrency">Parallel files</label>
+            <input
+              id="cv-concurrency"
+              type="number"
+              min={0}
+              max={64}
+              value={perf.concurrency}
+              onChange={(e) => updatePerf({ concurrency: Math.max(0, Math.min(64, Math.floor(Number(e.target.value) || 0))) })}
+            />
+            <span className="compress-perf-hint">0 = auto</span>
+          </div>
+          <div className="compress-perf-field">
+            <label htmlFor="cv-zip">Zip level</label>
+            <input
+              id="cv-zip"
+              type="number"
+              min={-1}
+              max={9}
+              value={perf.zipLevel}
+              onChange={(e) => updatePerf({ zipLevel: Math.max(-1, Math.min(9, Math.floor(Number(e.target.value) || -1))) })}
+            />
+            <span className="compress-perf-hint">-1 = default, 0-9</span>
+          </div>
+          {tools?.gpu && (tools.gpu.nvidia || tools.gpu.intel || tools.gpu.amd) && (
+            <span className="compress-perf-hint">
+              Detected:{" "}
+              {[tools.gpu.nvidia && "NVIDIA", tools.gpu.intel && "Intel", tools.gpu.amd && "AMD"].filter(Boolean).join(", ")}
+            </span>
+          )}
+        </div>
+      )}
 
       {inRun && (
         <div className="compress-overall">
@@ -1198,23 +1386,180 @@ function jobBadge(j: CompressJobSummary): { label: string; cls: string } {
   return { label: "Done", cls: "done" };
 }
 
-// In Progress tab: every compression job that's still running in this session or
-// left unfinished on disk (interrupted by an app restart, cancelled, or errored
-// with remaining work). Polls the list endpoint every 1.5s so running jobs show
-// live progress and resumable jobs appear after a restart. Each job can be
-// resumed (skips already-done files), cancelled, or have its output revealed.
+type FileOutcome = "passed" | "failed" | "skipped" | "pending";
+
+/** Classify a per-file snapshot row into a coarse outcome for badges + filters. */
+function outcomeOf(f: CompressJobFile): FileOutcome {
+  if (f.status === "done") return "passed";
+  if (f.status === "error") return "failed";
+  if (f.status === "skipped") return "skipped";
+  return "pending"; // pending / running
+}
+
+const OUTCOME_FILTERS: { id: "all" | FileOutcome; label: string }[] = [
+  { id: "all", label: "All" },
+  { id: "passed", label: "Passed" },
+  { id: "failed", label: "Failed" },
+  { id: "skipped", label: "Skipped" },
+];
+
+const FILE_DETAIL_ROW_H = 30;
+
+/** Per-file detail table shown inside an expanded run row. Virtualizes when a
+ *  run has many files; lets the user filter by outcome (passed/failed/skipped). */
+function JobFileTable({ files, loading }: { files: CompressJobFile[] | undefined; loading: boolean }) {
+  const [filter, setFilter] = useState<"all" | FileOutcome>("all");
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+
+  const rows = useMemo(() => {
+    const all = files ?? [];
+    return filter === "all" ? all : all.filter((f) => outcomeOf(f) === filter);
+  }, [files, filter]);
+
+  const counts = useMemo(() => {
+    const c = { passed: 0, failed: 0, skipped: 0, pending: 0 };
+    for (const f of files ?? []) c[outcomeOf(f)] += 1;
+    return c;
+  }, [files]);
+
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => scrollEl,
+    estimateSize: () => FILE_DETAIL_ROW_H,
+    overscan: 10,
+  });
+
+  if (loading && (!files || files.length === 0)) {
+    return <div className="compress-jobfiles-empty">Loading file details…</div>;
+  }
+  if (!files || files.length === 0) {
+    return <div className="compress-jobfiles-empty">No per-file detail available for this run.</div>;
+  }
+
+  return (
+    <div className="compress-jobfiles">
+      <div className="compress-jobfiles-filter" role="tablist" aria-label="Filter files by outcome">
+        {OUTCOME_FILTERS.map((o) => {
+          const n = o.id === "all" ? files.length : counts[o.id as FileOutcome];
+          return (
+            <button
+              key={o.id}
+              role="tab"
+              aria-selected={filter === o.id}
+              className={`compress-chip${filter === o.id ? " active" : ""}`}
+              onClick={() => setFilter(o.id)}
+            >
+              {o.label} ({n.toLocaleString()})
+            </button>
+          );
+        })}
+      </div>
+      <div className="compress-jobfiles-head">
+        <span className="cjf-name">File</span>
+        <span className="cjf-kind">Kind</span>
+        <span className="cjf-outcome">Outcome</span>
+        <span className="cjf-sizes">Original → New</span>
+        <span className="cjf-saved num">Saved</span>
+        <span className="cjf-rate num">Speed</span>
+        <span className="cjf-dur num">Duration</span>
+      </div>
+      <div className="compress-jobfiles-body" ref={setScrollEl}>
+        <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
+          {virtualizer.getVirtualItems().map((vi) => {
+            const f = rows[vi.index];
+            if (!f) return null;
+            const oc = outcomeOf(f);
+            const saved = f.savedBytes ?? Math.max(0, f.origBytes - f.newBytes);
+            const pctSaved = f.pctSaved ?? (f.origBytes > 0 ? (saved / f.origBytes) * 100 : 0);
+            const dur = f.durationMs ?? 0;
+            // MB/s = bytes processed (original) over wall-clock seconds.
+            const mbps = dur > 0 ? f.origBytes / (dur / 1000) / (1024 * 1024) : 0;
+            const reason = f.reason || "";
+            const badgeLabel =
+              oc === "passed" ? "Passed"
+              : oc === "failed" ? (REASON_LABEL[reason] ?? "Failed")
+              : oc === "skipped" ? (REASON_LABEL[reason] ?? "Skipped")
+              : f.status === "running" ? `${Math.round(f.pct)}%` : "Pending";
+            const badgeCls =
+              oc === "passed" ? "done" : oc === "failed" ? "error" : oc === "skipped" ? "skipped" : "running";
+            const title = f.error || REASON_TOOLTIP[reason] || f.path;
+            return (
+              <div
+                key={f.index}
+                className="compress-jobfile-row"
+                style={{ position: "absolute", top: vi.start, left: 0, right: 0, height: vi.size }}
+                title={title}
+                onDoubleClick={() => f.path && void revealPath(f.path)}
+              >
+                <span className="cjf-name" title={f.path}>{baseName(f.path)}</span>
+                <span className="cjf-kind">{f.kind}</span>
+                <span className="cjf-outcome">
+                  <span className={`compress-chip-status ${badgeCls}`} title={title}>{badgeLabel}</span>
+                </span>
+                <span className="cjf-sizes">
+                  {formatBytes(f.origBytes)} <span className="clog-arrow">→</span>{" "}
+                  {oc === "failed" ? "—" : formatBytes(f.newBytes)}
+                </span>
+                <span className="cjf-saved num">
+                  {oc === "passed" && saved > 0 ? `−${formatBytes(saved)} (${pctSaved.toFixed(0)}%)` : "—"}
+                </span>
+                <span className="cjf-rate num">{mbps > 0 ? `${mbps.toFixed(1)} MB/s` : "—"}</span>
+                <span className="cjf-dur num">{formatDuration(dur)}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// In Progress tab: a table of every compression job — running in this session,
+// completed, or left unfinished on disk (interrupted by a restart, cancelled, or
+// errored). Polls the list endpoint every 1.5s so running jobs show live
+// progress and resumable jobs appear after a restart. Each row expands to a
+// lazy-loaded, virtualized per-file outcome table; active rows refresh live and
+// loaded detail is cached across collapse. Jobs can be resumed, cancelled, or
+// have their output revealed.
 function CompressInProgress() {
   const [jobs, setJobs] = useState<CompressJobSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [details, setDetails] = useState<Map<string, CompressJobFile[]>>(new Map());
+  const [detailLoading, setDetailLoading] = useState<Set<string>>(new Set());
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Read the live expanded set inside the poll loop without re-subscribing it.
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+
+  const loadDetail = useCallback(async (id: string, signal?: AbortSignal) => {
+    setDetailLoading((prev) => new Set(prev).add(id));
+    const snap = await fetchCompressJob(id, signal);
+    if (signal?.aborted) return;
+    setDetails((prev) => {
+      const n = new Map(prev);
+      n.set(id, snap?.files ?? []);
+      return n;
+    });
+    setDetailLoading((prev) => {
+      const n = new Set(prev);
+      n.delete(id);
+      return n;
+    });
+  }, []);
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const all = await listCompressJobs(signal);
     if (signal?.aborted) return;
-    setJobs(all.filter((j) => j.active || j.resumable));
+    // Show every run, newest first (running + completed + interrupted).
+    setJobs([...all].sort((a, b) => b.createdAt - a.createdAt));
     setLoading(false);
-  }, []);
+    // Keep expanded ACTIVE jobs' detail live.
+    for (const j of all) {
+      if (j.active && expandedRef.current.has(j.id)) void loadDetail(j.id, signal);
+    }
+  }, [loadDetail]);
 
   // Poll on a 1.5s cadence while mounted; abort + clear on unmount.
   useEffect(() => {
@@ -1232,6 +1577,23 @@ function CompressInProgress() {
       if (timerRef.current) clearTimeout(timerRef.current);
     };
   }, [refresh]);
+
+  const toggleExpand = useCallback(
+    (id: string) => {
+      setExpanded((prev) => {
+        const n = new Set(prev);
+        if (n.has(id)) {
+          n.delete(id); // collapse — keep cached detail for instant re-open
+        } else {
+          n.add(id);
+        }
+        return n;
+      });
+      // Lazy-load on first expand (cached detail is reused without a refetch).
+      if (!expanded.has(id) && !details.has(id)) void loadDetail(id);
+    },
+    [expanded, details, loadDetail],
+  );
 
   const onResume = useCallback(
     async (id: string) => {
@@ -1260,16 +1622,18 @@ function CompressInProgress() {
     [refresh],
   );
 
-  // Reveal a produced output in Explorer. Only live jobs expose a full snapshot,
-  // so interrupted/manifest-only jobs fall back to a soft notice.
-  const onReveal = useCallback(async (id: string) => {
-    const snap = await fetchCompressJob(id);
-    const out =
-      snap?.files.find((f) => f.status === "done" && f.newBytes > 0) ??
-      snap?.files.find((f) => f.path);
-    if (out?.path) void revealPath(out.path);
-    else toast.info("No output to reveal yet for this job.");
-  }, []);
+  // Reveal a produced output in Explorer. Uses cached detail when available,
+  // else fetches the snapshot; manifest-only jobs fall back to a soft notice.
+  const onReveal = useCallback(
+    async (id: string) => {
+      const files = details.get(id) ?? (await fetchCompressJob(id))?.files;
+      const out =
+        files?.find((f) => f.status === "done" && f.newBytes > 0) ?? files?.find((f) => f.path);
+      if (out?.path) void revealPath(out.path);
+      else toast.info("No output to reveal yet for this job.");
+    },
+    [details],
+  );
 
   return (
     <div className="compress-progress">
@@ -1278,12 +1642,10 @@ function CompressInProgress() {
           {jobs.length > 0 ? (
             <>
               <span className="compress-total">{jobs.length.toLocaleString()}</span>
-              <span className="compress-total-label">
-                active / resumable job{jobs.length === 1 ? "" : "s"}
-              </span>
+              <span className="compress-total-label">run{jobs.length === 1 ? "" : "s"}</span>
             </>
           ) : (
-            <span className="compress-total-label">No jobs in progress</span>
+            <span className="compress-total-label">No jobs yet</span>
           )}
         </div>
         <div className="compress-toolbar-spacer" />
@@ -1298,72 +1660,92 @@ function CompressInProgress() {
         ) : jobs.length === 0 ? (
           <EmptyState
             icon="file-zip"
-            title="Nothing in progress"
-            hint="Running jobs appear here live, and jobs interrupted by a restart show up as resumable."
+            title="Nothing here yet"
+            hint="Running jobs appear here live, completed runs stay listed, and jobs interrupted by a restart show up as resumable."
           />
         ) : (
-          <div className="compress-jobs">
-            {jobs.map((j) => {
-              const badge = jobBadge(j);
-              const completed = j.done + j.errors + j.skipped;
-              const pct = j.total > 0 ? Math.round((completed / j.total) * 100) : 0;
-              const isBusy = busy === j.id;
-              return (
-                <div key={j.id} className="compress-job">
-                  <div className="compress-job-head">
-                    <span className={`compress-chip-status ${badge.cls}`}>{badge.label}</span>
-                    <span className="compress-job-preset">{j.preset}</span>
-                    <span className="compress-job-when" title={`Created ${formatTs(new Date(j.createdAt).toISOString())}`}>
-                      {j.createdAt ? formatTs(new Date(j.createdAt).toISOString()) : "—"}
-                    </span>
-                    <div className="compress-toolbar-spacer" />
-                    {j.savedBytes > 0 && (
-                      <span className="compress-job-saved">saved {formatBytes(j.savedBytes)}</span>
-                    )}
-                  </div>
-                  <div className="compress-job-prog">
-                    <div className="compress-bar" title={`${pct}%`}>
-                      <div
-                        className={`compress-bar-fill${j.active ? "" : " skipped"}`}
-                        style={{ width: `${pct}%` }}
-                      />
-                    </div>
-                    <span className="compress-job-counts">
-                      {completed.toLocaleString()} / {j.total.toLocaleString()} · {pct}%
-                      {j.errors > 0 ? ` · ${j.errors.toLocaleString()} error${j.errors === 1 ? "" : "s"}` : ""}
-                    </span>
-                  </div>
-                  <div className="compress-job-actions">
-                    {j.active ? (
-                      <button
-                        className="compress-btn danger"
-                        onClick={() => void onCancel(j.id)}
-                        disabled={isBusy}
-                      >
-                        <Icon name="stop-fill" size={13} /> Cancel
-                      </button>
-                    ) : (
-                      <button
-                        className="compress-btn primary"
-                        onClick={() => void onResume(j.id)}
-                        disabled={isBusy}
-                        title="Resume this job, skipping files already compressed"
-                      >
-                        <Icon name="arrow-repeat" size={13} /> {isBusy ? "Resuming…" : "Resume"}
-                      </button>
-                    )}
-                    <button
-                      className="compress-btn"
-                      onClick={() => void onReveal(j.id)}
-                      title="Show a produced output in Explorer"
+          <table className="compress-runs-table">
+            <thead>
+              <tr>
+                <th className="cr-toggle" aria-label="Expand" />
+                <th>Status</th>
+                <th>Preset</th>
+                <th>Created</th>
+                <th className="cr-prog">Progress</th>
+                <th className="num">Saved</th>
+                <th className="cr-actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {jobs.map((j) => {
+                const badge = jobBadge(j);
+                const completed = j.done + j.errors + j.skipped;
+                const pct = j.total > 0 ? Math.round((completed / j.total) * 100) : 0;
+                const isBusy = busy === j.id;
+                const isOpen = expanded.has(j.id);
+                return (
+                  <Fragment key={j.id}>
+                    <tr
+                      className={`compress-run-row${isOpen ? " open" : ""}`}
+                      onClick={() => toggleExpand(j.id)}
                     >
-                      <Icon name="folder-open" size={13} /> Reveal
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+                      <td className="cr-toggle">
+                        <Icon name={isOpen ? "chevron-down" : "chevron-right"} size={12} />
+                      </td>
+                      <td>
+                        <span className={`compress-chip-status ${badge.cls}`}>{badge.label}</span>
+                      </td>
+                      <td className="compress-run-preset">{j.preset}</td>
+                      <td className="compress-run-when" title={j.updatedAt ? `Updated ${formatTs(new Date(j.updatedAt).toISOString())}` : undefined}>
+                        {j.createdAt ? formatTs(new Date(j.createdAt).toISOString()) : "—"}
+                      </td>
+                      <td className="cr-prog">
+                        <div className="compress-run-prog">
+                          <div className="compress-bar" title={`${pct}%`}>
+                            <div
+                              className={`compress-bar-fill${j.active ? "" : badge.cls === "done" ? " done" : " skipped"}`}
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+                          <span className="compress-run-counts">
+                            {completed.toLocaleString()} / {j.total.toLocaleString()}
+                            {j.errors > 0 ? ` · ${j.errors.toLocaleString()} err` : ""}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="num compress-run-saved">{j.savedBytes > 0 ? formatBytes(j.savedBytes) : "—"}</td>
+                      <td className="cr-actions" onClick={(e) => e.stopPropagation()}>
+                        {j.active ? (
+                          <button className="compress-btn danger" onClick={() => void onCancel(j.id)} disabled={isBusy}>
+                            <Icon name="stop-fill" size={12} /> Cancel
+                          </button>
+                        ) : j.resumable ? (
+                          <button
+                            className="compress-btn primary"
+                            onClick={() => void onResume(j.id)}
+                            disabled={isBusy}
+                            title="Resume this job, skipping files already compressed"
+                          >
+                            <Icon name="arrow-repeat" size={12} /> {isBusy ? "Resuming…" : "Resume"}
+                          </button>
+                        ) : null}
+                        <button className="compress-btn" onClick={() => void onReveal(j.id)} title="Show a produced output in Explorer">
+                          <Icon name="folder-open" size={12} /> Reveal
+                        </button>
+                      </td>
+                    </tr>
+                    {isOpen && (
+                      <tr className="compress-run-detail-row">
+                        <td colSpan={7}>
+                          <JobFileTable files={details.get(j.id)} loading={detailLoading.has(j.id)} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
         )}
       </div>
     </div>
@@ -1428,6 +1810,15 @@ function CompressHistory() {
 
   // Newest first for display (the backend returns oldest→newest).
   const display = useMemo(() => [...rows].reverse(), [rows]);
+
+  // Virtualize the row body so a full 1000-row log stays responsive.
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const virtualizer = useVirtualizer({
+    count: display.length,
+    getScrollElement: () => scrollEl,
+    estimateSize: () => 29,
+    overscan: 16,
+  });
 
   return (
     <div className="compress-history">
@@ -1510,48 +1901,54 @@ function CompressHistory() {
             hint="Compress some files and each one will be logged here (and to compress-log.csv)."
           />
         ) : (
-          <table className="compress-log-table">
-            <thead>
-              <tr>
-                <th>File</th>
-                <th>Kind</th>
-                <th>Preset</th>
-                <th>Original → New</th>
-                <th className="num">Saved</th>
-                <th>Tool</th>
-                <th className="num">Duration</th>
-                <th>Status</th>
-                <th>When</th>
-              </tr>
-            </thead>
-            <tbody>
-              {display.map((r, i) => (
-                <tr key={`${r.ts}-${r.jobId}-${r.index}-${i}`} className={`clog-${r.status}`}>
-                  <td className="clog-name" title={r.path}>{r.name || r.path}</td>
-                  <td>{r.kind}</td>
-                  <td>{r.preset}</td>
-                  <td className="clog-sizes">
-                    {formatBytes(r.origBytes)} <span className="clog-arrow">→</span>{" "}
-                    {r.status === "error" ? "—" : formatBytes(r.newBytes)}
-                  </td>
-                  <td className="num">
-                    {r.status === "success" ? `${r.pctSaved.toFixed(1)}%` : "—"}
-                  </td>
-                  <td title={[r.tool, r.toolVersion].filter(Boolean).join(" ") + (r.codecParams ? ` · ${r.codecParams}` : "")}>{r.tool || "—"}</td>
-                  <td className="num">{formatDuration(r.durationMs)}</td>
-                  <td>
-                    <span
-                      className={`compress-chip-status ${reasonClass(r.reason, r.status)}`}
-                      title={r.error || REASON_TOOLTIP[r.reason] || REASON_TOOLTIP[r.status] || ""}
+          <div className="compress-log-vtable">
+            <div className="compress-log-vhead">
+              <span className="clog-name">File</span>
+              <span>Kind</span>
+              <span>Preset</span>
+              <span>Original → New</span>
+              <span className="num">Saved</span>
+              <span>Tool</span>
+              <span className="num">Duration</span>
+              <span>Status</span>
+              <span className="clog-ts">When</span>
+            </div>
+            <div className="compress-log-vbody" ref={setScrollEl}>
+              <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
+                {virtualizer.getVirtualItems().map((vi) => {
+                  const r = display[vi.index];
+                  if (!r) return null;
+                  return (
+                    <div
+                      key={`${r.ts}-${r.jobId}-${r.index}-${vi.index}`}
+                      className={`compress-log-vrow clog-${r.status}`}
+                      style={{ position: "absolute", top: vi.start, left: 0, right: 0, height: vi.size }}
                     >
-                      {REASON_LABEL[r.reason] ?? STATUS_LABEL[r.status] ?? r.status}
-                    </span>
-                  </td>
-                  <td className="clog-ts" title={r.ts}>{formatTs(r.ts)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                      <span className="clog-name" title={r.path}>{r.name || r.path}</span>
+                      <span>{r.kind}</span>
+                      <span>{r.preset}</span>
+                      <span className="clog-sizes">
+                        {formatBytes(r.origBytes)} <span className="clog-arrow">→</span>{" "}
+                        {r.status === "error" ? "—" : formatBytes(r.newBytes)}
+                      </span>
+                      <span className="num">{r.status === "success" ? `${r.pctSaved.toFixed(1)}%` : "—"}</span>
+                      <span title={[r.tool, r.toolVersion].filter(Boolean).join(" ") + (r.codecParams ? ` · ${r.codecParams}` : "")}>{r.tool || "—"}</span>
+                      <span className="num">{formatDuration(r.durationMs)}</span>
+                      <span>
+                        <span
+                          className={`compress-chip-status ${reasonClass(r.reason, r.status)}`}
+                          title={r.error || REASON_TOOLTIP[r.reason] || REASON_TOOLTIP[r.status] || ""}
+                        >
+                          {REASON_LABEL[r.reason] ?? STATUS_LABEL[r.status] ?? r.status}
+                        </span>
+                      </span>
+                      <span className="clog-ts" title={r.ts}>{formatTs(r.ts)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
         )}
       </div>
     </div>
