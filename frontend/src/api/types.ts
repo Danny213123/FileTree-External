@@ -429,12 +429,29 @@ export interface CompressCaps {
   x265: boolean;
   nvencH264: boolean;
   nvencH265: boolean;
+  nvencAv1?: boolean;
   qsvH264: boolean;
   qsvH265: boolean;
+  qsvAv1?: boolean;
   vceH264: boolean;
   vceH265: boolean;
-  /** Any hardware video encoder is available. */
+  vceAv1?: boolean;
+  /** Any hardware video encoder is available (per HandBrake's `-h` parse). */
   anyGpu: boolean;
+}
+
+/** Effective hardware-encoder availability: HandBrake `-h` token OR a matching
+ *  physical GPU adapter present. This is what the UI gates on (an empty `-h`
+ *  parse is treated as "unknown", not "no GPU"). `*Assumed` means availability
+ *  rests only on the adapter probe and hasn't been confirmed by a real encode. */
+export interface CompressAvailable {
+  nvenc: boolean;
+  qsv: boolean;
+  vce: boolean;
+  anyGpu: boolean;
+  nvencAssumed: boolean;
+  qsvAssumed: boolean;
+  vceAssumed: boolean;
 }
 
 /** GPU vendors inferred from the available HandBrake encoders (i.e. which
@@ -463,8 +480,14 @@ export interface CompressTools {
   image: CompressImageToolInfo;
   zip: { found: true };
   caps?: CompressCaps;
+  /** Effective availability combining `-h` caps with the physical-GPU probe. */
+  available?: CompressAvailable;
   gpu?: CompressGpuVendors;
   gpuHardware?: CompressGpuHardware;
+  /** Whether `HandBrakeCLI -h` produced parseable output (false ⇒ caps unknown). */
+  handbrakeHParseOk?: boolean;
+  /** Raw encoder-relevant lines from `HandBrakeCLI -h`, as ground-truth evidence. */
+  handbrakeEncodersRaw?: string;
 }
 
 /** POST /api/compress-tools/install response. */
@@ -495,8 +518,11 @@ export interface CompressJobFile {
   newBytes: number;
   error?: string;
   /** Precise outcome code (e.g. `success`, `skipped_no_gain`, `skipped_precompressed`,
-   *  `error_encoder`, `error_tool_missing`). Empty until the file terminates. */
+   *  `error_encoder`, `error_tool_missing`, `gpu_fallback`). Empty until terminal. */
   reason?: string;
+  /** The genuine encoder + codec params actually used (e.g. `nvenc_h265 q=26
+   *  preset=quality` or `x264 q=24 …`). Empty until the file terminates. */
+  encoder?: string;
   /** origBytes - newBytes (never negative). */
   savedBytes?: number;
   /** Percentage of the original size saved (0..100). */

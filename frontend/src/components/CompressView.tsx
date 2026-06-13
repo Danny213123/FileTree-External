@@ -121,18 +121,38 @@ const ENCODER_OPTIONS: { id: CompressEncoder; label: string }[] = [
   { id: "vce", label: "AMF/VCE (AMD)" },
 ];
 
-/** Whether a hardware encoder is available for the chosen codec, given caps. */
-function encoderAvailable(id: CompressEncoder, tools: CompressTools | null, codec: CompressCodec): boolean {
+/** Whether a hardware encoder can be offered for the chosen codec. Gated on
+ *  EFFECTIVE availability (HandBrake `-h` token OR a matching physical adapter),
+ *  NOT just the `-h` parse — some builds omit the tokens from redirected help
+ *  even though the encoder works, so an empty parse must not disable the GPU. */
+function encoderAvailable(id: CompressEncoder, tools: CompressTools | null, _codec: CompressCodec): boolean {
   if (id === "auto" || id === "x264") return true;
+  const av = tools?.available;
+  if (av) {
+    switch (id) {
+      case "nvenc": return av.nvenc;
+      case "qsv": return av.qsv;
+      case "vce": return av.vce;
+      default: return false;
+    }
+  }
+  // Fallback for older servers that don't send `available`: use `-h` caps.
   const caps = tools?.caps;
   if (!caps) return false;
-  const h265 = codec === "h265";
   switch (id) {
-    case "nvenc": return h265 ? caps.nvencH265 : caps.nvencH264;
-    case "qsv": return h265 ? caps.qsvH265 : caps.qsvH264;
-    case "vce": return h265 ? caps.vceH265 : caps.vceH264;
+    case "nvenc": return caps.nvencH264 || caps.nvencH265;
+    case "qsv": return caps.qsvH264 || caps.qsvH265;
+    case "vce": return caps.vceH264 || caps.vceH265;
     default: return false;
   }
+}
+
+/** Effective "any GPU encoder available" — adapter-aware, with a graceful
+ *  fallback to the `-h` caps for older servers. Drives the GPU toggle + default. */
+function anyGpuAvailable(tools: CompressTools | null): boolean {
+  if (!tools) return false;
+  if (tools.available) return tools.available.anyGpu;
+  return !!tools.caps?.anyGpu;
 }
 
 type TypeFilter = "all" | CompressKind;
@@ -289,13 +309,16 @@ export function CompressView({
     });
   }, []);
 
-  // Hardware-derived default: if no perf prefs were ever saved and the detected
-  // tools expose no GPU encoder, default GPU off (so Auto stays on CPU x264).
+  // Hardware-derived default: if no perf prefs were ever saved and NO GPU is
+  // effectively available (no `-h` token AND no physical adapter), default GPU
+  // off so Auto stays on CPU x264. When an adapter is present we leave GPU on
+  // even if `-h` didn't list an encoder — the encode will try GPU and surface a
+  // loud fallback if it can't.
   useEffect(() => {
     if (perfDefaultedRef.current || !tools) return;
     perfDefaultedRef.current = true;
     if (localStorage.getItem(PERF_KEY)) return; // user has explicit prefs
-    if (!tools.caps?.anyGpu) setPerf((p) => ({ ...p, useGpu: false }));
+    if (!anyGpuAvailable(tools)) setPerf((p) => ({ ...p, useGpu: false }));
   }, [tools]);
 
   // Abort the stream + stop polling on unmount.
@@ -1119,11 +1142,14 @@ export function CompressView({
             <input
               type="checkbox"
               checked={perf.useGpu}
-              disabled={!tools?.caps?.anyGpu}
+              disabled={!anyGpuAvailable(tools)}
               onChange={(e) => updatePerf({ useGpu: e.target.checked })}
             />
             Use GPU when available
-            {tools && !tools.caps?.anyGpu && <span className="compress-perf-hint"> (no GPU encoder detected)</span>}
+            {tools && !anyGpuAvailable(tools) && <span className="compress-perf-hint"> (no GPU detected)</span>}
+            {tools && anyGpuAvailable(tools) && !tools.caps?.anyGpu && (
+              <span className="compress-perf-hint"> (via adapter — verified on first run)</span>
+            )}
           </label>
           <div className="compress-perf-field">
             <label htmlFor="cv-concurrency">Parallel files</label>
@@ -1155,33 +1181,65 @@ export function CompressView({
                 HandBrake: <code>{tools.handbrake.path || "(on PATH)"}</code>
                 {tools.handbrake.version ? ` v${tools.handbrake.version}` : ""}
               </div>
+              {/* Effective availability (adapter-aware), with how it was derived. */}
               <div className="compress-perf-hint">
-                Hardware encoders:{" "}
-                {tools.caps?.anyGpu
+                GPU encoders:{" "}
+                {anyGpuAvailable(tools)
                   ? [
-                      (tools.caps.nvencH264 || tools.caps.nvencH265) && "NVENC",
-                      (tools.caps.qsvH264 || tools.caps.qsvH265) && "QSV",
-                      (tools.caps.vceH264 || tools.caps.vceH265) && "VCE",
+                      tools.available?.nvenc && `NVENC${tools.available?.nvencAssumed ? "*" : ""}`,
+                      tools.available?.qsv && `QSV${tools.available?.qsvAssumed ? "*" : ""}`,
+                      tools.available?.vce && `VCE${tools.available?.vceAssumed ? "*" : ""}`,
                     ]
                       .filter(Boolean)
-                      .join(", ")
+                      .join(", ") || "available"
                   : "none"}
-              </div>
-              {/* GPU present in the machine but this HandBrake build can't use it:
-                  the #1 reason encoding silently runs on CPU. Make it actionable. */}
-              {!tools.caps?.anyGpu &&
-                tools.gpuHardware &&
-                (tools.gpuHardware.nvidia || tools.gpuHardware.intel || tools.gpuHardware.amd) && (
-                  <div className="compress-perf-warn">
-                    GPU detected ({tools.gpuHardware.names.join(", ") ||
-                      [tools.gpuHardware.nvidia && "NVIDIA", tools.gpuHardware.intel && "Intel", tools.gpuHardware.amd && "AMD"]
-                        .filter(Boolean)
-                        .join(", ")}
-                    ) but this HandBrakeCLI has no hardware encoder, so encoding will use the CPU. Point
-                    {" "}<code>FILETREE_HANDBRAKE</code> at a GPU-capable HandBrakeCLI (or drop one into the
-                    app's tools folder) and reopen this panel.
-                  </div>
+                {(tools.available?.nvencAssumed || tools.available?.qsvAssumed || tools.available?.vceAssumed) && (
+                  <span> — * assumed from GPU adapter, verified on first encode</span>
                 )}
+              </div>
+              {/* Ground-truth evidence: did `-h` parse, what did it report. */}
+              <div className="compress-perf-hint">
+                HandBrake <code>-h</code> parse: {tools.handbrakeHParseOk === false ? "no output (caps unknown)" : "ok"}
+                {tools.caps && (
+                  <>
+                    {" "}· tokens:{" "}
+                    {[
+                      (tools.caps.nvencH264 || tools.caps.nvencH265 || tools.caps.nvencAv1) && "nvenc",
+                      (tools.caps.qsvH264 || tools.caps.qsvH265 || tools.caps.qsvAv1) && "qsv",
+                      (tools.caps.vceH264 || tools.caps.vceH265 || tools.caps.vceAv1) && "vce",
+                    ]
+                      .filter(Boolean)
+                      .join(", ") || "none"}
+                  </>
+                )}
+              </div>
+              {tools.gpuHardware && tools.gpuHardware.names.length > 0 && (
+                <div className="compress-perf-hint">GPU adapter(s): {tools.gpuHardware.names.join(", ")}</div>
+              )}
+              {tools.handbrakeEncodersRaw && (
+                <details className="compress-perf-evidence">
+                  <summary className="compress-perf-hint">HandBrake encoder list (raw)</summary>
+                  <pre className="compress-perf-raw">{tools.handbrakeEncodersRaw}</pre>
+                </details>
+              )}
+              {/* Adapter present but `-h` empty: GPU will still be attempted; a
+                  failure surfaces loudly as a gpu_fallback outcome with the error. */}
+              {!tools.caps?.anyGpu && anyGpuAvailable(tools) && (
+                <div className="compress-perf-note">
+                  A GPU adapter is present but HandBrake&apos;s <code>-h</code> didn&apos;t list a hardware
+                  encoder. FileTree will still try the GPU encoder; if it fails, the file shows a
+                  <b> GPU→CPU fallback</b> with HandBrake&apos;s exact error. NVENC activity appears under
+                  Task Manager → Performance → GPU → <b>Video Encode</b>.
+                </div>
+              )}
+              {/* No GPU adapter at all and no -h encoder: genuinely CPU-only. */}
+              {!anyGpuAvailable(tools) && (
+                <div className="compress-perf-warn">
+                  No GPU encoder or adapter detected, so encoding will use the CPU. If you have a
+                  GPU-capable HandBrakeCLI elsewhere, point <code>FILETREE_HANDBRAKE</code> at it (or drop
+                  it into the app&apos;s tools folder) and reopen this panel.
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1365,6 +1423,7 @@ const REASON_LABEL: Record<string, string> = {
   error_output_empty: "Error — empty output",
   error_source_missing: "Error — source missing",
   error_spawn: "Error — couldn't start",
+  gpu_fallback: "Saved — GPU→CPU fallback",
 };
 
 const REASON_TOOLTIP: Record<string, string> = {
@@ -1376,12 +1435,13 @@ const REASON_TOOLTIP: Record<string, string> = {
   error_output_empty: "The encoder reported success but produced a missing or empty output file.",
   error_source_missing: "The source file no longer exists — it may have been recycled by a prior run.",
   error_spawn: "The encoder process could not be started.",
+  gpu_fallback: "The GPU encoder failed, so the file was re-encoded on the CPU. The file still compressed; see the error/stderr for the exact GPU failure (driver/session/codec).",
 };
 
 /** CSS status class for a History row, derived from the precise reason (falls
  *  back to the coarse status). */
 function reasonClass(reason: string, status: string): string {
-  if (reason === "success" || status === "success") return "done";
+  if (reason === "success" || reason === "gpu_fallback" || status === "success") return "done";
   if (reason === "skipped_no_gain" || status === "skipped_no_gain") return "skipped";
   return "error";
 }
@@ -1487,6 +1547,7 @@ function JobFileTable({ files, loading }: { files: CompressJobFile[] | undefined
         <span className="cjf-name">File</span>
         <span className="cjf-kind">Kind</span>
         <span className="cjf-outcome">Outcome</span>
+        <span className="cjf-enc">Encoder</span>
         <span className="cjf-sizes">Original → New</span>
         <span className="cjf-saved num">Saved</span>
         <span className="cjf-rate num">Speed</span>
@@ -1504,14 +1565,18 @@ function JobFileTable({ files, loading }: { files: CompressJobFile[] | undefined
             // MB/s = bytes processed (original) over wall-clock seconds.
             const mbps = dur > 0 ? f.origBytes / (dur / 1000) / (1024 * 1024) : 0;
             const reason = f.reason || "";
+            const isFallback = reason === "gpu_fallback";
             const badgeLabel =
-              oc === "passed" ? "Passed"
+              oc === "passed" ? (isFallback ? "GPU→CPU" : "Passed")
               : oc === "failed" ? (REASON_LABEL[reason] ?? "Failed")
               : oc === "skipped" ? (REASON_LABEL[reason] ?? "Skipped")
               : f.status === "running" ? `${Math.round(f.pct)}%` : "Pending";
+            // A GPU→CPU fallback still passed, but flag it amber to draw the eye.
             const badgeCls =
-              oc === "passed" ? "done" : oc === "failed" ? "error" : oc === "skipped" ? "skipped" : "running";
-            const title = f.error || REASON_TOOLTIP[reason] || f.path;
+              oc === "passed" ? (isFallback ? "skipped" : "done")
+              : oc === "failed" ? "error" : oc === "skipped" ? "skipped" : "running";
+            const encoderText = (f.encoder || "").split(" ")[0] || "—";
+            const title = f.error || REASON_TOOLTIP[reason] || f.encoder || f.path;
             return (
               <div
                 key={f.index}
@@ -1525,6 +1590,7 @@ function JobFileTable({ files, loading }: { files: CompressJobFile[] | undefined
                 <span className="cjf-outcome">
                   <span className={`compress-chip-status ${badgeCls}`} title={title}>{badgeLabel}</span>
                 </span>
+                <span className="cjf-enc" title={f.encoder || undefined}>{encoderText}</span>
                 <span className="cjf-sizes">
                   {formatBytes(f.origBytes)} <span className="clog-arrow">→</span>{" "}
                   {oc === "failed" ? "—" : formatBytes(f.newBytes)}

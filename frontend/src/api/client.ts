@@ -1290,6 +1290,15 @@ export async function fetchCompressTools(signal?: AbortSignal): Promise<Compress
       handbrake: data.handbrake ?? { found: false },
       image: data.image ?? { found: false, kind: null },
       zip: { found: true },
+      // Pass through the capability/availability diagnostics so the Performance
+      // panel can gate the GPU controls on effective availability and show
+      // ground-truth evidence (resolved binary, `-h` parse, adapters).
+      caps: data.caps,
+      available: data.available,
+      gpu: data.gpu,
+      gpuHardware: data.gpuHardware,
+      handbrakeHParseOk: data.handbrakeHParseOk,
+      handbrakeEncodersRaw: data.handbrakeEncodersRaw,
     };
   } catch {
     return COMPRESS_TOOLS_NONE;

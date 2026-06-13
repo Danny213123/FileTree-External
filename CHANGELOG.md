@@ -4,6 +4,19 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.12.2] - 2026-06-12
+
+### Fixed
+
+- **GPU video encoding no longer blocked by HandBrake's unreliable `-h` parse**: capability detection runs `HandBrakeCLI -h` and scans the help text for `nvenc_*`/`qsv_*`/`vce_*` tokens, but some HandBrake builds omit those tokens from redirected (non-console) help even though the hardware encoders work — so detection reported "no GPU", the UI disabled the GPU controls, and every file fell back to CPU `x264`. GPU availability is now gated on **effective** availability: a vendor's encoder is offered when EITHER the `-h` token is present OR the matching physical GPU adapter is detected (via the independent `Win32_VideoController` probe). An empty `-h` parse is treated as "unknown", not "absent". The encoder selector now emits the hardware `-e` token (e.g. `nvenc_h265`) when a matching adapter is present or the user explicitly picked NVENC/QSV/VCE, instead of silently choosing `x264`.
+- **Silent CPU fallback is now loud and diagnosable**: when a GPU encode fails, the file is still re-encoded on the CPU (no lost work), but the outcome is recorded as a distinct `gpu_fallback` reason carrying HandBrake's actual stderr (driver/session/codec error) and exit code — surfaced in the In Progress tab (an amber "GPU→CPU" badge), the CSV history, and the debug log. This directly answers "VRAM rose but nothing encoded".
+
+### Changed
+
+- **Hardened HandBrake capability probe**: `HandBrakeCLI -h` now runs with its working directory set to the binary's own folder (so a build that loads sibling DLLs/initializes hardware relative to its install behaves like a normal launch), records whether the help actually parsed, and additionally recognizes AV1 hardware tokens (`nvenc_av1`/`qsv_av1`/`vce_av1`).
+- **Performance panel evidence**: the Compress page now shows the resolved HandBrake path + version, the effective GPU encoders available (with a `*` marking ones assumed from the adapter and verified on first run), the `-h` parse status and the raw encoder list (expandable), the physical GPU adapter name(s), and the actual encoder used per file. Includes a hint that NVENC activity shows under Task Manager → Performance → GPU → "Video Encode".
+- **`GET /api/compress-tools`** gained `available` (effective per-vendor availability + `*Assumed` flags), `handbrakeHParseOk`, `handbrakeEncodersRaw`, and AV1 capability flags; the per-file job snapshot gained the genuine `encoder` used. (The client also now forwards the `caps`/`gpu`/`gpuHardware` fields it had previously been dropping.)
+
 ## [1.12.1] - 2026-06-12
 
 ### Fixed

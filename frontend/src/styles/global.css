@@ -3952,6 +3952,20 @@ input:focus, select:focus {
   border-radius: 6px; padding: 6px 8px; overflow-wrap: anywhere;
 }
 .compress-perf-warn code { font-family: var(--mono, monospace); }
+.compress-perf-note {
+  font-size: 11px; line-height: 1.4; color: var(--text-5);
+  background: var(--surface-2, rgba(127, 127, 127, 0.08));
+  border: 1px solid var(--border-4); border-radius: 6px; padding: 6px 8px; overflow-wrap: anywhere;
+}
+.compress-perf-note code { font-family: var(--mono, monospace); }
+.compress-perf-evidence { width: 100%; }
+.compress-perf-evidence summary { cursor: pointer; }
+.compress-perf-raw {
+  margin: 4px 0 0; padding: 6px 8px; max-height: 160px; overflow: auto;
+  font-family: var(--mono, monospace); font-size: 10.5px; line-height: 1.4;
+  white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-5);
+  background: var(--vsc-editor-bg, rgba(0,0,0,0.18)); border: 1px solid var(--border-4); border-radius: 6px;
+}
 
 /* In Progress: table-style run list with expandable per-file detail */
 .compress-runs-table { width: 100%; border-collapse: collapse; font-size: 12px; color: var(--text); }
@@ -3986,9 +4000,10 @@ input:focus, select:focus {
 .compress-jobfiles-filter { display: flex; gap: 6px; flex-wrap: wrap; }
 .compress-jobfiles-head, .compress-jobfile-row {
   display: grid;
-  grid-template-columns: minmax(120px, 2fr) 60px 130px minmax(140px, 1.4fr) 120px 90px 80px;
+  grid-template-columns: minmax(120px, 2fr) 60px 130px minmax(96px, 1fr) minmax(140px, 1.4fr) 120px 90px 80px;
   align-items: center; gap: 8px; padding: 0 6px;
 }
+.compress-jobfiles .cjf-enc { color: var(--text-5); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .compress-jobfiles-head { font-size: 11px; font-weight: 600; color: var(--text-8); padding-bottom: 4px; border-bottom: 1px solid var(--border-4); }
 .compress-jobfiles-body { max-height: 320px; overflow-y: auto; }
 .compress-jobfile-row { border-bottom: 1px solid var(--border-4); font-size: 12px; }

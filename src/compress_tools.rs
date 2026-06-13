@@ -159,15 +159,57 @@ pub(crate) struct HandbrakeCaps {
     pub(crate) x265: bool,
     pub(crate) nvenc_h264: bool,
     pub(crate) nvenc_h265: bool,
+    pub(crate) nvenc_av1: bool,
     pub(crate) qsv_h264: bool,
     pub(crate) qsv_h265: bool,
+    pub(crate) qsv_av1: bool,
     pub(crate) vce_h264: bool,
     pub(crate) vce_h265: bool,
+    pub(crate) vce_av1: bool,
 }
 
 impl HandbrakeCaps {
     pub(crate) fn any_gpu(&self) -> bool {
-        self.nvenc_h264 || self.nvenc_h265 || self.qsv_h264 || self.qsv_h265 || self.vce_h264 || self.vce_h265
+        self.nvenc_h264 || self.nvenc_h265 || self.nvenc_av1
+            || self.qsv_h264 || self.qsv_h265 || self.qsv_av1
+            || self.vce_h264 || self.vce_h265 || self.vce_av1
+    }
+    fn any_nvenc(&self) -> bool { self.nvenc_h264 || self.nvenc_h265 || self.nvenc_av1 }
+    fn any_qsv(&self) -> bool { self.qsv_h264 || self.qsv_h265 || self.qsv_av1 }
+    fn any_vce(&self) -> bool { self.vce_h264 || self.vce_h265 || self.vce_av1 }
+}
+
+/// Effective hardware-encoder availability, combining HandBrake's (unreliable)
+/// `-h` token parse with the independent physical-GPU probe. The root-cause bug
+/// was treating an empty `-h` parse as "no GPU"; some HandBrake builds omit the
+/// `nvenc_*`/`qsv_*`/`vce_*` tokens from redirected (non-console) help even
+/// though the encoders work. Here a vendor's encoder is considered AVAILABLE
+/// when EITHER the `-h` token is present OR the matching physical adapter exists,
+/// and flagged "assumed" when it rests only on the adapter probe (UI hint: not
+/// yet confirmed by an actual encode).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct EffectiveCaps {
+    pub(crate) nvenc: bool,
+    pub(crate) qsv: bool,
+    pub(crate) vce: bool,
+    pub(crate) nvenc_assumed: bool,
+    pub(crate) qsv_assumed: bool,
+    pub(crate) vce_assumed: bool,
+}
+
+impl EffectiveCaps {
+    pub(crate) fn compute(caps: &HandbrakeCaps, hw: &GpuHardware) -> EffectiveCaps {
+        EffectiveCaps {
+            nvenc: caps.any_nvenc() || hw.nvidia,
+            qsv: caps.any_qsv() || hw.intel,
+            vce: caps.any_vce() || hw.amd,
+            nvenc_assumed: !caps.any_nvenc() && hw.nvidia,
+            qsv_assumed: !caps.any_qsv() && hw.intel,
+            vce_assumed: !caps.any_vce() && hw.amd,
+        }
+    }
+    pub(crate) fn any_gpu(&self) -> bool {
+        self.nvenc || self.qsv || self.vce
     }
 }
 
@@ -184,9 +226,9 @@ pub(crate) struct GpuVendors {
 impl GpuVendors {
     fn from_caps(c: &HandbrakeCaps) -> GpuVendors {
         GpuVendors {
-            nvidia: c.nvenc_h264 || c.nvenc_h265,
-            intel: c.qsv_h264 || c.qsv_h265,
-            amd: c.vce_h264 || c.vce_h265,
+            nvidia: c.any_nvenc(),
+            intel: c.any_qsv(),
+            amd: c.any_vce(),
         }
     }
 }
@@ -257,26 +299,49 @@ pub(crate) fn probe_gpu_hardware() -> &'static GpuHardware {
 /// help text is an accurate capability signal. Best-effort: a failure to run or
 /// parse yields empty caps (so the pipeline simply stays on CPU x264).
 pub(crate) fn detect_handbrake_caps(path: &Path) -> HandbrakeCaps {
+    detect_handbrake_caps_ex(path).0
+}
+
+/// Like [`detect_handbrake_caps`] but also returns whether the `-h` probe
+/// actually produced parseable output (`parse_ok`). `parse_ok == false` means
+/// the help text couldn't be read (spawn/exit failure or empty output) — i.e.
+/// the caps are "unknown", NOT "no hardware". Callers should fall back to the
+/// physical-GPU probe rather than concluding the GPU is unavailable.
+pub(crate) fn detect_handbrake_caps_ex(path: &Path) -> (HandbrakeCaps, bool) {
     let mut cmd = Command::new(path);
     cmd.arg("-h");
+    // Run from the binary's own folder so a build that loads sibling DLLs (and
+    // probes hardware relative to its install) behaves like a normal launch.
+    if let Some(dir) = path.parent() {
+        if dir.is_dir() {
+            cmd.current_dir(dir);
+        }
+    }
     no_window(&mut cmd);
     let Some(out) = cmd.output().ok() else {
-        return HandbrakeCaps::default();
+        return (HandbrakeCaps::default(), false);
     };
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push('\n');
     text.push_str(&String::from_utf8_lossy(&out.stderr));
+    // parse_ok: the command produced some help text to scan. An empty capture
+    // (e.g. output went somewhere we couldn't read) is "unknown", not "absent".
+    let parse_ok = text.trim().len() > 16;
     let t = text.to_ascii_lowercase();
     let has = |needle: &str| t.contains(needle);
-    HandbrakeCaps {
+    let caps = HandbrakeCaps {
         x265: has("x265"),
         nvenc_h264: has("nvenc_h264"),
         nvenc_h265: has("nvenc_h265"),
+        nvenc_av1: has("nvenc_av1"),
         qsv_h264: has("qsv_h264"),
         qsv_h265: has("qsv_h265"),
+        qsv_av1: has("qsv_av1"),
         vce_h264: has("vce_h264"),
         vce_h265: has("vce_h265"),
-    }
+        vce_av1: has("vce_av1"),
+    };
+    (caps, parse_ok)
 }
 
 /// Capture the encoder-relevant lines from `HandBrakeCLI -h` as evidence for the
@@ -287,6 +352,11 @@ pub(crate) fn detect_handbrake_caps(path: &Path) -> HandbrakeCaps {
 pub(crate) fn handbrake_encoders_raw(path: &Path) -> String {
     let mut cmd = Command::new(path);
     cmd.arg("-h");
+    if let Some(dir) = path.parent() {
+        if dir.is_dir() {
+            cmd.current_dir(dir);
+        }
+    }
     no_window(&mut cmd);
     let Some(out) = cmd.output().ok() else {
         return "<failed to run HandBrakeCLI -h>".to_string();
@@ -464,26 +534,53 @@ pub(crate) fn tools_json() -> String {
     let hb = detect_handbrake();
     let (img, kind) = detect_image();
 
-    let caps = hb.path.as_ref().map(|p| detect_handbrake_caps(p)).unwrap_or_default();
+    let (caps, parse_ok) = hb
+        .path
+        .as_ref()
+        .map(|p| detect_handbrake_caps_ex(p))
+        .unwrap_or((HandbrakeCaps::default(), false));
     let vendors = GpuVendors::from_caps(&caps);
+    let hw = probe_gpu_hardware();
+    let eff = EffectiveCaps::compute(&caps, hw);
+    let raw = hb
+        .path
+        .as_ref()
+        .map(|p| handbrake_encoders_raw(p))
+        .unwrap_or_else(|| "<HandBrakeCLI not found>".to_string());
 
-    let mut s = String::with_capacity(512);
+    let mut s = String::with_capacity(768);
     s.push_str("{\"handbrake\":");
     push_tool(&mut s, &hb, None);
     s.push_str(",\"image\":");
     push_tool(&mut s, &img, Some(kind));
     // The built-in zip is always available (pure-Rust, compiled in).
     s.push_str(",\"zip\":{\"found\":true}");
-    // Hardware-encoder capabilities + inferred GPU vendors for the encoder picker.
+    // Hardware-encoder capabilities parsed from `-h` (may under-report; see
+    // `available` for the effective gate that also trusts the hardware probe).
     s.push_str(",\"caps\":{");
     s.push_str(&format!("\"x265\":{}", caps.x265));
     s.push_str(&format!(",\"nvencH264\":{}", caps.nvenc_h264));
     s.push_str(&format!(",\"nvencH265\":{}", caps.nvenc_h265));
+    s.push_str(&format!(",\"nvencAv1\":{}", caps.nvenc_av1));
     s.push_str(&format!(",\"qsvH264\":{}", caps.qsv_h264));
     s.push_str(&format!(",\"qsvH265\":{}", caps.qsv_h265));
+    s.push_str(&format!(",\"qsvAv1\":{}", caps.qsv_av1));
     s.push_str(&format!(",\"vceH264\":{}", caps.vce_h264));
     s.push_str(&format!(",\"vceH265\":{}", caps.vce_h265));
+    s.push_str(&format!(",\"vceAv1\":{}", caps.vce_av1));
     s.push_str(&format!(",\"anyGpu\":{}", caps.any_gpu()));
+    s.push('}');
+    // Effective availability: `-h` token OR matching physical adapter present.
+    // This is what the UI should gate on; `*Assumed` means "adapter-only, not yet
+    // confirmed by a real encode".
+    s.push_str(",\"available\":{");
+    s.push_str(&format!("\"nvenc\":{}", eff.nvenc));
+    s.push_str(&format!(",\"qsv\":{}", eff.qsv));
+    s.push_str(&format!(",\"vce\":{}", eff.vce));
+    s.push_str(&format!(",\"anyGpu\":{}", eff.any_gpu()));
+    s.push_str(&format!(",\"nvencAssumed\":{}", eff.nvenc_assumed));
+    s.push_str(&format!(",\"qsvAssumed\":{}", eff.qsv_assumed));
+    s.push_str(&format!(",\"vceAssumed\":{}", eff.vce_assumed));
     s.push('}');
     s.push_str(",\"gpu\":{");
     s.push_str(&format!("\"nvidia\":{}", vendors.nvidia));
@@ -492,7 +589,6 @@ pub(crate) fn tools_json() -> String {
     s.push('}');
     // Physical GPU adapters present (independent of HandBrake), so the UI can say
     // "you have a GPU but HandBrake can't use it" rather than just "no GPU".
-    let hw = probe_gpu_hardware();
     s.push_str(",\"gpuHardware\":{");
     s.push_str(&format!("\"nvidia\":{}", hw.nvidia));
     s.push_str(&format!(",\"intel\":{}", hw.intel));
@@ -505,6 +601,10 @@ pub(crate) fn tools_json() -> String {
         push_json_string(&mut s, name);
     }
     s.push_str("]}");
+    // Ground-truth evidence for the panel: did `-h` parse, and the raw encoder line.
+    s.push_str(&format!(",\"handbrakeHParseOk\":{}", parse_ok));
+    s.push_str(",\"handbrakeEncodersRaw\":");
+    push_json_string(&mut s, &raw);
     s.push('}');
     s
 }
