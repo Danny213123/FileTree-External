@@ -625,6 +625,25 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
         ));
         l.push_str(" zip=built-in");
         crate::compress_debug::log(&l);
+
+        // Evidence dump: the exact encoder tokens THIS HandBrake build reports,
+        // plus a clear warning when the user asked for GPU but no HW encoder is
+        // available (so the inevitable x264 fallback isn't silent).
+        if let Some(p) = hb.path.as_ref() {
+            crate::compress_debug::log(&format!(
+                "[job_start] handbrake encoders ({}): {}",
+                p.display(),
+                compress_tools::handbrake_encoders_raw(p)
+            ));
+            if job.use_gpu && !caps.any_gpu() {
+                crate::compress_debug::log(
+                    "[job_start] WARNING: useGpu requested but this HandBrakeCLI exposes \
+                     no hardware encoder (nvenc/qsv/vce). Encoding will use CPU x264/x265. \
+                     Point FILETREE_HANDBRAKE at a hardware-capable HandBrakeCLI, or drop \
+                     one into the app tools dir, to enable GPU.",
+                );
+            }
+        }
     }
 
     // Per-job schedule: process the largest (longest-processing) files first for

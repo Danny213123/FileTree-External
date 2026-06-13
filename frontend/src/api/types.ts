@@ -437,21 +437,34 @@ export interface CompressCaps {
   anyGpu: boolean;
 }
 
-/** GPU vendors inferred from the available HandBrake encoders. */
+/** GPU vendors inferred from the available HandBrake encoders (i.e. which
+ *  hardware encoders HandBrake can actually USE on this machine). */
 export interface CompressGpuVendors {
   nvidia: boolean;
   intel: boolean;
   amd: boolean;
 }
 
+/** Physical GPU adapters present on the machine, probed independently of
+ *  HandBrake. Lets the UI distinguish "no GPU" from "GPU present but HandBrake
+ *  can't use it". Absent on older servers. */
+export interface CompressGpuHardware {
+  nvidia: boolean;
+  intel: boolean;
+  amd: boolean;
+  /** Human-readable adapter names (e.g. "AMD Radeon(TM) Graphics"). */
+  names: string[];
+}
+
 /** GET /api/compress-tools — which encoders are available. Zip is built-in so
- *  it is always `found`. `caps`/`gpu` are absent on older servers. */
+ *  it is always `found`. `caps`/`gpu`/`gpuHardware` are absent on older servers. */
 export interface CompressTools {
   handbrake: CompressToolInfo;
   image: CompressImageToolInfo;
   zip: { found: true };
   caps?: CompressCaps;
   gpu?: CompressGpuVendors;
+  gpuHardware?: CompressGpuHardware;
 }
 
 /** POST /api/compress-tools/install response. */

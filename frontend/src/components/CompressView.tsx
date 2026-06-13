@@ -1149,11 +1149,40 @@ export function CompressView({
             />
             <span className="compress-perf-hint">-1 = default, 0-9</span>
           </div>
-          {tools?.gpu && (tools.gpu.nvidia || tools.gpu.intel || tools.gpu.amd) && (
-            <span className="compress-perf-hint">
-              Detected:{" "}
-              {[tools.gpu.nvidia && "NVIDIA", tools.gpu.intel && "Intel", tools.gpu.amd && "AMD"].filter(Boolean).join(", ")}
-            </span>
+          {tools?.handbrake.found && (
+            <div className="compress-perf-diag">
+              <div className="compress-perf-hint" title={tools.handbrake.path || undefined}>
+                HandBrake: <code>{tools.handbrake.path || "(on PATH)"}</code>
+                {tools.handbrake.version ? ` v${tools.handbrake.version}` : ""}
+              </div>
+              <div className="compress-perf-hint">
+                Hardware encoders:{" "}
+                {tools.caps?.anyGpu
+                  ? [
+                      (tools.caps.nvencH264 || tools.caps.nvencH265) && "NVENC",
+                      (tools.caps.qsvH264 || tools.caps.qsvH265) && "QSV",
+                      (tools.caps.vceH264 || tools.caps.vceH265) && "VCE",
+                    ]
+                      .filter(Boolean)
+                      .join(", ")
+                  : "none"}
+              </div>
+              {/* GPU present in the machine but this HandBrake build can't use it:
+                  the #1 reason encoding silently runs on CPU. Make it actionable. */}
+              {!tools.caps?.anyGpu &&
+                tools.gpuHardware &&
+                (tools.gpuHardware.nvidia || tools.gpuHardware.intel || tools.gpuHardware.amd) && (
+                  <div className="compress-perf-warn">
+                    GPU detected ({tools.gpuHardware.names.join(", ") ||
+                      [tools.gpuHardware.nvidia && "NVIDIA", tools.gpuHardware.intel && "Intel", tools.gpuHardware.amd && "AMD"]
+                        .filter(Boolean)
+                        .join(", ")}
+                    ) but this HandBrakeCLI has no hardware encoder, so encoding will use the CPU. Point
+                    {" "}<code>FILETREE_HANDBRAKE</code> at a GPU-capable HandBrakeCLI (or drop one into the
+                    app's tools folder) and reopen this panel.
+                  </div>
+                )}
+            </div>
           )}
         </div>
       )}

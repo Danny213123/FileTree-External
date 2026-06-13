@@ -4,6 +4,16 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.12.1] - 2026-06-12
+
+### Fixed
+
+- **GPU encoding lost to the wrong HandBrake binary**: video compression could silently run on the CPU when a hardware-capable HandBrakeCLI existed on the machine but FileTree resolved a different/older one (or none of the few previously-searched locations). HandBrake discovery now (1) honors a `FILETREE_HANDBRAKE` environment override pointing at an exact HandBrakeCLI (or its folder), (2) searches more locations — the app tools dir, 64-bit and 32-bit Program Files, `ProgramW6432`, and per-user `LOCALAPPDATA\Programs` — and (3) when several HandBrake builds are present, **prefers one that actually exposes a hardware encoder** (NVENC/QSV/VCE) so the GPU path isn't dropped in favor of a HW-less build found first.
+
+### Added
+
+- **GPU/HandBrake diagnostics, end to end**: the job-start debug log now records which exact HandBrakeCLI was chosen (with every candidate it considered and that candidate's detected encoder caps) and dumps the raw encoder tokens that *this* build reports — the ground truth for "why didn't the GPU kick in". When GPU is requested but the resolved binary exposes no hardware encoder, an explicit warning is logged instead of a silent CPU fallback. The Performance panel on the Compress page now shows the resolved HandBrake path + version, the detected hardware encoders, and — when a physical GPU is present but HandBrake can't use it — an actionable hint to set `FILETREE_HANDBRAKE` (or drop a GPU-capable HandBrakeCLI in the tools folder). The actual per-file command line (`-e <encoder>`) and final encoder used remain captured in the debug log and the CSV history.
+
 ## [1.12.0] - 2026-06-12
 
 ### Added

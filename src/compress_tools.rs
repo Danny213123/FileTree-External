@@ -191,6 +191,66 @@ impl GpuVendors {
     }
 }
 
+/// Physical GPU adapters actually present on the machine, probed independently of
+/// HandBrake. This is the key signal for distinguishing "no GPU at all" from "a
+/// GPU is present but the installed HandBrake build can't use it" — without it
+/// the UI can only infer vendors from HandBrake's encoder list and would wrongly
+/// report "no AMD GPU" on a box that has one but whose HandBrake lacks AMF.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GpuHardware {
+    pub(crate) nvidia: bool,
+    pub(crate) intel: bool,
+    pub(crate) amd: bool,
+    /// Human-readable adapter names (e.g. "AMD Radeon(TM) Graphics"), for the UI.
+    pub(crate) names: Vec<String>,
+}
+
+/// Probe the physical display adapters on Windows and classify their vendor.
+/// Uses PowerShell's CIM (`Win32_VideoController`) — always available on Windows
+/// and dependency-free — and classifies each adapter name by vendor keyword.
+/// Best-effort: any failure yields an empty result (the UI then just can't show
+/// hardware-specific guidance). Off Windows this is always empty.
+fn probe_gpu_hardware_uncached() -> GpuHardware {
+    let mut hw = GpuHardware::default();
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }",
+        ]);
+        no_window(&mut cmd);
+        if let Ok(out) = cmd.output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let name = line.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                let lower = name.to_ascii_lowercase();
+                if lower.contains("nvidia") || lower.contains("geforce") || lower.contains("quadro") || lower.contains("rtx") || lower.contains("gtx") {
+                    hw.nvidia = true;
+                } else if lower.contains("amd") || lower.contains("radeon") || lower.contains("ati ") || lower.contains("vega") {
+                    hw.amd = true;
+                } else if lower.contains("intel") || lower.contains("iris") || lower.contains("uhd graphics") || lower.contains("hd graphics") || lower.contains("arc") {
+                    hw.intel = true;
+                }
+                hw.names.push(name.to_string());
+            }
+        }
+    }
+    hw
+}
+
+/// Cached physical-GPU probe. The hardware doesn't change during a session and
+/// the probe spawns PowerShell, so compute it once per process.
+pub(crate) fn probe_gpu_hardware() -> &'static GpuHardware {
+    static CACHE: std::sync::OnceLock<GpuHardware> = std::sync::OnceLock::new();
+    CACHE.get_or_init(probe_gpu_hardware_uncached)
+}
+
 /// Parse HandBrake's encoder list (`HandBrakeCLI -h`) to discover which hardware
 /// encoders this build + machine actually expose. HandBrake only lists an
 /// encoder when the underlying driver/hardware is usable, so presence in the
@@ -219,20 +279,151 @@ pub(crate) fn detect_handbrake_caps(path: &Path) -> HandbrakeCaps {
     }
 }
 
-/// Detect `HandBrakeCLI` for the video pipeline.
-pub(crate) fn detect_handbrake() -> ToolInfo {
-    let mut common = Vec::new();
-    if let Some(pf) = program_files() {
-        common.push(pf.join("HandBrake").join("HandBrakeCLI.exe"));
-        common.push(pf.join("HandBrake").join("HandBrakeCLI"));
-    }
-    match locate("HandBrakeCLI.exe", &common).or_else(|| locate("HandBrakeCLI", &common)) {
-        Some(path) => {
-            let version = capture_version(&path, &["--version"]);
-            ToolInfo { found: true, path: Some(path), version }
+/// Capture the encoder-relevant lines from `HandBrakeCLI -h` as evidence for the
+/// debug log: exactly which encoder tokens THIS build reports. This is the
+/// ground truth for "why didn't GPU kick in" — if `nvenc_*`/`qsv_*`/`vce_*`
+/// don't appear here, the build genuinely lacks HW support; if they do appear
+/// but FileTree still used x264, the bug is downstream (selection/threading).
+pub(crate) fn handbrake_encoders_raw(path: &Path) -> String {
+    let mut cmd = Command::new(path);
+    cmd.arg("-h");
+    no_window(&mut cmd);
+    let Some(out) = cmd.output().ok() else {
+        return "<failed to run HandBrakeCLI -h>".to_string();
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    // Keep only lines mentioning a video-encoder token so the log stays compact.
+    let tokens = [
+        "x264", "x265", "nvenc", "qsv", "vce", "mpeg", "av1", "vp8", "vp9", "theora",
+        "encoder",
+    ];
+    let mut kept: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let low = line.to_ascii_lowercase();
+        if tokens.iter().any(|tok| low.contains(tok)) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                kept.push(trimmed.to_string());
+            }
         }
-        None => ToolInfo::default(),
+        if kept.len() >= 40 {
+            break;
+        }
     }
+    if kept.is_empty() {
+        "<no encoder lines parsed from -h output>".to_string()
+    } else {
+        kept.join(" | ")
+    }
+}
+
+/// Every place we look for `HandBrakeCLI`, in priority order, that actually
+/// exists on disk. Order matters: an explicit override and the app's tools dir
+/// win over system installs, and a `PATH` hit is the last resort. Returning ALL
+/// existing candidates (not just the first) lets [`detect_handbrake`] prefer a
+/// hardware-capable build when more than one HandBrake is installed — the common
+/// cause of "it encodes on CPU" is FileTree resolving a different/older
+/// HandBrakeCLI than the GPU-capable one the user expects.
+fn handbrake_candidates() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let push_if_file = |p: PathBuf, out: &mut Vec<PathBuf>| {
+        if p.is_file() && !out.iter().any(|e| e == &p) {
+            out.push(p);
+        }
+    };
+
+    // 1. Explicit override: env var pointing at a HandBrakeCLI(.exe) or its dir.
+    //    Lets a user force the exact GPU-capable binary their other tools use.
+    if let Some(over) = std::env::var_os("FILETREE_HANDBRAKE") {
+        let p = PathBuf::from(over);
+        if p.is_dir() {
+            push_if_file(p.join("HandBrakeCLI.exe"), &mut out);
+            push_if_file(p.join("HandBrakeCLI"), &mut out);
+        } else {
+            push_if_file(p, &mut out);
+        }
+    }
+
+    // 2. App tools dir (a binary dropped here is intentionally preferred).
+    push_if_file(tools_dir().join("HandBrakeCLI.exe"), &mut out);
+    push_if_file(tools_dir().join("HandBrakeCLI"), &mut out);
+
+    // 3. Common install locations across the usual roots (incl. 32-bit Program
+    //    Files and per-user installs, which the old discovery missed).
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(pf) = program_files() {
+        roots.push(pf);
+    }
+    for var in ["ProgramFiles(x86)", "ProgramW6432", "LOCALAPPDATA"] {
+        if let Some(v) = std::env::var_os(var) {
+            roots.push(PathBuf::from(v));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local).join("Programs"));
+    }
+    for root in roots {
+        push_if_file(root.join("HandBrake").join("HandBrakeCLI.exe"), &mut out);
+        push_if_file(root.join("HandBrake").join("HandBrakeCLI"), &mut out);
+    }
+
+    // 4. PATH (system-installed / portable on PATH).
+    if let Some(p) = which("HandBrakeCLI.exe").or_else(|| which("HandBrakeCLI")) {
+        push_if_file(p, &mut out);
+    }
+
+    out
+}
+
+/// Detect `HandBrakeCLI` for the video pipeline. When multiple HandBrake builds
+/// are present, PREFER one that actually exposes a hardware encoder so the GPU
+/// path isn't lost to an older/HW-less binary that merely happens to be found
+/// first. Emits a one-line diagnostic of every candidate + its caps so a
+/// "running on CPU" report is debuggable from the log.
+pub(crate) fn detect_handbrake() -> ToolInfo {
+    let candidates = handbrake_candidates();
+    if candidates.is_empty() {
+        return ToolInfo::default();
+    }
+
+    // Probe each candidate's caps, preferring the first GPU-capable one. Stop as
+    // soon as a GPU-capable build is found to bound the number of `-h` spawns.
+    let mut chosen: Option<(PathBuf, HandbrakeCaps)> = None;
+    let mut diag = String::new();
+    for cand in &candidates {
+        let caps = detect_handbrake_caps(cand);
+        if crate::compress_debug::enabled() {
+            if !diag.is_empty() {
+                diag.push_str("; ");
+            }
+            diag.push_str(&format!(
+                "{}=[nvenc:{}/{} qsv:{}/{} vce:{}/{}]",
+                cand.display(),
+                caps.nvenc_h264, caps.nvenc_h265, caps.qsv_h264, caps.qsv_h265,
+                caps.vce_h264, caps.vce_h265
+            ));
+        }
+        let is_gpu = caps.any_gpu();
+        if chosen.is_none() || (is_gpu && !chosen.as_ref().unwrap().1.any_gpu()) {
+            chosen = Some((cand.clone(), caps));
+            if is_gpu {
+                break;
+            }
+        }
+    }
+
+    let (path, _caps) = chosen.expect("non-empty candidates");
+    if crate::compress_debug::enabled() {
+        crate::compress_debug::log(&format!(
+            "[handbrake_detect] chose {} from candidates: {}",
+            path.display(),
+            diag
+        ));
+    }
+    let version = capture_version(&path, &["--version"]);
+    ToolInfo { found: true, path: Some(path), version }
 }
 
 /// Detect the image encoder. Prefers `ffmpeg`, falls back to ImageMagick
@@ -299,6 +490,21 @@ pub(crate) fn tools_json() -> String {
     s.push_str(&format!(",\"intel\":{}", vendors.intel));
     s.push_str(&format!(",\"amd\":{}", vendors.amd));
     s.push('}');
+    // Physical GPU adapters present (independent of HandBrake), so the UI can say
+    // "you have a GPU but HandBrake can't use it" rather than just "no GPU".
+    let hw = probe_gpu_hardware();
+    s.push_str(",\"gpuHardware\":{");
+    s.push_str(&format!("\"nvidia\":{}", hw.nvidia));
+    s.push_str(&format!(",\"intel\":{}", hw.intel));
+    s.push_str(&format!(",\"amd\":{}", hw.amd));
+    s.push_str(",\"names\":[");
+    for (i, name) in hw.names.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        push_json_string(&mut s, name);
+    }
+    s.push_str("]}");
     s.push('}');
     s
 }

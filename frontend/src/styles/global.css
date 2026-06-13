@@ -3941,6 +3941,18 @@ input:focus, select:focus {
 .compress-perf-field input[type="number"] { width: 64px; }
 .compress-perf-hint { font-size: 11px; color: var(--text-8); white-space: nowrap; }
 
+/* HandBrake / GPU diagnostics block in the Performance panel */
+.compress-perf-diag { display: flex; flex-direction: column; gap: 4px; width: 100%; margin-top: 6px; }
+.compress-perf-diag .compress-perf-hint { white-space: normal; overflow-wrap: anywhere; }
+.compress-perf-diag code { font-family: var(--mono, monospace); font-size: 11px; overflow-wrap: anywhere; }
+.compress-perf-warn {
+  font-size: 11px; line-height: 1.4; color: var(--warn, #b8860b);
+  background: var(--warn-bg, rgba(184, 134, 11, 0.10));
+  border: 1px solid var(--warn-border, rgba(184, 134, 11, 0.35));
+  border-radius: 6px; padding: 6px 8px; overflow-wrap: anywhere;
+}
+.compress-perf-warn code { font-family: var(--mono, monospace); }
+
 /* In Progress: table-style run list with expandable per-file detail */
 .compress-runs-table { width: 100%; border-collapse: collapse; font-size: 12px; color: var(--text); }
 .compress-runs-table thead th {
