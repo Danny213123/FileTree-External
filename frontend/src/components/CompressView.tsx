@@ -16,6 +16,7 @@ import type {
 import {
   fetchCompressTools,
   installCompressTool,
+  compressPreflight,
   startCompressJob,
   cancelCompressJob,
   retryCompressJob,
@@ -810,13 +811,32 @@ export function CompressView({
       return;
     }
 
+    // Authoritative backend pre-flight: the in-memory tree consulted above can
+    // itself be stale (cache-served, never re-scanned this session), so confirm
+    // on-disk existence and flag cloud-only placeholders before starting — this
+    // avoids spawning a job that just emits per-file errors.
+    const pf = await compressPreflight(runnable.map((f) => f.path));
+    const badSet = new Set([...pf.missing, ...pf.placeholder].map((p) => normPath(p)));
+    const liveRunnable = badSet.size ? runnable.filter((f) => !badSet.has(normPath(f.path))) : runnable;
+    if (badSet.size > 0) {
+      const bits: string[] = [];
+      if (pf.missing.length > 0) bits.push(`${pf.missing.length} no longer present`);
+      if (pf.placeholder.length > 0) bits.push(`${pf.placeholder.length} cloud-only (not downloaded)`);
+      toast.info(`Pre-flight skipped ${badSet.size} file${badSet.size === 1 ? "" : "s"}: ${bits.join(", ")}.`);
+    }
+    if (liveRunnable.length === 0) {
+      setRunStatus("idle");
+      toast.info("Nothing to compress — all selected files are missing or cloud-only.");
+      return;
+    }
+
     abortRef.current?.abort();
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
     finalizedRef.current = false;
     setRunError("");
 
     const init = new Map<number, FileProg>();
-    runnable.forEach((f, i) => {
+    liveRunnable.forEach((f, i) => {
       init.set(i, {
         index: i,
         path: f.path,
@@ -839,7 +859,7 @@ export function CompressView({
 
     try {
       const id = await startCompressJob({
-        paths: runnable.map((f) => f.path),
+        paths: liveRunnable.map((f) => f.path),
         preset,
         recycleOriginals,
         tagFilename,
@@ -1506,6 +1526,7 @@ const REASON_LABEL: Record<string, string> = {
   error_encoder: "Error — encoder failed",
   error_output_empty: "Error — empty output",
   error_source_missing: "Error — source missing",
+  error_cloud_placeholder: "Skipped — cloud-only file",
   error_spawn: "Error — couldn't start",
   gpu_fallback: "Saved — GPU→CPU fallback",
 };
@@ -1518,6 +1539,7 @@ const REASON_TOOLTIP: Record<string, string> = {
   error_encoder: "The encoder ran but exited with an error. See the debug log / stderr excerpt for details.",
   error_output_empty: "The encoder reported success but produced a missing or empty output file.",
   error_source_missing: "The source file no longer exists — it may have been recycled by a prior run.",
+  error_cloud_placeholder: "The source is a cloud-only placeholder (OneDrive/Files On-Demand) that isn't downloaded locally. It was skipped to avoid forcing a large download — set it to \"Always keep on this device\" and retry.",
   error_spawn: "The encoder process could not be started.",
   gpu_fallback: "The GPU encoder failed, so the file was re-encoded on the CPU. The file still compressed; see the error/stderr for the exact GPU failure (driver/session/codec).",
 };

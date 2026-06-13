@@ -309,6 +309,37 @@ pub(crate) fn create_job(
 /// Rebuild a job from its persisted manifest for `retry`: files already `done`
 /// keep their `done` status (and recorded sizes) and are skipped by the worker;
 /// everything else is reset to `pending`.
+/// Re-validate that the external encoders a (to-be-resumed) job still needs are
+/// available, BEFORE spawning the worker. Done files are skipped on resume, so
+/// only the not-yet-done files' kinds matter. Returns an actionable error when a
+/// required tool is missing — far better than spawning a job that then reports
+/// `error_tool_missing` on every remaining video/image. `None` ⇒ good to resume.
+pub(crate) fn revalidate_job_tools(job: &CompressJob) -> Option<String> {
+    let mut needs_video = false;
+    let mut needs_image = false;
+    for f in &job.files {
+        if f.status.lock().expect("status lock").as_str() == "done" {
+            continue; // already compressed; will be skipped on resume
+        }
+        match f.kind {
+            FileKind::Video => needs_video = true,
+            FileKind::Image => needs_image = true,
+            FileKind::Other => {} // built-in zip, no external tool
+        }
+    }
+    if needs_video && !compress_tools::detect_handbrake().found {
+        return Some(
+            "HandBrake is required to resume this job's remaining video files, but HandBrakeCLI was not found. Install it (or set FILETREE_HANDBRAKE) and try again.".to_string(),
+        );
+    }
+    if needs_image && !compress_tools::detect_image().0.found {
+        return Some(
+            "An image encoder (ffmpeg or ImageMagick) is required to resume this job's remaining image files, but none was found.".to_string(),
+        );
+    }
+    None
+}
+
 pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
     if !is_safe_job_id(id) {
         return None;
@@ -1072,6 +1103,9 @@ pub(crate) enum Reason {
     ErrorOutputEmpty,
     /// The source file no longer exists (commonly recycled by a prior run).
     ErrorSourceMissing,
+    /// The source is a cloud-only placeholder (OneDrive etc.) whose data isn't
+    /// downloaded locally; skipped to avoid forcing a (possibly huge) hydration.
+    ErrorCloudPlaceholder,
     /// The encoder process could not be spawned at all.
     ErrorSpawn,
     /// Compressed successfully, but only after a GPU encode failed and the file
@@ -1092,6 +1126,7 @@ impl Reason {
             Reason::ErrorEncoder => "error_encoder",
             Reason::ErrorOutputEmpty => "error_output_empty",
             Reason::ErrorSourceMissing => "error_source_missing",
+            Reason::ErrorCloudPlaceholder => "error_cloud_placeholder",
             Reason::ErrorSpawn => "error_spawn",
             Reason::GpuFallback => "gpu_fallback",
         }
@@ -1150,6 +1185,33 @@ fn is_already_compressed_ext(path: &Path) -> bool {
             | "mp4" | "mkv" | "mov" | "m4v" | "webm" | "m4a" | "aac" | "mp3" | "ogg" | "flac"
             | "docx" | "xlsx" | "pptx"
     )
+}
+
+/// Whether `path` is a cloud-only placeholder whose contents aren't present
+/// locally (OneDrive "online-only" / Files On-Demand, or any provider using the
+/// same attributes). Checking metadata does NOT trigger hydration; only reading
+/// the data would. Returns false off Windows.
+#[cfg(windows)]
+pub(crate) fn is_dehydrated_cloud_file(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            let a = m.file_attributes();
+            a & (FILE_ATTRIBUTE_OFFLINE
+                | FILE_ATTRIBUTE_RECALL_ON_OPEN
+                | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+                != 0
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_dehydrated_cloud_file(_path: &Path) -> bool {
+    false
 }
 
 /// Pre-skip heuristic for image/video inputs: returns a reason string when an
@@ -1212,6 +1274,20 @@ fn process_file(
             reason: Reason::ErrorSourceMissing,
             message: "source no longer exists - may have been recycled by a prior run"
                 .to_string(),
+            diag: EncodeDiag::default(),
+            meta: EncodeMeta::default(),
+        };
+    }
+    // Cloud-only placeholder (OneDrive et al.): the file exists as a stub but its
+    // data isn't local. Reading it would force a (possibly huge) download, and on
+    // a metered/offline connection the encode would just stall or fail. Skip it
+    // with an actionable message rather than silently hydrating gigabytes.
+    if is_dehydrated_cloud_file(&input) {
+        return FileOutcome::Error {
+            reason: Reason::ErrorCloudPlaceholder,
+            message:
+                "source is a cloud-only placeholder (not downloaded locally); skipped to avoid forcing a download. Set it to \"Always keep on this device\" and retry."
+                    .to_string(),
             diag: EncodeDiag::default(),
             meta: EncodeMeta::default(),
         };

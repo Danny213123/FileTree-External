@@ -24,6 +24,16 @@ A backlog of quality, performance, correctness, security, and observability foll
 - **In Progress tab backs off when idle**: the run list polled every 1.5s unconditionally; it now polls at 1.5s only while a job is active and backs off to 8s when everything is idle (resuming/cancelling a job restarts fast polling immediately).
 - **Tool detection is cached (`GET /api/compress-tools`)**: detection shells out to `HandBrakeCLI -h`, `ffmpeg -version`, `where`, and a PowerShell GPU probe — previously recomputed on every poll, with the chosen HandBrake binary probed two-to-three times per request. Results are now served from a short-lived (15 s) cache, and the cold path runs `HandBrakeCLI -h` only once (caps + raw encoder list parsed from the same output). A detect/install attempt (`POST /api/compress-tools/install`) busts the cache so a freshly dropped binary is reflected immediately.
 
+### Fixed
+
+- **Long-path (>260) and UNC/network selections resolve for compression**: path containment now retries `canonicalize` with a Windows extended-length verbatim prefix (`\\?\` for a drive path, `\\?\UNC\` for a share) when the plain attempt fails, so deep or remote selections no longer silently fail the compress check. Both the registered roots and the requested paths go through the same helper, so the verbatim forms compare like-for-like.
+- **Cloud-only placeholder files are detected and skipped gracefully**: a OneDrive/Files-On-Demand file whose data isn't downloaded locally (offline / recall-on-access attributes) is no longer fed to an encoder — which would force a possibly huge hydration download or stall offline. It's recorded as a distinct `error_cloud_placeholder` outcome with an actionable "Always keep on this device" hint. (A likely contributor to the earlier unresolvable-path reports.)
+- **Resume re-validates tools first**: resuming an interrupted job now re-checks that the encoders its remaining files need are still installed and returns a clear `409` ("HandBrake/ffmpeg required …") instead of resuming and erroring every remaining file.
+
+### Added
+
+- **Pre-flight existence probe before starting a job**: the Compress page now confirms the selection on-disk via a lightweight backend probe (`POST /api/compress-preflight`) — the in-memory tree it previously consulted can itself be stale — and skips/flags missing or cloud-only files up front rather than surfacing them only per-file mid-run.
+
 ### Security
 
 - **Compressing a folder no longer widens content-read access**: the compress routes used to register a selection's directories into the shared `scan_roots`, which also gates the content-read routes (preview/thumbnail/owner). A dedicated `compress_roots` allowlist now backs compress/zip containment (accepted under `scan_roots` ∪ `compress_roots`), while preview/thumbnail/owner reads continue to consult `scan_roots` alone. Compress access therefore never grants read access.

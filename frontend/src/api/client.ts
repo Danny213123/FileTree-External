@@ -1369,6 +1369,30 @@ export async function autotuneCompress(codec: string): Promise<AutotuneResult> {
   return (r.data ?? { ok: false, error: "No response" }) as AutotuneResult;
 }
 
+export interface CompressPreflight {
+  ok: number;
+  missing: string[];
+  placeholder: string[];
+}
+
+/** Lightweight pre-flight: classify a selection's paths as present / missing /
+ *  cloud-placeholder before starting a job. Read-only POST; never throws (a
+ *  failure yields an all-ok result so it can't block a legitimate start). */
+export async function compressPreflight(paths: string[]): Promise<CompressPreflight> {
+  try {
+    const res = await fetch("/api/compress-preflight", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths }),
+    });
+    if (!res.ok) return { ok: paths.length, missing: [], placeholder: [] };
+    const d = (await res.json()) as Partial<CompressPreflight>;
+    return { ok: d.ok ?? 0, missing: d.missing ?? [], placeholder: d.placeholder ?? [] };
+  } catch {
+    return { ok: paths.length, missing: [], placeholder: [] };
+  }
+}
+
 /** Start a compression job. Returns the new job id (throws on failure so the
  *  caller can surface why the job couldn't start). */
 export async function startCompressJob(body: CompressJobRequest): Promise<string> {

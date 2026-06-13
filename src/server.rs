@@ -308,7 +308,7 @@ fn register_compress_root(state: &AppState, path: &Path) {
 /// canonicalized directory (symlinks/`..` resolved) so containment compares
 /// like-for-like, de-duplicated and bounded to avoid unbounded growth.
 fn register_root_into(roots: &RwLock<Vec<PathBuf>>, path: &Path) {
-    let canon = match fs::canonicalize(path) {
+    let canon = match canonicalize_robust(path) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -344,7 +344,7 @@ enum PathScanStatus {
 /// Pure (no `AppState`/locks) so it is directly unit-testable. Resolving
 /// symlinks/`..` first means traversal and symlink escapes are still rejected.
 fn classify_path_against_roots(roots: &[PathBuf], requested: &Path) -> PathScanStatus {
-    let canon = match fs::canonicalize(requested) {
+    let canon = match canonicalize_robust(requested) {
         Ok(c) => c,
         Err(_) => return PathScanStatus::Unresolvable,
     };
@@ -353,6 +353,51 @@ fn classify_path_against_roots(roots: &[PathBuf], requested: &Path) -> PathScanS
     } else {
         PathScanStatus::OutsideRoot
     }
+}
+
+/// Canonicalize `path`, retrying with a Windows extended-length verbatim prefix
+/// (`\\?\` for a drive path, `\\?\UNC\` for a UNC share) when the plain attempt
+/// fails. This lets deep (>260-char) and UNC/network selections resolve instead
+/// of silently failing containment. Roots are registered through the same
+/// helper, so both sides of a `starts_with` comparison share the verbatim form
+/// that `fs::canonicalize` already returns on Windows.
+fn canonicalize_robust(path: &Path) -> std::io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            #[cfg(windows)]
+            {
+                if let Some(prefixed) = to_verbatim_path(path) {
+                    if let Ok(p) = fs::canonicalize(&prefixed) {
+                        return Ok(p);
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Build an extended-length verbatim form of an absolute Windows path, or `None`
+/// when it is already verbatim / not an absolute drive-or-UNC path. Verbatim
+/// paths use backslashes and no relative components, so this is best-effort and
+/// only used as a fallback after the plain canonicalize fails.
+#[cfg(windows)]
+fn to_verbatim_path(path: &Path) -> Option<PathBuf> {
+    let s = path.to_str()?;
+    if s.starts_with("\\\\?\\") {
+        return None; // already verbatim
+    }
+    if let Some(rest) = s.strip_prefix("\\\\") {
+        // UNC: \\server\share\… → \\?\UNC\server\share\…
+        return Some(PathBuf::from(format!("\\\\?\\UNC\\{}", rest.replace('/', "\\"))));
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+        // Drive-absolute: C:\… → \\?\C:\…
+        return Some(PathBuf::from(format!("\\\\?\\{}", s.replace('/', "\\"))));
+    }
+    None
 }
 
 /// True only when `requested` canonicalizes to a path located under at least one
@@ -473,6 +518,42 @@ fn common_ancestor_dir(paths: &[String]) -> Option<PathBuf> {
         return None;
     }
     Some(out)
+}
+
+/// Classify each submitted path for a compress pre-flight: present and readable
+/// (`ok`), no longer present (`missing` — typically a stale cache selection), or
+/// a cloud-only placeholder not downloaded locally (`placeholder`). Read-only.
+fn compress_preflight_json(paths: &[String]) -> String {
+    let mut missing: Vec<&String> = Vec::new();
+    let mut placeholder: Vec<&String> = Vec::new();
+    let mut ok = 0usize;
+    for p in paths {
+        let pb = Path::new(p);
+        if !pb.is_file() {
+            missing.push(p);
+        } else if crate::compress_job::is_dehydrated_cloud_file(pb) {
+            placeholder.push(p);
+        } else {
+            ok += 1;
+        }
+    }
+    let mut s = String::with_capacity(128);
+    s.push_str(&format!("{{\"ok\":{ok},\"missing\":["));
+    for (i, p) in missing.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        push_json_string(&mut s, p);
+    }
+    s.push_str("],\"placeholder\":[");
+    for (i, p) in placeholder.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        push_json_string(&mut s, p);
+    }
+    s.push_str("]}");
+    s
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
@@ -1195,6 +1276,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         // Compression: GET lists jobs, POST creates one (token-gated via
         // `writes_on_post`).
         "/api/compress-jobs",
+        // Read-only pre-flight existence probe (no writes); POST carries the
+        // path list. Not token-gated — discloses only existence of the caller's
+        // own selection and performs no side effects.
+        "/api/compress-preflight",
     ];
     let method_allowed = if is_destructive {
         // No GET fall-through for destructive routes.
@@ -3322,6 +3407,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let id = extract_json_str(&body_str, "id").unwrap_or_default();
             match crate::compress_job::job_from_manifest(&id) {
                 Some(job) => {
+                    // Re-validate tool/encoder availability before resuming so a
+                    // job with remaining video/image files fails fast with an
+                    // actionable message instead of erroring every file.
+                    if let Some(msg) = crate::compress_job::revalidate_job_tools(&job) {
+                        let mut body = String::from("{\"error\":");
+                        push_json_string(&mut body, &msg);
+                        body.push('}');
+                        return respond_json(&mut stream, 409, "Conflict", &body);
+                    }
                     let jid = job.id.clone();
                     state
                         .compress_jobs
@@ -3366,6 +3460,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let body_str = String::from_utf8_lossy(&request.body);
             let codec = extract_json_str(&body_str, "codec").unwrap_or_else(|| "h264".to_string());
             respond_json(&mut stream, 200, "OK", &crate::compress_tools::autotune_json(&codec))
+        }
+        // Lightweight pre-flight: classify a selection's paths as ok / missing /
+        // cloud-placeholder so the UI can flag stale selections BEFORE starting a
+        // job (rather than only per-file once it's running). Read-only existence
+        // probe of the caller's own selection; performs no encode and no writes.
+        "/api/compress-preflight" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let paths = extract_json_str_array(&body_str, "paths");
+            respond_json(&mut stream, 200, "OK", &compress_preflight_json(&paths))
         }
         // Poll fallback: full job JSON for `GET /api/compress-jobs/<id>`. Placed
         // after the exact compress-jobs sub-routes so they match first.
