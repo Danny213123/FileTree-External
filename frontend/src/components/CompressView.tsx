@@ -1630,6 +1630,7 @@ const REASON_LABEL: Record<string, string> = {
   error_source_missing: "Error — source missing",
   error_cloud_placeholder: "Skipped — cloud-only file",
   error_spawn: "Error — couldn't start",
+  error_internal: "Error — internal",
   gpu_fallback: "Saved — GPU→CPU fallback",
 };
 
@@ -1643,6 +1644,7 @@ const REASON_TOOLTIP: Record<string, string> = {
   error_source_missing: "The source file no longer exists — it may have been recycled by a prior run.",
   error_cloud_placeholder: "The source is a cloud-only placeholder (OneDrive/Files On-Demand) that isn't downloaded locally. It was skipped to avoid forcing a large download — set it to \"Always keep on this device\" and retry.",
   error_spawn: "The encoder process could not be started.",
+  error_internal: "An unexpected internal error occurred while processing this file (a caught worker error). The rest of the batch was unaffected; retry to re-run this file.",
   gpu_fallback: "The GPU encoder failed, so the file was re-encoded on the CPU. The file still compressed; see the error/stderr for the exact GPU failure (driver/session/codec).",
 };
 

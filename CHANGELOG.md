@@ -4,6 +4,17 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.1] - 2026-06-13
+
+A reliability fix for the parallel compression pool: a single bad file could take the whole batch down (user saw 116 files stall at 39, with 77 left "pending" and a false "done").
+
+### Fixed
+
+- **One failing file can no longer halt the whole compression batch**: the worker pool shared several `Mutex`es accessed via `.lock().expect(...)`. A panic in one file's pipeline poisoned a shared lock, so every other worker's next lock panicked too — cascading until the entire pool died and the run finalized with most files left `pending` and a misleading `done`. Each file's processing is now wrapped in `catch_unwind`: a panic is logged, recorded as a per-file `error_internal` outcome, counted, and the worker continues. All shared compression/gate locks are now poison-tolerant (recover the guard instead of propagating), so one panic can never cascade.
+- **Actual panic trigger — non-UTF-8 encoder stderr**: `encoder_error_message` (run on *every* non-zero HandBrake exit, i.e. the whole "0 valid titles / unrecognized file type" wave) and the GPU-fallback stderr helper sliced the stderr tail by raw byte offset (`&s[s.len()-N..]`). When that offset landed mid-codepoint — common, since HandBrake stderr carries localized text and accented file names — the slice panicked, which was the lock-poisoning trigger. Both now snap to a UTF-8 char boundary (`safe_tail`) and never panic.
+- **No more false "done" with abandoned files**: after the pool joins, any file left non-terminal (`pending`/`running`) is reconciled to a per-file `error_internal` and the job status becomes `error` (resumable via Retry) instead of `done`, so the In Progress tab always shows a real outcome for every file.
+- **Audio files no longer routed to HandBrake**: `classify` folded audio (`mp3/wav/flac/aac/ogg/m4a`) into the video pipeline, so an audio-only file hit HandBrake and failed with "no title found". Audio is now treated as `Other` — already-compact audio is recorded as a clean no-gain skip and only genuinely compressible audio (e.g. WAV) is losslessly zipped — with no external tool required. (Latent for the all-video batch above, but the same error family.)
+
 ## [1.13.0] - 2026-06-13
 
 A backlog of quality, performance, correctness, security, and observability follow-ups surfaced while shipping 1.12.0–1.12.3. No regressions; each item is an independent improvement.

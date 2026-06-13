@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use crate::compress_tools::{self, HandbrakeCaps, ImageKind};
 use crate::export::push_json_string;
-use crate::io::{acquire_compress, CompressLane};
+use crate::io::{acquire_compress, CompressLane, LockRecover};
 use crate::model::AppState;
 
 /// Coarse file classification that selects a pipeline.
@@ -49,16 +49,25 @@ impl FileKind {
     }
 }
 
-/// Classify a path by extension. Audio is folded into the video pipeline (it is
-/// re-encoded by the same HandBrake/ffmpeg tooling).
+/// Classify a path by extension.
+///
+/// Audio is deliberately NOT classified as `Video`: HandBrake is a *video*
+/// transcoder and an audio-only input makes it fail with "no title found", so
+/// routing audio there produced spurious per-file errors. Audio is treated as
+/// `Other` instead — the built-in store/zip pipeline — where already-compact
+/// audio (mp3/aac/ogg/flac/m4a, all in [`is_already_compressed_ext`]) is cleanly
+/// recorded as a no-gain skip and only genuinely compressible audio (e.g. WAV)
+/// is losslessly zipped. No external tool is required, so the outcome is always
+/// coherent regardless of whether ffmpeg/HandBrake are installed.
 pub(crate) fn classify(path: &Path) -> FileKind {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg"
-        | "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" => FileKind::Video,
+        "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg" => {
+            FileKind::Video
+        }
         "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "tif" | "gif" => FileKind::Image,
         _ => FileKind::Other,
     }
@@ -155,7 +164,7 @@ pub(crate) struct CompressJob {
 impl CompressJob {
     /// Append one NDJSON event line and wake any stream reader tailing the buffer.
     fn emit(&self, line: String) {
-        let mut events = self.events.lock().expect("compress events lock");
+        let mut events = self.events.lock_recover();
         events.push(line);
         self.events_cv.notify_all();
     }
@@ -318,7 +327,7 @@ pub(crate) fn revalidate_job_tools(job: &CompressJob) -> Option<String> {
     let mut needs_video = false;
     let mut needs_image = false;
     for f in &job.files {
-        if f.status.lock().expect("status lock").as_str() == "done" {
+        if f.status.lock_recover().as_str() == "done" {
             continue; // already compressed; will be skipped on resume
         }
         match f.kind {
@@ -397,13 +406,13 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
                 Ordering::Relaxed,
             );
             if let Some(op) = f.get("outPath").and_then(|v| v.as_str()) {
-                *state.out_path.lock().expect("out_path lock") = op.to_string();
+                *state.out_path.lock_recover() = op.to_string();
             }
             if let Some(r) = f.get("reason").and_then(|v| v.as_str()) {
-                *state.reason.lock().expect("reason lock") = r.to_string();
+                *state.reason.lock_recover() = r.to_string();
             }
             if let Some(e) = f.get("encoder").and_then(|v| v.as_str()) {
-                *state.encoder.lock().expect("encoder lock") = e.to_string();
+                *state.encoder.lock_recover() = e.to_string();
             }
             state
                 .duration_ms
@@ -735,10 +744,10 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     let already_done = job
         .files
         .iter()
-        .filter(|f| f.status.lock().expect("status lock").as_str() == "done")
+        .filter(|f| f.status.lock_recover().as_str() == "done")
         .count();
     let mut schedule: Vec<usize> = (0..job.files.len())
-        .filter(|&i| job.files[i].status.lock().expect("status lock").as_str() != "done")
+        .filter(|&i| job.files[i].status.lock_recover().as_str() != "done")
         .collect();
     schedule.sort_by(|&a, &b| {
         job.files[b]
@@ -775,7 +784,31 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
                     break;
                 }
                 let i = schedule[k];
-                let stop = process_and_record(&state, &job, i, &hb, &img, img_kind, &caps, &counts);
+                // Isolate each file: a panic anywhere in the per-file pipeline
+                // (e.g. an unexpected slice/parse bug on pathological encoder
+                // output) is caught here so it can NEVER kill the worker and
+                // abandon the rest of the batch as pending. The offending file is
+                // recorded as a per-file internal error and the loop continues.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    process_and_record(&state, &job, i, &hb, &img, img_kind, &caps, &counts)
+                }));
+                let stop = match result {
+                    Ok(stop) => stop,
+                    Err(payload) => {
+                        let msg = panic_message(payload.as_ref());
+                        crate::compress_debug::log(&format!(
+                            "[panic] job={} #{i} worker caught a panic while processing file: {msg}",
+                            job.id
+                        ));
+                        record_internal_error(
+                            &job,
+                            i,
+                            &counts,
+                            &format!("internal error while processing this file: {msg}"),
+                        );
+                        false
+                    }
+                };
                 if stop {
                     break;
                 }
@@ -786,6 +819,28 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
         let _ = h.join();
     }
 
+    // Reconcile leftovers: with the per-file catch above a worker should never
+    // die mid-file, but should one ever leave a file non-terminal (`pending`/
+    // `running`) — a thread aborted by something catch_unwind can't intercept, or
+    // a future regression — mark it as an internal error so the run NEVER reports
+    // a false "done" with files silently abandoned. A cancelled job legitimately
+    // leaves files pending, so skip reconciliation then.
+    let mut reconciled = 0usize;
+    if !job.cancel.load(Ordering::SeqCst) {
+        for i in 0..job.files.len() {
+            let st = job.files[i].status.lock_recover().clone();
+            if st == "pending" || st == "running" {
+                record_internal_error(
+                    &job,
+                    i,
+                    &counts,
+                    "worker aborted before this file completed (no per-file outcome was recorded)",
+                );
+                reconciled += 1;
+            }
+        }
+    }
+
     let done_count = counts.done.load(Ordering::Relaxed);
     let error_count = counts.error.load(Ordering::Relaxed);
     let skipped_count = counts.skipped.load(Ordering::Relaxed);
@@ -793,12 +848,16 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     let cancelled = job.cancel.load(Ordering::SeqCst);
     let status = if cancelled {
         "cancelled"
+    } else if reconciled > 0 {
+        // A worker aborted and left files behind: the run is incomplete, so report
+        // `error` (resumable via Retry) rather than a misleading `done`.
+        "error"
     } else if error_count > 0 && done_count == 0 {
         "error"
     } else {
         "done"
     };
-    *job.status.lock().expect("status lock") = status.to_string();
+    *job.status.lock_recover() = status.to_string();
     write_manifest(&job);
 
     let total_saved = job.saved_bytes.load(Ordering::Relaxed);
@@ -809,6 +868,72 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     job.emit(ev_done(&job.id, done_count, error_count, total_saved));
     job.finished.store(true, Ordering::SeqCst);
     job.events_cv.notify_all();
+}
+
+/// Extract a human-readable message from a caught panic payload. `panic!`
+/// payloads are usually a `&'static str` or a `String`; anything else is
+/// reported generically.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Record a per-file internal error (caught worker panic, or a file reconciled
+/// after an aborted worker): set the `FileState` to a terminal `error` with
+/// [`Reason::ErrorInternal`], count it, append the CSV/debug rows, emit the live
+/// error event, and persist the manifest. Uses poison-tolerant locks so this can
+/// safely run after another worker panicked. Idempotent enough for reconcile:
+/// only called for files not already terminal.
+fn record_internal_error(job: &Arc<CompressJob>, i: usize, counts: &Counts, message: &str) {
+    let f = &job.files[i];
+    let name = file_name_of(&f.path);
+    let kind_str = f.kind.as_str();
+    let orig = f.orig_bytes.load(Ordering::Relaxed);
+
+    *f.error.lock_recover() = Some(message.to_string());
+    *f.status.lock_recover() = "error".to_string();
+    *f.reason.lock_recover() = Reason::ErrorInternal.as_str().to_string();
+    f.pct.store(0, Ordering::Relaxed);
+    counts.error.fetch_add(1, Ordering::Relaxed);
+
+    crate::compress_log::append_row(&crate::compress_log::Row {
+        job_id: &job.id,
+        index: i,
+        path: &f.path,
+        name: &name,
+        kind: kind_str,
+        preset: &job.preset,
+        status: "error",
+        orig_bytes: orig,
+        new_bytes: 0,
+        saved_bytes: 0,
+        pct_saved: 0.0,
+        ratio: 0.0,
+        tool: "",
+        codec_params: "",
+        duration_ms: 0,
+        out_path: "",
+        recycled: false,
+        error: message,
+        reason: Reason::ErrorInternal.as_str(),
+        exit_code: None,
+        tool_version: "",
+        command: "",
+        stderr_excerpt: "",
+    });
+    crate::compress_debug::log(&format!(
+        "[file] job={} #{i} path={:?} INTERNAL ERROR reason={} {message}",
+        job.id,
+        f.path,
+        Reason::ErrorInternal.as_str(),
+    ));
+    job.emit(ev_error(i, &f.path, message));
+    write_manifest(job);
 }
 
 /// Process one file and record its outcome (FileState, CSV row, debug log, live
@@ -826,7 +951,7 @@ fn process_and_record(
 ) -> bool {
     {
         let f = &job.files[i];
-        *f.status.lock().expect("status lock") = "running".to_string();
+        *f.status.lock_recover() = "running".to_string();
         f.pct.store(0, Ordering::Relaxed);
         let orig = f.orig_bytes.load(Ordering::Relaxed);
         job.emit(ev_file_start(i, &f.path, f.kind, orig));
@@ -863,12 +988,12 @@ fn process_and_record(
             let fallback_detail = meta.gpu_fallback.clone().unwrap_or_default();
             f.new_bytes.store(new_bytes, Ordering::Relaxed);
             f.recycled.store(recycled, Ordering::Relaxed);
-            *f.out_path.lock().expect("out lock") = out_path.clone();
-            *f.status.lock().expect("status lock") = "done".to_string();
-            *f.reason.lock().expect("reason lock") = reason.as_str().to_string();
-            *f.encoder.lock().expect("encoder lock") = codec_params.clone();
+            *f.out_path.lock_recover() = out_path.clone();
+            *f.status.lock_recover() = "done".to_string();
+            *f.reason.lock_recover() = reason.as_str().to_string();
+            *f.encoder.lock_recover() = codec_params.clone();
             if !fallback_detail.is_empty() {
-                *f.error.lock().expect("err lock") = Some(fallback_detail.clone());
+                *f.error.lock_recover() = Some(fallback_detail.clone());
             }
             f.pct.store(100, Ordering::Relaxed);
             let saved = orig.saturating_sub(new_bytes);
@@ -912,9 +1037,9 @@ fn process_and_record(
             let codec_params = if meta.codec_params.is_empty() { fallback_params.clone() } else { meta.codec_params.clone() };
             let tool_version = if meta.tool_version.is_empty() { fallback_version } else { meta.tool_version.as_str() };
             f.new_bytes.store(new_bytes, Ordering::Relaxed);
-            *f.status.lock().expect("status lock") = "skipped".to_string();
-            *f.reason.lock().expect("reason lock") = Reason::SkippedNoGain.as_str().to_string();
-            *f.encoder.lock().expect("encoder lock") = codec_params.clone();
+            *f.status.lock_recover() = "skipped".to_string();
+            *f.reason.lock_recover() = Reason::SkippedNoGain.as_str().to_string();
+            *f.encoder.lock_recover() = codec_params.clone();
             f.pct.store(100, Ordering::Relaxed);
             counts.skipped.fetch_add(1, Ordering::Relaxed);
             crate::compress_log::append_row(&crate::compress_log::Row {
@@ -952,10 +1077,10 @@ fn process_and_record(
             let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
             let codec_params = if meta.codec_params.is_empty() { fallback_params.clone() } else { meta.codec_params.clone() };
             let tool_version = if meta.tool_version.is_empty() { fallback_version } else { meta.tool_version.as_str() };
-            *f.error.lock().expect("err lock") = Some(message.clone());
-            *f.status.lock().expect("status lock") = "error".to_string();
-            *f.reason.lock().expect("reason lock") = reason.as_str().to_string();
-            *f.encoder.lock().expect("encoder lock") = codec_params.clone();
+            *f.error.lock_recover() = Some(message.clone());
+            *f.status.lock_recover() = "error".to_string();
+            *f.reason.lock_recover() = reason.as_str().to_string();
+            *f.encoder.lock_recover() = codec_params.clone();
             counts.error.fetch_add(1, Ordering::Relaxed);
             crate::compress_log::append_row(&crate::compress_log::Row {
                 job_id: &job.id,
@@ -989,7 +1114,7 @@ fn process_and_record(
             job.emit(ev_error(i, &f.path, &message));
         }
         FileOutcome::Cancelled => {
-            *f.status.lock().expect("status lock") = "pending".to_string();
+            *f.status.lock_recover() = "pending".to_string();
             f.pct.store(0, Ordering::Relaxed);
             stop = true;
         }
@@ -1108,6 +1233,10 @@ pub(crate) enum Reason {
     ErrorCloudPlaceholder,
     /// The encoder process could not be spawned at all.
     ErrorSpawn,
+    /// An unexpected internal error (a caught panic in the worker, or a file left
+    /// non-terminal by an aborted worker). Recorded per-file so one bad file can
+    /// never silently abandon the rest of the batch.
+    ErrorInternal,
     /// Compressed successfully, but only after a GPU encode failed and the file
     /// fell back to the CPU encoder. The GPU failure detail is carried in the
     /// file's error/message field for visibility.
@@ -1128,6 +1257,7 @@ impl Reason {
             Reason::ErrorSourceMissing => "error_source_missing",
             Reason::ErrorCloudPlaceholder => "error_cloud_placeholder",
             Reason::ErrorSpawn => "error_spawn",
+            Reason::ErrorInternal => "error_internal",
             Reason::GpuFallback => "gpu_fallback",
         }
     }
@@ -1473,11 +1603,27 @@ fn process_file(
         state
             .scan_cache
             .write()
-            .expect("scan_cache lock")
+            .unwrap_or_else(|e| e.into_inner())
             .invalidate(&parent.to_string_lossy());
     }
 
     FileOutcome::Done { out_path: out_str, new_bytes, recycled, recycle_error, tagged, diag, meta }
+}
+
+/// Return at most the last `max` bytes of `s`, snapped UP to the nearest UTF-8
+/// char boundary so the slice can never split a multi-byte codepoint. Encoder
+/// stderr routinely contains non-ASCII (localized messages, accented file names),
+/// so naive `&s[s.len()-max..]` slicing panics — and a panic here used to poison
+/// a shared lock and cascade across the whole worker pool.
+fn safe_tail(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
 }
 
 /// Build a human error message for a non-zero encoder exit from its diagnostics:
@@ -1494,8 +1640,7 @@ fn encoder_error_message(diag: &EncodeDiag) -> String {
         // Surface the last ~400 chars of stderr inline; the full tail still goes
         // to the CSV `stderr_excerpt` column and the verbose debug log.
         let snippet = if tail.len() > 400 {
-            let start = tail.len() - 400;
-            format!("…{}", &tail[start..])
+            format!("…{}", safe_tail(tail, 400))
         } else {
             tail.to_string()
         };
@@ -1640,7 +1785,7 @@ fn fallback_stderr_suffix(tail: &str) -> String {
     if t.is_empty() {
         return String::new();
     }
-    let snippet = if t.len() > 300 { &t[t.len() - 300..] } else { t };
+    let snippet = safe_tail(t, 300);
     format!(" — {}", snippet.replace(['\r', '\n'], " ").trim())
 }
 
@@ -1833,7 +1978,7 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     let stderr = child.stderr.take();
     // Track this child by file index so cancel can kill ALL active encoders
     // (multiple files run in parallel now).
-    job.children.lock().expect("children lock").insert(index, child);
+    job.children.lock_recover().insert(index, child);
 
     // Drain stdout so the pipe can never fill and block the child.
     let out_handle = stdout.map(|mut pipe| {
@@ -1857,14 +2002,14 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     let mut cancelled = false;
     let exit_status: Option<std::process::ExitStatus> = loop {
         if job.cancel.load(Ordering::SeqCst) {
-            if let Some(c) = job.children.lock().expect("children lock").get_mut(&index) {
+            if let Some(c) = job.children.lock_recover().get_mut(&index) {
                 let _ = c.kill();
             }
             cancelled = true;
             break None;
         }
         let poll = {
-            let mut guard = job.children.lock().expect("children lock");
+            let mut guard = job.children.lock_recover();
             match guard.get_mut(&index) {
                 // Missing means the handle vanished unexpectedly — treat as failure.
                 None => break None,
@@ -1883,7 +2028,7 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     };
 
     // Reap the child and drop its handle; readers finish once the pipes close.
-    if let Some(mut c) = job.children.lock().expect("children lock").remove(&index) {
+    if let Some(mut c) = job.children.lock_recover().remove(&index) {
         let _ = c.wait();
     }
     if let Some(h) = out_handle {
@@ -2119,7 +2264,7 @@ fn write_manifest(job: &CompressJob) {
     s.push_str("{\"id\":");
     push_json_string(&mut s, &job.id);
     s.push_str(",\"status\":");
-    push_json_string(&mut s, &job.status.lock().expect("status lock"));
+    push_json_string(&mut s, &job.status.lock_recover());
     s.push_str(",\"preset\":");
     push_json_string(&mut s, &job.preset);
     s.push_str(",\"recycleOriginals\":");
@@ -2159,7 +2304,7 @@ fn push_file_json(s: &mut String, f: &FileState) {
     s.push_str(",\"kind\":");
     push_json_string(s, f.kind.as_str());
     s.push_str(",\"status\":");
-    push_json_string(s, &f.status.lock().expect("status lock"));
+    push_json_string(s, &f.status.lock_recover());
     s.push_str(",\"pct\":");
     s.push_str(&f.pct.load(Ordering::Relaxed).to_string());
     s.push_str(",\"origBytes\":");
@@ -2169,9 +2314,9 @@ fn push_file_json(s: &mut String, f: &FileState) {
     s.push_str(",\"recycled\":");
     s.push_str(if f.recycled.load(Ordering::Relaxed) { "true" } else { "false" });
     s.push_str(",\"outPath\":");
-    push_json_string(s, &f.out_path.lock().expect("out lock"));
+    push_json_string(s, &f.out_path.lock_recover());
     s.push_str(",\"error\":");
-    match f.error.lock().expect("err lock").as_ref() {
+    match f.error.lock_recover().as_ref() {
         Some(e) => push_json_string(s, e),
         None => s.push_str("null"),
     }
@@ -2181,9 +2326,9 @@ fn push_file_json(s: &mut String, f: &FileState) {
     let newb = f.new_bytes.load(Ordering::Relaxed);
     let saved = orig.saturating_sub(newb);
     s.push_str(",\"reason\":");
-    push_json_string(s, &f.reason.lock().expect("reason lock"));
+    push_json_string(s, &f.reason.lock_recover());
     s.push_str(",\"encoder\":");
-    push_json_string(s, &f.encoder.lock().expect("encoder lock"));
+    push_json_string(s, &f.encoder.lock_recover());
     s.push_str(",\"savedBytes\":");
     s.push_str(&saved.to_string());
     s.push_str(",\"pctSaved\":");
@@ -2199,7 +2344,7 @@ pub(crate) fn job_full_json(job: &CompressJob) -> String {
     s.push_str("{\"id\":");
     push_json_string(&mut s, &job.id);
     s.push_str(",\"status\":");
-    push_json_string(&mut s, &job.status.lock().expect("status lock"));
+    push_json_string(&mut s, &job.status.lock_recover());
     s.push_str(",\"total\":");
     s.push_str(&job.total.to_string());
     s.push_str(",\"savedBytes\":");
@@ -2338,7 +2483,7 @@ fn manifest_mtime_ms(path: &Path) -> u64 {
 fn summary_from_live(job: &CompressJob) -> JobSummary {
     let (mut done, mut errors, mut skipped) = (0usize, 0usize, 0usize);
     for f in &job.files {
-        match f.status.lock().expect("status lock").as_str() {
+        match f.status.lock_recover().as_str() {
             "done" => done += 1,
             "error" => errors += 1,
             "skipped" => skipped += 1,
@@ -2355,7 +2500,7 @@ fn summary_from_live(job: &CompressJob) -> JobSummary {
     let mtime = manifest_mtime_ms(&job.manifest_path);
     JobSummary {
         id: job.id.clone(),
-        status: job.status.lock().expect("status lock").clone(),
+        status: job.status.lock_recover().clone(),
         preset: job.preset.clone(),
         total,
         done,
@@ -2452,7 +2597,7 @@ pub(crate) fn list_jobs_json(state: &AppState) -> String {
     let mut summaries: Vec<JobSummary> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     {
-        let jobs = state.compress_jobs.lock().expect("compress_jobs lock");
+        let jobs = state.compress_jobs.lock_recover();
         for job in jobs.values() {
             seen.insert(job.id.clone());
             summaries.push(summary_from_live(job));
@@ -2778,6 +2923,87 @@ mod manifest_tests {
         assert_eq!(*back.files[1].status.lock().unwrap(), "pending");
         // Saved bytes from the completed file are carried into the resumed job.
         assert_eq!(back.saved_bytes.load(Ordering::Relaxed), 600);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The core regression test for the 116→39 halt: a worker that panics WHILE
+    /// HOLDING a shared lock (the exact poisoning scenario) must not take the
+    /// pool down. The panicking file is recorded as a per-file internal error and
+    /// every other file in the batch still completes — and the poisoned shared
+    /// lock is still usable by the other workers (recovered, not propagated).
+    #[test]
+    fn panicking_file_does_not_halt_batch() {
+        use std::panic::AssertUnwindSafe;
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        // Three files; index 1 will panic mid-processing. Real files aren't
+        // needed (we drive the loop directly), but give them sizes so the run is
+        // representative.
+        let job = create_job(
+            &["a.bin".to_string(), "b.bin".to_string(), "c.bin".to_string()],
+            "balanced",
+            &CompressOptions::default(),
+        );
+        for f in &job.files {
+            f.orig_bytes.store(10, Ordering::Relaxed);
+        }
+
+        let counts = Arc::new(Counts::default());
+        let schedule = Arc::new(vec![0usize, 1, 2]);
+        let cursor = Arc::new(AtomicUsize::new(0));
+
+        // This mirrors run_job's worker loop (catch_unwind + record_internal_error)
+        // exactly, exercising the real resilience helpers.
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let job = Arc::clone(&job);
+            let counts = Arc::clone(&counts);
+            let schedule = Arc::clone(&schedule);
+            let cursor = Arc::clone(&cursor);
+            handles.push(std::thread::spawn(move || loop {
+                let k = cursor.fetch_add(1, O::Relaxed);
+                if k >= schedule.len() {
+                    break;
+                }
+                let i = schedule[k];
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    let f = &job.files[i];
+                    *f.status.lock_recover() = "running".to_string();
+                    if i == 1 {
+                        // Panic WHILE holding the shared events lock → poisons it.
+                        // The old `.lock().expect(...)` everywhere else would then
+                        // cascade-panic; `lock_recover` must keep the pool alive.
+                        let _held = job.events.lock_recover();
+                        panic!("boom while holding events lock");
+                    }
+                    // A normal success path also touches the shared events lock.
+                    job.emit(ev_file_done(i, "", 10, 10, 0, false, "done"));
+                    *f.status.lock_recover() = "done".to_string();
+                    counts.done.fetch_add(1, O::Relaxed);
+                }));
+                if let Err(payload) = result {
+                    let msg = panic_message(payload.as_ref());
+                    // This itself locks the now-poisoned events lock via job.emit.
+                    record_internal_error(&job, i, &counts, &msg);
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+
+        // The batch did NOT halt: 2 done, 1 internal error, nothing left pending.
+        assert_eq!(counts.done.load(Ordering::Relaxed), 2);
+        assert_eq!(counts.error.load(Ordering::Relaxed), 1);
+        assert_eq!(*job.files[0].status.lock_recover(), "done");
+        assert_eq!(*job.files[2].status.lock_recover(), "done");
+        assert_eq!(*job.files[1].status.lock_recover(), "error");
+        assert_eq!(*job.files[1].reason.lock_recover(), "error_internal");
+        // The poisoned shared lock is still usable (would panic pre-fix).
+        job.emit(ev_done(&job.id, 2, 1, 0));
 
         let _ = std::fs::remove_dir_all(&home);
     }

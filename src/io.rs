@@ -11,6 +11,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
+/// Poison-tolerant locking for the process-wide `Mutex`es that several worker
+/// threads share (compression pool, gates). If one worker panics while holding a
+/// lock the `Mutex` becomes poisoned; a plain `.lock().unwrap()`/`.expect()` on
+/// every *other* worker would then panic too, cascading one failure into the
+/// whole pool dying. Recovering the inner guard instead (the data is just
+/// bookkeeping/bytes, never left in a torn state across a panic here) keeps a
+/// single failing file from taking the batch down with it.
+pub(crate) trait LockRecover<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockRecover<T> for Mutex<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 pub(crate) fn reveal_path(path: &str) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -154,7 +171,7 @@ impl ScanThreadPermit {
 impl Drop for ScanThreadPermit {
     fn drop(&mut self) {
         let gate = scan_gate();
-        let mut available = gate.available.lock().expect("scan gate poisoned");
+        let mut available = gate.available.lock_recover();
         *available += self.count;
         // A waiting scan may now have enough slots, so wake all and let each
         // re-check its own `want` under the lock.
@@ -170,9 +187,9 @@ impl Drop for ScanThreadPermit {
 pub(crate) fn acquire_scan_threads(requested: usize) -> ScanThreadPermit {
     let want = requested.clamp(1, scan_thread_budget());
     let gate = scan_gate();
-    let mut available = gate.available.lock().expect("scan gate poisoned");
+    let mut available = gate.available.lock_recover();
     while *available < want {
-        available = gate.ready.wait(available).expect("scan gate poisoned");
+        available = gate.ready.wait(available).unwrap_or_else(|e| e.into_inner());
     }
     *available -= want;
     ScanThreadPermit { count: want }
@@ -258,7 +275,7 @@ pub(crate) struct CompressPermit {
 impl Drop for CompressPermit {
     fn drop(&mut self) {
         let gate = compress_gate();
-        let mut s = gate.state.lock().expect("compress gate poisoned");
+        let mut s = gate.state.lock_recover();
         match self.lane {
             CompressLane::VideoCpu => s.video_cpu += 1,
             CompressLane::Gpu => s.gpu += 1,
@@ -286,7 +303,7 @@ pub(crate) fn acquire_compress(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Option<CompressPermit> {
     let gate = compress_gate();
-    let mut s = gate.state.lock().expect("compress gate poisoned");
+    let mut s = gate.state.lock_recover();
     loop {
         if cancel.load(Ordering::SeqCst) {
             return None;
@@ -299,7 +316,7 @@ pub(crate) fn acquire_compress(
         let (g, _to) = gate
             .ready
             .wait_timeout(s, std::time::Duration::from_millis(200))
-            .expect("compress gate poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         s = g;
     }
 }

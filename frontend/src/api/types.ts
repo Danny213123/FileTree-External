@@ -683,8 +683,9 @@ export interface CompressLogRow {
   error: string;
   /** Precise outcome code. One of: `success`, `skipped_no_gain`,
    *  `error_tool_missing`, `error_unsupported`, `error_encoder`,
-   *  `error_output_empty`, `error_source_missing`, `error_spawn`. Falls back to
-   *  `status` for rows written before the diagnostics columns existed. */
+   *  `error_output_empty`, `error_source_missing`, `error_cloud_placeholder`,
+   *  `error_spawn`, `error_internal`, `gpu_fallback`. Falls back to `status` for
+   *  rows written before the diagnostics columns existed. */
   reason: string;
   /** Encoder process exit code, or `null` when no process ran / none produced. */
   exitCode: number | null;
