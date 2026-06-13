@@ -749,3 +749,216 @@ pub(crate) fn install_json(tool: &str) -> String {
     }
     s
 }
+
+// ── GPU encode probe (definitive HW-encode test + CPU/GPU auto-tune) ─────────
+
+/// Write a tiny, valid YUV4MPEG2 (`.y4m`) clip to a temp file for a real encode
+/// test. Generated in pure Rust — no bundled binary asset, no external tool —
+/// and decodable by HandBrake's libav demuxer. 128×128, 8 frames of a moving
+/// gradient (real content so the encoder actually does work). Returns the path.
+fn write_test_clip() -> Option<PathBuf> {
+    const W: usize = 128;
+    const H: usize = 128;
+    const FRAMES: usize = 8;
+    let y_size = W * H;
+    let c_size = (W / 2) * (H / 2);
+    let mut data: Vec<u8> = Vec::with_capacity(64 + FRAMES * (6 + y_size + 2 * c_size));
+    data.extend_from_slice(format!("YUV4MPEG2 W{W} H{H} F25:1 Ip A1:1 C420jpeg\n").as_bytes());
+    for f in 0..FRAMES {
+        data.extend_from_slice(b"FRAME\n");
+        // Luma: a diagonal gradient that shifts per frame (gives the encoder
+        // motion + detail, so a HW path that no-ops on a flat frame still runs).
+        for j in 0..H {
+            for i in 0..W {
+                data.push(((i + j + f * 16) & 0xff) as u8);
+            }
+        }
+        // Neutral chroma planes.
+        data.extend(std::iter::repeat(128u8).take(2 * c_size));
+    }
+    let path = std::env::temp_dir().join("filetree_gpuprobe.y4m");
+    std::fs::write(&path, &data).ok()?;
+    Some(path)
+}
+
+/// Outcome of one encode probe.
+struct ProbeOutcome {
+    encoder: String,
+    is_gpu: bool,
+    success: bool,
+    ms: u128,
+    out_bytes: u64,
+    exit_code: Option<i32>,
+    stderr_tail: String,
+}
+
+/// Run HandBrake once on the test clip with `encoder_token`, timing the encode
+/// and capturing success/size/stderr. The output temp file is removed.
+fn run_encode_probe(hb: &Path, src: &Path, encoder_token: &str, is_gpu: bool) -> ProbeOutcome {
+    let out = std::env::temp_dir().join(format!("filetree_gpuprobe_out_{encoder_token}.mp4"));
+    let _ = std::fs::remove_file(&out);
+    let enc_preset = if is_gpu { "quality" } else { "veryfast" };
+    let mut cmd = Command::new(hb);
+    cmd.arg("-i").arg(src).arg("-o").arg(&out);
+    cmd.args(["-e", encoder_token, "-q", "30", "--encoder-preset", enc_preset]);
+    if let Some(dir) = hb.parent() {
+        if dir.is_dir() {
+            cmd.current_dir(dir);
+        }
+    }
+    no_window(&mut cmd);
+    let start = Instant::now();
+    let result = cmd.output();
+    let ms = start.elapsed().as_millis();
+    let outcome = match result {
+        Ok(o) => {
+            let out_bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+            let success = o.status.success() && out_bytes > 0;
+            let mut tail = String::from_utf8_lossy(&o.stderr).into_owned();
+            let trimmed = tail.trim();
+            if trimmed.len() > 600 {
+                tail = trimmed[trimmed.len() - 600..].to_string();
+            } else {
+                tail = trimmed.to_string();
+            }
+            ProbeOutcome {
+                encoder: encoder_token.to_string(),
+                is_gpu,
+                success,
+                ms,
+                out_bytes,
+                exit_code: o.status.code(),
+                stderr_tail: tail,
+            }
+        }
+        Err(e) => ProbeOutcome {
+            encoder: encoder_token.to_string(),
+            is_gpu,
+            success: false,
+            ms,
+            out_bytes: 0,
+            exit_code: None,
+            stderr_tail: format!("failed to start HandBrakeCLI: {e}"),
+        },
+    };
+    let _ = std::fs::remove_file(&out);
+    outcome
+}
+
+fn push_probe_fields(s: &mut String, p: &ProbeOutcome) {
+    s.push_str("\"encoder\":");
+    push_json_string(s, &p.encoder);
+    s.push_str(&format!(",\"isGpu\":{}", p.is_gpu));
+    s.push_str(&format!(",\"success\":{}", p.success));
+    s.push_str(&format!(",\"ms\":{}", p.ms));
+    s.push_str(&format!(",\"outBytes\":{}", p.out_bytes));
+    s.push_str(",\"exitCode\":");
+    match p.exit_code {
+        Some(c) => s.push_str(&c.to_string()),
+        None => s.push_str("null"),
+    }
+    s.push_str(",\"stderr\":");
+    push_json_string(s, &p.stderr_tail);
+}
+
+/// Handle `POST /api/compress-tools/test-gpu`: a definitive hardware-encode check
+/// that actually runs the resolved GPU encoder on a tiny generated clip — beyond
+/// `-h`/adapter inference. `{ok:false,error}` when HandBrake is missing or no GPU
+/// encoder resolves; otherwise `{ok:true, <probe fields>}` with `success` telling
+/// whether the GPU encode genuinely worked.
+pub(crate) fn test_gpu_json(encoder: &str, codec: &str) -> String {
+    let hb = detect_handbrake();
+    let Some(hb_path) = hb.path.as_ref() else {
+        return "{\"ok\":false,\"error\":\"HandBrakeCLI not found\"}".to_string();
+    };
+    let (caps, _ok, _raw) = detect_handbrake_caps_and_raw(hb_path);
+    let hw = probe_gpu_hardware();
+    // Resolve what the real pipeline would use for a GPU run of this codec.
+    let enc = crate::compress_job::select_video_encoder(encoder, codec, true, &caps, hw);
+    if !enc.is_gpu {
+        let mut s = String::from("{\"ok\":false,\"error\":");
+        push_json_string(
+            &mut s,
+            "No GPU encoder is available for this codec/selection (would run on the CPU).",
+        );
+        s.push_str(",\"resolvedEncoder\":");
+        push_json_string(&mut s, &enc.hb);
+        s.push('}');
+        return s;
+    }
+    let Some(clip) = write_test_clip() else {
+        return "{\"ok\":false,\"error\":\"Could not create a test clip\"}".to_string();
+    };
+    let probe = run_encode_probe(hb_path, &clip, &enc.hb, true);
+    let _ = std::fs::remove_file(&clip);
+    let mut s = String::from("{\"ok\":true,");
+    push_probe_fields(&mut s, &probe);
+    s.push('}');
+    s
+}
+
+/// Handle `POST /api/compress-tools/autotune`: sample-encode the CPU software
+/// encoder and the best available GPU encoder on the tiny clip, then recommend
+/// the faster of the two that actually succeeded. `{ok:true, cpu:{…}, gpu:{…}?,
+/// recommendedEncoder, recommendedUseGpu}`.
+pub(crate) fn autotune_json(codec: &str) -> String {
+    let hb = detect_handbrake();
+    let Some(hb_path) = hb.path.as_ref() else {
+        return "{\"ok\":false,\"error\":\"HandBrakeCLI not found\"}".to_string();
+    };
+    let (caps, _ok, _raw) = detect_handbrake_caps_and_raw(hb_path);
+    let hw = probe_gpu_hardware();
+    let Some(clip) = write_test_clip() else {
+        return "{\"ok\":false,\"error\":\"Could not create a test clip\"}".to_string();
+    };
+
+    // CPU baseline: force the software encoder (use_gpu=false → x264/x265/svt_av1).
+    let cpu_enc = crate::compress_job::select_video_encoder("x264", codec, false, &caps, hw);
+    let cpu = run_encode_probe(hb_path, &clip, &cpu_enc.hb, false);
+
+    // Best GPU encoder for the codec (auto preference order), if any resolves.
+    let gpu_enc = crate::compress_job::select_video_encoder("auto", codec, true, &caps, hw);
+    let gpu = if gpu_enc.is_gpu {
+        Some(run_encode_probe(hb_path, &clip, &gpu_enc.hb, true))
+    } else {
+        None
+    };
+    let _ = std::fs::remove_file(&clip);
+
+    // Recommend the faster encoder that succeeded; prefer GPU on a tie since it
+    // offloads the CPU. Fall back to CPU when GPU is unavailable or failed.
+    let (rec_encoder, rec_use_gpu): (String, bool) = match &gpu {
+        Some(g) if g.success && (!cpu.success || g.ms <= cpu.ms) => {
+            // Map the resolved HW token back to a UI encoder id.
+            let id = if g.encoder.starts_with("nvenc") {
+                "nvenc"
+            } else if g.encoder.starts_with("qsv") {
+                "qsv"
+            } else if g.encoder.starts_with("vce") {
+                "vce"
+            } else {
+                "auto"
+            };
+            (id.to_string(), true)
+        }
+        _ => ("x264".to_string(), false),
+    };
+
+    let mut s = String::from("{\"ok\":true,\"cpu\":{");
+    push_probe_fields(&mut s, &cpu);
+    s.push('}');
+    s.push_str(",\"gpu\":");
+    match &gpu {
+        Some(g) => {
+            s.push('{');
+            push_probe_fields(&mut s, g);
+            s.push('}');
+        }
+        None => s.push_str("null"),
+    }
+    s.push_str(",\"recommendedEncoder\":");
+    push_json_string(&mut s, &rec_encoder);
+    s.push_str(&format!(",\"recommendedUseGpu\":{rec_use_gpu}"));
+    s.push('}');
+    s
+}

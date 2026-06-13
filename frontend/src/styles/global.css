@@ -3958,6 +3958,7 @@ input:focus, select:focus {
   border: 1px solid var(--border-4); border-radius: 6px; padding: 6px 8px; overflow-wrap: anywhere;
 }
 .compress-perf-note code { font-family: var(--mono, monospace); }
+.compress-perf-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
 .compress-perf-evidence { width: 100%; }
 .compress-perf-evidence summary { cursor: pointer; }
 .compress-perf-raw {

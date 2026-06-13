@@ -1324,6 +1324,51 @@ export async function installCompressTool(
   };
 }
 
+/** One encode-probe result (a real HandBrake run on a tiny generated clip). */
+export interface EncodeProbe {
+  encoder: string;
+  isGpu: boolean;
+  success: boolean;
+  ms: number;
+  outBytes: number;
+  exitCode: number | null;
+  stderr: string;
+}
+
+export interface GpuTestResult extends Partial<EncodeProbe> {
+  ok: boolean;
+  error?: string;
+  resolvedEncoder?: string;
+}
+
+export interface AutotuneResult {
+  ok: boolean;
+  error?: string;
+  cpu?: EncodeProbe;
+  gpu?: EncodeProbe | null;
+  recommendedEncoder?: string;
+  recommendedUseGpu?: boolean;
+}
+
+/** Definitive GPU-encoder test: runs the resolved HW encoder on a tiny clip
+ *  (token-authed POST). Never throws — a failure surfaces as `{ok:false}`. */
+export async function testGpuEncoder(
+  encoder: string,
+  codec: string,
+): Promise<GpuTestResult> {
+  const r = await postMutation("/api/compress-tools/test-gpu", { encoder, codec });
+  if (!r.ok) return { ok: false, error: mutateErrorText(r) };
+  return (r.data ?? { ok: false, error: "No response" }) as GpuTestResult;
+}
+
+/** Auto-tune: sample-encode CPU vs GPU on a tiny clip and recommend the faster
+ *  (token-authed POST). Never throws. */
+export async function autotuneCompress(codec: string): Promise<AutotuneResult> {
+  const r = await postMutation("/api/compress-tools/autotune", { codec });
+  if (!r.ok) return { ok: false, error: mutateErrorText(r) };
+  return (r.data ?? { ok: false, error: "No response" }) as AutotuneResult;
+}
+
 /** Start a compression job. Returns the new job id (throws on failure so the
  *  caller can surface why the job couldn't start). */
 export async function startCompressJob(body: CompressJobRequest): Promise<string> {

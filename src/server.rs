@@ -1174,6 +1174,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         "/api/compress-jobs/cancel",
         "/api/compress-jobs/retry",
         "/api/compress-tools/install",
+        "/api/compress-tools/test-gpu",
+        "/api/compress-tools/autotune",
         "/api/exit",
     ];
     let is_destructive = DESTRUCTIVE_ROUTES.contains(&route.as_str());
@@ -3350,6 +3352,20 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let body_str = String::from_utf8_lossy(&request.body);
             let tool = extract_json_str(&body_str, "tool").unwrap_or_default();
             respond_json(&mut stream, 200, "OK", &crate::compress_tools::install_json(&tool))
+        }
+        // Definitive HW-encode check: actually runs the resolved GPU encoder on a
+        // tiny generated clip (beyond `-h`/adapter inference).
+        "/api/compress-tools/test-gpu" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let encoder = extract_json_str(&body_str, "encoder").unwrap_or_else(|| "auto".to_string());
+            let codec = extract_json_str(&body_str, "codec").unwrap_or_else(|| "h264".to_string());
+            respond_json(&mut stream, 200, "OK", &crate::compress_tools::test_gpu_json(&encoder, &codec))
+        }
+        // Sample-encode CPU vs GPU on the tiny clip and recommend the faster.
+        "/api/compress-tools/autotune" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let codec = extract_json_str(&body_str, "codec").unwrap_or_else(|| "h264".to_string());
+            respond_json(&mut stream, 200, "OK", &crate::compress_tools::autotune_json(&codec))
         }
         // Poll fallback: full job JSON for `GET /api/compress-jobs/<id>`. Placed
         // after the exact compress-jobs sub-routes so they match first.

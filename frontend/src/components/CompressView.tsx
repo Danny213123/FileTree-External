@@ -30,6 +30,10 @@ import {
   compressLogCsvUrl,
   compressDebugPath,
   compressDebugLogUrl,
+  testGpuEncoder,
+  autotuneCompress,
+  type GpuTestResult,
+  type AutotuneResult,
 } from "../api/client";
 import { invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import { formatBytes } from "../utils/formatBytes";
@@ -101,7 +105,7 @@ function loadPerf(): CompressPerfSettings {
         ? (p.encoder as CompressEncoder)
         : "auto",
       useGpu: typeof p.useGpu === "boolean" ? p.useGpu : true,
-      codec: p.codec === "h265" ? "h265" : "h264",
+      codec: p.codec === "h265" || p.codec === "av1" ? p.codec : "h264",
       zipLevel: typeof p.zipLevel === "number" && p.zipLevel >= -1 && p.zipLevel <= 9 ? Math.floor(p.zipLevel) : -1,
     };
   } catch {
@@ -288,6 +292,11 @@ export function CompressView({
   const finalizedRef = useRef(false);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // GPU test / auto-tune (definitive HW-encode probes on a tiny clip).
+  const [gpuTest, setGpuTest] = useState<GpuTestResult | null>(null);
+  const [autotune, setAutotune] = useState<AutotuneResult | null>(null);
+  const [probing, setProbing] = useState<"" | "test" | "tune">("");
+
   // ── Tool detection ─────────────────────────────────────────────────────────
   const refreshTools = useCallback(async (signal?: AbortSignal) => {
     const t = await fetchCompressTools(signal);
@@ -308,6 +317,36 @@ export function CompressView({
       return next;
     });
   }, []);
+
+  // Definitive GPU-encoder test: a real HW encode of a tiny generated clip.
+  const onTestGpu = useCallback(async () => {
+    setProbing("test");
+    setGpuTest(null);
+    try {
+      const res = await testGpuEncoder(perf.encoder, perf.codec);
+      setGpuTest(res);
+    } finally {
+      setProbing("");
+    }
+  }, [perf.encoder, perf.codec]);
+
+  // Auto-tune: sample-encode CPU vs GPU and apply the faster recommendation.
+  const onAutotune = useCallback(async () => {
+    setProbing("tune");
+    setAutotune(null);
+    try {
+      const res = await autotuneCompress(perf.codec);
+      setAutotune(res);
+      if (res.ok && res.recommendedEncoder) {
+        updatePerf({
+          encoder: res.recommendedEncoder as CompressEncoder,
+          useGpu: res.recommendedUseGpu ?? perf.useGpu,
+        });
+      }
+    } finally {
+      setProbing("");
+    }
+  }, [perf.codec, perf.useGpu, updatePerf]);
 
   // Hardware-derived default: if no perf prefs were ever saved and NO GPU is
   // effectively available (no `-h` token AND no physical adapter), default GPU
@@ -1136,6 +1175,12 @@ export function CompressView({
               <option value="h265" disabled={!!tools && !tools.caps?.x265 && !tools.caps?.nvencH265 && !tools.caps?.qsvH265 && !tools.caps?.vceH265}>
                 H.265 (smaller)
               </option>
+              {/* AV1: hardware AV1 needs a recent GPU (gated on the -h AV1 caps);
+                  CPU SVT-AV1 is always available as a (slow) fallback, so the
+                  option is never disabled, but the label flags HW availability. */}
+              <option value="av1">
+                AV1 (smallest{tools && (tools.caps?.nvencAv1 || tools.caps?.qsvAv1 || tools.caps?.vceAv1) ? ", GPU-capable" : ", CPU only"})
+              </option>
             </select>
           </div>
           <label className="compress-toggle">
@@ -1215,6 +1260,45 @@ export function CompressView({
               </div>
               {tools.gpuHardware && tools.gpuHardware.names.length > 0 && (
                 <div className="compress-perf-hint">GPU adapter(s): {tools.gpuHardware.names.join(", ")}</div>
+              )}
+              {/* Definitive checks: actually run the encoder(s) on a tiny clip. */}
+              <div className="compress-perf-actions">
+                <button
+                  type="button"
+                  className="compress-btn"
+                  onClick={() => void onTestGpu()}
+                  disabled={probing !== ""}
+                  title="Run the resolved GPU encoder on a tiny generated clip to confirm it really encodes"
+                >
+                  {probing === "test" ? "Testing…" : "Test GPU encoder"}
+                </button>
+                <button
+                  type="button"
+                  className="compress-btn"
+                  onClick={() => void onAutotune()}
+                  disabled={probing !== ""}
+                  title="Sample-encode CPU vs GPU and pick the faster encoder"
+                >
+                  {probing === "tune" ? "Tuning…" : "Auto-tune CPU vs GPU"}
+                </button>
+              </div>
+              {gpuTest && (
+                <div className={gpuTest.ok && gpuTest.success ? "compress-perf-note" : "compress-perf-warn"}>
+                  {gpuTest.ok
+                    ? gpuTest.success
+                      ? `GPU encode OK: ${gpuTest.encoder} in ${gpuTest.ms} ms (${formatBytes(gpuTest.outBytes ?? 0)}).`
+                      : `GPU encode FAILED: ${gpuTest.encoder ?? "?"}${gpuTest.exitCode != null ? ` (exit ${gpuTest.exitCode})` : ""}. ${gpuTest.stderr ?? ""}`
+                    : `Could not test: ${gpuTest.error ?? "unknown error"}`}
+                </div>
+              )}
+              {autotune && (
+                <div className="compress-perf-note">
+                  {autotune.ok
+                    ? `Auto-tune: CPU ${autotune.cpu?.success ? `${autotune.cpu.ms} ms` : "failed"}` +
+                      `, GPU ${autotune.gpu ? (autotune.gpu.success ? `${autotune.gpu.ms} ms` : "failed") : "n/a"}` +
+                      ` → using ${autotune.recommendedEncoder}${autotune.recommendedUseGpu ? " (GPU)" : " (CPU)"}.`
+                    : `Auto-tune failed: ${autotune.error ?? "unknown error"}`}
+                </div>
               )}
               {tools.handbrakeEncodersRaw && (
                 <details className="compress-perf-evidence">

@@ -237,7 +237,7 @@ impl CompressOptions {
     }
     fn norm_codec(c: &str) -> String {
         match c {
-            "h264" | "h265" => c.to_string(),
+            "h264" | "h265" | "av1" => c.to_string(),
             _ => "h264".to_string(),
         }
     }
@@ -437,16 +437,24 @@ pub(crate) fn select_video_encoder(
     caps: &HandbrakeCaps,
     hw: &compress_tools::GpuHardware,
 ) -> VideoEncoder {
+    let av1 = codec == "av1";
     let h265 = codec == "h265";
+    // CPU software encoder per codec: SVT-AV1 for AV1, x265 for HEVC (when the
+    // build exposes it), else x264.
     let cpu = || VideoEncoder {
-        hb: if h265 && caps.x265 { "x265".to_string() } else { "x264".to_string() },
+        hb: if av1 {
+            "svt_av1".to_string()
+        } else if h265 && caps.x265 {
+            "x265".to_string()
+        } else {
+            "x264".to_string()
+        },
         lane: CompressLane::VideoCpu,
         is_gpu: false,
     };
     let gpu = |hb: &str| VideoEncoder { hb: hb.to_string(), lane: CompressLane::Gpu, is_gpu: true };
-    let tok = |vendor: &str| -> String {
-        format!("{vendor}_{}", if h265 { "h265" } else { "h264" })
-    };
+    let suffix = if av1 { "av1" } else if h265 { "h265" } else { "h264" };
+    let tok = |vendor: &str| -> String { format!("{vendor}_{suffix}") };
 
     if !use_gpu || encoder == "x264" {
         return cpu();
@@ -459,9 +467,20 @@ pub(crate) fn select_video_encoder(
     // A failed attempt now falls back to CPU *loudly* (see run_video), so this
     // never silently wastes work — and we still avoid attempts when there is no
     // matching adapter at all (unless the user explicitly picked that vendor).
-    let nvenc_ok = caps.nvenc_h264 || caps.nvenc_h265 || hw.nvidia;
-    let qsv_ok = caps.qsv_h264 || caps.qsv_h265 || hw.intel;
-    let vce_ok = caps.vce_h264 || caps.vce_h265 || hw.amd;
+    //
+    // AV1 is gated more tightly: only fairly recent GPUs encode AV1, so the mere
+    // presence of an adapter does NOT imply AV1 support. We require the `-h` AV1
+    // token; absent that, AV1 stays on the CPU SVT-AV1 encoder (no wasted GPU
+    // attempt that would just fall back).
+    let (nvenc_ok, qsv_ok, vce_ok) = if av1 {
+        (caps.nvenc_av1, caps.qsv_av1, caps.vce_av1)
+    } else {
+        (
+            caps.nvenc_h264 || caps.nvenc_h265 || hw.nvidia,
+            caps.qsv_h264 || caps.qsv_h265 || hw.intel,
+            caps.vce_h264 || caps.vce_h265 || hw.amd,
+        )
+    };
 
     // Explicit vendor pick: honor it even with no adapter detected (the user
     // asked for it; the loud fallback explains any failure).
@@ -501,6 +520,14 @@ fn video_quality(hb_encoder: &str, preset: &str) -> (String, Option<&'static str
     };
     let enc_preset = if gpu {
         "quality"
+    } else if hb_encoder.starts_with("svt_av1") {
+        // SVT-AV1 uses a numeric speed preset (0 slowest/best … 13 fastest).
+        // Bias toward "slower but smaller" for the quality-focused presets.
+        match preset {
+            "max" => "9",
+            "high" => "5",
+            _ => "7",
+        }
     } else {
         match preset {
             "max" => "veryfast",
@@ -1125,6 +1152,47 @@ fn is_already_compressed_ext(path: &Path) -> bool {
     )
 }
 
+/// Pre-skip heuristic for image/video inputs: returns a reason string when an
+/// encode is very unlikely to shrink the file, so the encoder is never spawned.
+/// Extension-only (no media probe), deliberately conservative so a genuinely
+/// compressible file is never skipped:
+/// - any image already smaller than 32 KiB,
+/// - an image already in an efficient codec (AVIF/HEIC/WebP) AND under 2 MiB,
+/// - any video already smaller than 1 MiB.
+fn media_pre_skip(kind: FileKind, path: &Path, orig: u64) -> Option<&'static str> {
+    if orig == 0 {
+        return None;
+    }
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match kind {
+        FileKind::Image => {
+            const IMAGE_MIN_BYTES: u64 = 32 * 1024;
+            const EFFICIENT_IMAGE_CAP: u64 = 2 * 1024 * 1024;
+            if orig < IMAGE_MIN_BYTES {
+                Some("image already small")
+            } else if matches!(ext.as_str(), "avif" | "heic" | "webp")
+                && orig < EFFICIENT_IMAGE_CAP
+            {
+                Some("already an efficient image codec")
+            } else {
+                None
+            }
+        }
+        FileKind::Video => {
+            const VIDEO_MIN_BYTES: u64 = 1024 * 1024;
+            if orig < VIDEO_MIN_BYTES {
+                Some("video already small")
+            } else {
+                None
+            }
+        }
+        FileKind::Other => None,
+    }
+}
+
 fn process_file(
     state: &Arc<AppState>,
     job: &Arc<CompressJob>,
@@ -1162,6 +1230,27 @@ fn process_file(
         return FileOutcome::Skipped {
             new_bytes: orig,
             diag: EncodeDiag { command: "pre-skip (already compressed)".to_string(), exit_code: Some(0), stderr_tail: String::new() },
+            meta,
+        };
+    }
+
+    // Pre-skip heuristic for media: avoid spawning an encoder when a shrink is
+    // very unlikely — an image already in an efficient codec, or media already
+    // small enough that the encode overhead (and the real risk of growing it)
+    // isn't worth it. Recorded as a no-gain skip (same outcome the post-encode
+    // size check would produce) but without the wasted encode.
+    if let Some(reason) = media_pre_skip(kind, &input, orig) {
+        let mut meta = EncodeMeta::default();
+        meta.tool = if kind == FileKind::Video { "handbrake" } else { "ffmpeg" }.to_string();
+        meta.tool_version = "pre-skip".to_string();
+        meta.codec_params = format!("pre-skip: {reason}");
+        return FileOutcome::Skipped {
+            new_bytes: orig,
+            diag: EncodeDiag {
+                command: format!("pre-skip ({reason})"),
+                exit_code: Some(0),
+                stderr_tail: String::new(),
+            },
             meta,
         };
     }
@@ -1442,7 +1531,13 @@ fn run_video(
             let _ = std::fs::remove_file(out);
             // Fall back to the CPU software encoder for the chosen codec.
             let cpu = VideoEncoder {
-                hb: if job.codec == "h265" && caps.x265 { "x265".to_string() } else { "x264".to_string() },
+                hb: if job.codec == "av1" {
+                    "svt_av1".to_string()
+                } else if job.codec == "h265" && caps.x265 {
+                    "x265".to_string()
+                } else {
+                    "x264".to_string()
+                },
                 lane: CompressLane::VideoCpu,
                 is_gpu: false,
             };
@@ -1496,7 +1591,19 @@ fn run_handbrake(
 
     let mut cmd = Command::new(hb);
     cmd.arg("-i").arg(input).arg("-o").arg(out);
-    cmd.args(["-e", &enc.hb, "-q", &quality, "-E", "av_aac", "-B", "160", "--optimize"]);
+    cmd.args(["-e", &enc.hb, "-q", &quality]);
+    // Audio: pass through tracks that are ALREADY in a compact lossy codec
+    // (aac/ac3/eac3/mp3) rather than needlessly re-encoding them (wasted work +
+    // a generational quality loss). Anything outside that mask — lossless PCM,
+    // FLAC, TrueHD, DTS-HD, etc., which are NOT compact — falls back to AAC @160k.
+    // HandBrake decides per track, so a file with a mix is handled correctly.
+    cmd.args([
+        "-E", "copy",
+        "-B", "160",
+        "--audio-fallback", "av_aac",
+        "--audio-copy-mask", "aac,ac3,eac3,mp3",
+        "--optimize",
+    ]);
     cmd.args(["--encoder-preset", enc_preset]);
     if !enc.is_gpu {
         // CPU tuning: let x264/x265 use the box's threads for this encode (the
@@ -2375,5 +2482,78 @@ fn ev_done(id: &str, done: usize, errors: usize, saved: u64) -> String {
     s.push_str(&saved.to_string());
     s.push_str("}\n");
     s
+}
+
+#[cfg(test)]
+mod encoder_tests {
+    use super::*;
+    use crate::compress_tools::{GpuHardware, HandbrakeCaps};
+
+    fn no_gpu() -> GpuHardware {
+        GpuHardware::default()
+    }
+
+    #[test]
+    fn av1_falls_back_to_svt_av1_without_hw_token() {
+        // No AV1 -h token and no GPU adapter ⇒ CPU SVT-AV1, regardless of use_gpu.
+        let caps = HandbrakeCaps::default();
+        let enc = select_video_encoder("auto", "av1", true, &caps, &no_gpu());
+        assert_eq!(enc.hb, "svt_av1");
+        assert!(!enc.is_gpu);
+    }
+
+    #[test]
+    fn av1_uses_nvenc_av1_when_token_present() {
+        let caps = HandbrakeCaps { nvenc_av1: true, ..Default::default() };
+        let enc = select_video_encoder("auto", "av1", true, &caps, &no_gpu());
+        assert_eq!(enc.hb, "nvenc_av1");
+        assert!(enc.is_gpu);
+    }
+
+    #[test]
+    fn av1_adapter_without_token_stays_cpu() {
+        // A recent-ish requirement: a mere NVIDIA adapter must NOT imply AV1 HW
+        // support (only newer GPUs encode AV1), so AV1 stays on CPU here.
+        let caps = HandbrakeCaps::default();
+        let hw = GpuHardware { nvidia: true, ..Default::default() };
+        let enc = select_video_encoder("auto", "av1", true, &caps, &hw);
+        assert_eq!(enc.hb, "svt_av1");
+        assert!(!enc.is_gpu);
+    }
+
+    #[test]
+    fn h264_adapter_inference_still_attempts_gpu() {
+        // H.264/H.265 keep the lenient adapter-based inference.
+        let caps = HandbrakeCaps::default();
+        let hw = GpuHardware { nvidia: true, ..Default::default() };
+        let enc = select_video_encoder("auto", "h264", true, &caps, &hw);
+        assert_eq!(enc.hb, "nvenc_h264");
+        assert!(enc.is_gpu);
+    }
+
+    #[test]
+    fn explicit_x264_or_no_gpu_is_cpu() {
+        let caps = HandbrakeCaps { x265: true, ..Default::default() };
+        let hw = GpuHardware { nvidia: true, ..Default::default() };
+        assert_eq!(select_video_encoder("x264", "h264", true, &caps, &hw).hb, "x264");
+        assert_eq!(select_video_encoder("auto", "h265", false, &caps, &hw).hb, "x265");
+    }
+
+    #[test]
+    fn media_pre_skip_rules() {
+        use std::path::Path;
+        // Efficient codec under the cap → skipped; large stays.
+        assert!(media_pre_skip(FileKind::Image, Path::new("a.webp"), 500 * 1024).is_some());
+        assert!(media_pre_skip(FileKind::Image, Path::new("a.webp"), 8 * 1024 * 1024).is_none());
+        // Tiny image of any type → skipped.
+        assert!(media_pre_skip(FileKind::Image, Path::new("a.png"), 4 * 1024).is_some());
+        // Normal JPEG → not skipped.
+        assert!(media_pre_skip(FileKind::Image, Path::new("a.jpg"), 800 * 1024).is_none());
+        // Small video → skipped; larger video → not.
+        assert!(media_pre_skip(FileKind::Video, Path::new("a.mp4"), 500 * 1024).is_some());
+        assert!(media_pre_skip(FileKind::Video, Path::new("a.mp4"), 50 * 1024 * 1024).is_none());
+        // Zero size is unknown → never pre-skip.
+        assert!(media_pre_skip(FileKind::Image, Path::new("a.webp"), 0).is_none());
+    }
 }
 
