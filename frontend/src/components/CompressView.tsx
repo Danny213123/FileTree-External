@@ -297,6 +297,7 @@ export function CompressView({
   const [gpuTest, setGpuTest] = useState<GpuTestResult | null>(null);
   const [autotune, setAutotune] = useState<AutotuneResult | null>(null);
   const [probing, setProbing] = useState<"" | "test" | "tune">("");
+  const [diagCopied, setDiagCopied] = useState(false);
 
   // ── Tool detection ─────────────────────────────────────────────────────────
   const refreshTools = useCallback(async (signal?: AbortSignal) => {
@@ -348,6 +349,99 @@ export function CompressView({
       setProbing("");
     }
   }, [perf.codec, perf.useGpu, updatePerf]);
+
+  // Copy a plain-text diagnostics bundle (HandBrake path/version, `-h` evidence,
+  // GPU adapter info, current encoder/codec settings, and the latest GPU
+  // test / auto-tune outcomes) to the clipboard so it can be pasted into a bug
+  // report. Best-effort: clipboard may be unavailable in some contexts.
+  const onCopyDiagnostics = useCallback(async () => {
+    const lines: string[] = [];
+    lines.push(`FileTree compress diagnostics — ${new Date().toISOString()}`);
+    if (tools) {
+      const hb = tools.handbrake;
+      lines.push(`HandBrake: ${hb.found ? (hb.path || "(on PATH)") : "NOT FOUND"}${hb.version ? ` v${hb.version}` : ""}`);
+      lines.push(`HandBrake -h parse: ${tools.handbrakeHParseOk === false ? "no output (caps unknown)" : "ok"}`);
+      if (tools.image) {
+        lines.push(`Image tool: ${tools.image.found ? (tools.image.path || "(on PATH)") : "NOT FOUND"}${tools.image.kind ? ` [${tools.image.kind}]` : ""}${tools.image.version ? ` v${tools.image.version}` : ""}`);
+      }
+      const tokens = tools.caps
+        ? [
+            (tools.caps.nvencH264 || tools.caps.nvencH265 || tools.caps.nvencAv1) && "nvenc",
+            (tools.caps.qsvH264 || tools.caps.qsvH265 || tools.caps.qsvAv1) && "qsv",
+            (tools.caps.vceH264 || tools.caps.vceH265 || tools.caps.vceAv1) && "vce",
+          ].filter(Boolean).join(", ") || "none"
+        : "unknown";
+      lines.push(`-h GPU tokens: ${tokens}`);
+      lines.push(
+        `Effective GPU encoders: ${
+          anyGpuAvailable(tools)
+            ? [
+                tools.available?.nvenc && `NVENC${tools.available?.nvencAssumed ? "*" : ""}`,
+                tools.available?.qsv && `QSV${tools.available?.qsvAssumed ? "*" : ""}`,
+                tools.available?.vce && `VCE${tools.available?.vceAssumed ? "*" : ""}`,
+              ].filter(Boolean).join(", ") || "available"
+            : "none"
+        } (* = assumed from adapter)`,
+      );
+      if (tools.caps) {
+        lines.push(
+          `Codec caps: x265=${!!tools.caps.x265} nvencH265=${!!tools.caps.nvencH265} qsvH265=${!!tools.caps.qsvH265} vceH265=${!!tools.caps.vceH265} nvencAv1=${!!tools.caps.nvencAv1} qsvAv1=${!!tools.caps.qsvAv1} vceAv1=${!!tools.caps.vceAv1}`,
+        );
+      }
+      if (tools.gpuHardware?.names?.length) {
+        lines.push(`GPU adapter(s): ${tools.gpuHardware.names.join(", ")}`);
+      }
+    } else {
+      lines.push("Tools: not detected yet");
+    }
+    lines.push(`Settings: encoder=${perf.encoder} codec=${perf.codec} useGpu=${perf.useGpu} concurrency=${perf.concurrency} zipLevel=${perf.zipLevel} preset=${preset}`);
+    if (gpuTest) {
+      lines.push(
+        `GPU test: ${
+          gpuTest.ok
+            ? gpuTest.success
+              ? `OK ${gpuTest.encoder} in ${gpuTest.ms} ms (${gpuTest.outBytes ?? 0} bytes)`
+              : `FAILED ${gpuTest.encoder ?? "?"}${gpuTest.exitCode != null ? ` exit ${gpuTest.exitCode}` : ""} ${gpuTest.stderr ?? ""}`
+            : `error ${gpuTest.error ?? "unknown"}`
+        }`,
+      );
+    }
+    if (autotune) {
+      lines.push(
+        `Auto-tune: ${
+          autotune.ok
+            ? `CPU ${autotune.cpu?.success ? `${autotune.cpu.ms} ms` : "failed"}, GPU ${autotune.gpu ? (autotune.gpu.success ? `${autotune.gpu.ms} ms` : "failed") : "n/a"} → ${autotune.recommendedEncoder}${autotune.recommendedUseGpu ? " (GPU)" : " (CPU)"}`
+            : `failed ${autotune.error ?? "unknown"}`
+        }`,
+      );
+    }
+    if (tools?.handbrakeEncodersRaw) {
+      lines.push("HandBrake encoder list (raw):");
+      lines.push(tools.handbrakeEncodersRaw);
+    }
+    const text = lines.join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setDiagCopied(true);
+      window.setTimeout(() => setDiagCopied(false), 2000);
+    } catch {
+      // Fallback: a hidden textarea + execCommand for non-secure contexts.
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        setDiagCopied(true);
+        window.setTimeout(() => setDiagCopied(false), 2000);
+      } catch {
+        // give up silently
+      }
+    }
+  }, [tools, perf, preset, gpuTest, autotune]);
 
   // Hardware-derived default: if no perf prefs were ever saved and NO GPU is
   // effectively available (no `-h` token AND no physical adapter), default GPU
@@ -1300,6 +1394,14 @@ export function CompressView({
                   title="Sample-encode CPU vs GPU and pick the faster encoder"
                 >
                   {probing === "tune" ? "Tuning…" : "Auto-tune CPU vs GPU"}
+                </button>
+                <button
+                  type="button"
+                  className="compress-btn"
+                  onClick={() => void onCopyDiagnostics()}
+                  title="Copy HandBrake path/version, -h evidence, adapter info, and recent probe results to the clipboard"
+                >
+                  {diagCopied ? "Copied!" : "Copy diagnostics"}
                 </button>
               </div>
               {gpuTest && (

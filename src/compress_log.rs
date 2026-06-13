@@ -23,6 +23,13 @@
 //! original columns keep working. A pre-existing file simply gains the new
 //! columns from the next row written (the parser tolerates short rows).
 //!
+//! ## Size cap
+//! Append-only history would otherwise grow without bound. After each append the
+//! file is compacted in place once it crosses [`MAX_BYTES`] (~8 MB): the header
+//! plus the most recent [`KEEP_ROWS`] rows are rewritten atomically via a temp
+//! file + rename. Because compaction drops the file well below the cap it fires
+//! only periodically, never on the hot path of a normal append.
+//!
 //! ## Guarantees
 //! Logging is best-effort: any failure (missing APPDATA, I/O error, …) is
 //! swallowed and never blocks or fails the real compression.
@@ -37,6 +44,13 @@ use crate::export::push_json_string;
 /// CSV header, also used to detect a freshly-created file. Column order MUST
 /// match [`format_row`] and the JSON mapping in [`read_rows_json`].
 const HEADER: &str = "ts,job_id,index,path,name,kind,preset,status,orig_bytes,new_bytes,saved_bytes,pct_saved,ratio,tool,codec_params,duration_ms,out_path,recycled,error,reason,exit_code,tool_version,command,stderr_excerpt\n";
+
+/// Compact the CSV once it grows past ~8 MB so a long-running install's history
+/// can't grow without bound. Compaction keeps the header plus the most recent
+/// [`KEEP_ROWS`] rows (the History tab only ever shows a recent window anyway).
+const MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Rows retained on compaction (most recent).
+const KEEP_ROWS: usize = 5000;
 
 /// One compressed-file record. All fields borrow so this is cheap to build at
 /// the call site (see `run_job`'s outcome arms).
@@ -117,11 +131,64 @@ fn append_line(path: &Path, line: &str) -> io::Result<()> {
         Ok(m) => m.len() == 0,
         Err(_) => true,
     };
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    if needs_header {
-        file.write_all(HEADER.as_bytes())?;
+    {
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        if needs_header {
+            file.write_all(HEADER.as_bytes())?;
+        }
+        file.write_all(line.as_bytes())?;
     }
-    file.write_all(line.as_bytes())
+    // Best-effort compaction once the file crosses the cap. Because compaction
+    // shrinks the file well below the cap it only fires periodically, never on
+    // the hot path of a typical append.
+    compact_if_needed(path);
+    Ok(())
+}
+
+/// When the CSV exceeds [`MAX_BYTES`], rewrite it keeping the header plus the
+/// last [`KEEP_ROWS`] data rows. Atomic via a temp file + rename. Best-effort:
+/// any error leaves the existing (oversized) file untouched. Runs under the
+/// caller's `LOCK`, so no other writer can interleave.
+fn compact_if_needed(path: &Path) {
+    let too_big = fs::metadata(path).map(|m| m.len() >= MAX_BYTES).unwrap_or(false);
+    if !too_big {
+        return;
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let mut records = parse_csv(&text);
+    if records.is_empty() {
+        return;
+    }
+    // Drop a leading header row if present (re-emitted from the constant below).
+    if records.first().map(|r| r.first().map(|c| c == "ts").unwrap_or(false)).unwrap_or(false) {
+        records.remove(0);
+    }
+    let start = records.len().saturating_sub(KEEP_ROWS);
+    let kept = &records[start..];
+
+    let mut out = String::with_capacity(HEADER.len() + kept.len() * 160);
+    out.push_str(HEADER);
+    for rec in kept {
+        for (i, f) in rec.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&csv_escape(f));
+        }
+        out.push('\n');
+    }
+
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if fs::write(&tmp, out.as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    } else {
+        let _ = fs::remove_file(&tmp);
+    }
 }
 
 fn format_row(r: &Row) -> String {
