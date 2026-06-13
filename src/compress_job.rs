@@ -1606,23 +1606,31 @@ fn run_video(
             meta.gpu_fallback = Some(detail);
             let _ = std::fs::remove_file(out);
             // Fall back to the CPU software encoder for the chosen codec.
-            let cpu = VideoEncoder {
-                hb: if job.codec == "av1" {
-                    "svt_av1".to_string()
-                } else if job.codec == "h265" && caps.x265 {
-                    "x265".to_string()
-                } else {
-                    "x264".to_string()
-                },
-                lane: CompressLane::VideoCpu,
-                is_gpu: false,
-            };
+            let cpu = cpu_fallback_encoder(&job.codec, caps);
             // run_handbrake overwrites meta.codec_params with the CPU encoder, so
             // `meta` ends up reflecting the genuine encoder actually used.
             return run_handbrake(job, index, hb, input, out, &job.preset, &cpu, meta);
         }
     }
     result
+}
+
+/// The CPU software encoder to retry on after a GPU encode fails, chosen by the
+/// job's target codec: SVT-AV1 for AV1, x265 for H.265 when the build supports
+/// it (else x264), x264 otherwise. Always a CPU lane, never GPU — this is the
+/// guaranteed-available fallback.
+fn cpu_fallback_encoder(codec: &str, caps: &HandbrakeCaps) -> VideoEncoder {
+    VideoEncoder {
+        hb: if codec == "av1" {
+            "svt_av1".to_string()
+        } else if codec == "h265" && caps.x265 {
+            "x265".to_string()
+        } else {
+            "x264".to_string()
+        },
+        lane: CompressLane::VideoCpu,
+        is_gpu: false,
+    }
 }
 
 /// Compact, single-line suffix of a GPU encoder's stderr tail for the
@@ -2616,6 +2624,26 @@ mod encoder_tests {
     }
 
     #[test]
+    fn cpu_fallback_encoder_by_codec() {
+        // The GPU→CPU fallback never returns a GPU encoder and maps each codec to
+        // its guaranteed CPU software encoder.
+        let no_x265 = HandbrakeCaps::default();
+        let with_x265 = HandbrakeCaps { x265: true, ..Default::default() };
+
+        let av1 = cpu_fallback_encoder("av1", &no_x265);
+        assert_eq!(av1.hb, "svt_av1");
+        assert!(!av1.is_gpu);
+
+        // H.265 only uses x265 when the build actually supports it; else x264.
+        assert_eq!(cpu_fallback_encoder("h265", &with_x265).hb, "x265");
+        assert_eq!(cpu_fallback_encoder("h265", &no_x265).hb, "x264");
+
+        let h264 = cpu_fallback_encoder("h264", &with_x265);
+        assert_eq!(h264.hb, "x264");
+        assert!(!h264.is_gpu);
+    }
+
+    #[test]
     fn media_pre_skip_rules() {
         use std::path::Path;
         // Efficient codec under the cap → skipped; large stays.
@@ -2630,6 +2658,128 @@ mod encoder_tests {
         assert!(media_pre_skip(FileKind::Video, Path::new("a.mp4"), 50 * 1024 * 1024).is_none());
         // Zero size is unknown → never pre-skip.
         assert!(media_pre_skip(FileKind::Image, Path::new("a.webp"), 0).is_none());
+    }
+}
+
+/// Integration tests for the manifest persistence + resume round-trip. These
+/// drive the real [`write_manifest`] / [`job_from_manifest`] pair through a
+/// temporary `APPDATA`/`HOME` so the on-disk `jobs/` directory is isolated.
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// `jobs_dir()` reads `APPDATA`/`HOME` at call time, and Rust runs tests in
+    /// the same process concurrently, so env-mutating tests must be serialized.
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Env var that `jobs_dir()` keys off on this platform.
+    const HOME_VAR: &str = if cfg!(windows) { "APPDATA" } else { "HOME" };
+
+    /// Point `jobs_dir()` at a fresh temp directory and return it. The returned
+    /// guard restores the previous env value on drop.
+    fn redirect_home() -> (PathBuf, EnvGuard) {
+        let prev = std::env::var_os(HOME_VAR);
+        let dir = std::env::temp_dir().join(format!(
+            "ft-manifest-test-{}-{}",
+            std::process::id(),
+            new_job_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp home");
+        // SAFETY: serialized by ENV_LOCK; no other thread reads/writes env here.
+        unsafe { std::env::set_var(HOME_VAR, &dir) };
+        (dir, EnvGuard { prev })
+    }
+
+    struct EnvGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by ENV_LOCK.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(HOME_VAR, v),
+                    None => std::env::remove_var(HOME_VAR),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_round_trip_preserves_options() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let opts = CompressOptions {
+            recycle_originals: false,
+            tag_filename: true,
+            concurrency: 4,
+            encoder: "qsv".to_string(),
+            use_gpu: false,
+            codec: "h265".to_string(),
+            zip_level: 3,
+        };
+        let job = create_job(
+            &["a.mp4".to_string(), "b.png".to_string(), "c.txt".to_string()],
+            "high",
+            &opts,
+        );
+        write_manifest(&job);
+
+        let back = job_from_manifest(&job.id).expect("manifest reloads");
+        assert_eq!(back.preset, "high");
+        assert!(!back.recycle_originals);
+        assert!(back.tag_filename);
+        assert_eq!(back.concurrency, 4);
+        assert_eq!(back.encoder, "qsv");
+        assert!(!back.use_gpu);
+        assert_eq!(back.codec, "h265");
+        assert_eq!(back.zip_level, 3);
+        assert_eq!(back.total, 3);
+        // Kinds survive the round-trip.
+        assert_eq!(back.files[0].kind, FileKind::Video);
+        assert_eq!(back.files[1].kind, FileKind::Image);
+        assert_eq!(back.files[2].kind, FileKind::Other);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resume_preserves_done_resets_rest_and_carries_saved() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let job = create_job(
+            &["v.mp4".to_string(), "i.png".to_string()],
+            "balanced",
+            &CompressOptions::default(),
+        );
+        // Simulate file 0 having completed in a prior (interrupted) run.
+        *job.files[0].status.lock().unwrap() = "done".to_string();
+        job.files[0].orig_bytes.store(1000, Ordering::Relaxed);
+        job.files[0].new_bytes.store(400, Ordering::Relaxed);
+        job.files[0].recycled.store(true, Ordering::Relaxed);
+        *job.files[0].out_path.lock().unwrap() = "v.mp4".to_string();
+        *job.files[0].reason.lock().unwrap() = "success".to_string();
+        *job.files[0].encoder.lock().unwrap() = "x264".to_string();
+        // File 1 was still mid-flight: mark it running so we prove it resets.
+        *job.files[1].status.lock().unwrap() = "running".to_string();
+        write_manifest(&job);
+
+        let back = job_from_manifest(&job.id).expect("manifest reloads");
+        // Done file is preserved verbatim and skipped on resume.
+        assert_eq!(*back.files[0].status.lock().unwrap(), "done");
+        assert_eq!(back.files[0].new_bytes.load(Ordering::Relaxed), 400);
+        assert!(back.files[0].recycled.load(Ordering::Relaxed));
+        assert_eq!(*back.files[0].reason.lock().unwrap(), "success");
+        assert_eq!(*back.files[0].encoder.lock().unwrap(), "x264");
+        // The not-yet-done file is reset to pending so the worker re-runs it.
+        assert_eq!(*back.files[1].status.lock().unwrap(), "pending");
+        // Saved bytes from the completed file are carried into the resumed job.
+        assert_eq!(back.saved_bytes.load(Ordering::Relaxed), 600);
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 

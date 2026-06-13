@@ -140,6 +140,12 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
         // incompatible hashes (which would cause false non-matches).
         base.join("FileTree").join("hash_cache_v2.json")
     };
+    // One-time cleanup: the v1 cache (`hash_cache.json`) is retired by the `_v2`
+    // rename above and is never read again, so delete the orphaned file if it's
+    // still lying around from a pre-upgrade install. Best-effort.
+    if let Some(dir) = hash_cache_path.parent() {
+        let _ = std::fs::remove_file(dir.join("hash_cache.json"));
+    }
     // Load the persistent hash cache. `should_compact` is set when the on-disk
     // file accumulated incremental-append duplicate rows (or was capped); rewrite
     // a tidy snapshot once at startup so the file stays bounded across restarts.

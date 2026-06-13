@@ -374,7 +374,7 @@ pub(crate) struct AppState {
     pub(crate) ignore_list_path: PathBuf,
     /// Persistent content-hash cache `(path) -> (size, mtime, hash)` so unchanged
     /// files are never re-hashed across repeat duplicate scans. Persisted to
-    /// `%APPDATA%\FileTree\hash_cache.json`.
+    /// `%APPDATA%\FileTree\hash_cache_v2.json`.
     pub(crate) hash_cache: Mutex<HashMap<PathBuf, HashCacheEntry>>,
     pub(crate) hash_cache_path: PathBuf,
     /// Per-session local auth token minted by Electron (passed in via the
