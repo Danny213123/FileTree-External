@@ -309,17 +309,69 @@ fn register_scan_root(state: &AppState, path: &Path) {
     roots.push(canon);
 }
 
-/// True only when `requested` canonicalizes to a path located under at least one
-/// recorded scan root. Resolving symlinks/`..` first means path traversal and
-/// symlink escapes outside every scan root are rejected. A path that can't be
-/// canonicalized (missing, or no root recorded yet) is rejected.
-fn path_within_scan_root(state: &AppState, requested: &Path) -> bool {
+/// Outcome of checking a requested path against the registered scan roots.
+/// Distinguishing "unresolvable" from "outside" lets the compress routes accept
+/// a missing/stale source (handled per-file as `ErrorSourceMissing`) while still
+/// rejecting a path that genuinely resolves to a location the user never
+/// referenced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathScanStatus {
+    /// Canonicalized and located under at least one registered scan root.
+    WithinRoot,
+    /// Canonicalized successfully but located outside every root (the genuine
+    /// security-rejection case).
+    OutsideRoot,
+    /// Could not be canonicalized — missing/stale path (or no root recorded yet).
+    /// Not a security failure; the per-file worker records `ErrorSourceMissing`.
+    Unresolvable,
+}
+
+/// Classify `requested` against a set of (already-canonicalized) scan roots.
+/// Pure (no `AppState`/locks) so it is directly unit-testable. Resolving
+/// symlinks/`..` first means traversal and symlink escapes are still rejected.
+fn classify_path_against_roots(roots: &[PathBuf], requested: &Path) -> PathScanStatus {
     let canon = match fs::canonicalize(requested) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return PathScanStatus::Unresolvable,
     };
+    if roots.iter().any(|root| canon.starts_with(root)) {
+        PathScanStatus::WithinRoot
+    } else {
+        PathScanStatus::OutsideRoot
+    }
+}
+
+/// Classify `requested` against the live registered scan roots.
+fn path_scan_status(state: &AppState, requested: &Path) -> PathScanStatus {
     let roots = state.scan_roots.read().expect("scan_roots lock poisoned");
-    roots.iter().any(|root| canon.starts_with(root))
+    classify_path_against_roots(&roots, requested)
+}
+
+/// True only when `requested` canonicalizes to a path located under at least one
+/// recorded scan root. A path that can't be canonicalized (missing, or no root
+/// recorded yet) is NOT within a root.
+fn path_within_scan_root(state: &AppState, requested: &Path) -> bool {
+    path_scan_status(state, requested) == PathScanStatus::WithinRoot
+}
+
+/// Register the directory each submitted path lives in (the path itself when it
+/// is a directory, else its parent) as an allowed scan root. Safe on the
+/// token-gated compress routes: `register_scan_root` only records real on-disk
+/// directories the caller demonstrably referenced, so it cannot widen access
+/// beyond the user's own selection. Covers disjoint/multi-drive selections that
+/// `common_ancestor_dir` returns `None` for.
+fn register_selection_parents(state: &AppState, paths: &[String]) {
+    for p in paths {
+        let pb = Path::new(p);
+        let dir: &Path = if pb.is_dir() {
+            pb
+        } else {
+            pb.parent().unwrap_or(pb)
+        };
+        if dir.is_dir() {
+            register_scan_root(state, dir);
+        }
+    }
 }
 
 /// Snapshot the registered scan roots as display strings, for diagnostics.
@@ -3081,28 +3133,44 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 if let Some(ancestor) = common_ancestor_dir(&paths) {
                     register_scan_root(&state, &ancestor);
                 }
+                // Also register each submitted path's own directory. This covers
+                // disjoint/multi-drive selections (no common ancestor) and is safe
+                // — only real on-disk dirs the caller referenced get recorded.
+                register_selection_parents(&state, &paths);
+                // Containment check, leniently: ONLY reject a path that resolves
+                // to a real location outside every registered root (the genuine
+                // security case). A path that can't be canonicalized is
+                // missing/stale (commonly a cache-expanded folder child recycled
+                // or renamed since the scan) — it must NOT fail the whole batch;
+                // the per-file worker records it as `ErrorSourceMissing`.
                 for p in &paths {
-                    if !path_within_scan_root(&state, Path::new(p)) {
-                        // Diagnose the rejection: log the offending path, its
-                        // canonicalize result and the registered roots, and name
-                        // the path in the 403 body so the UI can be specific.
-                        let canonical = match fs::canonicalize(Path::new(p)) {
-                            Ok(c) => c.to_string_lossy().into_owned(),
-                            Err(e) => format!("<canonicalize failed: {e}>"),
-                        };
-                        let roots = scan_roots_snapshot(&state);
-                        crate::compress_debug::log(&format!(
-                            "[authz] POST /api/compress-jobs rejected path={p:?} canonical={canonical:?} roots={roots:?}"
-                        ));
-                        let mut body = String::from("{\"error\":");
-                        push_json_string(
-                            &mut body,
-                            &format!("Source path is outside the scanned directories: {p}"),
-                        );
-                        body.push_str(",\"path\":");
-                        push_json_string(&mut body, p);
-                        body.push('}');
-                        return respond_json(&mut stream, 403, "Forbidden", &body);
+                    match path_scan_status(&state, Path::new(p)) {
+                        PathScanStatus::WithinRoot => {}
+                        PathScanStatus::Unresolvable => {
+                            crate::compress_debug::log(&format!(
+                                "[authz] POST /api/compress-jobs allowing missing/unresolvable source (handled per-file as error_source_missing) path={p:?}"
+                            ));
+                        }
+                        PathScanStatus::OutsideRoot => {
+                            // Resolved, but outside everything the user referenced.
+                            let canonical = match fs::canonicalize(Path::new(p)) {
+                                Ok(c) => c.to_string_lossy().into_owned(),
+                                Err(e) => format!("<canonicalize failed: {e}>"),
+                            };
+                            let roots = scan_roots_snapshot(&state);
+                            crate::compress_debug::log(&format!(
+                                "[authz] POST /api/compress-jobs rejected (resolved outside roots) path={p:?} canonical={canonical:?} roots={roots:?}"
+                            ));
+                            let mut body = String::from("{\"error\":");
+                            push_json_string(
+                                &mut body,
+                                &format!("Source path is outside the scanned directories: {p}"),
+                            );
+                            body.push_str(",\"path\":");
+                            push_json_string(&mut body, p);
+                            body.push('}');
+                            return respond_json(&mut stream, 403, "Forbidden", &body);
+                        }
                     }
                 }
                 let opts = crate::compress_job::CompressOptions {
@@ -3268,6 +3336,11 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             if paths.is_empty() || dest.is_empty() {
                 return respond_text(&mut stream, 400, "Bad request", "Missing paths or dest");
             }
+            // Register each selected path's own directory first (same rationale as
+            // the compress-jobs route): a cache-served tree this session never
+            // `/api/scan`-ed otherwise fails the containment check below. Only real
+            // on-disk dirs the caller referenced are recorded.
+            register_selection_parents(&state, &paths);
             for p in &paths {
                 if !path_within_scan_root(&state, Path::new(p)) {
                     return respond_json(
@@ -4890,6 +4963,106 @@ mod static_assets_tests {
         assert_eq!(content_type_for("logo.svg"), "image/svg+xml");
         assert_eq!(content_type_for("font.woff2"), "font/woff2");
         assert_eq!(content_type_for("noextension"), "application/octet-stream");
+    }
+}
+
+#[cfg(test)]
+mod compress_path_authz_tests {
+    use super::{classify_path_against_roots, common_ancestor_dir, PathScanStatus};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// Mirror of the compress route's batch rule: the first path that resolves
+    /// outside every root (`None` ⇒ the batch is accepted; missing/stale paths
+    /// are allowed and handled per-file).
+    fn first_path_outside_roots(roots: &[PathBuf], paths: &[String]) -> Option<String> {
+        paths
+            .iter()
+            .find(|p| classify_path_against_roots(roots, Path::new(p)) == PathScanStatus::OutsideRoot)
+            .cloned()
+    }
+
+    /// Create a unique, real temp directory for a test fixture.
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut d = std::env::temp_dir();
+        d.push(format!("filetree_authz_{tag}_{nanos}_{:?}", std::thread::current().id()));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // The core fix: a batch mixing a real source with a missing/stale one is
+    // ACCEPTED (the missing one is handled per-file), while a source that
+    // genuinely resolves outside every root is still REJECTED.
+    #[test]
+    fn missing_source_accepted_but_resolved_outside_rejected() {
+        let root = unique_dir("root");
+        let canon_root = fs::canonicalize(&root).unwrap();
+
+        let inside = root.join("clip.mp4");
+        fs::write(&inside, b"x").unwrap();
+        let missing = root.join("was-recycled.mp4"); // never created (stale child)
+
+        let other = unique_dir("other");
+        let outside = other.join("elsewhere.mp4");
+        fs::write(&outside, b"y").unwrap();
+
+        let roots = vec![canon_root];
+
+        // Per-path classification.
+        assert_eq!(classify_path_against_roots(&roots, &inside), PathScanStatus::WithinRoot);
+        assert_eq!(classify_path_against_roots(&roots, &missing), PathScanStatus::Unresolvable);
+        assert_eq!(classify_path_against_roots(&roots, &outside), PathScanStatus::OutsideRoot);
+
+        // A batch of {existing, missing} has no path outside the roots -> accepted
+        // (the route creates the job; the worker reports the missing one per-file).
+        let ok_batch = vec![
+            inside.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(first_path_outside_roots(&roots, &ok_batch), None);
+
+        // A batch containing a resolvable-but-outside path is rejected (that path).
+        let bad_batch = vec![
+            inside.to_string_lossy().into_owned(),
+            outside.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(
+            first_path_outside_roots(&roots, &bad_batch),
+            Some(outside.to_string_lossy().into_owned())
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn common_ancestor_dir_shares_parent() {
+        let dir = unique_dir("ca");
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        let paths = vec![
+            f1.to_string_lossy().into_owned(),
+            f2.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(common_ancestor_dir(&paths), Some(dir.clone()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Disjoint drives share no prefix -> None (so per-path registration, not the
+    // ancestor, is what covers multi-drive selections). Windows-only: on Unix all
+    // absolute paths share the "/" root.
+    #[cfg(windows)]
+    #[test]
+    fn common_ancestor_dir_disjoint_drives_is_none() {
+        let paths = vec![
+            "C:\\alpha\\one.txt".to_string(),
+            "D:\\beta\\two.txt".to_string(),
+        ];
+        assert_eq!(common_ancestor_dir(&paths), None);
     }
 }
 

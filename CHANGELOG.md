@@ -4,6 +4,16 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.12.3] - 2026-06-13
+
+### Fixed
+
+- **Compression no longer fails with a misleading "a source path is outside the scanned directories" (403)**: the `POST /api/compress-jobs` containment pre-check rejected the entire request whenever any single submitted path failed to canonicalize — typically a stale/missing descendant produced by expanding a folder from the renderer's in-memory cache (a file recycled or renamed since the last scan). The check is now lenient: a path is only rejected when it canonicalizes successfully AND resolves outside every directory the user referenced (the genuine security case). A missing/stale path is allowed through and recorded per-file by the worker as `error_source_missing` — so valid files in the selection still compress and the stale one simply shows a "source missing" outcome in the In Progress tab. The genuine security guard (rejecting a path that resolves to a location the user never referenced) is preserved.
+
+### Changed
+
+- **Resilient scan-root registration on the token-gated compress routes**: both `POST /api/compress-jobs` and the F5 zip route (`POST /api/compress`) now register each submitted path's own directory (the path itself if it is a directory, else its parent) as an allowed root, in addition to the existing `scanRoot` and common-ancestor registration. This covers disjoint/multi-drive selections (where there is no common ancestor) and cache-served trees this server session never scanned. Registration only ever records real on-disk directories the caller demonstrably referenced, so it does not widen access. The `[authz]` debug log now distinguishes a "missing/unresolvable" source (allowed, handled per-file) from a "resolved-but-outside" source (rejected).
+
 ## [1.12.2] - 2026-06-12
 
 ### Fixed
