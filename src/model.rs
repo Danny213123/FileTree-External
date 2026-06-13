@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -193,7 +193,10 @@ pub(crate) const SCAN_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 struct ScanCacheEntry {
     result: Arc<ScanResult>,
     inserted: Instant,
-    last_used: u64,
+    /// LRU recency, mutated on every lookup. An atomic so a *read* (`get_fresh`/
+    /// `get_any`) can record the access while holding only a shared `RwLock`
+    /// read guard — readers no longer serialize behind each other.
+    last_used: AtomicU64,
     bytes: usize,
 }
 
@@ -207,7 +210,9 @@ pub(crate) struct ScanCache {
     entries: HashMap<String, ScanCacheEntry>,
     cap_bytes: usize,
     total_bytes: usize,
-    tick: u64,
+    /// Monotonic recency counter. Atomic so the read path can advance it under a
+    /// shared lock; only relative order matters (wrapping is harmless here).
+    tick: AtomicU64,
 }
 
 impl std::fmt::Debug for ScanCache {
@@ -232,33 +237,31 @@ impl ScanCache {
             entries: HashMap::new(),
             cap_bytes: SCAN_CACHE_MAX_BYTES,
             total_bytes: 0,
-            tick: 0,
+            tick: AtomicU64::new(0),
         }
     }
 
-    fn bump(&mut self) -> u64 {
-        self.tick = self.tick.wrapping_add(1);
-        self.tick
+    fn bump(&self) -> u64 {
+        self.tick.fetch_add(1, AtomicOrdering::Relaxed).wrapping_add(1)
     }
 
     /// Look up `key`, returning a cheap `Arc` clone only when the entry is still
-    /// within `ttl`. Records the access for LRU recency.
-    pub(crate) fn get_fresh(&mut self, key: &str, ttl: Duration) -> Option<Arc<ScanResult>> {
-        let tick = self.bump();
-        let entry = self.entries.get_mut(key)?;
+    /// within `ttl`. Records the access for LRU recency. Takes `&self` so it runs
+    /// under a shared `RwLock` read guard (recency is updated atomically).
+    pub(crate) fn get_fresh(&self, key: &str, ttl: Duration) -> Option<Arc<ScanResult>> {
+        let entry = self.entries.get(key)?;
         if entry.inserted.elapsed() >= ttl {
             return None;
         }
-        entry.last_used = tick;
+        entry.last_used.store(self.bump(), AtomicOrdering::Relaxed);
         Some(Arc::clone(&entry.result))
     }
 
     /// Look up `key` ignoring TTL (the "current view" the user is looking at).
-    /// Records the access for LRU recency.
-    pub(crate) fn get_any(&mut self, key: &str) -> Option<Arc<ScanResult>> {
-        let tick = self.bump();
-        let entry = self.entries.get_mut(key)?;
-        entry.last_used = tick;
+    /// Records the access for LRU recency. `&self` (see [`get_fresh`]).
+    pub(crate) fn get_any(&self, key: &str) -> Option<Arc<ScanResult>> {
+        let entry = self.entries.get(key)?;
+        entry.last_used.store(self.bump(), AtomicOrdering::Relaxed);
         Some(Arc::clone(&entry.result))
     }
 
@@ -277,7 +280,7 @@ impl ScanCache {
             ScanCacheEntry {
                 result,
                 inserted: Instant::now(),
-                last_used: tick,
+                last_used: AtomicU64::new(tick),
                 bytes,
             },
         );
@@ -290,7 +293,7 @@ impl ScanCache {
                 .entries
                 .iter()
                 .filter(|(k, _)| k.as_str() != keep)
-                .min_by_key(|(_, e)| e.last_used)
+                .min_by_key(|(_, e)| e.last_used.load(AtomicOrdering::Relaxed))
                 .map(|(k, _)| k.clone());
             let Some(victim) = victim else { break };
             if let Some(removed) = self.entries.remove(&victim) {
@@ -346,17 +349,22 @@ pub(crate) struct AppState {
     pub(crate) last_scan: RwLock<Option<Arc<ScanResult>>>,
     /// Per-path scan-result cache keyed by normalized lowercase path, bounded by
     /// total estimated bytes with LRU eviction (see [`ScanCache`]). TTL freshness
-    /// is enforced via `get_fresh`.
-    pub(crate) scan_cache: Mutex<ScanCache>,
+    /// is enforced via `get_fresh`. An `RwLock` (not `Mutex`) because lookups
+    /// dominate and are now `&self` — concurrent scan/dupe/compress reads share a
+    /// read guard instead of serializing; only inserts/invalidations take the
+    /// write guard.
+    pub(crate) scan_cache: RwLock<ScanCache>,
     /// Cached shell icon BMPs, keyed by lowercase extension (no dot).
     pub(crate) icon_cache: Mutex<HashMap<String, Vec<u8>>>,
     /// Cached shell-generated thumbnail PNGs, keyed by
     /// `"<normalized_lower_path>|<mtime_nanos>|<size>"`. The mtime+size token
     /// means a file that is edited or replaced misses and regenerates instead of
-    /// serving a stale image. Bounded to ~512 entries with arbitrary-entry
-    /// eviction in `serve_thumbnail`, so repeated hovers skip the slow Windows
-    /// Shell thumbnail API. Mirrors `icon_cache`'s `Mutex<HashMap<…>>` style.
-    pub(crate) thumbnail_cache: Mutex<HashMap<String, Vec<u8>>>,
+    /// serving a stale image. Bounded to ~512 entries with true LRU eviction in
+    /// `serve_thumbnail` (each entry carries a monotonically-increasing "last
+    /// used" tick, bumped on hit; the lowest tick is evicted when full), so
+    /// repeated hovers skip the slow Windows Shell thumbnail API and a burst of
+    /// misses can't evict a still-hot entry. The `u64` is the recency tick.
+    pub(crate) thumbnail_cache: Mutex<HashMap<String, (Vec<u8>, u64)>>,
     pub(crate) dupes_progress: Arc<DupesProgress>,
     pub(crate) dupes_cancel: Arc<AtomicBool>,
     /// Read-dominated: consulted (read) on every duplicate scan to filter ignored

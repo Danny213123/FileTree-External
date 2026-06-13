@@ -179,7 +179,7 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
     let state = Arc::new(AppState {
         initial_path,
         last_scan: RwLock::new(None),
-        scan_cache: Mutex::new(crate::model::ScanCache::new()),
+        scan_cache: RwLock::new(crate::model::ScanCache::new()),
         icon_cache: Mutex::new(std::collections::HashMap::new()),
         thumbnail_cache: Mutex::new(std::collections::HashMap::new()),
         dupes_progress: Arc::new(DupesProgress::default()),
@@ -853,7 +853,7 @@ fn bulk_rename_results(
 
     // ── Audit + cache invalidation ──
     {
-        let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+        let mut cache = state.scan_cache.write().expect("scan_cache lock");
         for plan in &plans {
             let dst_str = plan.dst.to_string_lossy().to_string();
             crate::audit::record(crate::audit::Entry {
@@ -1086,9 +1086,9 @@ fn find_current_scan(
     let cache_key = path.to_string_lossy().replace('\\', "/").to_lowercase();
     if let Some(result) = state
         .scan_cache
-        .lock()
+        .read()
         .ok()
-        .and_then(|mut cache| cache.get_any(&cache_key))
+        .and_then(|cache| cache.get_any(&cache_key))
     {
         return Some(result);
     }
@@ -1293,7 +1293,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 // we never hold the lock during a multi-hundred-MB stream and never
                 // materialise the whole JSON body as a String — stream it instead.
                 let cached = {
-                    let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                    let cache = state.scan_cache.read().expect("scan_cache lock");
                     cache.get_fresh(&cache_key, SCAN_CACHE_TTL)
                 };
                 if let Some(result) = cached {
@@ -1344,7 +1344,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     if !is_partial {
                         *state.last_scan.write().expect("scan lock poisoned") =
                             Some(Arc::clone(&result));
-                        let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                        let mut cache = state.scan_cache.write().expect("scan_cache lock");
                         // LRU insert; eviction by total estimated bytes is handled
                         // inside ScanCache so peak memory stays bounded.
                         cache.insert(cache_key.clone(), Arc::clone(&result));
@@ -1814,7 +1814,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 // for this exact root, so a fresh server-side scan is avoided.
                 let cache_key = PathBuf::from(raw_path).to_string_lossy().replace('\\', "/").to_lowercase();
                 let cached = {
-                    let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                    let cache = state.scan_cache.read().expect("scan_cache lock");
                     cache.get_fresh(&cache_key, SCAN_CACHE_TTL)
                 };
                 let result: Arc<crate::model::ScanResult> = if let Some(result) = cached {
@@ -2029,7 +2029,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             // for a moved/deleted source path is invalid. Drop both so the next
             // scan re-aggregates the real tree (the routes previously did neither).
             {
-                let mut scan_cache = state.scan_cache.lock().expect("scan_cache lock");
+                let mut scan_cache = state.scan_cache.write().expect("scan_cache lock");
                 let mut affected: Vec<String> = Vec::new();
                 for p in &paths {
                     if let Some(parent) = p.parent() {
@@ -2234,7 +2234,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     if let Some(parent) = path_buf.parent() {
                         state
                             .scan_cache
-                            .lock()
+                            .write()
                             .expect("scan_cache lock")
                             .invalidate(&parent.to_string_lossy());
                     }
@@ -2305,7 +2305,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     if let Some(parent) = path_buf.parent() {
                         state
                             .scan_cache
-                            .lock()
+                            .write()
                             .expect("scan_cache lock")
                             .invalidate(&parent.to_string_lossy());
                     }
@@ -2349,7 +2349,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             match move_result {
                 Ok(_) => {
                     // Invalidate cache for both source and destination parents
-                    let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                    let mut cache = state.scan_cache.write().expect("scan_cache lock");
                     if let Some(p) = src_path.parent() {
                         cache.invalidate(&p.to_string_lossy());
                     }
@@ -2435,7 +2435,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 Ok(_) => {
                     state
                         .scan_cache
-                        .lock()
+                        .write()
                         .expect("scan_cache lock")
                         .invalidate(&parent.to_string_lossy());
                     respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
@@ -2592,7 +2592,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             }
             touched_parents.push(dest_buf.clone());
             {
-                let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                let mut cache = state.scan_cache.write().expect("scan_cache lock");
                 for p in &touched_parents {
                     cache.invalidate(&p.to_string_lossy());
                 }
@@ -2690,7 +2690,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             // If result is cached and fresh, return it as a single NDJSON chunk
             if !skip_cache {
                 let cached = {
-                    let mut cache = state.scan_cache.lock().expect("scan_cache lock");
+                    let cache = state.scan_cache.read().expect("scan_cache lock");
                     cache.get_fresh(&cache_key, SCAN_CACHE_TTL)
                 };
                 if let Some(result) = cached {
@@ -2758,7 +2758,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         // inside ScanCache so peak memory stays bounded.
                         state
                             .scan_cache
-                            .lock()
+                            .write()
                             .expect("scan_cache lock")
                             .insert(cache_key, Arc::clone(&result));
                     }
@@ -3030,7 +3030,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         if let Some(parent) = pb.parent() {
                             state
                                 .scan_cache
-                                .lock()
+                                .write()
                                 .expect("scan_cache lock")
                                 .invalidate(&parent.to_string_lossy());
                         }
@@ -3421,7 +3421,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     if let Some(parent) = dest_path.parent() {
                         state
                             .scan_cache
-                            .lock()
+                            .write()
                             .expect("scan_cache lock")
                             .invalidate(&parent.to_string_lossy());
                     }
@@ -3478,7 +3478,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 Ok(_) => {
                     state
                         .scan_cache
-                        .lock()
+                        .write()
                         .expect("scan_cache lock")
                         .invalidate(&dest_path.to_string_lossy());
                     body.push_str("true}");
@@ -4076,6 +4076,99 @@ fn thumbnail_gate() -> &'static Arc<ConnLimiter> {
     GATE.get_or_init(|| Arc::new(ConnLimiter::new(THUMBNAIL_MAX_CONCURRENT)))
 }
 
+/// Monotonic "last used" tick for the thumbnail LRU. A simple process-wide
+/// counter is enough — strictly increasing, and only relative order matters.
+fn next_thumb_tick() -> u64 {
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One unit of work for the STA thumbnail pool: a path + requested size, and a
+/// one-shot sender for the PNG bytes (or `None`).
+struct ThumbJob {
+    path: String,
+    size: i32,
+    resp: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+}
+
+/// Submission handle for the persistent STA worker pool (lazily initialized on
+/// first use). Generating a Windows Shell thumbnail needs a COM STA; spinning up
+/// a fresh thread (and `CoInitializeEx`/`CoUninitialize`) per request is wasteful
+/// under hover/scroll bursts, so a small pool of long-lived STA threads — each
+/// initializing COM once — services jobs off a shared channel.
+fn thumbnail_pool() -> &'static std::sync::mpsc::Sender<ThumbJob> {
+    static POOL: OnceLock<std::sync::mpsc::Sender<ThumbJob>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<ThumbJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..THUMBNAIL_MAX_CONCURRENT {
+            let rx = Arc::clone(&rx);
+            let _ = std::thread::Builder::new()
+                .name(format!("thumb-sta-{i}"))
+                .spawn(move || thumbnail_worker_loop(rx));
+        }
+        tx
+    })
+}
+
+/// Body of a persistent STA worker: initialize COM once (apartment-threaded),
+/// then loop pulling jobs off the shared receiver until the channel closes.
+fn thumbnail_worker_loop(rx: Arc<Mutex<std::sync::mpsc::Receiver<ThumbJob>>>) {
+    #[cfg(windows)]
+    unsafe {
+        // COINIT_APARTMENTTHREADED = 0x2. Ignore failure: a subsequent
+        // already-initialized result is fine, and GetImage still works.
+        #[link(name = "ole32")]
+        unsafe extern "system" {
+            fn CoInitializeEx(reserved: *mut std::ffi::c_void, dwCoInit: u32) -> i32;
+        }
+        let _ = CoInitializeEx(std::ptr::null_mut(), 0x2);
+    }
+    loop {
+        // Lock only to dequeue one job, then release before the slow Shell call
+        // so sibling workers can pull concurrently.
+        let job = {
+            let guard = match rx.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            match guard.recv() {
+                Ok(j) => j,
+                Err(_) => return, // channel closed → pool shutting down
+            }
+        };
+        #[cfg(windows)]
+        let png = shell_thumbnail_jpeg(&job.path, job.size);
+        #[cfg(not(windows))]
+        let png = {
+            let _ = &job.path;
+            let _ = job.size;
+            None::<Vec<u8>>
+        };
+        let _ = job.resp.send(png);
+    }
+}
+
+/// Submit a thumbnail generation to the STA pool and block for the result. Falls
+/// back to a one-off thread if the pool channel is somehow unavailable.
+fn generate_thumbnail_pooled(path: String, size: i32) -> Option<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+    let job = ThumbJob { path: path.clone(), size, resp: tx };
+    if thumbnail_pool().send(job).is_err() {
+        // Pool unavailable (shouldn't happen): degrade to the legacy spawn/join.
+        return std::thread::spawn(move || {
+            #[cfg(windows)]
+            { shell_thumbnail_jpeg(&path, size) }
+            #[cfg(not(windows))]
+            { let _ = (&path, size); None::<Vec<u8>> }
+        })
+        .join()
+        .ok()
+        .flatten();
+    }
+    rx.recv().ok().flatten()
+}
+
 fn serve_thumbnail(stream: &mut TcpStream, path: &str, state: &AppState) -> sio::Result<()> {
     // Server-side thumbnail cache cap. Generating a thumbnail round-trips through
     // the (slow) Windows Shell API on a dedicated COM/STA thread, so we keep the
@@ -4114,11 +4207,15 @@ fn serve_thumbnail(stream: &mut TcpStream, path: &str, state: &AppState) -> sio:
         });
 
         // Cache HIT: serve the stored PNG without touching the Shell API. The lock
-        // is held only long enough to clone the bytes out, then released.
+        // is held only long enough to clone the bytes out and bump the entry's
+        // recency tick (so true LRU keeps hot thumbnails resident), then released.
         if let Some(key) = &cache_key {
             let hit = {
-                let cache = state.thumbnail_cache.lock().expect("thumbnail_cache poisoned");
-                cache.get(key).cloned()
+                let mut cache = state.thumbnail_cache.lock().expect("thumbnail_cache poisoned");
+                cache.get_mut(key).map(|entry| {
+                    entry.1 = next_thumb_tick();
+                    entry.0.clone()
+                })
             };
             if let Some(data) = hit {
                 eprintln!("[thumb-route] cache hit");
@@ -4128,38 +4225,36 @@ fn serve_thumbnail(stream: &mut TcpStream, path: &str, state: &AppState) -> sio:
         }
 
         // MISS: generate via the Windows Shell thumbnail cache.
-        // IShellItemImageFactory::GetImage requires a COM STA with a message pump.
-        // Server connection threads are plain OS threads with no pump, so we
-        // spawn a dedicated thread, join it, and return the PNG bytes (or 404).
-        // The cache lock is NOT held across this slow call.
+        // IShellItemImageFactory::GetImage requires a COM STA, so generation runs
+        // on a small pool of persistent STA worker threads (each initializes COM
+        // once and loops on a job channel) rather than spawning + joining a fresh
+        // thread per request. The cache lock is NOT held across this slow call.
         //
-        // Bound concurrent generations with a global gate so a flood of cache
-        // misses (e.g. fast-scrolling a folder of fresh images) can't spawn an
-        // unbounded number of simultaneous Shell/STA threads and saturate the
-        // machine. Held only for the duration of the generation (RAII release).
+        // The gate still bounds outstanding generations so a flood of cache
+        // misses (e.g. fast-scrolling a folder of fresh images) applies
+        // backpressure rather than queueing unboundedly behind the pool.
         let _thumb_permit = thumbnail_gate().acquire();
-        let path_owned = path.to_string();
-        let png = std::thread::spawn(move || {
-            #[cfg(windows)]
-            { shell_thumbnail_jpeg(&path_owned, 480) }
-            #[cfg(not(windows))]
-            { None::<Vec<u8>> }
-        }).join().ok().flatten();
+        let png = generate_thumbnail_pooled(path.to_string(), 480);
 
         return match png {
             Some(data) => {
                 // Cache the freshly generated PNG before responding. Briefly lock,
-                // evict one arbitrary entry if at capacity (unless we're refreshing
-                // an existing key), insert, then unlock. Only successes are cached;
-                // 404s are never cached so a transient failure can recover.
+                // evict the least-recently-used entry if at capacity (unless we're
+                // refreshing an existing key), insert with a fresh tick, then
+                // unlock. Only successes are cached; 404s are never cached so a
+                // transient failure can recover.
                 if let Some(key) = cache_key {
                     let mut cache = state.thumbnail_cache.lock().expect("thumbnail_cache poisoned");
                     if cache.len() >= THUMBNAIL_CACHE_CAP && !cache.contains_key(&key) {
-                        if let Some(victim) = cache.keys().next().cloned() {
+                        if let Some(victim) = cache
+                            .iter()
+                            .min_by_key(|(_, (_, tick))| *tick)
+                            .map(|(k, _)| k.clone())
+                        {
                             cache.remove(&victim);
                         }
                     }
-                    cache.insert(key, data.clone());
+                    cache.insert(key, (data.clone(), next_thumb_tick()));
                 }
                 respond_bytes(stream, 200, "OK", "image/png", &data,
                     &[("Cache-Control", "private, max-age=300")])

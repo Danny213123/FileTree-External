@@ -1307,7 +1307,7 @@ fn process_file(
     if let Some(parent) = input.parent() {
         state
             .scan_cache
-            .lock()
+            .write()
             .expect("scan_cache lock")
             .invalidate(&parent.to_string_lossy());
     }

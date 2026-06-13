@@ -1624,6 +1624,9 @@ function CompressInProgress() {
   const [details, setDetails] = useState<Map<string, CompressJobFile[]>>(new Map());
   const [detailLoading, setDetailLoading] = useState<Set<string>>(new Set());
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Bumped on user actions (resume/cancel) to restart the poll loop at the fast
+  // cadence immediately rather than waiting out the idle interval.
+  const [pollKick, setPollKick] = useState(0);
   // Read the live expanded set inside the poll loop without re-subscribing it.
   const expandedRef = useRef(expanded);
   expandedRef.current = expanded;
@@ -1644,26 +1647,38 @@ function CompressInProgress() {
     });
   }, []);
 
-  const refresh = useCallback(async (signal?: AbortSignal) => {
+  // Returns whether any job is currently active, so the poll loop can back off
+  // when there's nothing live to track.
+  const refresh = useCallback(async (signal?: AbortSignal): Promise<boolean> => {
     const all = await listCompressJobs(signal);
-    if (signal?.aborted) return;
+    if (signal?.aborted) return false;
     // Show every run, newest first (running + completed + interrupted).
     setJobs([...all].sort((a, b) => b.createdAt - a.createdAt));
     setLoading(false);
     // Keep expanded ACTIVE jobs' detail live.
+    let anyActive = false;
     for (const j of all) {
-      if (j.active && expandedRef.current.has(j.id)) void loadDetail(j.id, signal);
+      if (j.active) {
+        anyActive = true;
+        if (expandedRef.current.has(j.id)) void loadDetail(j.id, signal);
+      }
     }
+    return anyActive;
   }, [loadDetail]);
 
-  // Poll on a 1.5s cadence while mounted; abort + clear on unmount.
+  // Poll while mounted, but adaptively: a tight 1.5s cadence only while a job is
+  // active, backing off to 8s when everything is idle (the list only changes
+  // then on a user action, which refreshes directly). Avoids a perpetual 1.5s
+  // request loop on a quiescent tab.
   useEffect(() => {
     const ac = new AbortController();
     let stopped = false;
+    const ACTIVE_MS = 1500;
+    const IDLE_MS = 8000;
     const tick = async () => {
-      await refresh(ac.signal);
+      const anyActive = await refresh(ac.signal);
       if (stopped || ac.signal.aborted) return;
-      timerRef.current = setTimeout(() => void tick(), 1500);
+      timerRef.current = setTimeout(() => void tick(), anyActive ? ACTIVE_MS : IDLE_MS);
     };
     void tick();
     return () => {
@@ -1671,7 +1686,7 @@ function CompressInProgress() {
       ac.abort();
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, [refresh]);
+  }, [refresh, pollKick]);
 
   const toggleExpand = useCallback(
     (id: string) => {
@@ -1697,6 +1712,7 @@ function CompressInProgress() {
         await retryCompressJob(id);
         toast.success("Resuming job — skipping files already done.");
         await refresh();
+        setPollKick((k) => k + 1); // resume live (fast-cadence) tracking now
       } catch (e) {
         toast.error(`Could not resume: ${e instanceof Error ? e.message : String(e)}`);
       } finally {

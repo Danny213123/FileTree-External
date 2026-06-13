@@ -977,12 +977,12 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
         nodes[id].children = children; // restore (taken above to avoid a clone)
     }
 
-    // Sort each dir's children by size desc, then name asc.
-    // Two-pass approach: collect (dir_id, sorted_children) first so we can
-    // borrow `nodes` immutably for the sort keys, then write results back.
-    // This allocates one small Vec<usize> per directory (just IDs — cheap)
-    // rather than the previous approach of cloning two full-length name+size
-    // Vecs over the entire node set.
+    // Sort each dir's children by size desc, then name asc. This is independent
+    // per directory and the dominant finalize cost on wide trees (every
+    // comparison lowercases a name), so it's parallelized: sorted child-id
+    // vectors are computed with shared immutable reads across N threads, then
+    // written back sequentially (the only mutation). Just IDs are cloned (cheap)
+    // rather than full-length name+size Vecs over the entire node set.
     let dir_ids: Vec<usize> = nodes
         .iter()
         .enumerate()
@@ -990,14 +990,7 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
         .map(|(id, _)| id)
         .collect();
 
-    for dir_id in dir_ids {
-        let mut children = std::mem::take(&mut nodes[dir_id].children);
-        // Sort by size desc, then case-insensitive name asc. A cached key
-        // lowercases each name once instead of twice on every comparison.
-        children.sort_by_cached_key(|&cid| {
-            let n = &nodes[cid];
-            (std::cmp::Reverse(n.size), n.name.to_lowercase())
-        });
+    for (dir_id, children) in sort_children_parallel(nodes, &dir_ids) {
         nodes[dir_id].children = children;
     }
 
@@ -1006,6 +999,51 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
     for node in nodes.iter_mut() {
         node.children = Vec::new();
     }
+}
+
+/// Compute each directory's sorted child-id list (size desc, then
+/// case-insensitive name asc) for `dir_ids`. Reads `nodes` immutably only, so it
+/// parallelizes across scoped threads for large trees; below a threshold (or on
+/// a single core) it runs inline to avoid spawn overhead. Returns
+/// `(dir_id, sorted_children)` pairs for the caller to write back.
+fn sort_children_parallel(
+    nodes: &[NodeRecord],
+    dir_ids: &[usize],
+) -> Vec<(usize, Vec<usize>)> {
+    let sort_one = |dir_id: usize| -> (usize, Vec<usize>) {
+        let mut children = nodes[dir_id].children.clone();
+        // A cached key lowercases each name once instead of twice per compare.
+        children.sort_by_cached_key(|&cid| {
+            let n = &nodes[cid];
+            (std::cmp::Reverse(n.size), n.name.to_lowercase())
+        });
+        (dir_id, children)
+    };
+
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(8);
+    // Below this many directories the spawn/join overhead outweighs the win.
+    const PARALLEL_THRESHOLD: usize = 2048;
+    if threads <= 1 || dir_ids.len() < PARALLEL_THRESHOLD {
+        return dir_ids.iter().map(|&id| sort_one(id)).collect();
+    }
+
+    let chunk = dir_ids.len().div_ceil(threads);
+    let mut out: Vec<(usize, Vec<usize>)> = Vec::with_capacity(dir_ids.len());
+    std::thread::scope(|s| {
+        let handles: Vec<_> = dir_ids
+            .chunks(chunk)
+            .map(|slice| s.spawn(move || slice.iter().map(|&id| sort_one(id)).collect::<Vec<_>>()))
+            .collect();
+        for h in handles {
+            if let Ok(mut part) = h.join() {
+                out.append(&mut part);
+            }
+        }
+    });
+    out
 }
 
 #[cfg(test)]
