@@ -382,6 +382,14 @@ pub(crate) struct AppState {
     /// to only when a new root is scanned), so an `RwLock` keeps those checks
     /// concurrent.
     pub(crate) scan_roots: RwLock<Vec<PathBuf>>,
+    /// Canonicalized directories allowed as compression *sources/destinations*
+    /// only. The token-gated compress routes register a selection's own
+    /// directories here (per-path parent + common ancestor) so a cache-served
+    /// tree this session never `/api/scan`-ed can still be compressed — WITHOUT
+    /// widening the content-read confinement, which checks `scan_roots` alone.
+    /// Compress containment accepts a path under `scan_roots` ∪ `compress_roots`;
+    /// preview/thumbnail/owner reads accept only `scan_roots`.
+    pub(crate) compress_roots: RwLock<Vec<PathBuf>>,
     /// Live compression-job registry, keyed by job id. Each job owns its worker
     /// thread, per-file state, cancel flag, active child handle, and live NDJSON
     /// event buffer (see [`crate::compress_job::CompressJob`]). The `Mutex` is

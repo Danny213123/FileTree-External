@@ -23,6 +23,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::export::push_json_string;
 
@@ -308,22 +310,19 @@ pub(crate) fn detect_handbrake_caps(path: &Path) -> HandbrakeCaps {
 /// the caps are "unknown", NOT "no hardware". Callers should fall back to the
 /// physical-GPU probe rather than concluding the GPU is unavailable.
 pub(crate) fn detect_handbrake_caps_ex(path: &Path) -> (HandbrakeCaps, bool) {
-    let mut cmd = Command::new(path);
-    cmd.arg("-h");
-    // Run from the binary's own folder so a build that loads sibling DLLs (and
-    // probes hardware relative to its install) behaves like a normal launch.
-    if let Some(dir) = path.parent() {
-        if dir.is_dir() {
-            cmd.current_dir(dir);
-        }
-    }
-    no_window(&mut cmd);
-    let Some(out) = cmd.output().ok() else {
-        return (HandbrakeCaps::default(), false);
+    let (caps, parse_ok, _raw) = detect_handbrake_caps_and_raw(path);
+    (caps, parse_ok)
+}
+
+/// Run `HandBrakeCLI -h` ONCE and derive everything we read from it: the
+/// hardware-encoder caps, whether the help parsed, and the compact raw encoder
+/// line (evidence for the panel/log). Folding these into a single spawn avoids
+/// the previous triple-invocation on the (cold) `tools_json` path.
+pub(crate) fn detect_handbrake_caps_and_raw(path: &Path) -> (HandbrakeCaps, bool, String) {
+    let text = match run_handbrake_help(path) {
+        Some(t) => t,
+        None => return (HandbrakeCaps::default(), false, "<failed to run HandBrakeCLI -h>".to_string()),
     };
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push('\n');
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
     // parse_ok: the command produced some help text to scan. An empty capture
     // (e.g. output went somewhere we couldn't read) is "unknown", not "absent".
     let parse_ok = text.trim().len() > 16;
@@ -341,15 +340,13 @@ pub(crate) fn detect_handbrake_caps_ex(path: &Path) -> (HandbrakeCaps, bool) {
         vce_h265: has("vce_h265"),
         vce_av1: has("vce_av1"),
     };
-    (caps, parse_ok)
+    (caps, parse_ok, summarize_encoder_lines(&text))
 }
 
-/// Capture the encoder-relevant lines from `HandBrakeCLI -h` as evidence for the
-/// debug log: exactly which encoder tokens THIS build reports. This is the
-/// ground truth for "why didn't GPU kick in" — if `nvenc_*`/`qsv_*`/`vce_*`
-/// don't appear here, the build genuinely lacks HW support; if they do appear
-/// but FileTree still used x264, the bug is downstream (selection/threading).
-pub(crate) fn handbrake_encoders_raw(path: &Path) -> String {
+/// Spawn `HandBrakeCLI -h` from the binary's own folder (so a build that loads
+/// sibling DLLs / probes hardware relative to its install behaves like a normal
+/// launch) and return combined stdout+stderr. `None` on spawn failure.
+fn run_handbrake_help(path: &Path) -> Option<String> {
     let mut cmd = Command::new(path);
     cmd.arg("-h");
     if let Some(dir) = path.parent() {
@@ -358,13 +355,16 @@ pub(crate) fn handbrake_encoders_raw(path: &Path) -> String {
         }
     }
     no_window(&mut cmd);
-    let Some(out) = cmd.output().ok() else {
-        return "<failed to run HandBrakeCLI -h>".to_string();
-    };
+    let out = cmd.output().ok()?;
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push('\n');
     text.push_str(&String::from_utf8_lossy(&out.stderr));
-    // Keep only lines mentioning a video-encoder token so the log stays compact.
+    Some(text)
+}
+
+/// Keep only the encoder-relevant lines of `-h` output, bounded, for compact
+/// logging/diagnostics.
+fn summarize_encoder_lines(text: &str) -> String {
     let tokens = [
         "x264", "x265", "nvenc", "qsv", "vce", "mpeg", "av1", "vp8", "vp9", "theora",
         "encoder",
@@ -386,6 +386,15 @@ pub(crate) fn handbrake_encoders_raw(path: &Path) -> String {
         "<no encoder lines parsed from -h output>".to_string()
     } else {
         kept.join(" | ")
+    }
+}
+
+/// Capture the encoder-relevant lines from `HandBrakeCLI -h` as evidence for the
+/// debug log: exactly which encoder tokens THIS build reports.
+pub(crate) fn handbrake_encoders_raw(path: &Path) -> String {
+    match run_handbrake_help(path) {
+        Some(text) => summarize_encoder_lines(&text),
+        None => "<failed to run HandBrakeCLI -h>".to_string(),
     }
 }
 
@@ -529,24 +538,66 @@ pub(crate) fn detect_image() -> (ToolInfo, Option<ImageKind>) {
     (ToolInfo::default(), None)
 }
 
-/// Build the `GET /api/compress-tools` JSON body.
+/// Cached `GET /api/compress-tools` body + when it was computed. Tool detection
+/// shells out to `HandBrakeCLI -h`, `ffmpeg -version`, `where`, and PowerShell
+/// (`probe_gpu_hardware`), so recomputing it on every request is wasteful —
+/// nothing here changes within a few seconds of normal use.
+struct ToolsCache {
+    json: String,
+    at: Instant,
+}
+
+fn tools_cache() -> &'static Mutex<Option<ToolsCache>> {
+    static CACHE: OnceLock<Mutex<Option<ToolsCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// How long a cached tool-detection snapshot stays fresh. Short enough that
+/// dropping a binary into the tools dir is reflected promptly even without an
+/// explicit detect, long enough to coalesce the UI's repeated polls.
+const TOOLS_TTL: Duration = Duration::from_secs(15);
+
+/// Drop any cached tool-detection snapshot so the next `tools_json()` re-detects
+/// immediately. Called after an install/detect attempt so a freshly-provisioned
+/// binary shows up at once rather than after the TTL.
+pub(crate) fn invalidate_tools_cache() {
+    if let Ok(mut guard) = tools_cache().lock() {
+        *guard = None;
+    }
+}
+
+/// Build the `GET /api/compress-tools` JSON body, served from a short-lived
+/// cache (see [`TOOLS_TTL`]). Use [`invalidate_tools_cache`] to force a refresh.
 pub(crate) fn tools_json() -> String {
+    if let Ok(guard) = tools_cache().lock() {
+        if let Some(c) = guard.as_ref() {
+            if c.at.elapsed() < TOOLS_TTL {
+                return c.json.clone();
+            }
+        }
+    }
+    let json = tools_json_uncached();
+    if let Ok(mut guard) = tools_cache().lock() {
+        *guard = Some(ToolsCache { json: json.clone(), at: Instant::now() });
+    }
+    json
+}
+
+/// Compute the tools JSON from scratch (detection + probes). Cold path behind
+/// [`tools_json`]'s cache. Runs `HandBrakeCLI -h` only once for the chosen
+/// binary (caps + raw encoder list parsed from the same output).
+fn tools_json_uncached() -> String {
     let hb = detect_handbrake();
     let (img, kind) = detect_image();
 
-    let (caps, parse_ok) = hb
+    let (caps, parse_ok, raw) = hb
         .path
         .as_ref()
-        .map(|p| detect_handbrake_caps_ex(p))
-        .unwrap_or((HandbrakeCaps::default(), false));
+        .map(|p| detect_handbrake_caps_and_raw(p))
+        .unwrap_or((HandbrakeCaps::default(), false, "<HandBrakeCLI not found>".to_string()));
     let vendors = GpuVendors::from_caps(&caps);
     let hw = probe_gpu_hardware();
     let eff = EffectiveCaps::compute(&caps, hw);
-    let raw = hb
-        .path
-        .as_ref()
-        .map(|p| handbrake_encoders_raw(p))
-        .unwrap_or_else(|| "<HandBrakeCLI not found>".to_string());
 
     let mut s = String::with_capacity(768);
     s.push_str("{\"handbrake\":");
@@ -654,6 +705,10 @@ fn download_url(tool: &str) -> &'static str {
 /// `downloadUrl` so the UI can link the user out. This build does not fetch
 /// bytes itself (documented deviation).
 pub(crate) fn install_json(tool: &str) -> String {
+    // A detect/install attempt may have changed what's on disk (a binary dropped
+    // into the tools dir), so drop any cached tools snapshot — the next
+    // `GET /api/compress-tools` then reflects reality immediately.
+    invalidate_tools_cache();
     let (found, path) = match tool {
         "handbrake" => {
             let info = detect_handbrake();

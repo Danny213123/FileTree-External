@@ -190,6 +190,7 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
         hash_cache_path,
         auth_token,
         scan_roots: RwLock::new(Vec::new()),
+        compress_roots: RwLock::new(Vec::new()),
         compress_jobs: Mutex::new(std::collections::HashMap::new()),
     });
 
@@ -294,11 +295,24 @@ fn generate_session_token() -> String {
 /// file-content reads. Stored canonicalized (symlinks/`..` resolved) so the
 /// read-time containment check compares like-for-like. Bounded to avoid growth.
 fn register_scan_root(state: &AppState, path: &Path) {
+    register_root_into(&state.scan_roots, path);
+}
+
+/// Record a directory as an allowed COMPRESS source/destination root only (does
+/// not widen content-read access — those routes consult `scan_roots` alone).
+fn register_compress_root(state: &AppState, path: &Path) {
+    register_root_into(&state.compress_roots, path);
+}
+
+/// Shared body for [`register_scan_root`]/[`register_compress_root`]: store the
+/// canonicalized directory (symlinks/`..` resolved) so containment compares
+/// like-for-like, de-duplicated and bounded to avoid unbounded growth.
+fn register_root_into(roots: &RwLock<Vec<PathBuf>>, path: &Path) {
     let canon = match fs::canonicalize(path) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let mut roots = state.scan_roots.write().expect("scan_roots lock poisoned");
+    let mut roots = roots.write().expect("scan_roots lock poisoned");
     if roots.iter().any(|existing| existing == &canon) {
         return;
     }
@@ -341,24 +355,49 @@ fn classify_path_against_roots(roots: &[PathBuf], requested: &Path) -> PathScanS
     }
 }
 
-/// Classify `requested` against the live registered scan roots.
-fn path_scan_status(state: &AppState, requested: &Path) -> PathScanStatus {
-    let roots = state.scan_roots.read().expect("scan_roots lock poisoned");
-    classify_path_against_roots(&roots, requested)
-}
-
 /// True only when `requested` canonicalizes to a path located under at least one
 /// recorded scan root. A path that can't be canonicalized (missing, or no root
-/// recorded yet) is NOT within a root.
+/// recorded yet) is NOT within a root. Used by the content-read routes
+/// (preview/thumbnail/owner) — these consult `scan_roots` ALONE, so compressing
+/// a folder never widens read access.
 fn path_within_scan_root(state: &AppState, requested: &Path) -> bool {
-    path_scan_status(state, requested) == PathScanStatus::WithinRoot
+    let roots = state.scan_roots.read().expect("scan_roots lock poisoned");
+    classify_path_against_roots(&roots, requested) == PathScanStatus::WithinRoot
+}
+
+/// Classify `requested` for the COMPRESS routes: accepted when it resolves under
+/// `scan_roots` ∪ `compress_roots`. Keeps the compress allowlist separate from
+/// the content-read confinement.
+fn compress_path_status(state: &AppState, requested: &Path) -> PathScanStatus {
+    classify_path_against_roots(&compress_allowed_roots(state), requested)
+}
+
+/// True when `requested` is an acceptable compress source/destination (within
+/// `scan_roots` ∪ `compress_roots`).
+fn compress_path_within(state: &AppState, requested: &Path) -> bool {
+    compress_path_status(state, requested) == PathScanStatus::WithinRoot
+}
+
+/// Snapshot of the roots a compress request may reference: scanned roots plus
+/// the compress-only allowlist.
+fn compress_allowed_roots(state: &AppState) -> Vec<PathBuf> {
+    let mut roots = state.scan_roots.read().expect("scan_roots lock poisoned").clone();
+    roots.extend(
+        state
+            .compress_roots
+            .read()
+            .expect("compress_roots lock poisoned")
+            .iter()
+            .cloned(),
+    );
+    roots
 }
 
 /// Register the directory each submitted path lives in (the path itself when it
-/// is a directory, else its parent) as an allowed scan root. Safe on the
-/// token-gated compress routes: `register_scan_root` only records real on-disk
-/// directories the caller demonstrably referenced, so it cannot widen access
-/// beyond the user's own selection. Covers disjoint/multi-drive selections that
+/// is a directory, else its parent) into the COMPRESS allowlist. Safe on the
+/// token-gated compress routes: only real on-disk directories the caller
+/// demonstrably referenced are recorded, and they grant compress access only —
+/// not content-read access. Covers disjoint/multi-drive selections that
 /// `common_ancestor_dir` returns `None` for.
 fn register_selection_parents(state: &AppState, paths: &[String]) {
     for p in paths {
@@ -369,17 +408,15 @@ fn register_selection_parents(state: &AppState, paths: &[String]) {
             pb.parent().unwrap_or(pb)
         };
         if dir.is_dir() {
-            register_scan_root(state, dir);
+            register_compress_root(state, dir);
         }
     }
 }
 
-/// Snapshot the registered scan roots as display strings, for diagnostics.
+/// Snapshot the registered roots as display strings, for diagnostics. Includes
+/// both the scanned roots and the compress-only allowlist.
 fn scan_roots_snapshot(state: &AppState) -> Vec<String> {
-    state
-        .scan_roots
-        .read()
-        .expect("scan_roots lock poisoned")
+    compress_allowed_roots(state)
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect()
@@ -422,6 +459,18 @@ fn common_ancestor_dir(paths: &[String]) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for c in comps {
         out.push(c);
+    }
+    // Don't register a bare drive/filesystem root (`C:\`, `\\?\C:\`, `/`) as a
+    // compress root: for disjoint same-drive selections the only shared prefix
+    // is the drive itself, and per-path parent registration already covers each
+    // real selection directory. Returning that bare root would grant compress
+    // access to the whole drive. A path with no "normal" (named) component is
+    // exactly such a bare root.
+    let has_named_component = out
+        .components()
+        .any(|c| matches!(c, std::path::Component::Normal(_)));
+    if !has_named_component {
+        return None;
     }
     Some(out)
 }
@@ -3106,45 +3155,46 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     return respond_text(&mut stream, 400, "Bad request", "Missing paths");
                 }
                 // Re-register the scan root the renderer says these files came
-                // from. `register_scan_root` canonicalizes and only records a
-                // directory that actually exists, so this is equivalent to the
-                // user having scanned it — it cannot widen access to anything
-                // not under a real, on-disk directory. This covers the case
-                // where the tree was served from the renderer's in-memory cache
-                // and this server session never saw a `/api/scan` for that root,
-                // which previously made every valid source path fail the
-                // containment check below.
+                // from into the COMPRESS allowlist. `register_compress_root`
+                // canonicalizes and only records a directory that actually
+                // exists, so this grants compress access to a real, on-disk
+                // directory the caller referenced — WITHOUT widening content-read
+                // access (those routes consult `scan_roots` alone). This covers
+                // the case where the tree was served from the renderer's
+                // in-memory cache and this server session never saw a `/api/scan`
+                // for that root, which previously made every valid source path
+                // fail the containment check below.
                 if let Some(scan_root) = extract_json_str(&body_str, "scanRoot") {
                     let trimmed = scan_root.trim();
                     if !trimmed.is_empty() {
                         let candidate = Path::new(trimmed);
                         if candidate.is_dir() {
-                            register_scan_root(&state, candidate);
+                            register_compress_root(&state, candidate);
                         }
                     }
                 }
                 // Robustness: register the common-ancestor directory of the
-                // submitted paths as an allowed root. This route is already
-                // token-gated, and `register_scan_root` only records a directory
-                // that canonicalizes to a real on-disk path, so this can't widen
-                // access beyond a directory the caller demonstrably has files in
-                // — it just stops legitimate selections from a cache-served tree
-                // (no `/api/scan` this session) from failing the check below.
+                // submitted paths as an allowed compress root. With per-path
+                // parents registered (below), `common_ancestor_dir` deliberately
+                // returns `None` for disjoint same-drive selections rather than a
+                // bare drive root, so this only fires when the selection truly
+                // shares a meaningful directory.
                 if let Some(ancestor) = common_ancestor_dir(&paths) {
-                    register_scan_root(&state, &ancestor);
+                    register_compress_root(&state, &ancestor);
                 }
                 // Also register each submitted path's own directory. This covers
                 // disjoint/multi-drive selections (no common ancestor) and is safe
-                // — only real on-disk dirs the caller referenced get recorded.
+                // — only real on-disk dirs the caller referenced get recorded, and
+                // only into the compress allowlist.
                 register_selection_parents(&state, &paths);
                 // Containment check, leniently: ONLY reject a path that resolves
-                // to a real location outside every registered root (the genuine
-                // security case). A path that can't be canonicalized is
+                // to a real location outside every allowed compress root (the
+                // genuine security case). A path that can't be canonicalized is
                 // missing/stale (commonly a cache-expanded folder child recycled
                 // or renamed since the scan) — it must NOT fail the whole batch;
                 // the per-file worker records it as `ErrorSourceMissing`.
                 for p in &paths {
-                    match path_scan_status(&state, Path::new(p)) {
+                    match compress_path_status(&state, Path::new(p)) {
                         PathScanStatus::WithinRoot => {}
                         PathScanStatus::Unresolvable => {
                             crate::compress_debug::log(&format!(
@@ -3342,7 +3392,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             // on-disk dirs the caller referenced are recorded.
             register_selection_parents(&state, &paths);
             for p in &paths {
-                if !path_within_scan_root(&state, Path::new(p)) {
+                if !compress_path_within(&state, Path::new(p)) {
                     return respond_json(
                         &mut stream,
                         403,
@@ -3355,7 +3405,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             // The `.zip` doesn't exist yet, so gate its parent directory instead.
             let dest_ok = dest_path
                 .parent()
-                .map(|parent| path_within_scan_root(&state, parent))
+                .map(|parent| compress_path_within(&state, parent))
                 .unwrap_or(false);
             if !dest_ok {
                 return respond_json(
@@ -5061,6 +5111,19 @@ mod compress_path_authz_tests {
         let paths = vec![
             "C:\\alpha\\one.txt".to_string(),
             "D:\\beta\\two.txt".to_string(),
+        ];
+        assert_eq!(common_ancestor_dir(&paths), None);
+    }
+
+    // Disjoint selections on the SAME drive share only the bare drive root
+    // (`C:\`). We must NOT register that — it would grant compress access to the
+    // whole drive — so the ancestor is `None` and per-path parents cover it.
+    #[cfg(windows)]
+    #[test]
+    fn common_ancestor_dir_same_drive_disjoint_is_none() {
+        let paths = vec![
+            "C:\\alpha\\one.txt".to_string(),
+            "C:\\beta\\two.txt".to_string(),
         ];
         assert_eq!(common_ancestor_dir(&paths), None);
     }

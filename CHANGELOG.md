@@ -4,6 +4,21 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.0] - 2026-06-13
+
+A backlog of quality, performance, correctness, security, and observability follow-ups surfaced while shipping 1.12.0–1.12.3. No regressions; each item is an independent improvement.
+
+### Added
+
+### Changed
+
+- **Tool detection is cached (`GET /api/compress-tools`)**: detection shells out to `HandBrakeCLI -h`, `ffmpeg -version`, `where`, and a PowerShell GPU probe — previously recomputed on every poll, with the chosen HandBrake binary probed two-to-three times per request. Results are now served from a short-lived (15 s) cache, and the cold path runs `HandBrakeCLI -h` only once (caps + raw encoder list parsed from the same output). A detect/install attempt (`POST /api/compress-tools/install`) busts the cache so a freshly dropped binary is reflected immediately.
+
+### Security
+
+- **Compressing a folder no longer widens content-read access**: the compress routes used to register a selection's directories into the shared `scan_roots`, which also gates the content-read routes (preview/thumbnail/owner). A dedicated `compress_roots` allowlist now backs compress/zip containment (accepted under `scan_roots` ∪ `compress_roots`), while preview/thumbnail/owner reads continue to consult `scan_roots` alone. Compress access therefore never grants read access.
+- **`common_ancestor_dir` no longer registers a bare drive root**: for disjoint same-drive selections the only shared prefix is the drive itself (`C:\`); registering it would have granted compress access to the whole drive. Such a bare root is now rejected and per-path parent registration covers the real selection directories instead.
+
 ## [1.12.3] - 2026-06-13
 
 ### Fixed
