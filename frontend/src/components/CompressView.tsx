@@ -144,6 +144,10 @@ interface CompressPerfSettings {
   /** Whether the always-visible Options section (resolution/quality/codec/
    *  encoder) is expanded. Persisted so the choice sticks across sessions. */
   showOptions: boolean;
+  /** Hide the encoder-missing warning banner (persisted dismissal). */
+  bannerDismissed: boolean;
+  /** Hide the preset dropdown + options row (persisted). */
+  hidePresets: boolean;
 }
 
 const DEFAULT_PERF: CompressPerfSettings = {
@@ -157,6 +161,8 @@ const DEFAULT_PERF: CompressPerfSettings = {
   customQuality: 26,
   preset: "balanced",
   showOptions: true,
+  bannerDismissed: false,
+  hidePresets: false,
 };
 
 /** Discrete stops for the minimum-size slider (bytes). Finer at the low end
@@ -228,6 +234,8 @@ function loadPerf(): CompressPerfSettings {
         return "balanced";
       })(),
       showOptions: typeof p.showOptions === "boolean" ? p.showOptions : true,
+      bannerDismissed: typeof p.bannerDismissed === "boolean" ? p.bannerDismissed : false,
+      hidePresets: typeof p.hidePresets === "boolean" ? p.hidePresets : false,
     };
   } catch {
     return { ...DEFAULT_PERF };
@@ -541,8 +549,6 @@ interface CompressViewProps {
   scannedRoot?: string;
   /** The focused pane's scan tree — the source of compressible files. */
   nodeById: Map<number, NodeRecord>;
-  /** Reveal + select a node in the tree. */
-  onNavigate: (id: number) => void;
   /** Refresh the focused pane's tree (used after a run completes). */
   onRescan: () => void;
   /** Paths to pre-check when opened from the table's "Compress..." action. */
@@ -589,7 +595,6 @@ export function CompressView({
   scanPath,
   scannedRoot,
   nodeById,
-  onNavigate,
   onRescan,
   initialSelectedPaths,
   onInitialApplied,
@@ -1654,7 +1659,7 @@ export function CompressView({
           <button className="compress-notice-x" onClick={() => setPreflightNotice("")} title="Dismiss">×</button>
         </div>
       )}
-      {showBanner && (
+      {showBanner && !perf.bannerDismissed && (
         <div className="compress-tools-banner">
           <span className="ct-ico"><Icon name="warning" size={15} /></span>
           <span className="compress-tools-text">
@@ -1685,10 +1690,18 @@ export function CompressView({
               </button>
             )}
           </span>
+          <button
+            className="compress-notice-x"
+            onClick={() => updatePerf({ bannerDismissed: true })}
+            title="Hide this warning"
+          >
+            ×
+          </button>
         </div>
       )}
 
       <div className="compress-toolbar">
+        {!perf.hidePresets && (
         <div className="compress-group" aria-label="Quality preset">
           <span className="compress-group-label">Preset</span>
           <select
@@ -1734,6 +1747,7 @@ export function CompressView({
             {perf.showOptions ? "Hide options" : "Show options"}
           </button>
         </div>
+        )}
         <div
           className="compress-group"
           role="radiogroup"
@@ -1816,7 +1830,7 @@ export function CompressView({
         )}
       </div>
 
-      {perf.showOptions && (
+      {!perf.hidePresets && perf.showOptions && (
         <div className="compress-options" aria-label="Compression options">
           <div className="compress-perf-field">
             <label htmlFor="cv-resolution">Resolution</label>
@@ -1906,6 +1920,22 @@ export function CompressView({
 
       {showPerf && !inRun && (
         <div className="compress-perf-panel">
+          <label className="compress-toggle">
+            <input
+              type="checkbox"
+              checked={perf.hidePresets}
+              onChange={(e) => updatePerf({ hidePresets: e.target.checked })}
+            />
+            Hide preset controls
+          </label>
+          <label className="compress-toggle">
+            <input
+              type="checkbox"
+              checked={perf.bannerDismissed}
+              onChange={(e) => updatePerf({ bannerDismissed: e.target.checked })}
+            />
+            Hide encoder-missing warning
+          </label>
           <label className="compress-toggle">
             <input
               type="checkbox"
@@ -2188,7 +2218,7 @@ export function CompressView({
                     key={row.key}
                     className={`compress-row${isChecked ? " on" : ""}`}
                     style={common}
-                    onDoubleClick={() => onNavigate(f.id)}
+                    onDoubleClick={() => void openPath(f.path)}
                     onContextMenu={(e) => handleRowContextMenu(f, e)}
                   >
                     <input
@@ -2351,16 +2381,79 @@ const OUTCOME_FILTERS: { id: "all" | FileOutcome; label: string }[] = [
 
 const FILE_DETAIL_ROW_H = 30;
 
+/** The on-disk target to act on for a compress row: prefer the produced output
+ *  (still present after a run), fall back to the original source path. */
+function rowTarget(path: string | undefined, outPath?: string): string {
+  return outPath && outPath.length > 0 ? outPath : path ?? "";
+}
+
+/** Open a compress row's file in its default app (output if present, else source). */
+function openRow(path: string | undefined, outPath?: string): void {
+  const t = rowTarget(path, outPath);
+  if (t) void openPath(t);
+}
+
+/** Native OS context menu for one or more compress rows. */
+function rowContextMenu(e: React.MouseEvent, paths: string[]): void {
+  e.preventDefault();
+  const targets = paths.filter((p) => p && p.length > 0);
+  if (targets.length) void shellContextMenu(targets, e.clientX, e.clientY);
+}
+
+/** Lightweight row selection (single / ctrl-toggle / shift-range) over an ordered
+ *  key list, so the compress tables select and right-click like the main table. */
+function useRowSelection<K>() {
+  const [sel, setSel] = useState<Set<K>>(new Set());
+  const anchorRef = useRef<K | null>(null);
+  const onRowClick = useCallback((key: K, index: number, order: K[], e: React.MouseEvent) => {
+    setSel((prev) => {
+      const next = new Set<K>(prev);
+      if (e.shiftKey && anchorRef.current != null) {
+        const a = order.indexOf(anchorRef.current);
+        if (a >= 0) {
+          next.clear();
+          const [lo, hi] = a < index ? [a, index] : [index, a];
+          for (let i = lo; i <= hi; i++) next.add(order[i]);
+          return next;
+        }
+      }
+      if (e.ctrlKey || e.metaKey) {
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        anchorRef.current = key;
+        return next;
+      }
+      next.clear();
+      next.add(key);
+      anchorRef.current = key;
+      return next;
+    });
+  }, []);
+  return { sel, setSel, onRowClick };
+}
+
 /** Per-file detail table shown inside an expanded run row. Virtualizes when a
  *  run has many files; lets the user filter by outcome (passed/failed/skipped). */
 function JobFileTable({ files, loading }: { files: CompressJobFile[] | undefined; loading: boolean }) {
   const [filter, setFilter] = useState<"all" | FileOutcome>("all");
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const { sel, onRowClick } = useRowSelection<number>();
 
   const rows = useMemo(() => {
     const all = files ?? [];
     return filter === "all" ? all : all.filter((f) => outcomeOf(f) === filter);
   }, [files, filter]);
+
+  const order = useMemo(() => rows.map((f) => f.index), [rows]);
+  const rowMenu = useCallback(
+    (e: React.MouseEvent, f: CompressJobFile) => {
+      const targets = sel.has(f.index) && sel.size > 1
+        ? rows.filter((r) => sel.has(r.index)).map((r) => rowTarget(r.path))
+        : [rowTarget(f.path)];
+      rowContextMenu(e, targets);
+    },
+    [sel, rows],
+  );
 
   const counts = useMemo(() => {
     const c = { passed: 0, failed: 0, skipped: 0, pending: 0 };
@@ -2463,10 +2556,12 @@ function JobFileTable({ files, loading }: { files: CompressJobFile[] | undefined
             return (
               <div
                 key={f.index}
-                className="compress-jobfile-row"
+                className={`compress-jobfile-row${sel.has(f.index) ? " selected" : ""}`}
                 style={{ position: "absolute", top: vi.start, left: 0, right: 0, height: vi.size }}
                 title={title}
-                onDoubleClick={() => f.path && void revealPath(f.path)}
+                onClick={(e) => onRowClick(f.index, vi.index, order, e)}
+                onDoubleClick={() => openRow(f.path)}
+                onContextMenu={(e) => rowMenu(e, f)}
               >
                 <span className="cjf-name" title={f.path}>{baseName(f.path)}</span>
                 <span className="cjf-kind">{f.kind}</span>
@@ -2626,15 +2721,46 @@ function CompressInProgress() {
 
   // Reveal a produced output in Explorer. Uses cached detail when available,
   // else fetches the snapshot; manifest-only jobs fall back to a soft notice.
-  const onReveal = useCallback(
-    async (id: string) => {
+  // Resolve a job's representative produced output (falls back to a source path).
+  const jobOutputTarget = useCallback(
+    async (id: string): Promise<string | null> => {
       const files = details.get(id) ?? (await fetchCompressJob(id))?.files;
       const out =
-        files?.find((f) => f.status === "done" && f.newBytes > 0) ?? files?.find((f) => f.path);
-      if (out?.path) void revealPath(out.path);
-      else toast.info("No output to reveal yet for this job.");
+        files?.find((f) => f.status === "done" && f.newBytes > 0) ??
+        files?.find((f) => f.path);
+      return out ? rowTarget(out.path) : null;
     },
     [details],
+  );
+
+  const onReveal = useCallback(
+    async (id: string) => {
+      const t = await jobOutputTarget(id);
+      if (t) void revealPath(t);
+      else toast.info("No output to reveal yet for this job.");
+    },
+    [jobOutputTarget],
+  );
+
+  const onOpenJob = useCallback(
+    async (id: string) => {
+      const t = await jobOutputTarget(id);
+      if (t) void openPath(t);
+      else toast.info("No output to open yet for this job.");
+    },
+    [jobOutputTarget],
+  );
+
+  const onJobMenu = useCallback(
+    (e: React.MouseEvent, id: string) => {
+      e.preventDefault();
+      const x = e.clientX;
+      const y = e.clientY;
+      void jobOutputTarget(id).then((t) => {
+        if (t) void shellContextMenu([t], x, y);
+      });
+    },
+    [jobOutputTarget],
   );
 
   return (
@@ -2690,6 +2816,8 @@ function CompressInProgress() {
                     <tr
                       className={`compress-run-row${isOpen ? " open" : ""}`}
                       onClick={() => toggleExpand(j.id)}
+                      onDoubleClick={() => void onOpenJob(j.id)}
+                      onContextMenu={(e) => onJobMenu(e, j.id)}
                     >
                       <td className="cr-toggle">
                         <Icon name={isOpen ? "chevron-down" : "chevron-right"} size={12} />
@@ -2826,6 +2954,18 @@ function CompressHistory() {
     overscan: 16,
   });
 
+  const { sel, onRowClick } = useRowSelection<number>();
+  const order = useMemo(() => display.map((_, i) => i), [display]);
+  const rowMenu = useCallback(
+    (e: React.MouseEvent, idx: number, r: CompressLogRow) => {
+      const targets = sel.has(idx) && sel.size > 1
+        ? [...sel].sort((a, b) => a - b).map((i) => rowTarget(display[i]?.path, display[i]?.outPath))
+        : [rowTarget(r.path, r.outPath)];
+      rowContextMenu(e, targets);
+    },
+    [sel, display],
+  );
+
   return (
     <div className="compress-history">
       <div className="compress-toolbar">
@@ -2927,8 +3067,11 @@ function CompressHistory() {
                   return (
                     <div
                       key={`${r.ts}-${r.jobId}-${r.index}-${vi.index}`}
-                      className={`compress-log-vrow clog-${r.status}`}
+                      className={`compress-log-vrow clog-${r.status}${sel.has(vi.index) ? " selected" : ""}`}
                       style={{ position: "absolute", top: vi.start, left: 0, right: 0, height: vi.size }}
+                      onClick={(e) => onRowClick(vi.index, vi.index, order, e)}
+                      onDoubleClick={() => openRow(r.path, r.outPath)}
+                      onContextMenu={(e) => rowMenu(e, vi.index, r)}
                     >
                       <span className="clog-name" title={r.path}>{r.name || r.path}</span>
                       <span>{r.kind}</span>

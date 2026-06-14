@@ -4,6 +4,24 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.12] - 2026-06-14
+
+Overhauls the Compress page so its tables look and behave like the main file table, and lets you hide the parts of the toolbar you don't need. Frontend-only.
+
+### Added
+
+- **Working right-click and double-click on every Compress table**: the file picker, the In Progress runs + per-file detail tables, and the History log now all support double-click to open a file in its default app (preferring the produced output, falling back to the source) and a native OS right-click menu. The History and per-file detail tables also gained lightweight single / Ctrl / Shift row selection, so a right-click can target the whole multi-selection.
+- **Hide the encoder-missing warning**: the amber "No image/video encoder was found" banner now has an "×" to dismiss it. It can be restored from a new **Hide encoder-missing warning** checkbox in the **Performance** panel. The choice persists.
+- **Hide the preset controls**: a new **Hide preset controls** checkbox in the **Performance** panel collapses the Preset dropdown, **Manage presets**, the options toggle, and the Resolution/Quality/Codec options row for a cleaner toolbar. The choice persists, and the active preset still applies to jobs.
+
+### Changed
+
+- **Compress tables match the main file table**: the picker, runs, per-file detail, and History tables now share the main table's visual tokens (24px sticky headers, `var(--hover)` row hover, `var(--selected)` selection, `var(--border)` separators, tabular-nums numeric cells) while keeping their existing columns.
+
+### Fixed
+
+- **Compress page double-click now opens files**: the file picker previously jumped to the tree on double-click instead of opening the file; it now opens it, consistent with the rest of the app.
+
 ## [1.13.11] - 2026-06-14
 
 Fixes the actual cause of a compression batch "finishing" almost immediately having processed only a handful of files (e.g. "saved 0 bytes over 0 files"): file paths containing a `]` truncated the job's file list at job-creation time. Also pins the build version in the title bar.

@@ -1902,7 +1902,6 @@ function WorkbenchCompress({
       scanPath={m.scanPath}
       scannedRoot={m.data?.rootPath}
       nodeById={m.nodeById}
-      onNavigate={m.onNavigate}
       onRescan={m.onRefresh}
       initialSelectedPaths={initialSelectedPaths}
       onInitialApplied={onInitialApplied}

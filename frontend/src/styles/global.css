@@ -3925,10 +3925,11 @@ input:focus, select:focus {
 .compress-group-size { margin-left: auto; font-size: 12px; color: var(--text-5); font-variant-numeric: tabular-nums; }
 .compress-row {
   display: flex; align-items: center; gap: 8px; padding: 0 14px 0 30px; font-size: 12px;
-  border-bottom: 1px solid var(--border-4); box-sizing: border-box;
+  border-bottom: 1px solid var(--border); box-sizing: border-box;
+  color: var(--text); cursor: default; user-select: none;
 }
-.compress-row:hover { background: var(--vsc-list-hover); }
-.compress-row.on { background: rgba(0, 120, 212, 0.08); }
+.compress-row:hover { background: var(--hover); }
+.compress-row.on { background: var(--selected); }
 .compress-check { cursor: pointer; flex: 0 0 auto; accent-color: var(--accent); }
 .compress-row-name {
   flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
@@ -4071,8 +4072,8 @@ input:focus, select:focus {
 .compress-runs-table { width: 100%; border-collapse: collapse; font-size: 12px; color: var(--text); }
 .compress-runs-table thead th {
   position: sticky; top: 0; z-index: 1; text-align: left; font-weight: 600;
-  color: var(--text-5); background: var(--surface); padding: 6px 10px;
-  border-bottom: 1px solid var(--vsc-border); white-space: nowrap;
+  color: var(--text); background: var(--bg-4); padding: 0 10px; height: 24px;
+  font-size: 11px; border-bottom: 1px solid var(--border); white-space: nowrap;
 }
 .compress-runs-table th.num, .compress-runs-table td.num {
   text-align: right; font-variant-numeric: tabular-nums;
@@ -4080,10 +4081,10 @@ input:focus, select:focus {
 .compress-runs-table th.cr-toggle, .compress-runs-table td.cr-toggle { width: 24px; text-align: center; color: var(--text-8); }
 .compress-runs-table th.cr-prog { width: 34%; }
 .compress-runs-table th.cr-actions { text-align: right; }
-.compress-run-row { cursor: pointer; }
-.compress-run-row > td { padding: 5px 10px; border-bottom: 1px solid var(--border-4); vertical-align: middle; }
-.compress-run-row:hover { background: var(--vsc-list-hover); }
-.compress-run-row.open { background: var(--vsc-list-hover); }
+.compress-run-row { cursor: default; }
+.compress-run-row > td { padding: 0 10px; height: 28px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.compress-run-row:hover { background: var(--hover); }
+.compress-run-row.open { background: var(--selected); }
 .compress-run-preset { text-transform: capitalize; color: var(--text-5); }
 .compress-run-when { color: var(--text-5); white-space: nowrap; }
 .compress-run-prog { display: flex; align-items: center; gap: 8px; }
@@ -4110,10 +4111,11 @@ input:focus, select:focus {
   align-items: center; gap: 8px; padding: 0 6px;
 }
 .compress-jobfiles .cjf-enc { color: var(--text-5); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.compress-jobfiles-head { font-size: 11px; font-weight: 600; color: var(--text-8); padding-bottom: 4px; border-bottom: 1px solid var(--border-4); }
+.compress-jobfiles-head { font-size: 11px; font-weight: 600; color: var(--text); height: 24px; background: var(--bg-4); border-bottom: 1px solid var(--border); }
 .compress-jobfiles-body { max-height: 320px; overflow-y: auto; }
-.compress-jobfile-row { border-bottom: 1px solid var(--border-4); font-size: 12px; }
-.compress-jobfile-row:hover { background: var(--vsc-list-hover); }
+.compress-jobfile-row { border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text); cursor: default; user-select: none; }
+.compress-jobfile-row:hover { background: var(--hover); }
+.compress-jobfile-row.selected { background: var(--selected); }
 .compress-jobfiles .cjf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .compress-jobfiles .cjf-kind { color: var(--text-5); text-transform: capitalize; }
 .compress-jobfiles .cjf-sizes { white-space: nowrap; color: var(--text-5); }
@@ -4158,12 +4160,13 @@ input:focus, select:focus {
   align-items: center; gap: 10px; padding: 0 10px;
 }
 .compress-log-vhead {
-  font-weight: 600; color: var(--text-5); background: var(--surface);
-  border-bottom: 1px solid var(--vsc-border); padding-top: 6px; padding-bottom: 6px;
+  font-weight: 600; font-size: 11px; color: var(--text); background: var(--bg-4);
+  border-bottom: 1px solid var(--border); height: 24px;
 }
 .compress-log-vbody { flex: 1 1 0; min-height: 0; overflow-y: auto; }
-.compress-log-vrow { border-bottom: 1px solid var(--border-4); }
-.compress-log-vrow:hover { background: var(--vsc-list-hover); }
+.compress-log-vrow { border-bottom: 1px solid var(--border); color: var(--text); cursor: default; user-select: none; }
+.compress-log-vrow:hover { background: var(--hover); }
+.compress-log-vrow.selected { background: var(--selected); }
 .compress-log-vtable .num { text-align: right; font-variant-numeric: tabular-nums; }
 .compress-log-vtable .clog-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .compress-log-vtable .clog-sizes { white-space: nowrap; color: var(--text-5); }
