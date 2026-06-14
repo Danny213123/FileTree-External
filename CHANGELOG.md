@@ -4,7 +4,16 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
-## [1.13.5] - 2026-06-13
+## [1.13.6] - 2026-06-13
+
+Adds two new compression presets between the existing ones: a fixed **More savings** step and a fully **Custom** preset for video.
+
+### Added
+
+- **"More savings" preset**: a fixed in-between step that sits between Balanced (1080p / RF24) and Maximum savings (480p / RF30). Video is capped at 720p and encoded at RF 27 (CPU) / CQ 29 (GPU) using the x264 `medium` / SVT-AV1 speed `8` encoder presets. Images shrink a bit more than Balanced (ffmpeg `q:v 9` @ long-edge 1600; ImageMagick `quality 72` @ ~2.56 MP area cap).
+- **"Custom" preset (video)**: exposes a video **resolution cap** (Original / 1440p / 1080p / 720p / 480p; default 1080p) and a **quality** slider (RF base 16–40, default 26; lower = better quality, larger file). GPU encoders add the usual +2 quality offset. The chosen values — and the last-selected preset itself — are persisted across sessions in the browser, so reopening the app restores your choice. Images under Custom reuse Balanced behavior (the Custom controls are video-only). Custom settings round-trip through the job manifest so a resumed job keeps the same encoding.
+
+
 
 Restores the video compression savings that the v1.13.x audio change removed, and tells genuinely corrupt/incomplete downloads apart from real encoder failures.
 

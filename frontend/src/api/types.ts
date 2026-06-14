@@ -407,9 +407,10 @@ export interface ChecksumResult {
 // overall progress over NDJSON, then tags + recycles the originals. Every type
 // here matches the POST /api/compress-jobs* + GET /api/compress-tools contract.
 
-/** Quality preset. Labels: max → "Maximum savings", balanced → "Balanced",
- *  high → "High quality". */
-export type CompressPreset = "max" | "balanced" | "high";
+/** Quality preset. Labels: max → "Maximum savings", more → "More savings",
+ *  balanced → "Balanced", high → "High quality", custom → "Custom" (video
+ *  resolution cap + quality level chosen by the user). */
+export type CompressPreset = "max" | "more" | "balanced" | "high" | "custom";
 
 /** Detection state of one external compression tool. */
 export interface CompressToolInfo {
@@ -610,6 +611,12 @@ export interface CompressJobRequest {
   codec?: CompressCodec;
   /** Deflate level for the zip pipeline (0..9). -1 / omitted ⇒ server default. */
   zipLevel?: number;
+  /** Custom-preset video resolution cap (px height). 0 ⇒ original (no cap).
+   *  Only consulted when `preset === "custom"`. */
+  customMaxHeight?: number;
+  /** Custom-preset video quality (RF base, 16..40; lower = better). 0 / omitted
+   *  ⇒ backend default (26). Only consulted when `preset === "custom"`. */
+  customQuality?: number;
   /** Scan root the selected files belong to. Sent so the server can (re-)register
    *  it as an allowed read root before validating the source paths — covers the
    *  case where the tree was served from the renderer's cache and the current

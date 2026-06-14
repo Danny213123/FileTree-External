@@ -1396,7 +1396,14 @@ export async function compressPreflight(paths: string[]): Promise<CompressPrefli
 /** Start a compression job. Returns the new job id (throws on failure so the
  *  caller can surface why the job couldn't start). */
 export async function startCompressJob(body: CompressJobRequest): Promise<string> {
-  const r = await postMutation("/api/compress-jobs", body);
+  // Forward the custom-preset video knobs only when defined (mirrors how the
+  // other optional fields are sent), so older/non-custom requests are unchanged.
+  const payload: CompressJobRequest = { ...body };
+  if (body.customMaxHeight !== undefined) payload.customMaxHeight = body.customMaxHeight;
+  else delete payload.customMaxHeight;
+  if (body.customQuality !== undefined) payload.customQuality = body.customQuality;
+  else delete payload.customQuality;
+  const r = await postMutation("/api/compress-jobs", payload);
   if (!r.ok) throw new Error(mutateErrorText(r));
   const id = (r.data as { jobId?: string } | null)?.jobId;
   if (!id) throw new Error("Server did not return a job id");

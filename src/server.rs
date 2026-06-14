@@ -3271,6 +3271,25 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     .and_then(|v| v.as_f64())
                     .map(|n| n.max(0.0) as u64)
                     .unwrap_or(0);
+                // Custom-preset video knobs (only meaningful when preset=custom;
+                // otherwise harmlessly ignored downstream). Height 0 = original
+                // (no cap), clamped to a sane 0..=4320 range. Quality 0 = use the
+                // backend default (26), otherwise clamped to the 16..=40 RF window.
+                let custom_max_height = root
+                    .as_ref()
+                    .and_then(|v| v.get("customMaxHeight"))
+                    .and_then(|v| v.as_f64())
+                    .map(|n| n.max(0.0).min(4320.0) as u32)
+                    .unwrap_or(0);
+                let custom_quality = root
+                    .as_ref()
+                    .and_then(|v| v.get("customQuality"))
+                    .and_then(|v| v.as_f64())
+                    .map(|n| {
+                        let q = n.max(0.0) as u32;
+                        if q == 0 { 0 } else { q.clamp(16, 40) }
+                    })
+                    .unwrap_or(0);
                 if paths.is_empty() {
                     return respond_text(&mut stream, 400, "Bad request", "Missing paths");
                 }
@@ -3352,6 +3371,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     codec,
                     zip_level,
                     min_size_bytes,
+                    custom_max_height,
+                    custom_quality,
                 };
                 let job = crate::compress_job::create_job(&paths, &preset, &opts);
                 let id = job.id.clone();

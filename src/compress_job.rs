@@ -186,6 +186,10 @@ pub(crate) struct CompressJob {
     /// this are skipped (`SkippedTooSmall`) untouched — small files, especially
     /// videos with too few frames, rarely shrink. 0 = no minimum (compress all).
     pub(crate) min_size_bytes: u64,
+    /// Custom preset video resolution cap (px height). 0 = original (no cap).
+    pub(crate) custom_max_height: u32,
+    /// Custom preset video quality (RF base). 0 = use the default (26).
+    pub(crate) custom_quality: u32,
     /// "running" | "done" | "cancelled" | "error"
     pub(crate) status: Mutex<String>,
     pub(crate) total: usize,
@@ -269,6 +273,12 @@ pub(crate) struct CompressOptions {
     /// Minimum original size (bytes) to attempt compression; smaller files are
     /// skipped untouched. 0 = no minimum (compress all).
     pub(crate) min_size_bytes: u64,
+    /// Custom preset video resolution cap (px height). 0 = original (no cap).
+    /// Only consulted when the preset is `custom`.
+    pub(crate) custom_max_height: u32,
+    /// Custom preset video quality (RF base). 0 = use the default (26). Only
+    /// consulted when the preset is `custom`.
+    pub(crate) custom_quality: u32,
 }
 
 impl Default for CompressOptions {
@@ -282,6 +292,8 @@ impl Default for CompressOptions {
             codec: "h264".to_string(),
             zip_level: -1,
             min_size_bytes: 0,
+            custom_max_height: 0,
+            custom_quality: 0,
         }
     }
 }
@@ -351,6 +363,8 @@ pub(crate) fn create_job(
         codec: CompressOptions::norm_codec(&opts.codec),
         zip_level: opts.resolved_zip_level(),
         min_size_bytes: opts.min_size_bytes,
+        custom_max_height: opts.custom_max_height,
+        custom_quality: opts.custom_quality,
         status: Mutex::new("running".to_string()),
         total,
         files,
@@ -436,6 +450,16 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         .get("minSizeBytes")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let custom_max_height = root
+        .get("customMaxHeight")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(0);
+    let custom_quality = root
+        .get("customQuality")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(0);
     let opts = CompressOptions {
         original_action,
         tag_filename,
@@ -445,6 +469,8 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         codec,
         zip_level,
         min_size_bytes,
+        custom_max_height,
+        custom_quality,
     };
     let files_arr = root.get("files").and_then(|v| v.as_array())?;
 
@@ -498,6 +524,8 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         codec: CompressOptions::norm_codec(&opts.codec),
         zip_level: opts.resolved_zip_level(),
         min_size_bytes: opts.min_size_bytes,
+        custom_max_height: opts.custom_max_height,
+        custom_quality: opts.custom_quality,
         status: Mutex::new("running".to_string()),
         total,
         files,
@@ -514,7 +542,7 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
 
 fn normalize_preset(p: &str) -> String {
     match p {
-        "max" | "balanced" | "high" => p.to_string(),
+        "max" | "more" | "balanced" | "high" | "custom" => p.to_string(),
         _ => "balanced".to_string(),
     }
 }
@@ -609,19 +637,35 @@ pub(crate) fn select_video_encoder(
 /// QSV uses ICQ (all passed via HandBrake's `-q`), so the numbers are tuned per
 /// family to land at comparable visual quality. Also returns the
 /// `--encoder-preset` (speed/efficiency) appropriate to the family.
-fn video_quality(hb_encoder: &str, preset: &str) -> (String, Option<&'static str>, &'static str) {
+fn video_quality(
+    hb_encoder: &str,
+    preset: &str,
+    custom_q: u32,
+    custom_h: u32,
+) -> (String, Option<String>, &'static str) {
     let gpu = hb_encoder.starts_with("nvenc")
         || hb_encoder.starts_with("qsv")
         || hb_encoder.starts_with("vce");
     // (quality, maxHeight) by preset; GPU CQ/ICQ runs a touch higher than RF for
     // a similar size since hardware encoders are less efficient per quality step.
-    let (q, h): (&str, Option<&'static str>) = match (preset, gpu) {
-        ("max", false) => ("30", Some("480")),
-        ("max", true) => ("32", Some("480")),
-        ("high", false) => ("20", None),
-        ("high", true) => ("22", None),
-        (_, false) => ("24", Some("1080")),
-        (_, true) => ("26", Some("1080")),
+    let (q, h): (String, Option<String>) = match (preset, gpu) {
+        ("max", false) => ("30".to_string(), Some("480".to_string())),
+        ("max", true) => ("32".to_string(), Some("480".to_string())),
+        // "More savings": between Balanced (1080p/RF24) and Maximum (480p/RF30).
+        ("more", false) => ("27".to_string(), Some("720".to_string())),
+        ("more", true) => ("29".to_string(), Some("720".to_string())),
+        ("high", false) => ("20".to_string(), None),
+        ("high", true) => ("22".to_string(), None),
+        ("custom", _) => {
+            // User-chosen RF base (default 26, clamped); GPU adds +2 like the
+            // other presets. Height 0 ⇒ original (no cap).
+            let base = custom_quality_or_default(custom_q);
+            let q = if gpu { (base + 2).min(40) } else { base };
+            let h = if custom_h == 0 { None } else { Some(custom_h.to_string()) };
+            (q.to_string(), h)
+        }
+        (_, false) => ("24".to_string(), Some("1080".to_string())),
+        (_, true) => ("26".to_string(), Some("1080".to_string())),
     };
     let enc_preset = if gpu {
         "quality"
@@ -630,17 +674,26 @@ fn video_quality(hb_encoder: &str, preset: &str) -> (String, Option<&'static str
         // Bias toward "slower but smaller" for the quality-focused presets.
         match preset {
             "max" => "9",
+            "more" => "8",
             "high" => "5",
+            "custom" => "7",
             _ => "7",
         }
     } else {
         match preset {
             "max" => "veryfast",
             "high" => "slow",
+            // "more" and "custom" both use x264 medium.
             _ => "medium",
         }
     };
-    (q.to_string(), h, enc_preset)
+    (q, h, enc_preset)
+}
+
+/// Clamp a custom RF base into the supported 16..=40 window, substituting the
+/// default 26 when unset (0).
+fn custom_quality_or_default(custom_q: u32) -> u32 {
+    if custom_q == 0 { 26 } else { custom_q.clamp(16, 40) }
 }
 
 /// The encoder + a human-readable codec parameter string for one file, derived
@@ -653,13 +706,21 @@ fn pipeline_params(
     kind: FileKind,
     preset: &str,
     img_kind: Option<ImageKind>,
+    custom_q: u32,
+    custom_h: u32,
 ) -> (&'static str, String) {
     match kind {
         FileKind::Video => {
-            let (q, h) = match preset {
-                "max" => ("30", Some("480")),
-                "high" => ("20", None),
-                _ => ("24", Some("1080")),
+            let (q, h): (String, Option<String>) = match preset {
+                "max" => ("30".to_string(), Some("480".to_string())),
+                "more" => ("27".to_string(), Some("720".to_string())),
+                "high" => ("20".to_string(), None),
+                "custom" => {
+                    let q = custom_quality_or_default(custom_q).to_string();
+                    let h = if custom_h == 0 { None } else { Some(custom_h.to_string()) };
+                    (q, h)
+                }
+                _ => ("24".to_string(), Some("1080".to_string())),
             };
             let mut s = format!("x264 rf={q}");
             if let Some(h) = h {
@@ -669,8 +730,10 @@ fn pipeline_params(
         }
         FileKind::Image => match img_kind {
             Some(ImageKind::Ffmpeg) => {
+                // Custom images reuse Balanced behavior (video-only scope).
                 let (q, scale) = match preset {
                     "max" => ("12", Some("1280")),
+                    "more" => ("9", Some("1600")),
                     "high" => ("3", None),
                     _ => ("6", Some("1920")),
                 };
@@ -681,8 +744,10 @@ fn pipeline_params(
                 ("ffmpeg", s)
             }
             Some(ImageKind::ImageMagick) => {
+                // Custom images reuse Balanced behavior (video-only scope).
                 let (q, resize) = match preset {
                     "max" => ("60", Some("1280000@")),
+                    "more" => ("72", Some("2560000@")),
                     "high" => ("92", None),
                     _ => ("80", Some("3686400@")),
                 };
@@ -1065,7 +1130,8 @@ fn process_and_record(
 
     // Fallback tool/params for outcomes that never spawned an encoder; the live
     // path overrides these from the genuine encoder via EncodeMeta.
-    let (fallback_tool, fallback_params) = pipeline_params(f.kind, &job.preset, img_kind);
+    let (fallback_tool, fallback_params) =
+        pipeline_params(f.kind, &job.preset, img_kind, job.custom_quality, job.custom_max_height);
     let fallback_version = match f.kind {
         FileKind::Video => hb.version.as_deref().unwrap_or(""),
         FileKind::Image => img.version.as_deref().unwrap_or(""),
@@ -2609,7 +2675,9 @@ fn run_handbrake(
     enc: &VideoEncoder,
     meta: &mut EncodeMeta,
 ) -> EncodeResult {
-    let (quality, max_height, enc_preset) = video_quality(&enc.hb, preset);
+    let (quality, max_height, enc_preset) =
+        video_quality(&enc.hb, preset, job.custom_quality, job.custom_max_height);
+    let max_height = max_height.as_deref();
 
     let mut params = format!("{} q={quality} preset={enc_preset}", enc.hb);
     if let Some(h) = max_height {
@@ -2670,8 +2738,9 @@ fn run_ffmpeg_image(
 ) -> EncodeResult {
     let (quality, scale): (&str, Option<&str>) = match preset {
         "max" => ("12", Some("1280")),
+        "more" => ("9", Some("1600")),
         "high" => ("3", None),
-        _ => ("6", Some("1920")), // balanced
+        _ => ("6", Some("1920")), // balanced (and custom, video-only scope)
     };
     let _permit = match acquire_compress(CompressLane::Image, &job.cancel) {
         Some(p) => p,
@@ -2702,8 +2771,9 @@ fn run_magick_image(
 ) -> EncodeResult {
     let (quality, resize): (&str, Option<&str>) = match preset {
         "max" => ("60", Some("1280000@")),
+        "more" => ("72", Some("2560000@")),
         "high" => ("92", None),
-        _ => ("80", Some("3686400@")), // balanced (~1920x1920 area cap)
+        _ => ("80", Some("3686400@")), // balanced (and custom, video-only scope)
     };
     let _permit = match acquire_compress(CompressLane::Image, &job.cancel) {
         Some(p) => p,
@@ -3097,6 +3167,10 @@ fn write_manifest(job: &CompressJob) {
     s.push_str(&job.zip_level.to_string());
     s.push_str(",\"minSizeBytes\":");
     s.push_str(&job.min_size_bytes.to_string());
+    s.push_str(",\"customMaxHeight\":");
+    s.push_str(&job.custom_max_height.to_string());
+    s.push_str(",\"customQuality\":");
+    s.push_str(&job.custom_quality.to_string());
     s.push_str(",\"total\":");
     s.push_str(&job.total.to_string());
     s.push_str(",\"savedBytes\":");
@@ -3676,6 +3750,50 @@ mod encoder_tests {
     }
 
     #[test]
+    fn video_quality_more_and_custom_presets() {
+        // "More savings": CPU RF 27 / GPU CQ 29, both capped at 720p.
+        let (q, h, p) = video_quality("x264", "more", 0, 0);
+        assert_eq!(q, "27");
+        assert_eq!(h.as_deref(), Some("720"));
+        assert_eq!(p, "medium");
+        let (q, h, p) = video_quality("nvenc_h264", "more", 0, 0);
+        assert_eq!(q, "29");
+        assert_eq!(h.as_deref(), Some("720"));
+        assert_eq!(p, "quality");
+        // SVT-AV1 "more" uses speed 8.
+        let (_, _, p) = video_quality("svt_av1", "more", 0, 0);
+        assert_eq!(p, "8");
+
+        // Custom honors the supplied quality + height; GPU adds +2.
+        let (q, h, p) = video_quality("x264", "custom", 22, 1440);
+        assert_eq!(q, "22");
+        assert_eq!(h.as_deref(), Some("1440"));
+        assert_eq!(p, "medium");
+        let (q, h, _) = video_quality("nvenc_h264", "custom", 22, 1440);
+        assert_eq!(q, "24"); // +2 for GPU
+        assert_eq!(h.as_deref(), Some("1440"));
+        // Custom height 0 ⇒ original (no cap); quality 0 ⇒ default 26.
+        let (q, h, _) = video_quality("x264", "custom", 0, 0);
+        assert_eq!(q, "26");
+        assert_eq!(h, None);
+        // Custom SVT-AV1 uses speed 7.
+        let (_, _, p) = video_quality("svt_av1", "custom", 0, 0);
+        assert_eq!(p, "7");
+    }
+
+    #[test]
+    fn normalize_preset_accepts_more_and_custom() {
+        assert_eq!(normalize_preset("more"), "more");
+        assert_eq!(normalize_preset("custom"), "custom");
+        assert_eq!(normalize_preset("max"), "max");
+        assert_eq!(normalize_preset("balanced"), "balanced");
+        assert_eq!(normalize_preset("high"), "high");
+        // Junk still falls back to the safe default.
+        assert_eq!(normalize_preset("nonsense"), "balanced");
+        assert_eq!(normalize_preset(""), "balanced");
+    }
+
+    #[test]
     fn handbrake_args_optimize_only_for_mp4_family() {
         use std::path::Path;
         let has_optimize = |out: &str| {
@@ -3857,6 +3975,8 @@ mod manifest_tests {
             codec: "h265".to_string(),
             zip_level: 3,
             min_size_bytes: 2_000_000,
+            custom_max_height: 720,
+            custom_quality: 28,
         };
         let job = create_job(
             &["a.mp4".to_string(), "b.png".to_string(), "c.txt".to_string()],
@@ -3875,6 +3995,8 @@ mod manifest_tests {
         assert!(!back.use_gpu);
         assert_eq!(back.codec, "h265");
         assert_eq!(back.zip_level, 3);
+        assert_eq!(back.custom_max_height, 720);
+        assert_eq!(back.custom_quality, 28);
         assert_eq!(back.total, 3);
         // Kinds survive the round-trip.
         assert_eq!(back.files[0].kind, FileKind::Video);

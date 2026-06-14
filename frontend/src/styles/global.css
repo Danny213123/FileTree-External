@@ -3790,6 +3790,19 @@ input:focus, select:focus {
 /* "Delete permanently" disposition: irreversible, so warn even when active. */
 .compress-chip.danger.active { color: var(--danger); border-color: var(--danger); background: rgba(196, 43, 28, 0.1); }
 .compress-chip.danger:hover:not(:disabled) { color: var(--danger); border-color: rgba(196, 43, 28, 0.5); }
+/* Inline controls for the "Custom" preset (resolution cap + quality slider). */
+.compress-custom { display: inline-flex; align-items: center; gap: 12px; margin-left: 6px; }
+.compress-custom-field { display: inline-flex; align-items: center; gap: 6px; }
+.compress-custom-label { font-size: 11px; color: var(--text-5); }
+.compress-custom-value { color: var(--text); font-variant-numeric: tabular-nums; }
+.compress-custom-select {
+  appearance: none; border: 1px solid var(--vsc-border); background: var(--surface);
+  color: var(--text); cursor: pointer; font-size: 12px; padding: 3px 8px; border-radius: 8px;
+}
+.compress-custom-select:disabled { opacity: 0.45; cursor: default; }
+.compress-custom-range { width: 120px; cursor: pointer; }
+.compress-custom-range:disabled { opacity: 0.45; cursor: default; }
+.compress-custom-hint { font-size: 11px; color: var(--text-5); }
 .compress-toggle {
   display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text);
   cursor: pointer; user-select: none;
@@ -4031,6 +4044,10 @@ input:focus, select:focus {
 
 /* History tab */
 .compress-history { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
+/* The History body wraps a flex-sized virtualized table; make it a flex column
+   so .compress-log-vtable/.compress-log-vbody resolve a real height instead of
+   collapsing to 0 (which left the toolbar/headers visible but no rows). */
+.compress-history .compress-body { display: flex; flex-direction: column; }
 .compress-history a.compress-btn { text-decoration: none; }
 .compress-log-table {
   width: 100%; border-collapse: collapse; font-size: 12px; color: var(--text);
