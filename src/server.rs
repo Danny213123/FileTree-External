@@ -3213,11 +3213,29 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 let paths = extract_json_str_array(&body_str, "paths");
                 let preset = extract_json_str(&body_str, "preset")
                     .unwrap_or_else(|| "balanced".to_string());
-                let recycle = root
+                // Tri-state disposition for the original after a verified compress.
+                // Prefer the new `originalAction` string; fall back to the legacy
+                // `recycleOriginals` boolean (true => Recycle, false => Keep) so
+                // older clients keep working unchanged.
+                let original_action = match root
                     .as_ref()
-                    .and_then(|v| v.get("recycleOriginals"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                    .and_then(|v| v.get("originalAction"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) => crate::compress_job::OriginalAction::from_str(s),
+                    None => {
+                        let legacy = root
+                            .as_ref()
+                            .and_then(|v| v.get("recycleOriginals"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        if legacy {
+                            crate::compress_job::OriginalAction::Recycle
+                        } else {
+                            crate::compress_job::OriginalAction::Keep
+                        }
+                    }
+                };
                 let tag = root
                     .as_ref()
                     .and_then(|v| v.get("tagFilename"))
@@ -3317,7 +3335,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     }
                 }
                 let opts = crate::compress_job::CompressOptions {
-                    recycle_originals: recycle,
+                    original_action,
                     tag_filename: tag,
                     concurrency,
                     encoder,

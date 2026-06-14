@@ -3787,6 +3787,9 @@ input:focus, select:focus {
 .compress-chip:hover:not(:disabled) { color: var(--text); background: var(--vsc-list-hover); }
 .compress-chip.active { color: var(--text); border-color: var(--accent); }
 .compress-chip:disabled { opacity: 0.45; cursor: default; }
+/* "Delete permanently" disposition: irreversible, so warn even when active. */
+.compress-chip.danger.active { color: var(--danger); border-color: var(--danger); background: rgba(196, 43, 28, 0.1); }
+.compress-chip.danger:hover:not(:disabled) { color: var(--danger); border-color: rgba(196, 43, 28, 0.5); }
 .compress-toggle {
   display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text);
   cursor: pointer; user-select: none;
@@ -3867,6 +3870,11 @@ input:focus, select:focus {
 .compress-chip-status.done { background: rgba(46, 160, 67, 0.16); color: var(--accent-2, #2ea043); }
 .compress-chip-status.error { background: rgba(196, 43, 28, 0.16); color: var(--danger); }
 .compress-chip-status.skipped { background: rgba(148, 148, 148, 0.16); color: var(--text-5); }
+/* Disposition badges: what happened to the original after a verified compress. */
+.compress-chip-status.disposition { margin-left: 6px; border: 1px solid transparent; }
+.compress-chip-status.disposition.recycled { background: rgba(0, 120, 212, 0.12); color: var(--accent); }
+.compress-chip-status.disposition.deleted { background: rgba(196, 43, 28, 0.14); color: var(--danger); border-color: rgba(196, 43, 28, 0.4); }
+.compress-chip-status.disposition.kept { background: rgba(148, 148, 148, 0.14); color: var(--text-5); }
 .compress-row-saved { flex: 0 0 96px; text-align: right; color: var(--accent-2, var(--accent)); font-variant-numeric: tabular-nums; }
 .compress-loading {
   display: flex; align-items: center; gap: 10px; padding: 24px 16px;
@@ -3999,6 +4007,12 @@ input:focus, select:focus {
 .compress-jobfiles { display: flex; flex-direction: column; gap: 6px; padding-top: 6px; }
 .compress-jobfiles-empty { font-size: 12px; color: var(--text-8); padding: 10px 4px; }
 .compress-jobfiles-filter { display: flex; gap: 6px; flex-wrap: wrap; }
+.compress-jobfiles-reconcile {
+  display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
+  padding: 4px 2px 2px; font-size: 11px; color: var(--text-5);
+  font-variant-numeric: tabular-nums;
+}
+.compress-reconcile-dispo { color: var(--text-4, var(--text-5)); }
 .compress-jobfiles-head, .compress-jobfile-row {
   display: grid;
   grid-template-columns: minmax(120px, 2fr) 60px 130px minmax(96px, 1fr) minmax(140px, 1.4fr) 120px 90px 80px;

@@ -97,3 +97,13 @@ pub(crate) fn delete_path_permanent(path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
 }
+
+/// Permanently delete `path` with no Recycle Bin step, using only `std::fs`
+/// (never the Shell API). This is the explicit "Delete permanently" disposition
+/// for the compression workflow: the caller has already verified the compressed
+/// replacement is intact before invoking this, and the UI surfaces the
+/// irreversible nature of the choice. A thin, intention-revealing alias over
+/// [`delete_path_permanent`].
+pub(crate) fn delete_permanent(path: &Path) -> io::Result<()> {
+    delete_path_permanent(path)
+}

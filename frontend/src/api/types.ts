@@ -529,6 +529,11 @@ export interface CompressJobFile {
   pctSaved?: number;
   /** Wall-clock time spent on this file, in milliseconds. */
   durationMs?: number;
+  /** True only when the original was sent to the Recycle Bin. */
+  recycled?: boolean;
+  /** What actually happened to the original after a verified compress:
+   *  `recycled`, `deleted`, or `kept`. Empty until terminal / for non-success. */
+  disposition?: string;
 }
 
 /** Overall job status from the poll-fallback endpoint. */
@@ -554,6 +559,9 @@ export interface CompressJobSummary {
   done: number;
   errors: number;
   skipped: number;
+  /** Subset of `errors`: outputs rejected by the deep-verify gate (original
+   *  preserved). Present so the UI totals visibly sum to `total`. */
+  verifyFailed?: number;
   pending: number;
   savedBytes: number;
   /** Epoch ms the job was created (parsed from its id). */
@@ -573,10 +581,19 @@ export type CompressEncoder = "auto" | "x264" | "nvenc" | "qsv" | "vce";
 /** Target video codec. */
 export type CompressCodec = "h264" | "h265" | "av1";
 
+/** What to do with each ORIGINAL after its compressed replacement passes the
+ *  deep-verify gate. `recycle` (default) is recoverable; `delete` is permanent
+ *  (irreversible); `keep` leaves the original beside the new file. */
+export type OriginalAction = "recycle" | "delete" | "keep";
+
 /** Body for POST /api/compress-jobs. */
 export interface CompressJobRequest {
   paths: string[];
   preset: CompressPreset;
+  /** Tri-state disposition of the original after a verified compress. */
+  originalAction: OriginalAction;
+  /** @deprecated Back-compat only; the server derives this from originalAction.
+   *  Sent so an older server still honors the recoverable-vs-destroy intent. */
   recycleOriginals: boolean;
   tagFilename: boolean;
   /** Worker concurrency (parallel files). 0 / omitted ⇒ server hardware-default. */
@@ -627,6 +644,8 @@ export interface CompressFileDoneEvent {
   newBytes: number;
   savedBytes: number;
   recycled: boolean;
+  /** What happened to the original: `recycled` | `deleted` | `kept` | "". */
+  disposition?: string;
   status: "done" | "skipped_no_gain";
 }
 export interface CompressErrorEvent {
@@ -634,12 +653,20 @@ export interface CompressErrorEvent {
   index: number;
   path: string;
   error: string;
+  /** Precise outcome code (e.g. `error_verify_failed`, `error_encoder`). */
+  reason?: string;
 }
 export interface CompressDoneEvent {
   type: "done";
   jobId: string;
   done: number;
   errors: number;
+  /** Files that produced no gain (output discarded, original kept). */
+  skipped?: number;
+  /** Subset of `errors` rejected by the deep-verify gate (original preserved). */
+  verifyFailed?: number;
+  /** Total files in the job, so the UI can confirm post == pre. */
+  total?: number;
   savedBytes: number;
 }
 

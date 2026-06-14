@@ -12,6 +12,7 @@ import type {
   CompressLogRow,
   CompressEncoder,
   CompressCodec,
+  OriginalAction,
 } from "../api/types";
 import {
   fetchCompressTools,
@@ -68,6 +69,23 @@ const PRESETS: { id: CompressPreset; label: string }[] = [
   { id: "balanced", label: "Balanced" },
   { id: "high", label: "High quality" },
 ];
+
+// Tri-state disposition of the original after its compressed replacement passes
+// the deep-verify gate. Recycle is recoverable (default); Delete is permanent
+// (irreversible — flagged with a danger style); Keep leaves the original.
+const ORIGINAL_ACTIONS: { id: OriginalAction; label: string; title: string }[] = [
+  { id: "recycle", label: "Recycle Bin", title: "Send each original to the Recycle Bin after its compressed copy is verified (recoverable)." },
+  { id: "delete", label: "Delete permanently", title: "Permanently delete each original after its compressed copy is verified. This cannot be undone." },
+  { id: "keep", label: "Keep originals", title: "Leave every original in place; the new [COMPRESSED] file is created alongside it." },
+];
+
+/** Per-file disposition badge text + tooltip, keyed by the server's
+ *  `disposition` string. */
+const DISPOSITION_LABEL: Record<string, { label: string; title: string }> = {
+  recycled: { label: "Recycled", title: "Original sent to the Recycle Bin (recoverable)." },
+  deleted: { label: "Deleted", title: "Original permanently deleted." },
+  kept: { label: "Kept", title: "Original left in place alongside the new file." },
+};
 
 // ── Performance settings (Section D: persist-settings) ──────────────────────
 // User-tunable encoder/throughput knobs threaded into the job request. Persisted
@@ -185,6 +203,12 @@ interface FileProg {
   newBytes: number;
   savedBytes: number;
   error?: string;
+  /** Precise outcome code from the server (e.g. `error_verify_failed`). */
+  reason?: string;
+  /** True only when the original was recycled. */
+  recycled?: boolean;
+  /** What happened to the original: `recycled` | `deleted` | `kept` | "". */
+  disposition?: string;
 }
 
 type Row =
@@ -261,7 +285,7 @@ export function CompressView({
   const [tab, setTab] = useState<CompressTab>("compress");
   const [tools, setTools] = useState<CompressTools | null>(null);
   const [preset, setPreset] = useState<CompressPreset>("balanced");
-  const [recycleOriginals, setRecycleOriginals] = useState(true);
+  const [originalAction, setOriginalAction] = useState<OriginalAction>("recycle");
   const [tagFilename, setTagFilename] = useState(true);
   const [perf, setPerf] = useState<CompressPerfSettings>(() => loadPerf());
   const [showPerf, setShowPerf] = useState(false);
@@ -740,6 +764,8 @@ export function CompressView({
               pct: 100,
               newBytes: ev.newBytes,
               savedBytes: ev.savedBytes,
+              recycled: ev.recycled,
+              disposition: ev.disposition,
             });
             return next;
           });
@@ -759,6 +785,7 @@ export function CompressView({
               newBytes: 0,
               savedBytes: 0,
               error: ev.error,
+              reason: ev.reason,
             });
             return next;
           });
@@ -789,6 +816,9 @@ export function CompressView({
             newBytes: f.newBytes,
             savedBytes: Math.max(0, f.origBytes - f.newBytes) || 0,
             error: f.error,
+            reason: f.reason,
+            recycled: f.recycled,
+            disposition: f.disposition,
           });
         }
         return next;
@@ -955,7 +985,9 @@ export function CompressView({
       const id = await startCompressJob({
         paths: liveRunnable.map((f) => f.path),
         preset,
-        recycleOriginals,
+        originalAction,
+        // Back-compat for an older server: Recycle => true, Delete/Keep => false.
+        recycleOriginals: originalAction === "recycle",
         tagFilename,
         // Performance + encoder knobs (Section D). Omitted-as-0/-1 lets the
         // server apply hardware-derived defaults.
@@ -981,7 +1013,7 @@ export function CompressView({
       setRunError(e instanceof Error ? e.message : String(e));
       toast.error(`Could not start compression: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [selectedFiles, kindAvailable, preset, recycleOriginals, tagFilename, perf, attachStream, scanPath, scannedRoot, nodeById, onRescan]);
+  }, [selectedFiles, kindAvailable, preset, originalAction, tagFilename, perf, attachStream, scanPath, scannedRoot, nodeById, onRescan]);
 
   const handleStop = useCallback(async () => {
     abortRef.current?.abort();
@@ -1190,15 +1222,28 @@ export function CompressView({
             </button>
           ))}
         </div>
-        <label className="compress-toggle">
-          <input
-            type="checkbox"
-            checked={recycleOriginals}
-            disabled={inRun}
-            onChange={(e) => setRecycleOriginals(e.target.checked)}
-          />
-          Recycle originals
-        </label>
+        <div
+          className="compress-group"
+          role="radiogroup"
+          aria-label="What to do with each original after a verified compress"
+        >
+          <span className="compress-group-label">Original</span>
+          {ORIGINAL_ACTIONS.map((a) => (
+            <button
+              key={a.id}
+              role="radio"
+              aria-checked={originalAction === a.id}
+              className={`compress-chip${originalAction === a.id ? " active" : ""}${
+                a.id === "delete" ? " danger" : ""
+              }`}
+              onClick={() => setOriginalAction(a.id)}
+              disabled={inRun}
+              title={a.title}
+            >
+              {a.label}
+            </button>
+          ))}
+        </div>
         <label className="compress-toggle">
           <input
             type="checkbox"
@@ -1596,6 +1641,14 @@ export function CompressView({
                   <span className={`compress-chip-status ${rf.status}`} title={badge.title}>
                     {badge.label}
                   </span>
+                  {rf.status === "done" && rf.disposition && DISPOSITION_LABEL[rf.disposition] && (
+                    <span
+                      className={`compress-chip-status disposition ${rf.disposition}`}
+                      title={DISPOSITION_LABEL[rf.disposition].title}
+                    >
+                      {DISPOSITION_LABEL[rf.disposition].label}
+                    </span>
+                  )}
                   <span className="compress-row-saved">
                     {rf.savedBytes > 0 ? `−${formatBytes(rf.savedBytes)}` : rf.status === "done" ? "—" : ""}
                   </span>
@@ -1631,6 +1684,7 @@ const REASON_LABEL: Record<string, string> = {
   error_cloud_placeholder: "Skipped — cloud-only file",
   error_spawn: "Error — couldn't start",
   error_internal: "Error — internal",
+  error_verify_failed: "Verify failed",
   gpu_fallback: "Saved — GPU→CPU fallback",
 };
 
@@ -1645,6 +1699,7 @@ const REASON_TOOLTIP: Record<string, string> = {
   error_cloud_placeholder: "The source is a cloud-only placeholder (OneDrive/Files On-Demand) that isn't downloaded locally. It was skipped to avoid forcing a large download — set it to \"Always keep on this device\" and retry.",
   error_spawn: "The encoder process could not be started.",
   error_internal: "An unexpected internal error occurred while processing this file (a caught worker error). The rest of the batch was unaffected; retry to re-run this file.",
+  error_verify_failed: "The compressed output failed integrity verification (re-decode / CRC check), so it was discarded and the ORIGINAL was preserved untouched. Nothing was removed; retry to re-compress this file.",
   gpu_fallback: "The GPU encoder failed, so the file was re-encoded on the CPU. The file still compressed; see the error/stderr for the exact GPU failure (driver/session/codec).",
 };
 
@@ -1666,6 +1721,9 @@ function progBadge(rf: FileProg): { label: string; title: string } {
     case "skipped":
       return { label: "No gain", title: REASON_TOOLTIP.skipped_no_gain };
     case "error":
+      if (rf.reason && REASON_LABEL[rf.reason]) {
+        return { label: REASON_LABEL[rf.reason], title: rf.error || REASON_TOOLTIP[rf.reason] || "" };
+      }
       return { label: "Error", title: rf.error || REASON_TOOLTIP.error_encoder };
     case "done":
     default:
@@ -1721,6 +1779,20 @@ function JobFileTable({ files, loading }: { files: CompressJobFile[] | undefined
     return c;
   }, [files]);
 
+  // Disposition + verify-failed tallies for the reconciled summary line (so the
+  // user can see exactly how many originals were recycled/deleted/kept and that
+  // every file is accounted for).
+  const dispo = useMemo(() => {
+    const d = { recycled: 0, deleted: 0, kept: 0, verifyFailed: 0 };
+    for (const f of files ?? []) {
+      if (f.disposition === "recycled") d.recycled += 1;
+      else if (f.disposition === "deleted") d.deleted += 1;
+      else if (f.disposition === "kept") d.kept += 1;
+      if (f.reason === "error_verify_failed") d.verifyFailed += 1;
+    }
+    return d;
+  }, [files]);
+
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollEl,
@@ -1752,6 +1824,18 @@ function JobFileTable({ files, loading }: { files: CompressJobFile[] | undefined
             </button>
           );
         })}
+      </div>
+      <div className="compress-jobfiles-reconcile">
+        <span title="Every input file lands in exactly one bucket; these sum to the total.">
+          {counts.passed.toLocaleString()} done · {counts.skipped.toLocaleString()} skipped ·{" "}
+          {dispo.verifyFailed.toLocaleString()} verify-failed ·{" "}
+          {Math.max(0, counts.failed - dispo.verifyFailed).toLocaleString()} error ·{" "}
+          {counts.pending.toLocaleString()} pending / {files.length.toLocaleString()} files
+        </span>
+        <span className="compress-reconcile-dispo" title="What happened to the originals.">
+          {dispo.recycled.toLocaleString()} recycled · {dispo.deleted.toLocaleString()} deleted ·{" "}
+          {dispo.kept.toLocaleString()} kept
+        </span>
       </div>
       <div className="compress-jobfiles-head">
         <span className="cjf-name">File</span>
@@ -1799,6 +1883,14 @@ function JobFileTable({ files, loading }: { files: CompressJobFile[] | undefined
                 <span className="cjf-kind">{f.kind}</span>
                 <span className="cjf-outcome">
                   <span className={`compress-chip-status ${badgeCls}`} title={title}>{badgeLabel}</span>
+                  {oc === "passed" && f.disposition && DISPOSITION_LABEL[f.disposition] && (
+                    <span
+                      className={`compress-chip-status disposition ${f.disposition}`}
+                      title={DISPOSITION_LABEL[f.disposition].title}
+                    >
+                      {DISPOSITION_LABEL[f.disposition].label}
+                    </span>
+                  )}
                 </span>
                 <span className="cjf-enc" title={f.encoder || undefined}>{encoderText}</span>
                 <span className="cjf-sizes">
@@ -2028,9 +2120,13 @@ function CompressInProgress() {
                               style={{ width: `${pct}%` }}
                             />
                           </div>
-                          <span className="compress-run-counts">
+                          <span
+                            className="compress-run-counts"
+                            title={`${j.done} done · ${j.skipped} skipped · ${(j.verifyFailed ?? 0)} verify-failed · ${Math.max(0, j.errors - (j.verifyFailed ?? 0))} error / ${j.total} files`}
+                          >
                             {completed.toLocaleString()} / {j.total.toLocaleString()}
-                            {j.errors > 0 ? ` · ${j.errors.toLocaleString()} err` : ""}
+                            {(j.verifyFailed ?? 0) > 0 ? ` · ${(j.verifyFailed ?? 0).toLocaleString()} verify-fail` : ""}
+                            {j.errors - (j.verifyFailed ?? 0) > 0 ? ` · ${(j.errors - (j.verifyFailed ?? 0)).toLocaleString()} err` : ""}
                           </span>
                         </div>
                       </td>

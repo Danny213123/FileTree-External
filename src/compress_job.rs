@@ -87,6 +87,12 @@ pub(crate) struct FileState {
     pub(crate) orig_bytes: AtomicU64,
     pub(crate) new_bytes: AtomicU64,
     pub(crate) recycled: AtomicBool,
+    /// What actually happened to the ORIGINAL after a successful, verified
+    /// compress: `"recycled"`, `"deleted"`, or `"kept"` (empty until terminal /
+    /// for non-success outcomes). Distinct from the requested
+    /// [`OriginalAction`]: a Recycle that fails leaves the original in place and
+    /// records `"kept"`.
+    pub(crate) disposition: Mutex<String>,
     pub(crate) out_path: Mutex<String>,
     pub(crate) error: Mutex<Option<String>>,
     /// Precise outcome code (see [`Reason`]) so interrupted/old runs render an
@@ -111,11 +117,46 @@ impl FileState {
             orig_bytes: AtomicU64::new(orig),
             new_bytes: AtomicU64::new(0),
             recycled: AtomicBool::new(false),
+            disposition: Mutex::new(String::new()),
             out_path: Mutex::new(String::new()),
             error: Mutex::new(None),
             reason: Mutex::new(String::new()),
             duration_ms: AtomicU64::new(0),
             encoder: Mutex::new(String::new()),
+        }
+    }
+}
+
+/// What to do with the ORIGINAL file after its compressed replacement has been
+/// produced AND deep-verified. Replaces the old `recycle_originals: bool` so the
+/// user gets an explicit, safe-by-default choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OriginalAction {
+    /// Send the original to the Recycle Bin (recoverable). The default.
+    Recycle,
+    /// Permanently delete the original (no Recycle Bin). Irreversible — gated in
+    /// the UI with a warning and only ever runs after verification passes.
+    Delete,
+    /// Leave the original in place; the new `[COMPRESSED]` file coexists.
+    Keep,
+}
+
+impl OriginalAction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            OriginalAction::Recycle => "recycle",
+            OriginalAction::Delete => "delete",
+            OriginalAction::Keep => "keep",
+        }
+    }
+
+    /// Parse the request/manifest string. Unknown values fall back to the safe,
+    /// recoverable default (`Recycle`).
+    pub(crate) fn from_str(s: &str) -> OriginalAction {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "delete" => OriginalAction::Delete,
+            "keep" => OriginalAction::Keep,
+            _ => OriginalAction::Recycle,
         }
     }
 }
@@ -127,7 +168,7 @@ impl FileState {
 pub(crate) struct CompressJob {
     pub(crate) id: String,
     pub(crate) preset: String,
-    pub(crate) recycle_originals: bool,
+    pub(crate) original_action: OriginalAction,
     pub(crate) tag_filename: bool,
     /// Max files this job encodes at once (its worker-pool size). Clamped to a
     /// hardware-derived default when not specified by the request.
@@ -212,7 +253,7 @@ pub(crate) fn is_safe_job_id(id: &str) -> bool {
 /// [`CompressOptions::normalized`] so an older client (or resume) still works.
 #[derive(Clone, Debug)]
 pub(crate) struct CompressOptions {
-    pub(crate) recycle_originals: bool,
+    pub(crate) original_action: OriginalAction,
     pub(crate) tag_filename: bool,
     /// 0 ⇒ "auto" (hardware-derived); otherwise the requested worker count.
     pub(crate) concurrency: usize,
@@ -226,7 +267,7 @@ pub(crate) struct CompressOptions {
 impl Default for CompressOptions {
     fn default() -> Self {
         CompressOptions {
-            recycle_originals: true,
+            original_action: OriginalAction::Recycle,
             tag_filename: true,
             concurrency: 0,
             encoder: "auto".to_string(),
@@ -294,7 +335,7 @@ pub(crate) fn create_job(
     Arc::new(CompressJob {
         id: id.clone(),
         preset: normalize_preset(preset),
-        recycle_originals: opts.recycle_originals,
+        original_action: opts.original_action,
         tag_filename: opts.tag_filename,
         concurrency: opts.resolved_concurrency(),
         encoder: CompressOptions::norm_encoder(&opts.encoder),
@@ -358,10 +399,16 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
     let root = crate::json::parse(&text)?;
 
     let preset = root.get("preset").and_then(|v| v.as_str()).unwrap_or("balanced");
-    let recycle_originals = root
-        .get("recycleOriginals")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    // Tri-state disposition with back-compat: prefer the new `originalAction`
+    // string; if absent, derive from the legacy `recycleOriginals` boolean
+    // (true => Recycle, false => Keep) so older manifests resume unchanged.
+    let original_action = match root.get("originalAction").and_then(|v| v.as_str()) {
+        Some(s) => OriginalAction::from_str(s),
+        None => {
+            let legacy = root.get("recycleOriginals").and_then(|v| v.as_bool()).unwrap_or(true);
+            if legacy { OriginalAction::Recycle } else { OriginalAction::Keep }
+        }
+    };
     let tag_filename = root.get("tagFilename").and_then(|v| v.as_bool()).unwrap_or(true);
     let concurrency = root
         .get("concurrency")
@@ -377,7 +424,7 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         .map(|n| n as i64)
         .unwrap_or(-1);
     let opts = CompressOptions {
-        recycle_originals,
+        original_action,
         tag_filename,
         concurrency,
         encoder,
@@ -405,6 +452,9 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
                 f.get("recycled").and_then(|v| v.as_bool()).unwrap_or(false),
                 Ordering::Relaxed,
             );
+            if let Some(d) = f.get("disposition").and_then(|v| v.as_str()) {
+                *state.disposition.lock_recover() = d.to_string();
+            }
             if let Some(op) = f.get("outPath").and_then(|v| v.as_str()) {
                 *state.out_path.lock_recover() = op.to_string();
             }
@@ -426,7 +476,7 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
     Some(Arc::new(CompressJob {
         id: id.to_string(),
         preset: normalize_preset(preset),
-        recycle_originals,
+        original_action,
         tag_filename,
         concurrency: opts.resolved_concurrency(),
         encoder: CompressOptions::norm_encoder(&opts.encoder),
@@ -671,6 +721,10 @@ struct Counts {
     done: AtomicUsize,
     error: AtomicUsize,
     skipped: AtomicUsize,
+    /// Subset of `error`: files whose compressed output failed the deep-verify
+    /// gate (original was preserved). Surfaced separately so the UI totals can
+    /// distinguish a corrupt-output rejection from other failures.
+    verify_failed: AtomicUsize,
 }
 
 fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
@@ -678,6 +732,10 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
 
     let hb = compress_tools::detect_handbrake();
     let (img, img_kind) = compress_tools::detect_image();
+    // ffmpeg is the preferred output verifier (full re-decode); detect it once
+    // here even when ImageMagick is the chosen image encoder, since the video
+    // pipeline runs on HandBrake and wouldn't otherwise locate ffmpeg.
+    let ff = compress_tools::detect_ffmpeg();
     let caps = hb
         .path
         .as_ref()
@@ -688,8 +746,8 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     // detected (path + version) so a "tool missing" outcome later is unambiguous.
     if crate::compress_debug::enabled() {
         let mut l = format!(
-            "[job_start] job={} preset={} recycle={} tag={} files={} concurrency={} encoder={} codec={} useGpu={} zipLevel={}",
-            job.id, job.preset, job.recycle_originals, job.tag_filename, job.total,
+            "[job_start] job={} preset={} originalAction={} tag={} files={} concurrency={} encoder={} codec={} useGpu={} zipLevel={}",
+            job.id, job.preset, job.original_action.as_str(), job.tag_filename, job.total,
             job.concurrency, job.encoder, job.codec, job.use_gpu, job.zip_level
         );
         l.push_str(&format!(" handbrake={}", tool_desc(&hb)));
@@ -774,6 +832,7 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
         let counts = Arc::clone(&counts);
         let hb = hb.clone();
         let img = img.clone();
+        let ff = ff.clone();
         handles.push(std::thread::spawn(move || {
             loop {
                 if job.cancel.load(Ordering::SeqCst) {
@@ -790,7 +849,7 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
                 // abandon the rest of the batch as pending. The offending file is
                 // recorded as a per-file internal error and the loop continues.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    process_and_record(&state, &job, i, &hb, &img, img_kind, &caps, &counts)
+                    process_and_record(&state, &job, i, &hb, &img, &ff, img_kind, &caps, &counts)
                 }));
                 let stop = match result {
                     Ok(stop) => stop,
@@ -844,8 +903,22 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     let done_count = counts.done.load(Ordering::Relaxed);
     let error_count = counts.error.load(Ordering::Relaxed);
     let skipped_count = counts.skipped.load(Ordering::Relaxed);
+    let verify_failed_count = counts.verify_failed.load(Ordering::Relaxed);
 
+    // Post == pre guarantee: every input file must land in exactly one terminal
+    // bucket. After the reconcile above (which converts any leftover pending/
+    // running file into an error) this must hold for a non-cancelled run; log
+    // loudly if it ever doesn't so a silently-abandoned file can't hide.
     let cancelled = job.cancel.load(Ordering::SeqCst);
+    if !cancelled {
+        let accounted = done_count + skipped_count + error_count;
+        if accounted != job.total {
+            crate::compress_debug::log(&format!(
+                "[reconcile] job={} COUNT MISMATCH: done={done_count} + skipped={skipped_count} + error={error_count} = {accounted} != total={} (reconciled={reconciled})",
+                job.id, job.total
+            ));
+        }
+    }
     let status = if cancelled {
         "cancelled"
     } else if reconciled > 0 {
@@ -862,10 +935,18 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
 
     let total_saved = job.saved_bytes.load(Ordering::Relaxed);
     crate::compress_debug::log(&format!(
-        "[job_end] job={} done={done_count} skipped={skipped_count} error={error_count} saved={total_saved} status={status}",
-        job.id
+        "[job_end] job={} done={done_count} skipped={skipped_count} error={error_count} verifyFailed={verify_failed_count} total={} saved={total_saved} status={status}",
+        job.id, job.total
     ));
-    job.emit(ev_done(&job.id, done_count, error_count, total_saved));
+    job.emit(ev_done(
+        &job.id,
+        done_count,
+        error_count,
+        skipped_count,
+        verify_failed_count,
+        job.total,
+        total_saved,
+    ));
     job.finished.store(true, Ordering::SeqCst);
     job.events_cv.notify_all();
 }
@@ -932,7 +1013,7 @@ fn record_internal_error(job: &Arc<CompressJob>, i: usize, counts: &Counts, mess
         f.path,
         Reason::ErrorInternal.as_str(),
     ));
-    job.emit(ev_error(i, &f.path, message));
+    job.emit(ev_error(i, &f.path, message, Reason::ErrorInternal.as_str()));
     write_manifest(job);
 }
 
@@ -945,6 +1026,7 @@ fn process_and_record(
     i: usize,
     hb: &compress_tools::ToolInfo,
     img: &compress_tools::ToolInfo,
+    ff: &compress_tools::ToolInfo,
     img_kind: Option<ImageKind>,
     caps: &HandbrakeCaps,
     counts: &Counts,
@@ -958,7 +1040,7 @@ fn process_and_record(
     }
 
     let file_start = Instant::now();
-    let outcome = process_file(state, job, i, hb, img, img_kind, caps);
+    let outcome = process_file(state, job, i, hb, img, ff, img_kind, caps);
     let duration_ms = file_start.elapsed().as_millis() as u64;
     let f = &job.files[i];
     let orig = f.orig_bytes.load(Ordering::Relaxed);
@@ -977,7 +1059,7 @@ fn process_and_record(
 
     let mut stop = false;
     match outcome {
-        FileOutcome::Done { out_path, new_bytes, recycled, recycle_error, tagged, diag, meta } => {
+        FileOutcome::Done { out_path, new_bytes, recycled, disposition, disposition_error, tagged, diag, meta } => {
             let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
             let codec_params = if meta.codec_params.is_empty() { fallback_params.clone() } else { meta.codec_params.clone() };
             let tool_version = if meta.tool_version.is_empty() { fallback_version } else { meta.tool_version.as_str() };
@@ -988,6 +1070,7 @@ fn process_and_record(
             let fallback_detail = meta.gpu_fallback.clone().unwrap_or_default();
             f.new_bytes.store(new_bytes, Ordering::Relaxed);
             f.recycled.store(recycled, Ordering::Relaxed);
+            *f.disposition.lock_recover() = disposition.to_string();
             *f.out_path.lock_recover() = out_path.clone();
             *f.status.lock_recover() = "done".to_string();
             *f.reason.lock_recover() = reason.as_str().to_string();
@@ -1028,9 +1111,9 @@ fn process_and_record(
             log_file_debug(
                 &job.id, i, &f.path, kind_str, orig, tool, &diag, &out_path, new_bytes,
                 "compressed", reason.as_str(), duration_ms, recycled,
-                recycle_error.as_deref(), Some(tagged),
+                disposition_error.as_deref(), Some(tagged),
             );
-            job.emit(ev_file_done(i, &out_path, orig, new_bytes, saved, recycled, "done"));
+            job.emit(ev_file_done(i, &out_path, orig, new_bytes, saved, recycled, disposition, "done"));
         }
         FileOutcome::Skipped { new_bytes, diag, meta } => {
             let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
@@ -1071,7 +1154,7 @@ fn process_and_record(
                 &job.id, i, &f.path, kind_str, orig, tool, &diag, "", new_bytes,
                 "skipped", Reason::SkippedNoGain.as_str(), duration_ms, false, None, None,
             );
-            job.emit(ev_file_done(i, "", orig, new_bytes, 0, false, "skipped_no_gain"));
+            job.emit(ev_file_done(i, "", orig, new_bytes, 0, false, "", "skipped_no_gain"));
         }
         FileOutcome::Error { reason, message, diag, meta } => {
             let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
@@ -1082,6 +1165,9 @@ fn process_and_record(
             *f.reason.lock_recover() = reason.as_str().to_string();
             *f.encoder.lock_recover() = codec_params.clone();
             counts.error.fetch_add(1, Ordering::Relaxed);
+            if reason == Reason::ErrorVerifyFailed {
+                counts.verify_failed.fetch_add(1, Ordering::Relaxed);
+            }
             crate::compress_log::append_row(&crate::compress_log::Row {
                 job_id: &job.id,
                 index: i,
@@ -1111,7 +1197,7 @@ fn process_and_record(
                 &job.id, i, &f.path, kind_str, orig, tool, &diag, "", 0,
                 "error", reason.as_str(), duration_ms, false, None, None,
             );
-            job.emit(ev_error(i, &f.path, &message));
+            job.emit(ev_error(i, &f.path, &message, reason.as_str()));
         }
         FileOutcome::Cancelled => {
             *f.status.lock_recover() = "pending".to_string();
@@ -1237,6 +1323,10 @@ pub(crate) enum Reason {
     /// non-terminal by an aborted worker). Recorded per-file so one bad file can
     /// never silently abandon the rest of the batch.
     ErrorInternal,
+    /// The encode "succeeded" and was smaller, but the produced output failed the
+    /// deep-verify gate (re-decode / CRC). The corrupt output was deleted and the
+    /// ORIGINAL was preserved untouched — so this is fully resumable via Retry.
+    ErrorVerifyFailed,
     /// Compressed successfully, but only after a GPU encode failed and the file
     /// fell back to the CPU encoder. The GPU failure detail is carried in the
     /// file's error/message field for visibility.
@@ -1258,6 +1348,7 @@ impl Reason {
             Reason::ErrorCloudPlaceholder => "error_cloud_placeholder",
             Reason::ErrorSpawn => "error_spawn",
             Reason::ErrorInternal => "error_internal",
+            Reason::ErrorVerifyFailed => "error_verify_failed",
             Reason::GpuFallback => "gpu_fallback",
         }
     }
@@ -1287,8 +1378,14 @@ enum FileOutcome {
     Done {
         out_path: String,
         new_bytes: u64,
+        /// True only when the original was actually sent to the Recycle Bin
+        /// (back-compat with the CSV/manifest `recycled` column + `file_done`).
         recycled: bool,
-        recycle_error: Option<String>,
+        /// What actually happened to the original: `"recycled"`, `"deleted"`, or
+        /// `"kept"`. Distinct from the requested action (a failed Recycle/Delete
+        /// degrades to `"kept"` with `disposition_error` set).
+        disposition: &'static str,
+        disposition_error: Option<String>,
         tagged: bool,
         diag: EncodeDiag,
         meta: EncodeMeta,
@@ -1391,6 +1488,7 @@ fn process_file(
     index: usize,
     hb: &compress_tools::ToolInfo,
     img: &compress_tools::ToolInfo,
+    ff: &compress_tools::ToolInfo,
     img_kind: Option<ImageKind>,
     caps: &HandbrakeCaps,
 ) -> FileOutcome {
@@ -1550,6 +1648,29 @@ fn process_file(
         return FileOutcome::Skipped { new_bytes, diag, meta };
     }
 
+    // Deep-verify gate (HARD): re-decode / CRC-check the produced output BEFORE
+    // any disposition of the original. A "successful" encoder exit + smaller size
+    // is not proof the bytes are intact — a truncated container, a half-written
+    // file, or a corrupt zip can all slip past the size check. If verification
+    // fails we delete the bad output, leave the original untouched, and report a
+    // resumable error so a good original is NEVER removed behind a broken copy.
+    match verify_output(job, index, &out, kind, &input, hb, ff, img, img_kind) {
+        Verify::Ok => {}
+        Verify::Cancelled => {
+            let _ = std::fs::remove_file(&out);
+            return FileOutcome::Cancelled;
+        }
+        Verify::Failed(detail) => {
+            let _ = std::fs::remove_file(&out);
+            return FileOutcome::Error {
+                reason: Reason::ErrorVerifyFailed,
+                message: format!("compressed output failed integrity verification: {detail}"),
+                diag,
+                meta,
+            };
+        }
+    }
+
     let out_str = out.to_string_lossy().into_owned();
 
     // [COMPRESSED] sidecar metadata tag keyed to the new path (the filename
@@ -1560,7 +1681,9 @@ fn process_file(
         add_compressed_tag(&out_str);
     }
 
-    // Audit the compress, then recycle the original if requested.
+    // Audit the compress, then dispose of the original per the requested action.
+    // This only runs AFTER verification passed, so the original is never removed
+    // behind a corrupt output.
     let src_vec = [input_str.clone()];
     crate::audit::record(crate::audit::Entry {
         op: "compress",
@@ -1570,12 +1693,21 @@ fn process_file(
         ..Default::default()
     });
 
+    // Tri-state disposition of the verified original.
+    //  - Recycle: send to the Recycle Bin (recoverable).
+    //  - Delete:  permanent removal via std::fs (no Shell API), irreversible.
+    //  - Keep:    leave the original in place alongside the new file.
+    // A failed Recycle/Delete is non-fatal: the compressed file is still good, so
+    // the file is reported Done but the original is recorded as "kept" with the
+    // error surfaced. `recycled` (the legacy bool) is true only on a real recycle.
     let mut recycled = false;
-    let mut recycle_error: Option<String> = None;
-    if job.recycle_originals {
-        match crate::recycle::recycle_path(&input) {
+    let mut disposition: &'static str = "kept";
+    let mut disposition_error: Option<String> = None;
+    match job.original_action {
+        OriginalAction::Recycle => match crate::recycle::recycle_path(&input) {
             Ok(()) => {
                 recycled = true;
+                disposition = "recycled";
                 crate::audit::record(crate::audit::Entry {
                     op: "recycle",
                     disposition: "recycle",
@@ -1585,7 +1717,7 @@ fn process_file(
                 });
             }
             Err(e) => {
-                recycle_error = Some(e.to_string());
+                disposition_error = Some(e.to_string());
                 crate::audit::record(crate::audit::Entry {
                     op: "recycle",
                     disposition: "recycle",
@@ -1595,10 +1727,37 @@ fn process_file(
                     ..Default::default()
                 });
             }
+        },
+        OriginalAction::Delete => match crate::recycle::delete_permanent(&input) {
+            Ok(()) => {
+                disposition = "deleted";
+                crate::audit::record(crate::audit::Entry {
+                    op: "delete",
+                    disposition: "delete",
+                    src: &src_vec,
+                    by: "server",
+                    ..Default::default()
+                });
+            }
+            Err(e) => {
+                disposition_error = Some(e.to_string());
+                crate::audit::record(crate::audit::Entry {
+                    op: "delete",
+                    disposition: "delete",
+                    src: &src_vec,
+                    error: Some(&e.to_string()),
+                    by: "server",
+                    ..Default::default()
+                });
+            }
+        },
+        OriginalAction::Keep => {
+            disposition = "kept";
         }
     }
 
-    // The parent directory's tree changed (new file, possibly recycled original).
+    // The parent directory's tree changed (new file, possibly recycled/deleted
+    // original).
     if let Some(parent) = input.parent() {
         state
             .scan_cache
@@ -1607,7 +1766,397 @@ fn process_file(
             .invalidate(&parent.to_string_lossy());
     }
 
-    FileOutcome::Done { out_path: out_str, new_bytes, recycled, recycle_error, tagged, diag, meta }
+    FileOutcome::Done { out_path: out_str, new_bytes, recycled, disposition, disposition_error, tagged, diag, meta }
+}
+
+// ── Deep output verification (the post-encode integrity gate) ─────────────────
+
+/// Result of [`verify_output`].
+enum Verify {
+    /// Output decoded / CRC-checked clean.
+    Ok,
+    /// Output is corrupt/incomplete; carries a human-readable detail.
+    Failed(String),
+    /// The job was cancelled during verification.
+    Cancelled,
+}
+
+/// Captured result of a short verification subprocess.
+struct VerifyRun {
+    cancelled: bool,
+    /// False when the helper couldn't even be spawned (tool absent).
+    spawned: bool,
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Spawn a verification helper (`ffmpeg`/`HandBrakeCLI`/`magick`) as the job's
+/// active child for `index` so a cancel kills it, capturing BOTH stdout and
+/// stderr to the end. Unlike [`run_child`] it keeps stdout (tools like
+/// `identify` print results there) and emits no progress events. Respects the
+/// job cancel flag while polling.
+fn run_verify_capture(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> VerifyRun {
+    use std::io::Read;
+    use std::process::Stdio;
+    compress_tools::no_window(&mut cmd);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => {
+            return VerifyRun {
+                cancelled: false,
+                spawned: false,
+                success: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            };
+        }
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    job.children.lock_recover().insert(index, child);
+
+    let out_handle = stdout.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut s = Vec::new();
+            let _ = pipe.read_to_end(&mut s);
+            s
+        })
+    });
+    let err_handle = stderr.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut s = Vec::new();
+            let _ = pipe.read_to_end(&mut s);
+            s
+        })
+    });
+
+    let mut cancelled = false;
+    let exit_status: Option<std::process::ExitStatus> = loop {
+        if job.cancel.load(Ordering::SeqCst) {
+            if let Some(c) = job.children.lock_recover().get_mut(&index) {
+                let _ = c.kill();
+            }
+            cancelled = true;
+            break None;
+        }
+        let poll = {
+            let mut guard = job.children.lock_recover();
+            match guard.get_mut(&index) {
+                None => break None,
+                Some(c) => match c.try_wait() {
+                    Ok(Some(st)) => Some(st),
+                    Ok(None) => None,
+                    Err(_) => break None,
+                },
+            }
+        };
+        match poll {
+            Some(st) => break Some(st),
+            None => std::thread::sleep(std::time::Duration::from_millis(40)),
+        }
+    };
+    if let Some(mut c) = job.children.lock_recover().remove(&index) {
+        let _ = c.wait();
+    }
+    let stdout = out_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+    let stderr = err_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+    let (success, exit_code) = match exit_status {
+        Some(st) => (st.success(), st.code()),
+        None => (false, None),
+    };
+    VerifyRun {
+        cancelled,
+        spawned: true,
+        success,
+        exit_code,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    }
+}
+
+/// Deep-verify a just-produced compressed output BEFORE the original is disposed
+/// of. Re-decodes media (ffmpeg, falling back to a HandBrake `--scan`), decodes
+/// images (ImageMagick `identify -regard-warnings`, falling back to ffmpeg) and
+/// confirms dimensions match the original, and CRC-checks zip archives. Returns
+/// [`Verify::Failed`] with a detail on any integrity problem, [`Verify::Cancelled`]
+/// if the job was cancelled, else [`Verify::Ok`]. When no suitable verifier tool
+/// is available it accepts (it can't *prove* corruption) rather than blocking an
+/// otherwise-valid run.
+#[allow(clippy::too_many_arguments)]
+fn verify_output(
+    job: &Arc<CompressJob>,
+    index: usize,
+    out: &Path,
+    kind: FileKind,
+    orig: &Path,
+    hb: &compress_tools::ToolInfo,
+    ff: &compress_tools::ToolInfo,
+    img: &compress_tools::ToolInfo,
+    img_kind: Option<ImageKind>,
+) -> Verify {
+    if job.cancel.load(Ordering::SeqCst) {
+        return Verify::Cancelled;
+    }
+    match kind {
+        FileKind::Video => verify_media(job, index, out, orig, ff, hb),
+        FileKind::Image => verify_image(job, index, out, orig, ff, img, img_kind),
+        // Audio also routes here (classified Other) and so flows through the same
+        // archive CRC check as every other zipped file — coherent and complete.
+        FileKind::Other => match crate::archive::verify_archive(out) {
+            Ok(()) => Verify::Ok,
+            Err(e) => Verify::Failed(format!("zip CRC/structure check failed: {e}")),
+        },
+    }
+}
+
+/// Verify a re-encoded video by full re-decode. ffmpeg is preferred
+/// (`-v error -xerror -i <out> -f null -`): any non-zero exit OR any stderr is a
+/// failure. Without ffmpeg, a HandBrake `--scan` must report at least one title.
+/// On success the probed duration is sanity-checked against the original.
+fn verify_media(
+    job: &Arc<CompressJob>,
+    index: usize,
+    out: &Path,
+    orig: &Path,
+    ff: &compress_tools::ToolInfo,
+    hb: &compress_tools::ToolInfo,
+) -> Verify {
+    if let Some(ffmpeg) = ff.path.as_ref() {
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args(["-v", "error", "-xerror", "-i"]).arg(out).args(["-f", "null", "-"]);
+        let run = run_verify_capture(job, index, cmd);
+        if run.cancelled {
+            return Verify::Cancelled;
+        }
+        if run.spawned {
+            if !run.success {
+                return Verify::Failed(format!(
+                    "ffmpeg re-decode exited {}: {}",
+                    run.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                    safe_tail(run.stderr.trim(), 400)
+                ));
+            }
+            let errtail = run.stderr.trim();
+            if !errtail.is_empty() {
+                return Verify::Failed(format!("ffmpeg reported decode errors: {}", safe_tail(errtail, 400)));
+            }
+            // Duration sanity check (best-effort: only fails on a clear mismatch).
+            if let (Some(od), Some(nd)) = (
+                probe_duration_secs(job, index, ffmpeg, orig),
+                probe_duration_secs(job, index, ffmpeg, out),
+            ) {
+                if od > 0.5 {
+                    let diff = (od - nd).abs();
+                    let tol = (od * 0.05).max(2.0);
+                    if diff > tol {
+                        return Verify::Failed(format!(
+                            "output duration {nd:.1}s differs from original {od:.1}s beyond tolerance ({tol:.1}s)"
+                        ));
+                    }
+                }
+            }
+            return Verify::Ok;
+        }
+    }
+    // ffmpeg unavailable → HandBrake scan title check.
+    if let Some(hbp) = hb.path.as_ref() {
+        let mut cmd = Command::new(hbp);
+        cmd.args(["--scan", "-i"]).arg(out).args(["-t", "0"]);
+        let run = run_verify_capture(job, index, cmd);
+        if run.cancelled {
+            return Verify::Cancelled;
+        }
+        if run.spawned {
+            let combined = format!("{}\n{}", run.stdout, run.stderr);
+            if handbrake_scan_title_count(&combined) >= 1 {
+                return Verify::Ok;
+            }
+            return Verify::Failed("HandBrake scan found no valid title in the output".to_string());
+        }
+    }
+    // No media verifier available: cannot prove corruption, so accept.
+    Verify::Ok
+}
+
+/// Verify a re-encoded image by decoding it and confirming its dimensions match
+/// the original. Uses ImageMagick `identify -regard-warnings` when it is the
+/// chosen tool, otherwise an ffmpeg decode + dimension probe.
+#[allow(clippy::too_many_arguments)]
+fn verify_image(
+    job: &Arc<CompressJob>,
+    index: usize,
+    out: &Path,
+    orig: &Path,
+    ff: &compress_tools::ToolInfo,
+    img: &compress_tools::ToolInfo,
+    img_kind: Option<ImageKind>,
+) -> Verify {
+    if let (Some(ImageKind::ImageMagick), Some(magick)) = (img_kind, img.path.as_ref()) {
+        let nd = match magick_identify_dims(job, index, magick, out) {
+            Ok(d) => d,
+            Err(e) if e == "cancelled" => return Verify::Cancelled,
+            Err(e) => return Verify::Failed(format!("ImageMagick rejected output: {e}")),
+        };
+        let od = magick_identify_dims(job, index, magick, orig).ok().flatten();
+        return match (od, nd) {
+            (Some(o), Some(n)) if o != n => Verify::Failed(format!(
+                "output dimensions {}x{} != original {}x{}",
+                n.0, n.1, o.0, o.1
+            )),
+            _ => Verify::Ok,
+        };
+    }
+    if let Some(ffmpeg) = ff.path.as_ref() {
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args(["-v", "error", "-xerror", "-i"]).arg(out).args(["-f", "null", "-"]);
+        let run = run_verify_capture(job, index, cmd);
+        if run.cancelled {
+            return Verify::Cancelled;
+        }
+        if run.spawned {
+            if !run.success || !run.stderr.trim().is_empty() {
+                return Verify::Failed(format!(
+                    "ffmpeg image decode failed: {}",
+                    safe_tail(run.stderr.trim(), 400)
+                ));
+            }
+            if let (Some(o), Some(n)) = (
+                ffmpeg_image_dims(job, index, ffmpeg, orig),
+                ffmpeg_image_dims(job, index, ffmpeg, out),
+            ) {
+                if o != n {
+                    return Verify::Failed(format!(
+                        "output dimensions {}x{} != original {}x{}",
+                        n.0, n.1, o.0, o.1
+                    ));
+                }
+            }
+            return Verify::Ok;
+        }
+    }
+    Verify::Ok
+}
+
+/// Run `magick identify -regard-warnings -format "%w %h"` on `file`. A corrupt
+/// image trips a warning that `-regard-warnings` promotes to a non-zero exit.
+/// Returns the parsed `(width, height)` of the first frame, `Ok(None)` if dims
+/// couldn't be parsed (still a clean decode), or `Err` on failure/cancel.
+fn magick_identify_dims(
+    job: &Arc<CompressJob>,
+    index: usize,
+    magick: &Path,
+    file: &Path,
+) -> Result<Option<(u64, u64)>, String> {
+    let mut cmd = Command::new(magick);
+    cmd.arg("identify").arg("-regard-warnings").args(["-format", "%w %h\\n"]).arg(file);
+    let run = run_verify_capture(job, index, cmd);
+    if run.cancelled {
+        return Err("cancelled".to_string());
+    }
+    if !run.spawned {
+        return Err("could not start ImageMagick identify".to_string());
+    }
+    if !run.success {
+        return Err(format!(
+            "identify exit {}: {}",
+            run.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+            safe_tail(run.stderr.trim(), 300)
+        ));
+    }
+    Ok(parse_dims_pair(&run.stdout))
+}
+
+/// Probe image dimensions with `ffmpeg -hide_banner -i <file>` (parsed from the
+/// Video stream line). Best-effort; `None` when unavailable/unparseable.
+fn ffmpeg_image_dims(
+    job: &Arc<CompressJob>,
+    index: usize,
+    ffmpeg: &Path,
+    file: &Path,
+) -> Option<(u64, u64)> {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.arg("-hide_banner").arg("-i").arg(file);
+    let run = run_verify_capture(job, index, cmd);
+    if run.cancelled || !run.spawned {
+        return None;
+    }
+    parse_stream_dims(&run.stderr)
+}
+
+/// Probe a media file's duration in seconds via `ffmpeg -hide_banner -i <file>`
+/// (ffmpeg exits non-zero with no output specified, but still prints the
+/// `Duration:` line we parse). Best-effort; `None` when unavailable/unparseable.
+fn probe_duration_secs(
+    job: &Arc<CompressJob>,
+    index: usize,
+    ffmpeg: &Path,
+    file: &Path,
+) -> Option<f64> {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.arg("-hide_banner").arg("-i").arg(file);
+    let run = run_verify_capture(job, index, cmd);
+    if run.cancelled || !run.spawned {
+        return None;
+    }
+    parse_ffmpeg_duration(&run.stderr)
+}
+
+/// Parse `Duration: HH:MM:SS.ss` out of ffmpeg's stderr into seconds.
+fn parse_ffmpeg_duration(s: &str) -> Option<f64> {
+    let idx = s.find("Duration:")?;
+    let rest = s[idx + "Duration:".len()..].trim_start();
+    let token: String = rest.chars().take_while(|c| !c.is_whitespace() && *c != ',').collect();
+    if token.starts_with("N/A") {
+        return None;
+    }
+    let parts: Vec<&str> = token.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h: f64 = parts[0].parse().ok()?;
+    let m: f64 = parts[1].parse().ok()?;
+    let sec: f64 = parts[2].parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + sec)
+}
+
+/// Parse the first `WxH` from an ffmpeg `Video:` stream line in stderr.
+fn parse_stream_dims(s: &str) -> Option<(u64, u64)> {
+    for line in s.lines() {
+        if !line.contains("Video:") {
+            continue;
+        }
+        for tok in line.split(|c: char| c == ' ' || c == ',' || c == '[' || c == '(') {
+            if let Some((w, h)) = tok.split_once('x') {
+                let h_digits: String = h.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let (Ok(w), Ok(h)) = (w.parse::<u64>(), h_digits.parse::<u64>()) {
+                    if w > 0 && h > 0 {
+                        return Some((w, h));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse `"<w> <h>"` (first line) from `identify` output.
+fn parse_dims_pair(s: &str) -> Option<(u64, u64)> {
+    let line = s.lines().find(|l| !l.trim().is_empty())?;
+    let mut it = line.split_whitespace();
+    let w: u64 = it.next()?.parse().ok()?;
+    let h: u64 = it.next()?.parse().ok()?;
+    Some((w, h))
+}
+
+/// Count HandBrake `--scan` titles from its log output (one `+ title N:` header
+/// per detected title).
+fn handbrake_scan_title_count(s: &str) -> usize {
+    s.lines().filter(|l| l.trim_start().starts_with("+ title ")).count()
 }
 
 /// Return at most the last `max` bytes of `s`, snapped UP to the nearest UTF-8
@@ -2267,8 +2816,12 @@ fn write_manifest(job: &CompressJob) {
     push_json_string(&mut s, &job.status.lock_recover());
     s.push_str(",\"preset\":");
     push_json_string(&mut s, &job.preset);
+    s.push_str(",\"originalAction\":");
+    push_json_string(&mut s, job.original_action.as_str());
+    // Keep the legacy boolean too so a downgraded/older reader still honors the
+    // recoverable-vs-destroy intent (Delete maps to recycle=false there).
     s.push_str(",\"recycleOriginals\":");
-    s.push_str(if job.recycle_originals { "true" } else { "false" });
+    s.push_str(if matches!(job.original_action, OriginalAction::Recycle) { "true" } else { "false" });
     s.push_str(",\"tagFilename\":");
     s.push_str(if job.tag_filename { "true" } else { "false" });
     s.push_str(",\"concurrency\":");
@@ -2313,6 +2866,8 @@ fn push_file_json(s: &mut String, f: &FileState) {
     s.push_str(&f.new_bytes.load(Ordering::Relaxed).to_string());
     s.push_str(",\"recycled\":");
     s.push_str(if f.recycled.load(Ordering::Relaxed) { "true" } else { "false" });
+    s.push_str(",\"disposition\":");
+    push_json_string(s, &f.disposition.lock_recover());
     s.push_str(",\"outPath\":");
     push_json_string(s, &f.out_path.lock_recover());
     s.push_str(",\"error\":");
@@ -2408,6 +2963,8 @@ pub(crate) fn job_full_json_from_manifest(id: &str) -> Option<String> {
             let newb = f.get("newBytes").and_then(|v| v.as_u64()).unwrap_or(0);
             let reason = f.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             let duration = f.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0);
+            let disposition = f.get("disposition").and_then(|v| v.as_str()).unwrap_or("");
+            let recycled = f.get("recycled").and_then(|v| v.as_bool()).unwrap_or(false);
             let saved_b = orig.saturating_sub(newb);
             s.push_str("{\"index\":");
             s.push_str(&idx.to_string());
@@ -2430,6 +2987,10 @@ pub(crate) fn job_full_json_from_manifest(id: &str) -> Option<String> {
             }
             s.push_str(",\"reason\":");
             push_json_string(&mut s, reason);
+            s.push_str(",\"disposition\":");
+            push_json_string(&mut s, disposition);
+            s.push_str(",\"recycled\":");
+            s.push_str(if recycled { "true" } else { "false" });
             s.push_str(",\"savedBytes\":");
             s.push_str(&saved_b.to_string());
             s.push_str(",\"pctSaved\":");
@@ -2453,6 +3014,10 @@ struct JobSummary {
     done: usize,
     errors: usize,
     skipped: usize,
+    /// Subset of `errors`: outputs rejected by the deep-verify gate (original
+    /// preserved). Surfaced so UI totals can sum to `total` while distinguishing
+    /// a corrupt-output rejection from other failures.
+    verify_failed: usize,
     pending: usize,
     saved_bytes: u64,
     created_at: u64,
@@ -2481,11 +3046,16 @@ fn manifest_mtime_ms(path: &Path) -> u64 {
 }
 
 fn summary_from_live(job: &CompressJob) -> JobSummary {
-    let (mut done, mut errors, mut skipped) = (0usize, 0usize, 0usize);
+    let (mut done, mut errors, mut skipped, mut verify_failed) = (0usize, 0usize, 0usize, 0usize);
     for f in &job.files {
         match f.status.lock_recover().as_str() {
             "done" => done += 1,
-            "error" => errors += 1,
+            "error" => {
+                errors += 1;
+                if f.reason.lock_recover().as_str() == Reason::ErrorVerifyFailed.as_str() {
+                    verify_failed += 1;
+                }
+            }
             "skipped" => skipped += 1,
             _ => {}
         }
@@ -2506,6 +3076,7 @@ fn summary_from_live(job: &CompressJob) -> JobSummary {
         done,
         errors,
         skipped,
+        verify_failed,
         pending,
         saved_bytes: job.saved_bytes.load(Ordering::Relaxed),
         created_at: created,
@@ -2527,12 +3098,17 @@ fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or_else(|| files.map(|a| a.len()).unwrap_or(0));
-    let (mut done, mut errors, mut skipped) = (0usize, 0usize, 0usize);
+    let (mut done, mut errors, mut skipped, mut verify_failed) = (0usize, 0usize, 0usize, 0usize);
     if let Some(files) = files {
         for f in files {
             match f.get("status").and_then(|v| v.as_str()).unwrap_or("pending") {
                 "done" => done += 1,
-                "error" => errors += 1,
+                "error" => {
+                    errors += 1;
+                    if f.get("reason").and_then(|v| v.as_str()) == Some(Reason::ErrorVerifyFailed.as_str()) {
+                        verify_failed += 1;
+                    }
+                }
                 "skipped" => skipped += 1,
                 _ => {}
             }
@@ -2548,6 +3124,7 @@ fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
         done,
         errors,
         skipped,
+        verify_failed,
         pending,
         saved_bytes,
         created_at: created_at_from_id(id),
@@ -2574,6 +3151,8 @@ fn push_summary_json(s: &mut String, j: &JobSummary) {
     s.push_str(&j.errors.to_string());
     s.push_str(",\"skipped\":");
     s.push_str(&j.skipped.to_string());
+    s.push_str(",\"verifyFailed\":");
+    s.push_str(&j.verify_failed.to_string());
     s.push_str(",\"pending\":");
     s.push_str(&j.pending.to_string());
     s.push_str(",\"savedBytes\":");
@@ -2669,6 +3248,7 @@ fn ev_file_done(
     new_bytes: u64,
     saved: u64,
     recycled: bool,
+    disposition: &str,
     status: &str,
 ) -> String {
     let mut s = String::from("{\"type\":\"file_done\",\"index\":");
@@ -2683,30 +3263,48 @@ fn ev_file_done(
     s.push_str(&saved.to_string());
     s.push_str(",\"recycled\":");
     s.push_str(if recycled { "true" } else { "false" });
+    s.push_str(",\"disposition\":");
+    push_json_string(&mut s, disposition);
     s.push_str(",\"status\":");
     push_json_string(&mut s, status);
     s.push_str("}\n");
     s
 }
 
-fn ev_error(index: usize, path: &str, error: &str) -> String {
+fn ev_error(index: usize, path: &str, error: &str, reason: &str) -> String {
     let mut s = String::from("{\"type\":\"error\",\"index\":");
     s.push_str(&index.to_string());
     s.push_str(",\"path\":");
     push_json_string(&mut s, path);
     s.push_str(",\"error\":");
     push_json_string(&mut s, error);
+    s.push_str(",\"reason\":");
+    push_json_string(&mut s, reason);
     s.push_str("}\n");
     s
 }
 
-fn ev_done(id: &str, done: usize, errors: usize, saved: u64) -> String {
+fn ev_done(
+    id: &str,
+    done: usize,
+    errors: usize,
+    skipped: usize,
+    verify_failed: usize,
+    total: usize,
+    saved: u64,
+) -> String {
     let mut s = String::from("{\"type\":\"done\",\"jobId\":");
     push_json_string(&mut s, id);
     s.push_str(",\"done\":");
     s.push_str(&done.to_string());
     s.push_str(",\"errors\":");
     s.push_str(&errors.to_string());
+    s.push_str(",\"skipped\":");
+    s.push_str(&skipped.to_string());
+    s.push_str(",\"verifyFailed\":");
+    s.push_str(&verify_failed.to_string());
+    s.push_str(",\"total\":");
+    s.push_str(&total.to_string());
     s.push_str(",\"savedBytes\":");
     s.push_str(&saved.to_string());
     s.push_str("}\n");
@@ -2857,7 +3455,7 @@ mod manifest_tests {
         let (home, _restore) = redirect_home();
 
         let opts = CompressOptions {
-            recycle_originals: false,
+            original_action: OriginalAction::Delete,
             tag_filename: true,
             concurrency: 4,
             encoder: "qsv".to_string(),
@@ -2874,7 +3472,7 @@ mod manifest_tests {
 
         let back = job_from_manifest(&job.id).expect("manifest reloads");
         assert_eq!(back.preset, "high");
-        assert!(!back.recycle_originals);
+        assert_eq!(back.original_action, OriginalAction::Delete);
         assert!(back.tag_filename);
         assert_eq!(back.concurrency, 4);
         assert_eq!(back.encoder, "qsv");
@@ -2980,7 +3578,7 @@ mod manifest_tests {
                         panic!("boom while holding events lock");
                     }
                     // A normal success path also touches the shared events lock.
-                    job.emit(ev_file_done(i, "", 10, 10, 0, false, "done"));
+                    job.emit(ev_file_done(i, "", 10, 10, 0, false, "", "done"));
                     *f.status.lock_recover() = "done".to_string();
                     counts.done.fetch_add(1, O::Relaxed);
                 }));
@@ -3003,9 +3601,156 @@ mod manifest_tests {
         assert_eq!(*job.files[1].status.lock_recover(), "error");
         assert_eq!(*job.files[1].reason.lock_recover(), "error_internal");
         // The poisoned shared lock is still usable (would panic pre-fix).
-        job.emit(ev_done(&job.id, 2, 1, 0));
+        job.emit(ev_done(&job.id, 2, 1, 0, 0, 3, 0));
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── Post-compression safety workflow tests ────────────────────────────────
+
+    /// Build a one-file job whose single file is `FileKind::Other`, for driving
+    /// `verify_output` through the zip/archive path without spawning encoders.
+    fn other_job() -> Arc<CompressJob> {
+        create_job(&["x.bin".to_string()], "balanced", &CompressOptions::default())
+    }
+
+    fn empty_tool() -> compress_tools::ToolInfo {
+        compress_tools::ToolInfo::default()
+    }
+
+    /// (a) A corrupt/truncated compressed output is rejected by the deep-verify
+    /// gate and the ORIGINAL is left untouched. Exercises the real
+    /// `verify_output` wiring for the zip pipeline (and `Reason::ErrorVerifyFailed`
+    /// classification by status).
+    #[test]
+    fn corrupt_output_is_rejected_and_original_preserved() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let dir = std::env::temp_dir().join(format!("ft-verify-{}-{}", std::process::id(), new_job_id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let original = dir.join("data.txt");
+        std::fs::write(&original, b"the original payload that must survive").expect("write original");
+        let archive = dir.join("data [COMPRESSED].zip");
+        crate::archive::compress_with_level(&[original.to_string_lossy().into_owned()], &archive, 6)
+            .expect("zip created");
+
+        let job = other_job();
+
+        // A well-formed archive passes.
+        assert!(matches!(
+            verify_output(&job, 0, &archive, FileKind::Other, &original, &empty_tool(), &empty_tool(), &empty_tool(), None),
+            Verify::Ok
+        ));
+
+        // Truncate the archive to corrupt it, then it must FAIL and the original
+        // must still exist (the disposition step never runs on a failed verify).
+        let bytes = std::fs::read(&archive).unwrap();
+        std::fs::write(&archive, &bytes[..bytes.len() / 2]).expect("truncate");
+        assert!(matches!(
+            verify_output(&job, 0, &archive, FileKind::Other, &original, &empty_tool(), &empty_tool(), &empty_tool(), None),
+            Verify::Failed(_)
+        ));
+        assert!(original.exists(), "original must be preserved when verification fails");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (b) "Delete permanently" removes the original (no Recycle Bin) — the
+    /// disposition helper used after a verify pass. (c) "Keep" leaves it alone.
+    #[test]
+    fn delete_permanent_removes_and_keep_leaves_original() {
+        let dir = std::env::temp_dir().join(format!("ft-dispo-{}-{}", std::process::id(), new_job_id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+
+        // Delete permanently.
+        let to_delete = dir.join("gone.txt");
+        std::fs::write(&to_delete, b"bye").unwrap();
+        crate::recycle::delete_permanent(&to_delete).expect("delete_permanent");
+        assert!(!to_delete.exists(), "Delete must permanently remove the original");
+
+        // Keep: nothing is invoked, so the file simply remains.
+        let kept = dir.join("stays.txt");
+        std::fs::write(&kept, b"stay").unwrap();
+        assert_eq!(OriginalAction::Keep.as_str(), "keep");
+        assert!(kept.exists(), "Keep must leave the original in place");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (d) Counts reconcile to the total on a mixed batch, and the verify-failed
+    /// subset is tallied from `error_verify_failed`. Drives `summary_from_manifest`
+    /// on a hand-built manifest with one of every terminal outcome.
+    #[test]
+    fn counts_reconcile_to_total_on_mixed_batch() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let id = new_job_id();
+        let path = jobs_dir().join(format!("{id}.json"));
+        std::fs::create_dir_all(jobs_dir()).unwrap();
+        // 5 files: done, skipped, plain error, verify-failed error, pending.
+        let manifest = format!(
+            "{{\"id\":\"{id}\",\"status\":\"error\",\"preset\":\"balanced\",\"originalAction\":\"delete\",\"total\":5,\"savedBytes\":600,\"files\":[\
+             {{\"index\":0,\"path\":\"a\",\"kind\":\"other\",\"status\":\"done\",\"reason\":\"success\",\"disposition\":\"deleted\",\"origBytes\":1000,\"newBytes\":400}},\
+             {{\"index\":1,\"path\":\"b\",\"kind\":\"other\",\"status\":\"skipped\",\"reason\":\"skipped_no_gain\",\"origBytes\":10,\"newBytes\":10}},\
+             {{\"index\":2,\"path\":\"c\",\"kind\":\"video\",\"status\":\"error\",\"reason\":\"error_encoder\",\"origBytes\":50,\"newBytes\":0}},\
+             {{\"index\":3,\"path\":\"d\",\"kind\":\"video\",\"status\":\"error\",\"reason\":\"error_verify_failed\",\"origBytes\":80,\"newBytes\":0}},\
+             {{\"index\":4,\"path\":\"e\",\"kind\":\"other\",\"status\":\"pending\",\"origBytes\":5,\"newBytes\":0}}\
+             ]}}"
+        );
+        std::fs::write(&path, manifest).unwrap();
+
+        let sum = summary_from_manifest(&id, &path).expect("summary");
+        assert_eq!(sum.total, 5);
+        assert_eq!(sum.done, 1);
+        assert_eq!(sum.skipped, 1);
+        assert_eq!(sum.errors, 2);
+        assert_eq!(sum.verify_failed, 1, "verify-failed is tallied from error_verify_failed");
+        assert_eq!(sum.pending, 1);
+        // Every file is accounted for: done + skipped + errors + pending == total.
+        assert_eq!(sum.done + sum.skipped + sum.errors + sum.pending, sum.total);
+        // The back-compat boolean disposition derivation also round-trips.
+        let job = job_from_manifest(&id).expect("job reload");
+        assert_eq!(job.original_action, OriginalAction::Delete);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The legacy `recycleOriginals` boolean still drives disposition when no
+    /// `originalAction` is present (true => Recycle, false => Keep).
+    #[test]
+    fn legacy_recycle_originals_maps_to_action() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        for (legacy, expect) in [("true", OriginalAction::Recycle), ("false", OriginalAction::Keep)] {
+            let id = new_job_id();
+            let path = jobs_dir().join(format!("{id}.json"));
+            std::fs::create_dir_all(jobs_dir()).unwrap();
+            let manifest = format!(
+                "{{\"id\":\"{id}\",\"status\":\"done\",\"preset\":\"balanced\",\"recycleOriginals\":{legacy},\"total\":1,\"files\":[\
+                 {{\"index\":0,\"path\":\"a\",\"kind\":\"other\",\"status\":\"pending\",\"origBytes\":1,\"newBytes\":0}}]}}"
+            );
+            std::fs::write(&path, manifest).unwrap();
+            let job = job_from_manifest(&id).expect("job reload");
+            assert_eq!(job.original_action, expect);
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The final `done` event payload carries skipped + verifyFailed + total so
+    /// the UI totals can sum to the original count.
+    #[test]
+    fn done_event_includes_reconciled_counts() {
+        let ev = ev_done("job-1", 3, 2, 1, 1, 6, 1234);
+        assert!(ev.contains("\"done\":3"));
+        assert!(ev.contains("\"errors\":2"));
+        assert!(ev.contains("\"skipped\":1"));
+        assert!(ev.contains("\"verifyFailed\":1"));
+        assert!(ev.contains("\"total\":6"));
     }
 }
 

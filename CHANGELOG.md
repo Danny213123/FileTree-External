@@ -4,6 +4,20 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.2] - 2026-06-13
+
+A post-compression safety workflow so a good original is never removed behind a corrupt compressed output, plus an explicit choice of what happens to each original and a guarantee that every input file is accounted for in the final counts.
+
+### Added
+
+- **Deep output verification (hard gate before any original is touched)**: a successful encoder exit and a smaller file are no longer treated as proof the output is intact. After the size check, each compressed output is now re-verified before the original is disposed of — video/audio by a full ffmpeg re-decode (`ffmpeg -v error -xerror -i <out> -f null -`; any non-zero exit or stderr fails), falling back to a HandBrake `--scan` title check when ffmpeg is absent, with a duration sanity-check against the original; images by an ImageMagick `identify -regard-warnings` (or ffmpeg) decode confirming the dimensions match; and zip archives by opening the produced file and reading every entry to validate its CRC32. On failure the bad output is deleted, the **original is left untouched**, and the file is recorded as the new resumable `error_verify_failed` outcome (with its own badge + tooltip).
+- **Recycle / Delete-permanently / Keep choice for originals**: the single "Recycle originals" checkbox is replaced by a three-way control. *Recycle Bin* (default) sends each verified original to the Recycle Bin (recoverable); *Delete permanently* removes it with no Recycle Bin step (irreversible — flagged with a warning style and only ever run after verification passes); *Keep originals* leaves every original in place beside the new `[COMPRESSED]` file. The request carries a new `originalAction` (with `recycleOriginals` kept for back-compat); older manifests/clients map `recycleOriginals` true→Recycle, false→Keep.
+- **Per-file disposition + reconciled totals in the UI**: each finished file now shows what happened to its original (Recycled / Deleted / Kept) and the run detail surfaces aggregate counts that visibly sum to the total — done / skipped / verify-failed / error / pending out of N files, plus "N recycled, N deleted, N kept".
+
+### Changed
+
+- **Final job counts reconcile to the input count**: the `done` event and job summaries now include `skipped` and a `verifyFailed` tally (a subset of errors), and the worker logs a loud `[reconcile] COUNT MISMATCH` to the debug log if `done + skipped + error` ever fails to equal the total — building on the 1.13.1 post-join reconcile so post-job count always equals pre-job count.
+
 ## [1.13.1] - 2026-06-13
 
 A reliability fix for the parallel compression pool: a single bad file could take the whole batch down (user saw 116 files stall at 39, with 77 left "pending" and a false "done").

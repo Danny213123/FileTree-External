@@ -507,7 +507,14 @@ pub(crate) fn detect_handbrake() -> ToolInfo {
 
 /// Detect the image encoder. Prefers `ffmpeg`, falls back to ImageMagick
 /// (`magick`). Returns the kind so the pipeline can pick the right CLI shape.
-pub(crate) fn detect_image() -> (ToolInfo, Option<ImageKind>) {
+/// Locate `ffmpeg` on its own (PATH + common install dirs), independent of the
+/// image-tool selection. Used by the post-compression verification gate to
+/// re-decode media: ffmpeg is the preferred verifier even when ImageMagick is
+/// the chosen image encoder, and the video pipeline uses HandBrake (not ffmpeg)
+/// so its presence isn't implied by HandBrake detection. Returns a not-found
+/// `ToolInfo` when ffmpeg isn't installed (callers fall back to HandBrake
+/// `--scan`).
+pub(crate) fn detect_ffmpeg() -> ToolInfo {
     let mut ffmpeg_common = Vec::new();
     if let Some(pf) = program_files() {
         ffmpeg_common.push(pf.join("ffmpeg").join("bin").join("ffmpeg.exe"));
@@ -515,10 +522,16 @@ pub(crate) fn detect_image() -> (ToolInfo, Option<ImageKind>) {
     }
     if let Some(path) = locate("ffmpeg.exe", &ffmpeg_common).or_else(|| locate("ffmpeg", &ffmpeg_common)) {
         let version = capture_version(&path, &["-version"]);
-        return (
-            ToolInfo { found: true, path: Some(path), version },
-            Some(ImageKind::Ffmpeg),
-        );
+        ToolInfo { found: true, path: Some(path), version }
+    } else {
+        ToolInfo::default()
+    }
+}
+
+pub(crate) fn detect_image() -> (ToolInfo, Option<ImageKind>) {
+    let ff = detect_ffmpeg();
+    if ff.found {
+        return (ff, Some(ImageKind::Ffmpeg));
     }
 
     let mut magick_common = Vec::new();

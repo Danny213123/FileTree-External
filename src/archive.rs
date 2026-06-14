@@ -166,6 +166,37 @@ pub(crate) fn extract(archive: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Integrity-verify a produced `.zip` by opening it and reading EVERY entry to
+/// the end, which forces the `zip` crate to validate each entry's stored CRC32
+/// against the decompressed bytes. Any structural problem (truncated/corrupt
+/// central directory, unreadable entry) or CRC mismatch is returned as an error.
+/// An archive with no entries is also rejected. This is the post-compression
+/// integrity gate for the zip pipeline — it never mutates the archive.
+pub(crate) fn verify_archive(archive: &Path) -> Result<(), String> {
+    let file = File::open(archive).map_err(|e| format!("open archive: {e}"))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("read archive: {e}"))?;
+    if zip.is_empty() {
+        return Err("archive contains no entries".to_string());
+    }
+    let mut buf = vec![0u8; CHUNK];
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| format!("entry {i}: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        // Reading to EOF makes the zip crate verify this entry's CRC32; a
+        // mismatch surfaces as an io error here.
+        loop {
+            let n = entry.read(&mut buf).map_err(|e| format!("{name}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Stream `path` through the requested hasher and return `(normalized_algo,
 /// lowercase_hex)`. `algo` is matched case-insensitively; only `sha256` and
 /// `md5` are supported.
