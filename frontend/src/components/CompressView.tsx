@@ -137,8 +137,10 @@ interface CompressPerfSettings {
   /** Custom-preset video quality (RF base, 16..40; lower = better/larger).
    *  Only used when preset === "custom". */
   customQuality: number;
-  /** Last-selected preset, persisted so reopening restores the choice. */
-  preset: CompressPreset;
+  /** Last-selected preset id, persisted so reopening restores the choice. May be
+   *  a built-in id (max|more|balanced|high|custom) OR a saved-preset id of the
+   *  form `user:<id>`; widened to string to carry saved presets. */
+  preset: string;
   /** Whether the always-visible Options section (resolution/quality/codec/
    *  encoder) is expanded. Persisted so the choice sticks across sessions. */
   showOptions: boolean;
@@ -215,9 +217,16 @@ function loadPerf(): CompressPerfSettings {
         typeof p.customQuality === "number"
           ? Math.min(CUSTOM_QUALITY_MAX, Math.max(CUSTOM_QUALITY_MIN, Math.floor(p.customQuality)))
           : 26,
-      preset: (["max", "more", "balanced", "high", "custom"] as const).includes(p.preset as CompressPreset)
-        ? (p.preset as CompressPreset)
-        : "balanced",
+      preset: (() => {
+        const id = typeof p.preset === "string" ? p.preset : "";
+        if ((["max", "more", "balanced", "high", "custom"] as const).includes(id as CompressPreset)) return id;
+        // A saved-preset reference is only valid if that preset still exists;
+        // otherwise fall back to "custom" (its values may already be in perf).
+        if (id.startsWith("user:")) {
+          return loadUserPresets().some((u) => u.id === id) ? id : "custom";
+        }
+        return "balanced";
+      })(),
       showOptions: typeof p.showOptions === "boolean" ? p.showOptions : true,
     };
   } catch {
@@ -227,6 +236,216 @@ function loadPerf(): CompressPerfSettings {
 
 function savePerf(p: CompressPerfSettings): void {
   try { localStorage.setItem(PERF_KEY, JSON.stringify(p)); } catch { /* ignore quota / private mode */ }
+}
+
+// ── Saved custom presets ────────────────────────────────────────────────────
+// Named bundles of {resolution cap, quality, codec, encoder} the user can save,
+// rename, overwrite, and delete. They appear in the preset dropdown and, when
+// selected, apply all four fields. On a job they resolve to the backend's
+// existing `custom` preset (no backend change). Persisted in localStorage.
+
+const USER_PRESETS_KEY = "filetree.compress.userPresets";
+
+interface SavedPreset {
+  id: string;
+  name: string;
+  customMaxHeight: number;
+  customQuality: number;
+  codec: CompressCodec;
+  encoder: CompressEncoder;
+}
+
+/** Built-in NAMED presets resolve straight through to the backend; "custom" and
+ *  any `user:*` saved preset resolve to backend `preset=custom`. */
+function isBuiltinNamed(id: string): id is Exclude<CompressPreset, "custom"> {
+  return id === "max" || id === "more" || id === "balanced" || id === "high";
+}
+
+/** Map a UI selection id to the value SENT to the backend. */
+function toBackendPreset(id: string): CompressPreset {
+  return isBuiltinNamed(id) ? id : "custom";
+}
+
+/** Generate a unique saved-preset id. */
+function newUserPresetId(): string {
+  return `user:${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Load + validate saved presets, dropping any malformed entries. */
+function loadUserPresets(): SavedPreset[] {
+  try {
+    const raw = localStorage.getItem(USER_PRESETS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    const out: SavedPreset[] = [];
+    for (const e of arr) {
+      if (!e || typeof e !== "object") continue;
+      const id = (e as { id?: unknown }).id;
+      const name = (e as { name?: unknown }).name;
+      const height = (e as { customMaxHeight?: unknown }).customMaxHeight;
+      const quality = (e as { customQuality?: unknown }).customQuality;
+      const codec = (e as { codec?: unknown }).codec;
+      const encoder = (e as { encoder?: unknown }).encoder;
+      if (typeof id !== "string" || id.length === 0) continue;
+      if (typeof name !== "string" || name.trim().length === 0) continue;
+      if (typeof height !== "number" || !CUSTOM_HEIGHTS.includes(Math.floor(height))) continue;
+      if (typeof quality !== "number") continue;
+      if (codec !== "h264" && codec !== "h265" && codec !== "av1") continue;
+      if (!(["auto", "x264", "nvenc", "qsv", "vce"] as const).includes(encoder as CompressEncoder)) continue;
+      out.push({
+        id,
+        name,
+        customMaxHeight: Math.floor(height),
+        customQuality: Math.min(CUSTOM_QUALITY_MAX, Math.max(CUSTOM_QUALITY_MIN, Math.floor(quality))),
+        codec: codec as CompressCodec,
+        encoder: encoder as CompressEncoder,
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function saveUserPresets(list: SavedPreset[]): void {
+  try { localStorage.setItem(USER_PRESETS_KEY, JSON.stringify(list)); } catch { /* ignore quota / private mode */ }
+}
+
+/** Short human summary of a saved preset's four fields, e.g. "1080p · RF 24 · h264 · auto". */
+function describeSavedPreset(sp: SavedPreset): string {
+  const res = sp.customMaxHeight === 0 ? "Original" : `${sp.customMaxHeight}p`;
+  return `${res} · RF ${sp.customQuality} · ${sp.codec} · ${sp.encoder}`;
+}
+
+interface PresetManagerDialogProps {
+  presets: SavedPreset[];
+  selectedId: string;
+  currentSummary: string;
+  onClose: () => void;
+  onSaveCurrentAs: (name: string) => void;
+  onRename: (id: string, name: string) => void;
+  onOverwrite: (id: string) => void;
+  onDelete: (id: string) => void;
+}
+
+/** Modal manager for saved custom presets: save-current-as, rename, overwrite
+ *  with current values, and delete. Plain React state, no extra deps. */
+function PresetManagerDialog({
+  presets,
+  selectedId,
+  currentSummary,
+  onClose,
+  onSaveCurrentAs,
+  onRename,
+  onOverwrite,
+  onDelete,
+}: PresetManagerDialogProps) {
+  const [newName, setNewName] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editName, setEditName] = useState("");
+
+  const submitNew = () => {
+    const t = newName.trim();
+    if (!t) return;
+    onSaveCurrentAs(t);
+    setNewName("");
+  };
+
+  const commitRename = (id: string) => {
+    const t = editName.trim();
+    if (t) onRename(id, t);
+    setEditingId(null);
+    setEditName("");
+  };
+
+  return (
+    <div className="compress-preset-overlay" role="presentation" onClick={onClose}>
+      <div
+        className="compress-preset-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Manage custom presets"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="compress-preset-dialog-head">
+          <span className="compress-preset-dialog-title">Manage presets</span>
+          <button className="compress-btn" onClick={onClose} aria-label="Close">Close</button>
+        </div>
+
+        <div className="compress-preset-save-row">
+          <input
+            className="compress-preset-input"
+            type="text"
+            placeholder="Save current as…"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") submitNew(); }}
+            aria-label="New preset name"
+          />
+          <button className="compress-btn primary" onClick={submitNew} disabled={!newName.trim()}>
+            Save
+          </button>
+        </div>
+        <div className="compress-preset-current-hint">Current: {currentSummary}</div>
+
+        {presets.length === 0 ? (
+          <div className="compress-preset-empty">No saved presets yet.</div>
+        ) : (
+          <ul className="compress-preset-list">
+            {presets.map((sp) => (
+              <li key={sp.id} className={`compress-preset-row${sp.id === selectedId ? " active" : ""}`}>
+                {editingId === sp.id ? (
+                  <input
+                    className="compress-preset-input"
+                    type="text"
+                    value={editName}
+                    autoFocus
+                    onChange={(e) => setEditName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") commitRename(sp.id);
+                      else if (e.key === "Escape") { setEditingId(null); setEditName(""); }
+                    }}
+                    onBlur={() => commitRename(sp.id)}
+                    aria-label="Preset name"
+                  />
+                ) : (
+                  <div className="compress-preset-meta">
+                    <span className="compress-preset-name">{sp.name}</span>
+                    <span className="compress-preset-desc">{describeSavedPreset(sp)}</span>
+                  </div>
+                )}
+                <div className="compress-preset-actions">
+                  {editingId === sp.id ? (
+                    <button className="compress-btn" onClick={() => commitRename(sp.id)}>Done</button>
+                  ) : (
+                    <>
+                      <button
+                        className="compress-btn"
+                        onClick={() => { setEditingId(sp.id); setEditName(sp.name); }}
+                      >
+                        Rename
+                      </button>
+                      <button
+                        className="compress-btn"
+                        onClick={() => onOverwrite(sp.id)}
+                        title="Replace this preset's values with the current settings"
+                      >
+                        Update
+                      </button>
+                      <button className="compress-btn danger" onClick={() => onDelete(sp.id)}>
+                        Delete
+                      </button>
+                    </>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
 }
 
 const ENCODER_OPTIONS: { id: CompressEncoder; label: string }[] = [
@@ -377,7 +596,12 @@ export function CompressView({
 }: CompressViewProps) {
   const [tab, setTab] = useState<CompressTab>("compress");
   const [tools, setTools] = useState<CompressTools | null>(null);
-  const [preset, setPreset] = useState<CompressPreset>(() => loadPerf().preset);
+  const [selectedId, setSelectedId] = useState<string>(() => loadPerf().preset);
+  const [userPresets, setUserPresets] = useState<SavedPreset[]>(loadUserPresets);
+  const [managerOpen, setManagerOpen] = useState(false);
+  // The value SENT to the backend: built-in named passes through, Custom and any
+  // saved (`user:*`) preset resolve to backend `preset=custom`.
+  const backendPreset: CompressPreset = toBackendPreset(selectedId);
   const [originalAction, setOriginalAction] = useState<OriginalAction>("recycle");
   const [tagFilename, setTagFilename] = useState(true);
   const [perf, setPerf] = useState<CompressPerfSettings>(() => loadPerf());
@@ -441,27 +665,136 @@ export function CompressView({
   // A NAMED preset also writes its canonical video values into the always-visible
   // Resolution/Quality controls so they visibly move; "custom" keeps the current
   // shown values (which the user is editing directly).
-  const selectPreset = useCallback((id: CompressPreset) => {
-    setPreset(id);
-    if (id === "custom") {
-      updatePerf({ preset: "custom" });
-    } else {
+  const selectPreset = useCallback((id: string) => {
+    setSelectedId(id);
+    if (isBuiltinNamed(id)) {
       const v = PRESET_VALUES[id];
       updatePerf({ preset: id, customMaxHeight: v.height, customQuality: v.quality });
+    } else if (id.startsWith("user:")) {
+      const sp = loadUserPresets().find((u) => u.id === id);
+      if (sp) {
+        updatePerf({
+          preset: id,
+          customMaxHeight: sp.customMaxHeight,
+          customQuality: sp.customQuality,
+          codec: sp.codec,
+          encoder: sp.encoder,
+        });
+      } else {
+        // Referenced preset vanished — fall back to Custom, keeping shown values.
+        setSelectedId("custom");
+        updatePerf({ preset: "custom" });
+      }
+    } else {
+      // "custom" — keep the current shown values, just persist the selection.
+      updatePerf({ preset: "custom" });
     }
   }, [updatePerf]);
 
   // Manually editing resolution OR quality switches to the Custom preset (the
   // job then encodes with the shown values) and persists the change.
   const changeResolution = useCallback((height: number) => {
-    setPreset("custom");
+    setSelectedId("custom");
     updatePerf({ preset: "custom", customMaxHeight: height });
   }, [updatePerf]);
 
   const changeQuality = useCallback((quality: number) => {
-    setPreset("custom");
+    setSelectedId("custom");
     updatePerf({ preset: "custom", customQuality: quality });
   }, [updatePerf]);
+
+  // Codec/encoder are orthogonal for built-in presets (they don't switch the
+  // selection), matching prior behavior — but when a SAVED preset is active they
+  // are part of the saved bundle, so editing them defects to Custom.
+  const changeCodec = useCallback((codec: CompressCodec) => {
+    updatePerf({ codec });
+    setSelectedId((prev) => {
+      if (prev.startsWith("user:")) {
+        updatePerf({ preset: "custom" });
+        return "custom";
+      }
+      return prev;
+    });
+  }, [updatePerf]);
+
+  const changeEncoder = useCallback((encoder: CompressEncoder) => {
+    updatePerf({ encoder });
+    setSelectedId((prev) => {
+      if (prev.startsWith("user:")) {
+        updatePerf({ preset: "custom" });
+        return "custom";
+      }
+      return prev;
+    });
+  }, [updatePerf]);
+
+  // ── Saved-preset management ────────────────────────────────────────────────
+  const persistUserPresets = useCallback((next: SavedPreset[]) => {
+    setUserPresets(next);
+    saveUserPresets(next);
+  }, []);
+
+  // Create a saved preset from the CURRENT four fields, persist, and select it.
+  const saveCurrentAsPreset = useCallback((name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const sp: SavedPreset = {
+      id: newUserPresetId(),
+      name: trimmed,
+      customMaxHeight: perf.customMaxHeight,
+      customQuality: perf.customQuality,
+      codec: perf.codec,
+      encoder: perf.encoder,
+    };
+    const next = [...userPresets, sp];
+    persistUserPresets(next);
+    setSelectedId(sp.id);
+    updatePerf({ preset: sp.id });
+  }, [perf, userPresets, persistUserPresets, updatePerf]);
+
+  const renamePreset = useCallback((id: string, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    persistUserPresets(userPresets.map((u) => (u.id === id ? { ...u, name: trimmed } : u)));
+  }, [userPresets, persistUserPresets]);
+
+  // Overwrite a saved preset's four fields with the CURRENT values.
+  const overwritePreset = useCallback((id: string) => {
+    persistUserPresets(
+      userPresets.map((u) =>
+        u.id === id
+          ? {
+              ...u,
+              customMaxHeight: perf.customMaxHeight,
+              customQuality: perf.customQuality,
+              codec: perf.codec,
+              encoder: perf.encoder,
+            }
+          : u,
+      ),
+    );
+  }, [perf, userPresets, persistUserPresets]);
+
+  const deletePreset = useCallback((id: string) => {
+    persistUserPresets(userPresets.filter((u) => u.id !== id));
+    // Deleting the active preset falls back to Custom (its values stay in perf).
+    setSelectedId((prev) => {
+      if (prev === id) {
+        updatePerf({ preset: "custom" });
+        return "custom";
+      }
+      return prev;
+    });
+  }, [userPresets, persistUserPresets, updatePerf]);
+
+  // Display name for the current selection (built-in label, saved name, Custom).
+  const selectedPresetName = useMemo(() => {
+    const builtin = PRESETS.find((p) => p.id === selectedId);
+    if (builtin) return builtin.label;
+    const saved = userPresets.find((u) => u.id === selectedId);
+    if (saved) return saved.name;
+    return "Custom";
+  }, [selectedId, userPresets]);
 
   // Definitive GPU-encoder test: a real HW encode of a tiny generated clip.
   const onTestGpu = useCallback(async () => {
@@ -537,7 +870,7 @@ export function CompressView({
     } else {
       lines.push("Tools: not detected yet");
     }
-    lines.push(`Settings: encoder=${perf.encoder} codec=${perf.codec} useGpu=${perf.useGpu} concurrency=${perf.concurrency} zipLevel=${perf.zipLevel} minSizeBytes=${perf.minSizeBytes} preset=${preset} resolution=${perf.customMaxHeight === 0 ? "original" : `${perf.customMaxHeight}p`} quality=${perf.customQuality}`);
+    lines.push(`Settings: encoder=${perf.encoder} codec=${perf.codec} useGpu=${perf.useGpu} concurrency=${perf.concurrency} zipLevel=${perf.zipLevel} minSizeBytes=${perf.minSizeBytes} preset=${selectedPresetName} resolution=${perf.customMaxHeight === 0 ? "original" : `${perf.customMaxHeight}p`} quality=${perf.customQuality}`);
     if (gpuTest) {
       lines.push(
         `GPU test: ${
@@ -584,7 +917,7 @@ export function CompressView({
         // give up silently
       }
     }
-  }, [tools, perf, preset, gpuTest, autotune]);
+  }, [tools, perf, selectedPresetName, gpuTest, autotune]);
 
   // Hardware-derived default: if no perf prefs were ever saved and NO GPU is
   // effectively available (no `-h` token AND no physical adapter), default GPU
@@ -1104,7 +1437,7 @@ export function CompressView({
     try {
       const id = await startCompressJob({
         paths: liveRunnable.map((f) => f.path),
-        preset,
+        preset: backendPreset,
         originalAction,
         // Back-compat for an older server: Recycle => true, Delete/Keep => false.
         recycleOriginals: originalAction === "recycle",
@@ -1117,8 +1450,9 @@ export function CompressView({
         codec: perf.codec,
         zipLevel: perf.zipLevel,
         minSizeBytes: perf.minSizeBytes,
-        // Custom-preset video knobs, only meaningful when preset === "custom".
-        ...(preset === "custom"
+        // Custom-preset video knobs, only meaningful when the backend resolves to
+        // "custom" (covers the Custom preset AND any saved `user:*` preset).
+        ...(backendPreset === "custom"
           ? { customMaxHeight: perf.customMaxHeight, customQuality: perf.customQuality }
           : {}),
         // Re-assert the scan root so a cache-served tree (no /api/scan this
@@ -1138,7 +1472,7 @@ export function CompressView({
       setRunError(e instanceof Error ? e.message : String(e));
       toast.error(`Could not start compression: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [selectedFiles, kindAvailable, preset, originalAction, tagFilename, perf, attachStream, scanPath, scannedRoot, nodeById, onRescan]);
+  }, [selectedFiles, kindAvailable, backendPreset, originalAction, tagFilename, perf, attachStream, scanPath, scannedRoot, nodeById, onRescan]);
 
   const handleStop = useCallback(async () => {
     abortRef.current?.abort();
@@ -1337,16 +1671,36 @@ export function CompressView({
           <select
             className="compress-custom-select"
             aria-label="Quality preset"
-            value={preset}
-            onChange={(e) => selectPreset(e.target.value as CompressPreset)}
+            value={selectedId}
+            onChange={(e) => selectPreset(e.target.value)}
             disabled={inRun}
           >
-            {PRESETS.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.label}
-              </option>
-            ))}
+            <optgroup label="Presets">
+              {PRESETS.filter((p) => p.id !== "custom").map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </optgroup>
+            {userPresets.length > 0 && (
+              <optgroup label="Saved">
+                {userPresets.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.name}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            <option value="custom">Custom</option>
           </select>
+          <button
+            className="compress-btn"
+            onClick={() => setManagerOpen(true)}
+            disabled={inRun}
+            title="Save, rename, overwrite, or delete custom presets"
+          >
+            Manage presets
+          </button>
           <button
             className={`compress-btn${perf.showOptions ? " active" : ""}`}
             onClick={() => updatePerf({ showOptions: !perf.showOptions })}
@@ -1479,7 +1833,7 @@ export function CompressView({
               id="cv-encoder"
               value={perf.encoder}
               disabled={inRun}
-              onChange={(e) => updatePerf({ encoder: e.target.value as CompressEncoder })}
+              onChange={(e) => changeEncoder(e.target.value as CompressEncoder)}
             >
               {ENCODER_OPTIONS.map((o) => {
                 const avail = encoderAvailable(o.id, tools, perf.codec);
@@ -1497,7 +1851,7 @@ export function CompressView({
               id="cv-codec"
               value={perf.codec}
               disabled={inRun}
-              onChange={(e) => updatePerf({ codec: e.target.value as CompressCodec })}
+              onChange={(e) => changeCodec(e.target.value as CompressCodec)}
             >
               <option value="h264">H.264 (compatible)</option>
               <option value="h265" disabled={!!tools && !tools.caps?.x265 && !tools.caps?.nvencH265 && !tools.caps?.qsvH265 && !tools.caps?.vceH265}>
@@ -1512,6 +1866,19 @@ export function CompressView({
             </select>
           </div>
         </div>
+      )}
+
+      {managerOpen && (
+        <PresetManagerDialog
+          presets={userPresets}
+          selectedId={selectedId}
+          currentSummary={`${perf.customMaxHeight === 0 ? "Original" : `${perf.customMaxHeight}p`} · RF ${perf.customQuality} · ${perf.codec} · ${perf.encoder}`}
+          onClose={() => setManagerOpen(false)}
+          onSaveCurrentAs={saveCurrentAsPreset}
+          onRename={renamePreset}
+          onOverwrite={overwritePreset}
+          onDelete={deletePreset}
+        />
       )}
 
       {showPerf && !inRun && (

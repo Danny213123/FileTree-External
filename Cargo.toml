@@ -1,6 +1,6 @@
 [package]
 name = "filetree"
-version = "1.13.7"
+version = "1.13.8"
 edition = "2024"
 description = "A standalone Windows disk-usage explorer with real-time threaded scans."
 repository = "https://github.com/Danny213123/FileTree"

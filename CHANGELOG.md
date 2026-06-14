@@ -4,6 +4,14 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.8] - 2026-06-14
+
+Lets you save your own named compression presets. Frontend-only — saved presets resolve to the backend's existing `custom` preset (resolution + quality), available since v1.13.6.
+
+### Added
+
+- **Saved custom presets**: save the current {resolution cap, quality, codec, encoder} as a named preset, then pick it again later from the **Preset** dropdown to re-apply all four fields at once. Saved presets appear under a **Saved** group in the dropdown (built-ins under **Presets**, plus **Custom**). A new **Manage presets** button opens a dialog to save-current-as, rename, overwrite-with-current, and delete presets; deleting the active preset falls back to **Custom**. Selecting a saved preset (or **Custom**) runs the job as backend `preset=custom` with the chosen resolution/quality. Saved presets and the last-selected preset persist across sessions in the browser.
+
 ## [1.13.7] - 2026-06-13
 
 Redesigns the Compress page controls so presets drive a set of always-visible options, and squares the page's styling to match the rest of the app. Frontend-only — the `custom` preset (resolution + quality) already exists in the backend as of v1.13.6.
