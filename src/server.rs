@@ -728,49 +728,22 @@ fn extract_json_str(json: &str, key: &str) -> Option<String> {
 }
 
 /// Extract a JSON array of strings: `"key":["a","b"]`.
+///
+/// Delegates to the real JSON parser ([`crate::json::parse`]) rather than scanning
+/// for the array's closing `]` by hand: a naive scan ends the array at the first
+/// literal `]` byte, which silently truncates the list the moment any element's
+/// string value contains a `]` (extremely common in file paths, e.g.
+/// `[COMPRESSED]`, `clip [1].mp4`, `Show [S01E01].mkv`). Parsing properly also
+/// handles escapes and unicode. Non-string elements are skipped; a missing key,
+/// non-array value, or parse failure yields an empty vec.
 fn extract_json_str_array(json: &str, key: &str) -> Vec<String> {
-    let needle = format!("\"{key}\"");
-    let Some(start) = json.find(&needle) else { return Vec::new(); };
-    let rest = &json[start + needle.len()..];
-    let Some(rest) = rest.trim_start().strip_prefix(':') else { return Vec::new(); };
-    let Some(arr_start) = rest.find('[') else { return Vec::new(); };
-    let rest = &rest[arr_start + 1..];
-    let Some(arr_end) = rest.find(']') else { return Vec::new(); };
-    let inner = &rest[..arr_end];
-
-    let mut results = Vec::new();
-    let mut remaining = inner;
-    while !remaining.is_empty() {
-        remaining = remaining.trim_start().trim_start_matches(',').trim_start();
-        if !remaining.starts_with('"') { break; }
-        remaining = &remaining[1..];
-        let mut s = String::new();
-        let mut chars = remaining.char_indices();
-        let mut end_pos = 0;
-        loop {
-            match chars.next() {
-                None => break,
-                Some((i, '"')) => { end_pos = i + 1; break; }
-                Some((_, '\\')) => {
-                    match chars.next() {
-                        Some((_, c)) => match c {
-                            '"' => s.push('"'),
-                            '\\' => s.push('\\'),
-                            'n' => s.push('\n'),
-                            'r' => s.push('\r'),
-                            't' => s.push('\t'),
-                            other => s.push(other),
-                        },
-                        None => break,
-                    }
-                }
-                Some((_, c)) => s.push(c),
-            }
-        }
-        results.push(s);
-        remaining = &remaining[end_pos..];
-    }
-    results
+    crate::json::parse(json)
+        .and_then(|root| {
+            root.get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        })
+        .unwrap_or_default()
 }
 
 /// Extract an unsigned integer value from naive JSON: `"key":123` or `"key": 123`.
@@ -1359,6 +1332,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         }
         "/api/config" => {
             let body = app_config_json(&state);
+            respond_json(&mut stream, 200, "OK", &body)
+        }
+        // Running build's version (from the binary's CARGO_PKG_VERSION) so the UI
+        // can surface it and a stale build is identifiable at a glance.
+        "/api/version" => {
+            let mut body = String::from("{\"version\":");
+            push_json_string(&mut body, crate::cli::APP_VERSION);
+            body.push('}');
             respond_json(&mut stream, 200, "OK", &body)
         }
         "/api/drives" => {
@@ -5455,4 +5436,67 @@ fn ollama_stream_chat(stream: &mut TcpStream, body: &[u8], port: u16) -> sio::Re
         write_chunk(stream, &buf)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod json_array_tests {
+    use super::extract_json_str_array;
+
+    /// The regression: any path/name containing `]` (e.g. a `[COMPRESSED]` tag,
+    /// `[S01E01]`, `clip [1].mp4`) must NOT truncate the array. The old naive
+    /// scanner ended the list at the first literal `]`, dropping every file from
+    /// the first bracketed name onward — which created compress jobs with only the
+    /// leading handful of files.
+    #[test]
+    fn bracketed_paths_do_not_truncate_the_array() {
+        let body = r#"{"paths":["C:\\vids\\a.mp4","C:\\vids\\clip [1].mp4","C:\\vids\\Show [S01E01] [COMPRESSED].mkv","C:\\vids\\z.mp4"],"preset":"balanced"}"#;
+        let got = extract_json_str_array(body, "paths");
+        assert_eq!(
+            got,
+            vec![
+                r"C:\vids\a.mp4".to_string(),
+                r"C:\vids\clip [1].mp4".to_string(),
+                r"C:\vids\Show [S01E01] [COMPRESSED].mkv".to_string(),
+                r"C:\vids\z.mp4".to_string(),
+            ],
+        );
+    }
+
+    /// Escapes (quotes, backslashes) and non-ASCII names round-trip intact.
+    #[test]
+    fn escapes_and_unicode_round_trip() {
+        let body = r#"{"paths":["C:\\d\\na\"me.mp4","C:\\d\\café \u00e9.mp4","D:\\films\\电影 [2023].mkv"]}"#;
+        let got = extract_json_str_array(body, "paths");
+        assert_eq!(
+            got,
+            vec![
+                r#"C:\d\na"me.mp4"#.to_string(),
+                "C:\\d\\café é.mp4".to_string(),
+                "D:\\films\\电影 [2023].mkv".to_string(),
+            ],
+        );
+    }
+
+    /// A large list (more than a typical batch) round-trips completely, including
+    /// when many entries carry brackets.
+    #[test]
+    fn large_array_with_brackets_round_trips_completely() {
+        let n = 117;
+        let entries: Vec<String> = (0..n)
+            .map(|i| format!("C:\\\\m\\\\file [{i}] [COMPRESSED].mkv"))
+            .collect();
+        let body = format!("{{\"paths\":[{}]}}", entries.iter().map(|e| format!("\"{e}\"")).collect::<Vec<_>>().join(","));
+        let got = extract_json_str_array(&body, "paths");
+        assert_eq!(got.len(), n);
+        assert_eq!(got[0], r"C:\m\file [0] [COMPRESSED].mkv");
+        assert_eq!(got[n - 1], format!(r"C:\m\file [{}] [COMPRESSED].mkv", n - 1));
+    }
+
+    /// Missing key / non-array value / malformed JSON all yield an empty vec.
+    #[test]
+    fn missing_or_invalid_yields_empty() {
+        assert!(extract_json_str_array(r#"{"other":["a"]}"#, "paths").is_empty());
+        assert!(extract_json_str_array(r#"{"paths":"notarray"}"#, "paths").is_empty());
+        assert!(extract_json_str_array("not json at all", "paths").is_empty());
+    }
 }

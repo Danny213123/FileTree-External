@@ -4,6 +4,20 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.11] - 2026-06-14
+
+Fixes the actual cause of a compression batch "finishing" almost immediately having processed only a handful of files (e.g. "saved 0 bytes over 0 files"): file paths containing a `]` truncated the job's file list at job-creation time. Also pins the build version in the title bar.
+
+### Fixed
+
+- **Bracketed file paths no longer silently truncate a batch (the real "only ~N of M files ran" bug)**: the server parsed the `paths` array of every batch request with a hand-rolled scanner that ended the array at the first literal `]` byte. JSON does not escape `]` inside string values, so the moment any selected file's path or name contained a `]` — extremely common: a `[COMPRESSED]` tag from a prior run, `clip [1].mp4`, `Show [S01E01].mkv` — the list was cut off there and every file from that point on was dropped before the job was even created. A 117-file selection with a bracketed name near the front became a ~7-file job (all the leading files), which then "finished" with nothing useful done while the rest appeared stuck "pending" in the UI. `extract_json_str_array` now uses the real JSON parser, so brackets, escapes, and unicode in paths are handled correctly. This fixes all eight batch endpoints that share it (compress, move, delete, copy, duplicates, etc.).
+- **No more perpetual "pending" spinners after a run completes**: when a finished (non-cancelled) run leaves any row without a terminal outcome, the UI now marks it as not-processed (with a Retry hint) instead of spinning forever.
+
+### Added
+
+- **Version in the title bar**: the title now reads `<tab> — FileTree v<version>`, sourced from the running binary, so a stale build is identifiable at a glance. New read-only `GET /api/version` endpoint.
+- **Regression tests** proving the `paths` parser keeps every entry when paths contain `]`/`[`, escaped quotes/backslashes, and non-ASCII names, and that a large (117-entry) bracketed list round-trips completely.
+
 ## [1.13.10] - 2026-06-14
 
 Fixes the real cause of a compression job stalling part-way through a batch of bad inputs: a hung encoder child could permanently block its worker. Backend-only.

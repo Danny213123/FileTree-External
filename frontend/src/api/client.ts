@@ -33,6 +33,18 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/**
+ * Running build's version string (from the server binary's CARGO_PKG_VERSION).
+ * Never throws — returns "" on any failure so the title bar degrades gracefully.
+ */
+export async function fetchAppVersion(signal?: AbortSignal): Promise<string> {
+  try {
+    return (await getJson<{ version: string }>("/api/version", signal)).version;
+  } catch {
+    return "";
+  }
+}
+
 /** Result shape returned by the Electron `mutate` IPC (token-authed POST). */
 type MutateResponse = { ok: boolean; status: number; data: any };
 

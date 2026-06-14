@@ -12,6 +12,7 @@ import {
   fetchSmartFolders,
   saveSmartFolders,
   fetchDriveSpace,
+  fetchAppVersion,
   notify,
   saveSnapshot,
 } from "./api/client";
@@ -167,6 +168,8 @@ export default function App() {
   // because per-file owner lookups slow large scans (see crate::owner cache).
   const [collectOwners, setCollectOwners] = useState(false);
   const [drives, setDrives] = useState<DriveEntry[]>([]);
+  // Running build's version, shown in the title bar so a stale build is obvious.
+  const [appVersion, setAppVersion] = useState("");
   const [bookmarkList, setBookmarkList] = useState<string[]>([]);
   // Tags & color labels (F4): the persisted full list (mirrors bookmarks) plus
   // the active tag filter applied to the focused tree.
@@ -466,6 +469,13 @@ export default function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = darkMode ? "dark" : "light";
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Fetch the running build's version once on mount for the title bar.
+  useEffect(() => {
+    let alive = true;
+    fetchAppVersion().then((v) => { if (alive) setAppVersion(v); });
+    return () => { alive = false; };
   }, []);
 
   // Load settings + config + drives on mount
@@ -1222,6 +1232,12 @@ export default function App() {
   const canPrevTab = focusedTabIndex > 0;
   const canNextTab = !!focusedGroup && focusedTabIndex >= 0 && focusedTabIndex < focusedGroup.tabIds.length - 1;
 
+  // Keep the OS window/taskbar title in sync with the in-app title bar so the
+  // running build's version is identifiable even outside the custom chrome.
+  useEffect(() => {
+    document.title = `${activeLabel} — FileTree${appVersion ? ` v${appVersion}` : ""}`;
+  }, [activeLabel, appVersion]);
+
   const menus: Menu[] = useMemo(() => [
     {
       label: "File",
@@ -1406,7 +1422,7 @@ export default function App() {
   return (
     <div className="vscode">
       <TitleBar
-        title={`${activeLabel} — FileTree`}
+        title={`${activeLabel} — FileTree${appVersion ? ` v${appVersion}` : ""}`}
         menus={menus}
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen((v) => !v)}

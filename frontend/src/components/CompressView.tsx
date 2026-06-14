@@ -1165,6 +1165,29 @@ export function CompressView({
           `Compression complete — saved ${formatBytes(savedBytes)} across ${done.toLocaleString()} file${done === 1 ? "" : "s"}.`,
         );
       }
+      // Defensive reconciliation: on a true completion (not a user cancel, which
+      // legitimately leaves files pending for Retry), any row still pending/
+      // running never received a terminal outcome from the backend. Rather than
+      // leave a perpetual spinner, surface it as not-processed so the run reads
+      // honestly and the user can Retry.
+      if (status !== "cancelled") {
+        setProgress((prev) => {
+          let changed = false;
+          const next = new Map(prev);
+          for (const [idx, f] of next) {
+            if (f.status === "pending" || f.status === "running") {
+              next.set(idx, {
+                ...f,
+                status: "error",
+                pct: 100,
+                error: f.error ?? "Not processed — the run finished before this file was reached. Use Retry to resume.",
+              });
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
+      }
     },
     [onRescan],
   );
