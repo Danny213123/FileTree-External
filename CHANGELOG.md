@@ -4,6 +4,19 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.10] - 2026-06-14
+
+Fixes the real cause of a compression job stalling part-way through a batch of bad inputs: a hung encoder child could permanently block its worker. Backend-only.
+
+### Fixed
+
+- **A hung encoder no longer removes its worker from the pool (the real "stops after ~N files" stall)**: each video/image file runs its encoder as a child process whose completion is polled in a loop. If an encoder (HandBrake/ffmpeg) got stuck on a pathological or corrupt input — spinning forever instead of exiting — that poll loop spun forever too, permanently tying up the worker. After roughly `concurrency` such files every worker was blocked, the pool stopped pulling new files, and because `run_job` was itself blocked joining the stuck workers it never reached the reconcile/finalize tail (so the v1.13.9 orchestration guard could not help) — the rest of the batch was left "pending" indefinitely. `run_child` now runs a per-file **inactivity watchdog**: a child that produces no output for longer than the limit (default 10 minutes, override via `FILETREE_ENCODE_INACTIVITY_MS`) is killed and recorded as a terminal non-success encode, so the worker is freed and moves on. A legitimately-progressing encode emits output continuously and is never affected. Only an explicit user cancel still stops the run early.
+- **A panic while recording a file's outcome can no longer kill a worker**: the per-file pipeline was panic-isolated, but the `Err`-arm that records a caught panic (CSV row, manifest write, event emit) ran outside that `catch_unwind`. A panic there — and the same in the reconcile/force-finalize sweeps — would unwind the worker (or the finalize pass) and strand the remaining files. Outcome-recording now goes through a panic-proof recorder that, as a last resort, still forces the file to a terminal `error`, so no per-file outcome can remove a worker or abandon the batch.
+
+### Added
+
+- **Regression tests**: a worker-pool batch with more panicking files than workers proves the pool drains completely; a `run_child` test with a genuinely silent long-running child proves the inactivity watchdog kills it promptly and reports a terminal failure (rather than blocking for the full sleep); and a `run_job` test proves a worker survives a panic raised *while recording* a file's outcome and still processes the files scheduled after it.
+
 ## [1.13.9] - 2026-06-14
 
 Hardens the compression job runner so a fault can never end the job early and strand files as "pending". Backend-only.

@@ -835,7 +835,7 @@ fn force_finalize_job(job: &Arc<CompressJob>) {
         for i in 0..job.files.len() {
             let st = job.files[i].status.lock_recover().clone();
             if st == "pending" || st == "running" {
-                record_internal_error(
+                record_internal_error_guarded(
                     job,
                     i,
                     &counts,
@@ -1020,12 +1020,17 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
                 let stop = match result {
                     Ok(stop) => stop,
                     Err(payload) => {
+                        // Recording the caught panic (manifest write, CSV row,
+                        // event emit, a slice on pathological data) runs OUTSIDE
+                        // the catch above, so it goes through the panic-proof
+                        // recorder: a panic while recording the outcome must NEVER
+                        // unwind the worker and remove it from the pool.
                         let msg = panic_message(payload.as_ref());
                         crate::compress_debug::log(&format!(
                             "[panic] job={} #{i} worker caught a panic while processing file: {msg}",
                             job.id
                         ));
-                        record_internal_error(
+                        record_internal_error_guarded(
                             &job,
                             i,
                             &counts,
@@ -1055,7 +1060,7 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
         for i in 0..job.files.len() {
             let st = job.files[i].status.lock_recover().clone();
             if st == "pending" || st == "running" {
-                record_internal_error(
+                record_internal_error_guarded(
                     &job,
                     i,
                     &counts,
@@ -1137,6 +1142,14 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// safely run after another worker panicked. Idempotent enough for reconcile:
 /// only called for files not already terminal.
 fn record_internal_error(job: &Arc<CompressJob>, i: usize, counts: &Counts, message: &str) {
+    // Test-only one-shot: simulate a panic raised WHILE recording an outcome
+    // (e.g. a slice on pathological data deep in the CSV/manifest write). Proves
+    // that such a panic — which historically ran outside any catch and unwound
+    // the worker — is now contained. One-shot so finalization can still record.
+    #[cfg(test)]
+    if TEST_RECORD_PANIC_ARMED.swap(false, Ordering::SeqCst) {
+        panic!("forced panic while recording outcome (test)");
+    }
     let f = &job.files[i];
     let name = file_name_of(&f.path);
     let kind_str = f.kind.as_str();
@@ -1181,6 +1194,34 @@ fn record_internal_error(job: &Arc<CompressJob>, i: usize, counts: &Counts, mess
     ));
     job.emit(ev_error(i, &f.path, message, Reason::ErrorInternal.as_str()));
     write_manifest(job);
+}
+
+/// Test-only one-shot trigger for [`record_internal_error`] to panic, exercising
+/// the "panic while recording the outcome" path.
+#[cfg(test)]
+pub(crate) static TEST_RECORD_PANIC_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Panic-proof wrapper around [`record_internal_error`]: recording an outcome
+/// (CSV row, manifest write, event emit, or a slice on pathological data) must
+/// NEVER unwind the caller — neither a pool worker (removing it from the pool)
+/// nor the finalize/reconcile pass (abandoning the rest of the batch). If the
+/// rich recording panics, the file is still forced to a terminal `error` so it
+/// can never be left pending.
+fn record_internal_error_guarded(job: &Arc<CompressJob>, i: usize, counts: &Counts, message: &str) {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        record_internal_error(job, i, counts, message);
+    }));
+    if res.is_err() {
+        // Last-resort terminal marking with no rich logging (which is what
+        // panicked). Poison-tolerant; idempotent enough for the reconcile sweep.
+        let f = &job.files[i];
+        if matches!(f.status.lock_recover().as_str(), "pending" | "running") {
+            *f.error.lock_recover() = Some(message.to_string());
+            *f.status.lock_recover() = "error".to_string();
+            *f.reason.lock_recover() = Reason::ErrorInternal.as_str().to_string();
+            counts.error.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Process one file and record its outcome (FileState, CSV row, debug log, live
@@ -2927,9 +2968,38 @@ fn command_to_string(cmd: &Command) -> String {
     s
 }
 
+/// Epoch milliseconds (monotonic-enough for inactivity bookkeeping).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Maximum time an encoder child may produce NO output before it is treated as
+/// hung and killed. A real HandBrake/ffmpeg encode emits progress to stderr
+/// continuously (sub-second), and even the scan phase is chatty, so a multi-
+/// minute silence means the child is stuck on a pathological/corrupt input
+/// (HandBrake can spin forever on some truncated streams instead of exiting).
+/// Without this watchdog such a child blocks its worker FOREVER; after
+/// `concurrency` hung files every worker is stuck, the pool stops, and the job
+/// never finalizes — the whole batch is abandoned mid-run. Generous by default
+/// (10 min) so it can never kill a legitimately-progressing encode; overridable
+/// via `FILETREE_ENCODE_INACTIVITY_MS` (used by tests to shrink it).
+fn encode_inactivity_limit_ms() -> u64 {
+    std::env::var("FILETREE_ENCODE_INACTIVITY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(10 * 60 * 1000)
+}
+
 /// Spawn `cmd` as the job's active child, drain stdout silently, parse `%`
 /// progress from stderr, and poll until exit or cancellation. The child handle
-/// is stored on the job so `cancel` can `kill()` it.
+/// is stored on the job so `cancel` can `kill()` it. A per-file inactivity
+/// watchdog kills a child that produces NO output for
+/// [`encode_inactivity_limit_ms`] (a hung/corrupt input), so a single bad file
+/// can never permanently remove its worker from the pool.
 fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeResult {
     use std::process::Stdio;
     compress_tools::no_window(&mut cmd);
@@ -2954,12 +3024,23 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     // (multiple files run in parallel now).
     job.children.lock_recover().insert(index, child);
 
+    // Last time the child produced ANY output, in epoch ms. The reader threads
+    // bump it on every chunk; the poll loop kills the child if it goes silent for
+    // longer than the inactivity limit (a hung/corrupt input).
+    let last_activity = Arc::new(AtomicU64::new(now_ms()));
+
     // Drain stdout so the pipe can never fill and block the child.
     let out_handle = stdout.map(|mut pipe| {
+        let last_activity = Arc::clone(&last_activity);
         std::thread::spawn(move || {
             use std::io::Read;
-            let mut sink = Vec::new();
-            let _ = pipe.read_to_end(&mut sink);
+            let mut buf = [0u8; 8192];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => last_activity.store(now_ms(), Ordering::Relaxed),
+                }
+            }
         })
     });
 
@@ -2968,18 +3049,32 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     // explained. The thread returns the captured tail + parsed fps.
     let err_handle = stderr.map(|pipe| {
         let job = Arc::clone(job);
-        std::thread::spawn(move || read_progress(pipe, &job, index))
+        let last_activity = Arc::clone(&last_activity);
+        std::thread::spawn(move || read_progress(pipe, &job, index, &last_activity))
     });
 
-    // Poll for completion / cancellation. Track the real exit status so the exit
-    // code can be recorded.
+    // Poll for completion / cancellation / inactivity. Track the real exit status
+    // so the exit code can be recorded.
+    let inactivity_limit = encode_inactivity_limit_ms();
     let mut cancelled = false;
+    let mut timed_out = false;
     let exit_status: Option<std::process::ExitStatus> = loop {
         if job.cancel.load(Ordering::SeqCst) {
             if let Some(c) = job.children.lock_recover().get_mut(&index) {
                 let _ = c.kill();
             }
             cancelled = true;
+            break None;
+        }
+        // Inactivity watchdog: a child that has produced no output for longer
+        // than the limit is stuck on a pathological input. Kill it so its worker
+        // is freed and the file ends as a terminal error instead of hanging the
+        // whole pool forever.
+        if now_ms().saturating_sub(last_activity.load(Ordering::Relaxed)) > inactivity_limit {
+            if let Some(c) = job.children.lock_recover().get_mut(&index) {
+                let _ = c.kill();
+            }
+            timed_out = true;
             break None;
         }
         let poll = {
@@ -3008,12 +3103,31 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     if let Some(h) = out_handle {
         let _ = h.join();
     }
-    let (stderr_tail, fps) = err_handle
+    let (mut stderr_tail, fps) = err_handle
         .map(|h| h.join().unwrap_or_default())
         .unwrap_or_default();
 
     if cancelled {
         return EncodeResult::Cancelled;
+    }
+    if timed_out {
+        // A hung child: report a terminal, non-success encode (the worker
+        // continues to the next file). The note is appended so the failure is
+        // explained in the CSV/debug logs.
+        let secs = inactivity_limit / 1000;
+        let note = format!(
+            "[filetree] encoder produced no output for {secs}s and was killed as a likely hang (corrupt or unreadable input)"
+        );
+        stderr_tail = if stderr_tail.trim().is_empty() {
+            note
+        } else {
+            format!("{stderr_tail}\n{note}")
+        };
+        return EncodeResult::Done {
+            success: false,
+            diag: EncodeDiag { command, exit_code: None, stderr_tail },
+            fps,
+        };
     }
     let (success, exit_code) = match exit_status {
         Some(st) => (st.success(), st.code()),
@@ -3036,7 +3150,12 @@ const STDERR_TAIL_BYTES: usize = 8 * 1024;
 /// lines / ~8 KB) of everything else so a non-zero exit can be explained.
 /// Returns the captured tail (newline-joined). Reads raw bytes and splits on
 /// `\r`/`\n` because HandBrake rewrites its progress line with carriage returns.
-fn read_progress<R: std::io::Read>(mut pipe: R, job: &Arc<CompressJob>, index: usize) -> (String, Option<f64>) {
+fn read_progress<R: std::io::Read>(
+    mut pipe: R,
+    job: &Arc<CompressJob>,
+    index: usize,
+    last_activity: &AtomicU64,
+) -> (String, Option<f64>) {
     use std::collections::VecDeque;
     let mut buf = [0u8; 4096];
     let mut line = String::new();
@@ -3072,6 +3191,9 @@ fn read_progress<R: std::io::Read>(mut pipe: R, job: &Arc<CompressJob>, index: u
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        // Any output resets the inactivity watchdog: the child is alive and
+        // working, so it must not be killed as a hang.
+        last_activity.store(now_ms(), Ordering::Relaxed);
         for &b in &buf[..n] {
             if b == b'\n' || b == b'\r' {
                 if let Some(p) = parse_percent(&line) {
@@ -4438,6 +4560,180 @@ mod manifest_tests {
         assert_eq!(*job.status.lock_recover(), "error", "an aborted run finalizes as a resumable error");
 
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Concurrency-exhaustion regression: with a worker pool (concurrency=4) and
+    /// MORE panicking files than workers, a "one dead worker per bad file" bug
+    /// would stall the batch once every worker had exited. Every file must reach a
+    /// terminal state and the job must finish.
+    #[test]
+    fn run_job_more_panicking_files_than_workers_still_completes() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let dir = std::env::temp_dir()
+            .join(format!("ft-exhaust-{}-{}", std::process::id(), new_job_id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+
+        let payload = vec![b'A'; 8 * 1024];
+        let mut paths: Vec<String> = Vec::new();
+        // 12 panicking files (> the 4 workers) scheduled first, then 6 good files.
+        for n in 0..12 {
+            let boom = dir.join(format!("__FORCE_PANIC__{n}.bin"));
+            std::fs::write(&boom, &payload).expect("write boom");
+            paths.push(boom.to_string_lossy().into_owned());
+        }
+        for n in 0..6 {
+            let good = dir.join(format!("good{n}.bin"));
+            std::fs::write(&good, &payload).expect("write good");
+            paths.push(good.to_string_lossy().into_owned());
+        }
+        let total = paths.len();
+
+        let opts = CompressOptions {
+            original_action: OriginalAction::Keep,
+            concurrency: 4,
+            ..CompressOptions::default()
+        };
+        let job = create_job(&paths, "balanced", &opts);
+        // Panicking files largest ⇒ scheduled first (sort is size desc).
+        for (i, f) in job.files.iter().enumerate() {
+            f.orig_bytes
+                .store(if i < 12 { 10_000_000 } else { 8 * 1024 }, Ordering::Relaxed);
+        }
+
+        run_job(test_state(), Arc::clone(&job));
+
+        assert!(job.finished.load(Ordering::SeqCst), "job must finish");
+        let pending = job
+            .files
+            .iter()
+            .filter(|f| matches!(f.status.lock_recover().as_str(), "pending" | "running"))
+            .count();
+        assert_eq!(pending, 0, "no file may be left pending with a pool of workers");
+        let terminal = job
+            .files
+            .iter()
+            .filter(|f| matches!(f.status.lock_recover().as_str(), "done" | "skipped" | "error"))
+            .count();
+        assert_eq!(terminal, total, "every file must reach a terminal state");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A panic raised WHILE RECORDING a file's outcome (the `Err`-arm recording
+    /// runs outside the per-file `catch_unwind`) must not unwind the worker and
+    /// remove it from the pool. Drives the real `run_job` with concurrency=1: file
+    /// A panics in the pipeline (caught), then its outcome-recording panics too
+    /// (one-shot injector). Before the fix the worker thread died there and the
+    /// good file B that follows was stranded (reconciled to `error`); after the
+    /// fix the SAME worker survives and processes B to `done`.
+    #[test]
+    fn worker_survives_panic_while_recording_outcome() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let dir = std::env::temp_dir()
+            .join(format!("ft-recpanic-{}-{}", std::process::id(), new_job_id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+
+        let payload = vec![b'A'; 8 * 1024];
+        let boom = dir.join("__FORCE_PANIC__a.bin");
+        std::fs::write(&boom, &payload).expect("write boom");
+        let good = dir.join("good.bin");
+        std::fs::write(&good, &payload).expect("write good");
+        let paths = vec![
+            boom.to_string_lossy().into_owned(),
+            good.to_string_lossy().into_owned(),
+        ];
+
+        let opts = CompressOptions {
+            original_action: OriginalAction::Keep,
+            concurrency: 1,
+            ..CompressOptions::default()
+        };
+        let job = create_job(&paths, "balanced", &opts);
+        // A scheduled first (largest); B follows.
+        job.files[0].orig_bytes.store(10_000_000, Ordering::Relaxed);
+        job.files[1].orig_bytes.store(8 * 1024, Ordering::Relaxed);
+
+        // Arm the one-shot so the FIRST outcome-recording (the worker's Err-arm
+        // recording for A) panics.
+        TEST_RECORD_PANIC_ARMED.store(true, Ordering::SeqCst);
+        run_job(test_state(), Arc::clone(&job));
+        TEST_RECORD_PANIC_ARMED.store(false, Ordering::SeqCst);
+
+        assert!(job.finished.load(Ordering::SeqCst), "job must finish");
+        // The crux: B (scheduled AFTER the record-panic) was processed by the SAME
+        // worker — it did NOT die. Pre-fix this would be "error" (reconciled).
+        assert_eq!(
+            *job.files[1].status.lock_recover(),
+            "done",
+            "good file after a record-panic must be processed by the worker, not stranded"
+        );
+        // A is terminal too, and nothing is left pending.
+        assert_eq!(*job.files[0].status.lock_recover(), "error");
+        let pending = job
+            .files
+            .iter()
+            .filter(|f| matches!(f.status.lock_recover().as_str(), "pending" | "running"))
+            .count();
+        assert_eq!(pending, 0, "no file may be left pending");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The inactivity watchdog: a child that produces NO output for longer than
+    /// the limit (a hung/corrupt input) is killed and reported as a terminal
+    /// non-success encode, so it can never block its worker forever. Drives the
+    /// real `run_child` with a genuinely silent, long-running subprocess and a
+    /// shrunk limit; without the watchdog this call would block for the full
+    /// sleep (≈30 s) instead of returning in ~the limit.
+    #[cfg(windows)]
+    #[test]
+    fn run_child_times_out_on_silent_hung_child() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let prev = std::env::var_os("FILETREE_ENCODE_INACTIVITY_MS");
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe { std::env::set_var("FILETREE_ENCODE_INACTIVITY_MS", "1500") };
+
+        let job = create_job(&["hang.bin".to_string()], "balanced", &CompressOptions::default());
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]);
+
+        let start = Instant::now();
+        let result = run_child(&job, 0, cmd);
+        let elapsed = start.elapsed();
+
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("FILETREE_ENCODE_INACTIVITY_MS", v),
+                None => std::env::remove_var("FILETREE_ENCODE_INACTIVITY_MS"),
+            }
+        }
+
+        assert!(
+            elapsed.as_secs() < 12,
+            "watchdog must kill the hung child quickly; took {elapsed:?}"
+        );
+        match result {
+            EncodeResult::Done { success, diag, .. } => {
+                assert!(!success, "a hung+killed child must be a non-success encode");
+                assert!(
+                    diag.stderr_tail.contains("killed") || diag.stderr_tail.contains("no output"),
+                    "stderr tail must explain the timeout, got: {:?}",
+                    diag.stderr_tail
+                );
+            }
+            _ => panic!("expected Done(success=false) from the watchdog"),
+        }
+
         let _ = std::fs::remove_dir_all(&home);
     }
 
