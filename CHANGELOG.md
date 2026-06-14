@@ -4,6 +4,16 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.7] - 2026-06-13
+
+Redesigns the Compress page controls so presets drive a set of always-visible options, and squares the page's styling to match the rest of the app. Frontend-only — the `custom` preset (resolution + quality) already exists in the backend as of v1.13.6.
+
+### Changed
+
+- **Preset is now a dropdown that drives always-visible controls**: the preset chip row is replaced by a labeled **Preset** `<select>` at the top of the toolbar. The **Resolution** cap and **Quality** slider are always visible (no longer gated behind the "Custom" preset) in a new collapsible **Options** section directly beneath the dropdown. Picking a named preset writes its canonical video values into the controls so they visibly move (Maximum savings → 480p / RF30, More savings → 720p / RF27, Balanced → 1080p / RF24, High quality → Original / RF20); manually changing the resolution or quality switches the preset to **Custom** and encodes with the shown values. A **Show options / Hide options** toggle (persisted across sessions) collapses the section.
+- **Codec + Video encoder moved into the Options section**: both selects are pulled out of the Performance panel and made always-visible alongside resolution/quality, keeping their capability gating. They are orthogonal to the preset — changing them does not switch the preset to Custom. GPU toggle, parallel files, zip level, minimum size, and diagnostics remain in the Performance panel.
+- **Compress page styling now matches the rest of the app**: every corner on the Compress page is squared (chips, buttons, selects, badges, progress bars, panels, job cards, log containers, and range sliders). The Compress / In Progress / History tab bar is restyled to the app's standard tab look (square filled active highlight with an inset accent underline and a square hover background), with thin flush vertical dividers between tabs.
+
 ## [1.13.6] - 2026-06-13
 
 Adds two new compression presets between the existing ones: a fixed **More savings** step and a fully **Custom** preset for video.

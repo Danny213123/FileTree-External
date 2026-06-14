@@ -3781,7 +3781,7 @@ input:focus, select:focus {
 .compress-toolbar-spacer { flex: 1; }
 .compress-chip {
   appearance: none; border: 1px solid var(--vsc-border); background: var(--surface);
-  color: var(--text-5); cursor: pointer; font-size: 12px; padding: 4px 10px; border-radius: 12px;
+  color: var(--text-5); cursor: pointer; font-size: 12px; padding: 4px 10px; border-radius: 0;
   display: inline-flex; align-items: center; gap: 4px;
 }
 .compress-chip:hover:not(:disabled) { color: var(--text); background: var(--vsc-list-hover); }
@@ -3797,11 +3797,36 @@ input:focus, select:focus {
 .compress-custom-value { color: var(--text); font-variant-numeric: tabular-nums; }
 .compress-custom-select {
   appearance: none; border: 1px solid var(--vsc-border); background: var(--surface);
-  color: var(--text); cursor: pointer; font-size: 12px; padding: 3px 8px; border-radius: 8px;
+  color: var(--text); cursor: pointer; font-size: 12px; padding: 3px 8px; border-radius: 0;
 }
 .compress-custom-select:disabled { opacity: 0.45; cursor: default; }
 .compress-custom-range { width: 120px; cursor: pointer; }
 .compress-custom-range:disabled { opacity: 0.45; cursor: default; }
+/* Square the range track + thumb on the compress page (override native rounding). */
+.compress-custom-range,
+.compress-options input[type="range"],
+.compress-perf-panel input[type="range"] { appearance: none; -webkit-appearance: none; height: 16px; background: transparent; }
+.compress-custom-range::-webkit-slider-runnable-track,
+.compress-options input[type="range"]::-webkit-slider-runnable-track,
+.compress-perf-panel input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px; border-radius: 0; background: var(--panel-2);
+}
+.compress-custom-range::-moz-range-track,
+.compress-options input[type="range"]::-moz-range-track,
+.compress-perf-panel input[type="range"]::-moz-range-track {
+  height: 4px; border-radius: 0; background: var(--panel-2);
+}
+.compress-custom-range::-webkit-slider-thumb,
+.compress-options input[type="range"]::-webkit-slider-thumb,
+.compress-perf-panel input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 12px; height: 12px; margin-top: -4px;
+  border-radius: 0; background: var(--accent); border: none; cursor: pointer;
+}
+.compress-custom-range::-moz-range-thumb,
+.compress-options input[type="range"]::-moz-range-thumb,
+.compress-perf-panel input[type="range"]::-moz-range-thumb {
+  width: 12px; height: 12px; border-radius: 0; background: var(--accent); border: none; cursor: pointer;
+}
 .compress-custom-hint { font-size: 11px; color: var(--text-5); }
 .compress-toggle {
   display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text);
@@ -3811,7 +3836,7 @@ input:focus, select:focus {
 .compress-btn {
   display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 14px;
   font-size: 12.5px; background: var(--surface); border: 1px solid var(--vsc-border);
-  color: var(--text); border-radius: 4px; cursor: pointer; white-space: nowrap;
+  color: var(--text); border-radius: 0; cursor: pointer; white-space: nowrap;
 }
 .compress-btn:hover:not(:disabled) { background: var(--vsc-list-hover); }
 .compress-btn:disabled { opacity: 0.5; cursor: default; }
@@ -3832,12 +3857,12 @@ input:focus, select:focus {
 /* Generic progress bar (overall + per-file) */
 .compress-bar {
   position: relative; flex: 1 1 auto; min-width: 60px; height: 8px;
-  background: var(--panel-2); border-radius: 6px; overflow: hidden;
+  background: var(--panel-2); border-radius: 0; overflow: hidden;
 }
 .compress-bar.slim { height: 6px; }
 .compress-bar-fill {
   position: absolute; inset: 0 auto 0 0; height: 100%; width: 0;
-  background: var(--accent); border-radius: 6px; transition: width 180ms ease;
+  background: var(--accent); border-radius: 0; transition: width 180ms ease;
 }
 .compress-bar-fill.done { background: var(--accent-2, #2ea043); }
 .compress-bar-fill.error { background: var(--danger); }
@@ -3875,7 +3900,7 @@ input:focus, select:focus {
 .compress-row-prog { flex: 0 0 140px; display: flex; align-items: center; gap: 6px; }
 .compress-row-size { flex: 0 0 84px; text-align: right; color: var(--text-5); font-variant-numeric: tabular-nums; }
 .compress-chip-status {
-  flex: 0 0 auto; display: inline-block; padding: 1px 7px; border-radius: 10px;
+  flex: 0 0 auto; display: inline-block; padding: 1px 7px; border-radius: 0;
   font-size: 10.5px; font-weight: 600; text-transform: capitalize;
   background: var(--panel-2); color: var(--text-5);
 }
@@ -3894,17 +3919,22 @@ input:focus, select:focus {
   color: var(--text-5); font-size: 13px;
 }
 
-/* Compress / History tab toggle */
+/* Compress / History tab toggle — matches the app's standard tab look
+   (filled active highlight + inset accent underline, square, flush dividers). */
 .compress-tabs {
-  display: flex; align-items: center; gap: 2px; flex: 0 0 auto;
+  display: flex; align-items: center; flex: 0 0 auto;
   padding: 6px 12px 0; border-bottom: 1px solid var(--vsc-border); background: var(--panel);
 }
 .compress-tab {
-  appearance: none; border: none; background: transparent; cursor: pointer;
-  color: var(--text-5); font-size: 12.5px; padding: 6px 12px; border-bottom: 2px solid transparent;
+  appearance: none; border: none; border-radius: 0; background: transparent; cursor: pointer;
+  color: var(--text-5); font-size: 12.5px; font-weight: 400; padding: 6px 12px;
 }
-.compress-tab:hover { color: var(--text); }
-.compress-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.compress-tab + .compress-tab { border-left: 1px solid var(--vsc-border); }
+.compress-tab:hover { color: var(--text); background: rgba(0, 0, 0, 0.05); }
+.compress-tab.active {
+  color: var(--text); font-weight: 600;
+  background: var(--surface); box-shadow: inset 0 -2px 0 var(--accent);
+}
 
 /* One-shot pre-selection notice (some paths weren't in the current scan) */
 .compress-notice {
@@ -3924,7 +3954,7 @@ input:focus, select:focus {
 .compress-scope-clear {
   margin-left: auto; appearance: none; border: 1px solid var(--vsc-border);
   background: var(--surface); color: var(--text); cursor: pointer;
-  font-size: 11.5px; line-height: 1; padding: 4px 10px; border-radius: 4px; white-space: nowrap;
+  font-size: 11.5px; line-height: 1; padding: 4px 10px; border-radius: 0; white-space: nowrap;
 }
 .compress-scope-clear:hover { background: var(--vsc-list-hover); }
 
@@ -3932,7 +3962,7 @@ input:focus, select:focus {
 .compress-progress { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
 .compress-jobs { display: flex; flex-direction: column; gap: 10px; padding: 4px 0; }
 .compress-job {
-  border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 0; padding: 10px 12px;
   background: var(--vsc-input-bg, rgba(255, 255, 255, 0.02));
   display: flex; flex-direction: column; gap: 8px;
 }
@@ -3945,19 +3975,30 @@ input:focus, select:focus {
 .compress-job-counts { font-size: 12px; color: var(--text-5); white-space: nowrap; }
 .compress-job-actions { display: flex; gap: 8px; justify-content: flex-end; }
 
+/* Always-visible Options section (preset-driven: resolution, quality, codec,
+   encoder). Mirrors the Performance panel layout but square + collapsible. */
+.compress-options {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+  padding: 10px 12px; margin: 0 0 4px;
+  border: 1px solid var(--border); border-radius: 0;
+  background: var(--vsc-input-bg, rgba(255, 255, 255, 0.02));
+}
+
 /* Performance settings panel (Compress tab) */
 .compress-perf-panel {
   display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
   padding: 10px 12px; margin: 0 0 4px;
-  border: 1px solid var(--border); border-radius: 6px;
+  border: 1px solid var(--border); border-radius: 0;
   background: var(--vsc-input-bg, rgba(255, 255, 255, 0.02));
 }
 .compress-perf-field { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-5); }
 .compress-perf-field label { white-space: nowrap; }
+.compress-options select,
+.compress-options input[type="number"],
 .compress-perf-field select,
 .compress-perf-field input[type="number"] {
   background: var(--surface); color: var(--text); border: 1px solid var(--border);
-  border-radius: 4px; padding: 3px 6px; font-size: 12px;
+  border-radius: 0; padding: 3px 6px; font-size: 12px;
 }
 .compress-perf-field input[type="number"] { width: 64px; }
 .compress-perf-hint { font-size: 11px; color: var(--text-8); white-space: nowrap; }
@@ -3970,13 +4011,13 @@ input:focus, select:focus {
   font-size: 11px; line-height: 1.4; color: var(--warn, #b8860b);
   background: var(--warn-bg, rgba(184, 134, 11, 0.10));
   border: 1px solid var(--warn-border, rgba(184, 134, 11, 0.35));
-  border-radius: 6px; padding: 6px 8px; overflow-wrap: anywhere;
+  border-radius: 0; padding: 6px 8px; overflow-wrap: anywhere;
 }
 .compress-perf-warn code { font-family: var(--mono, monospace); }
 .compress-perf-note {
   font-size: 11px; line-height: 1.4; color: var(--text-5);
   background: var(--surface-2, rgba(127, 127, 127, 0.08));
-  border: 1px solid var(--border-4); border-radius: 6px; padding: 6px 8px; overflow-wrap: anywhere;
+  border: 1px solid var(--border-4); border-radius: 0; padding: 6px 8px; overflow-wrap: anywhere;
 }
 .compress-perf-note code { font-family: var(--mono, monospace); }
 .compress-perf-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
@@ -3986,7 +4027,7 @@ input:focus, select:focus {
   margin: 4px 0 0; padding: 6px 8px; max-height: 160px; overflow: auto;
   font-family: var(--mono, monospace); font-size: 10.5px; line-height: 1.4;
   white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-5);
-  background: var(--vsc-editor-bg, rgba(0,0,0,0.18)); border: 1px solid var(--border-4); border-radius: 6px;
+  background: var(--vsc-editor-bg, rgba(0,0,0,0.18)); border: 1px solid var(--border-4); border-radius: 0;
 }
 
 /* In Progress: table-style run list with expandable per-file detail */

@@ -72,6 +72,17 @@ const PRESETS: { id: CompressPreset; label: string }[] = [
   { id: "custom", label: "Custom" },
 ];
 
+/** Canonical video resolution-cap (px height; 0 ⇒ original) + quality (RF base)
+ *  for each NAMED preset, mirroring the backend. Selecting a named preset writes
+ *  these into the always-visible Resolution/Quality controls so they visibly
+ *  move, while the values still round-trip via the preset id on the job. */
+const PRESET_VALUES: Record<Exclude<CompressPreset, "custom">, { height: number; quality: number }> = {
+  max: { height: 480, quality: 30 },
+  more: { height: 720, quality: 27 },
+  balanced: { height: 1080, quality: 24 },
+  high: { height: 0, quality: 20 },
+};
+
 /** Resolution-cap options for the Custom preset. 0 ⇒ original (no downscale). */
 const CUSTOM_HEIGHT_OPTIONS: { value: number; label: string }[] = [
   { value: 0, label: "Original" },
@@ -128,6 +139,9 @@ interface CompressPerfSettings {
   customQuality: number;
   /** Last-selected preset, persisted so reopening restores the choice. */
   preset: CompressPreset;
+  /** Whether the always-visible Options section (resolution/quality/codec/
+   *  encoder) is expanded. Persisted so the choice sticks across sessions. */
+  showOptions: boolean;
 }
 
 const DEFAULT_PERF: CompressPerfSettings = {
@@ -140,6 +154,7 @@ const DEFAULT_PERF: CompressPerfSettings = {
   customMaxHeight: 1080,
   customQuality: 26,
   preset: "balanced",
+  showOptions: true,
 };
 
 /** Discrete stops for the minimum-size slider (bytes). Finer at the low end
@@ -203,6 +218,7 @@ function loadPerf(): CompressPerfSettings {
       preset: (["max", "more", "balanced", "high", "custom"] as const).includes(p.preset as CompressPreset)
         ? (p.preset as CompressPreset)
         : "balanced",
+      showOptions: typeof p.showOptions === "boolean" ? p.showOptions : true,
     };
   } catch {
     return { ...DEFAULT_PERF };
@@ -422,9 +438,29 @@ export function CompressView({
   }, []);
 
   // Select a preset AND persist it so reopening the app restores the choice.
+  // A NAMED preset also writes its canonical video values into the always-visible
+  // Resolution/Quality controls so they visibly move; "custom" keeps the current
+  // shown values (which the user is editing directly).
   const selectPreset = useCallback((id: CompressPreset) => {
     setPreset(id);
-    updatePerf({ preset: id });
+    if (id === "custom") {
+      updatePerf({ preset: "custom" });
+    } else {
+      const v = PRESET_VALUES[id];
+      updatePerf({ preset: id, customMaxHeight: v.height, customQuality: v.quality });
+    }
+  }, [updatePerf]);
+
+  // Manually editing resolution OR quality switches to the Custom preset (the
+  // job then encodes with the shown values) and persists the change.
+  const changeResolution = useCallback((height: number) => {
+    setPreset("custom");
+    updatePerf({ preset: "custom", customMaxHeight: height });
+  }, [updatePerf]);
+
+  const changeQuality = useCallback((quality: number) => {
+    setPreset("custom");
+    updatePerf({ preset: "custom", customQuality: quality });
   }, [updatePerf]);
 
   // Definitive GPU-encoder test: a real HW encode of a tiny generated clip.
@@ -501,7 +537,7 @@ export function CompressView({
     } else {
       lines.push("Tools: not detected yet");
     }
-    lines.push(`Settings: encoder=${perf.encoder} codec=${perf.codec} useGpu=${perf.useGpu} concurrency=${perf.concurrency} zipLevel=${perf.zipLevel} minSizeBytes=${perf.minSizeBytes} preset=${preset}${preset === "custom" ? ` customMaxHeight=${perf.customMaxHeight} customQuality=${perf.customQuality}` : ""}`);
+    lines.push(`Settings: encoder=${perf.encoder} codec=${perf.codec} useGpu=${perf.useGpu} concurrency=${perf.concurrency} zipLevel=${perf.zipLevel} minSizeBytes=${perf.minSizeBytes} preset=${preset} resolution=${perf.customMaxHeight === 0 ? "original" : `${perf.customMaxHeight}p`} quality=${perf.customQuality}`);
     if (gpuTest) {
       lines.push(
         `GPU test: ${
@@ -1296,55 +1332,30 @@ export function CompressView({
       )}
 
       <div className="compress-toolbar">
-        <div className="compress-group" role="tablist" aria-label="Quality preset">
+        <div className="compress-group" aria-label="Quality preset">
           <span className="compress-group-label">Preset</span>
-          {PRESETS.map((p) => (
-            <button
-              key={p.id}
-              role="tab"
-              aria-selected={preset === p.id}
-              className={`compress-chip${preset === p.id ? " active" : ""}`}
-              onClick={() => selectPreset(p.id)}
-              disabled={inRun}
-            >
-              {p.label}
-            </button>
-          ))}
-          {preset === "custom" && (
-            <div className="compress-custom" aria-label="Custom preset settings">
-              <label className="compress-custom-field">
-                <span className="compress-custom-label">Resolution</span>
-                <select
-                  className="compress-custom-select"
-                  value={perf.customMaxHeight}
-                  onChange={(e) => updatePerf({ customMaxHeight: Number(e.target.value) })}
-                  disabled={inRun}
-                >
-                  {CUSTOM_HEIGHT_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="compress-custom-field">
-                <span className="compress-custom-label">
-                  Quality <span className="compress-custom-value">{perf.customQuality}</span>
-                </span>
-                <input
-                  type="range"
-                  className="compress-custom-range"
-                  min={CUSTOM_QUALITY_MIN}
-                  max={CUSTOM_QUALITY_MAX}
-                  step={1}
-                  value={perf.customQuality}
-                  onChange={(e) => updatePerf({ customQuality: Number(e.target.value) })}
-                  disabled={inRun}
-                />
-                <span className="compress-custom-hint">lower = better quality, larger file</span>
-              </label>
-            </div>
-          )}
+          <select
+            className="compress-custom-select"
+            aria-label="Quality preset"
+            value={preset}
+            onChange={(e) => selectPreset(e.target.value as CompressPreset)}
+            disabled={inRun}
+          >
+            {PRESETS.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+          <button
+            className={`compress-btn${perf.showOptions ? " active" : ""}`}
+            onClick={() => updatePerf({ showOptions: !perf.showOptions })}
+            disabled={inRun}
+            aria-expanded={perf.showOptions}
+            title="Resolution, quality, codec, and encoder"
+          >
+            {perf.showOptions ? "Hide options" : "Show options"}
+          </button>
         </div>
         <div
           className="compress-group"
@@ -1428,13 +1439,46 @@ export function CompressView({
         )}
       </div>
 
-      {showPerf && !inRun && (
-        <div className="compress-perf-panel">
+      {perf.showOptions && (
+        <div className="compress-options" aria-label="Compression options">
+          <div className="compress-perf-field">
+            <label htmlFor="cv-resolution">Resolution</label>
+            <select
+              id="cv-resolution"
+              value={perf.customMaxHeight}
+              onChange={(e) => changeResolution(Number(e.target.value))}
+              disabled={inRun}
+            >
+              {CUSTOM_HEIGHT_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="compress-perf-field compress-perf-field-wide">
+            <label htmlFor="cv-quality">
+              Quality <span className="compress-custom-value">{perf.customQuality}</span>
+            </label>
+            <input
+              id="cv-quality"
+              type="range"
+              className="compress-custom-range"
+              min={CUSTOM_QUALITY_MIN}
+              max={CUSTOM_QUALITY_MAX}
+              step={1}
+              value={perf.customQuality}
+              onChange={(e) => changeQuality(Number(e.target.value))}
+              disabled={inRun}
+            />
+            <span className="compress-perf-hint">lower = better quality, larger file</span>
+          </div>
           <div className="compress-perf-field">
             <label htmlFor="cv-encoder">Video encoder</label>
             <select
               id="cv-encoder"
               value={perf.encoder}
+              disabled={inRun}
               onChange={(e) => updatePerf({ encoder: e.target.value as CompressEncoder })}
             >
               {ENCODER_OPTIONS.map((o) => {
@@ -1452,6 +1496,7 @@ export function CompressView({
             <select
               id="cv-codec"
               value={perf.codec}
+              disabled={inRun}
               onChange={(e) => updatePerf({ codec: e.target.value as CompressCodec })}
             >
               <option value="h264">H.264 (compatible)</option>
@@ -1466,6 +1511,11 @@ export function CompressView({
               </option>
             </select>
           </div>
+        </div>
+      )}
+
+      {showPerf && !inRun && (
+        <div className="compress-perf-panel">
           <label className="compress-toggle">
             <input
               type="checkbox"
