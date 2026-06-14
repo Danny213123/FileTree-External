@@ -4,6 +4,19 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.5] - 2026-06-13
+
+Restores the video compression savings that the v1.13.x audio change removed, and tells genuinely corrupt/incomplete downloads apart from real encoder failures.
+
+### Fixed
+
+- **Videos compress (save bytes) again**: across the v1.13.x window the only behavioral change to the video pipeline was audio handling. Pre-v1.13.0 the encoder re-encoded audio to 160 kbps AAC (`-E av_aac -B 160`), and those audio savings are what tipped an already-compressed video net-smaller once the hardware video encoder left the video stream roughly size-neutral. v1.13.0 switched to `-E copy` (audio passthrough), removing the savings so files finished as **"no gain" (0 bytes saved)** and the output was discarded. The audio arguments are now back to the proven `-E av_aac -B 160` re-encode (still valid — `-B` is only invalid alongside `-E copy`, the separate v1.13.4 crash fix). All other v1.13.4 behavior is unchanged: `--optimize` only for MP4-family outputs, CPU-only `--encopts threads=N`, downscale only when needed, the minimal-arg retry, and up-front encoder-token validation.
+- **Corrupt/incomplete videos are labeled truthfully**: a source that fails HandBrake's scan phase (no readable title — e.g. `moov atom not found` / `unrecognized file type` / `0 valid title(s)` / `No title found`, typically a partial or failed download) is now reported as the new `error_unreadable_input` outcome ("video is corrupt or incomplete — no readable title") instead of a generic "encoder failed". The original is left untouched (an encode failure already keeps it), and the badge/tooltip explain that re-downloading — not retrying — is the fix.
+
+### Changed
+
+- **Portable build is now self-purging (no stale binaries/assets)**: `scripts/build-portable.ps1` (via `build-portable.bat`) removes `frontend/dist`, `electron/dist`, and the entire `dist-portable/` output before rebuilding, and always runs `cargo clean -p filetree` so the server binary and its embedded UI are rebuilt from current source. A new `-Clean` switch additionally runs a full `cargo clean` (recompiles all dependencies) for a maximally fresh build. `-SkipInstall`/`-NoLaunch` and the abort-on-any-failure flow are preserved.
+
 ## [1.13.4] - 2026-06-13
 
 A fix for a regression that made **every video fail** to compress (`error_encoder`, "encoder exited with code 2"), plus hardening so a bad encoder argument can never again wipe a whole batch.

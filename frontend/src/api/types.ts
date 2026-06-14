@@ -518,7 +518,8 @@ export interface CompressJobFile {
   newBytes: number;
   error?: string;
   /** Precise outcome code (e.g. `success`, `skipped_no_gain`, `skipped_too_small`,
-   *  `error_encoder`, `error_tool_missing`, `gpu_fallback`). Empty until terminal. */
+   *  `error_encoder`, `error_unreadable_input`, `error_tool_missing`,
+   *  `gpu_fallback`). Empty until terminal. */
   reason?: string;
   /** The genuine encoder + codec params actually used (e.g. `nvenc_h265 q=26
    *  preset=quality` or `x264 q=24 …`). Empty until the file terminates. */
@@ -718,9 +719,9 @@ export interface CompressLogRow {
   error: string;
   /** Precise outcome code. One of: `success`, `skipped_no_gain`, `skipped_too_small`,
    *  `error_tool_missing`, `error_unsupported`, `error_encoder`,
-   *  `error_output_empty`, `error_source_missing`, `error_cloud_placeholder`,
-   *  `error_spawn`, `error_internal`, `gpu_fallback`. Falls back to `status` for
-   *  rows written before the diagnostics columns existed. */
+   *  `error_unreadable_input`, `error_output_empty`, `error_source_missing`,
+   *  `error_cloud_placeholder`, `error_spawn`, `error_internal`, `gpu_fallback`.
+   *  Falls back to `status` for rows written before the diagnostics columns existed. */
   reason: string;
   /** Encoder process exit code, or `null` when no process ran / none produced. */
   exitCode: number | null;

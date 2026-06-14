@@ -1,6 +1,11 @@
 param(
   [switch]$SkipInstall,
-  [switch]$NoLaunch
+  [switch]$NoLaunch,
+  # Full `cargo clean` (purges the entire target/ cache and recompiles ALL
+  # dependencies — slow but maximally fresh). Regardless of this switch the build
+  # ALWAYS runs `cargo clean -p filetree` so our own crate and the embedded
+  # frontend assets can never be stale.
+  [switch]$Clean
 )
 
 Set-StrictMode -Version Latest
@@ -9,6 +14,8 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $frontendDir = Join-Path $repoRoot "frontend"
 $electronDir = Join-Path $repoRoot "electron"
+$frontendDist = Join-Path $frontendDir "dist"
+$electronDist = Join-Path $electronDir "dist"
 $electronRuntimeDir = Join-Path $electronDir "node_modules\electron\dist"
 $serverExe = Join-Path $repoRoot "target\release\filetree.exe"
 $portableRoot = Join-Path $repoRoot "dist-portable"
@@ -34,6 +41,18 @@ function Invoke-Checked {
     }
   } finally {
     Pop-Location
+  }
+}
+
+function Remove-PathSafe {
+  param(
+    [string]$Path,
+    [string]$Label
+  )
+
+  if (Test-Path -LiteralPath $Path) {
+    Write-Host "==> Removing stale $Label"
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
   }
 }
 
@@ -72,6 +91,23 @@ if (!(Test-Path $electronDir)) {
   throw "Missing electron directory: $electronDir"
 }
 
+# Purge stale build artifacts so a rebuild can never ship an old binary/assets.
+# A full `cargo clean` (opt-in via -Clean) recompiles every dependency; the
+# targeted `cargo clean -p filetree` always runs so our crate — which embeds the
+# freshly built frontend assets — is rebuilt from current source.
+if ($Clean) {
+  Invoke-Checked "Clean entire cargo target (full rebuild; recompiles ALL dependencies)" "cargo" @("clean") $repoRoot
+}
+Invoke-Checked "Clean filetree crate (refresh embedded assets)" "cargo" @("clean", "-p", "filetree") $repoRoot
+
+# Remove compiled frontend/electron output before rebuilding so no stale asset
+# survives into the package.
+Remove-PathSafe $frontendDist "frontend/dist"
+Remove-PathSafe $electronDist "electron/dist"
+# Remove the whole portable output root (not just the FileTree subfolder) so no
+# leftover packaged exe/resources remain.
+Remove-PathSafe $portableRoot "dist-portable"
+
 Ensure-NodeDependencies $frontendDir "Install frontend dependencies"
 Ensure-NodeDependencies $electronDir "Install Electron dependencies"
 
@@ -86,10 +122,7 @@ if (!(Test-Path $serverExe)) {
   throw "Rust server binary not found after build: $serverExe"
 }
 
-if (Test-Path $portableDir) {
-  Remove-Item -LiteralPath $portableDir -Recurse -Force
-}
-
+# The portable root was already purged above; (re)create the FileTree subfolder.
 New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 Copy-Item -Path (Join-Path $electronRuntimeDir "*") -Destination $portableDir -Recurse -Force
 
@@ -140,7 +173,16 @@ or:
 
   powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 
-Use -NoLaunch to build without starting FileTree afterward.
+Every build purges stale artifacts before rebuilding: it removes frontend/dist,
+electron/dist, and the dist-portable output, and always runs
+"cargo clean -p filetree" so the server binary and its embedded UI are rebuilt
+from current source.
+
+Switches:
+  -Clean        Full "cargo clean" first (recompiles ALL dependencies; slowest,
+                maximally fresh). Use if you suspect a stale dependency build.
+  -NoLaunch     Build without starting FileTree afterward.
+  -SkipInstall  Skip "npm ci" dependency installs (use existing node_modules).
 "@ | Set-Content -LiteralPath $readmePath -Encoding UTF8
 
 Write-Host ""

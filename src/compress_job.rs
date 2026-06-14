@@ -1344,6 +1344,12 @@ pub(crate) enum Reason {
     ErrorUnsupported,
     /// The encoder ran but exited non-zero (carries exit code + stderr tail).
     ErrorEncoder,
+    /// The source could not be read as a valid video: HandBrake's scan phase
+    /// found no readable title (e.g. `moov atom not found` / `unrecognized file
+    /// type` / `0 valid title(s)` / `No title found`). This is a corrupt or
+    /// incomplete source (commonly a partial/failed download), NOT an encoder or
+    /// argument fault. The original is untouched (an encode failure keeps it).
+    ErrorUnreadableInput,
     /// The encoder reported success but produced a missing/empty output.
     ErrorOutputEmpty,
     /// The source file no longer exists (commonly recycled by a prior run).
@@ -1378,6 +1384,7 @@ impl Reason {
             Reason::ErrorToolMissing => "error_tool_missing",
             Reason::ErrorUnsupported => "error_unsupported",
             Reason::ErrorEncoder => "error_encoder",
+            Reason::ErrorUnreadableInput => "error_unreadable_input",
             Reason::ErrorOutputEmpty => "error_output_empty",
             Reason::ErrorSourceMissing => "error_source_missing",
             Reason::ErrorCloudPlaceholder => "error_cloud_placeholder",
@@ -1684,6 +1691,20 @@ fn process_file(
             meta.fps = fps;
             if !success {
                 let _ = std::fs::remove_file(&out);
+                // A scan-phase failure (no readable title) is a corrupt/incomplete
+                // INPUT, not an encoder fault — classify it distinctly so the UI is
+                // truthful and the user knows to re-download rather than retry.
+                if is_unreadable_input_stderr(&diag.stderr_tail) {
+                    return FileOutcome::Error {
+                        reason: Reason::ErrorUnreadableInput,
+                        message: format!(
+                            "video is corrupt or incomplete (no readable title) — the source may be a partial/failed download — {}",
+                            encoder_error_message(&diag)
+                        ),
+                        diag,
+                        meta,
+                    };
+                }
                 return FileOutcome::Error {
                     reason: Reason::ErrorEncoder,
                     message: encoder_error_message(&diag),
@@ -2242,6 +2263,21 @@ fn safe_tail(s: &str, max: usize) -> &str {
     &s[start..]
 }
 
+/// Detect a HandBrake/ffmpeg scan-phase failure in an encoder's stderr tail: a
+/// corrupt or incomplete source with no readable title (commonly a partial or
+/// failed download), as opposed to an encoder or argument fault. Matches the
+/// known signatures case-insensitively. Pure so it is unit-testable.
+fn is_unreadable_input_stderr(stderr_tail: &str) -> bool {
+    let t = stderr_tail.to_ascii_lowercase();
+    const SIGNATURES: [&str; 4] = [
+        "no title found",
+        "0 valid title",
+        "unrecognized file type",
+        "moov atom not found",
+    ];
+    SIGNATURES.iter().any(|s| t.contains(s))
+}
+
 /// Build a human error message for a non-zero encoder exit from its diagnostics:
 /// the exit code, a trimmed tail of stderr (the part most likely to name the
 /// real failure), and the full command line for reproduction.
@@ -2514,17 +2550,19 @@ fn build_handbrake_args(
     push(&mut a, enc_preset);
 
     if !minimal {
-        // Audio: pass through tracks ALREADY in a compact lossy codec
-        // (aac/ac3/eac3/mp3) instead of needlessly re-encoding them (wasted work +
-        // a generational quality loss); anything outside the mask — lossless PCM,
-        // FLAC, TrueHD, DTS-HD — falls back to AAC. HandBrake decides per track.
-        // INVARIANT: never pass `-B` together with `-E copy` (invalid combo).
+        // Audio: re-encode every track to 160 kbps AAC. This is the proven
+        // pre-v1.13.0 behavior — the audio savings are what tip an
+        // already-compressed video net-smaller once NVENC leaves the video stream
+        // roughly size-neutral. v1.13.0 switched to `-E copy` passthrough, which
+        // removed those savings and made files finish as no-gain; we restore the
+        // re-encode here. `-B` IS valid with a real encoder (`av_aac`) — it is
+        // only invalid alongside `-E copy` (the v1.13.4 crash fix). A flat 160k
+        // can marginally grow audio already below 160k, which matches the
+        // long-working pre-regression behavior and is acceptable.
         push(&mut a, "-E");
-        push(&mut a, "copy");
-        push(&mut a, "--audio-fallback");
         push(&mut a, "av_aac");
-        push(&mut a, "--audio-copy-mask");
-        push(&mut a, "aac,ac3,eac3,mp3");
+        push(&mut a, "-B");
+        push(&mut a, "160");
         // --optimize (mp4 faststart) is MP4/M4V/MOV-only.
         if is_mp4_family(out) {
             push(&mut a, "--optimize");
@@ -3615,20 +3653,26 @@ mod encoder_tests {
     }
 
     #[test]
-    fn handbrake_args_audio_copy_has_no_bitrate() {
+    fn handbrake_args_audio_reencode_aac_160() {
         use std::path::Path;
-        // The v1.13.0 regression: `-E copy` + a global `-B` is an invalid combo
-        // HandBrake rejects. Assert the normal arg set passes copy WITHOUT any -B.
+        // Restored pre-v1.13.0 behavior: audio is RE-ENCODED to 160k AAC (the
+        // savings that tip an already-compressed video net-smaller), NOT passed
+        // through. `-B` is valid here because it accompanies a real encoder
+        // (av_aac) — it is only invalid alongside `-E copy`.
         let args = build_handbrake_args(
             Path::new("in.mkv"), Path::new("out.mkv"), "x264", "24", "medium",
             None, false, Some(8), false,
         );
-        assert!(args.iter().any(|a| a == "copy"), "audio should be passthrough");
-        assert!(!args.iter().any(|a| a == "-B"), "no global -B may accompany -E copy");
-        // The passthrough mask + AAC fallback are present.
-        assert!(args.windows(2).any(|w| w[0] == "-E" && w[1] == "copy"));
-        assert!(args.windows(2).any(|w| w[0] == "--audio-fallback" && w[1] == "av_aac"));
-        assert!(args.windows(2).any(|w| w[0] == "--audio-copy-mask" && w[1] == "aac,ac3,eac3,mp3"));
+        // `-E av_aac` is immediately followed by `-B 160`.
+        let e_pos = args.iter().position(|a| a == "-E").expect("-E present");
+        assert_eq!(args[e_pos + 1], "av_aac", "audio encoder is av_aac (re-encode)");
+        assert_eq!(args[e_pos + 2], "-B");
+        assert_eq!(args[e_pos + 3], "160");
+        // The old passthrough form is gone.
+        assert!(!args.iter().any(|a| a == "copy"), "audio must not be passthrough");
+        assert!(!args.iter().any(|a| a == "--audio-copy-mask"));
+        // --optimize remains mp4-family-only (mkv output ⇒ absent).
+        assert!(!args.iter().any(|a| a == "--optimize"), "mkv output gets no --optimize");
     }
 
     #[test]
@@ -3698,6 +3742,28 @@ mod encoder_tests {
         assert_eq!(validate_encoder_token("x265", &rich), "x265");
         assert_eq!(validate_encoder_token("svt_av1", &rich), "svt_av1");
         assert_eq!(validate_encoder_token("nvenc_h264", &rich), "nvenc_h264");
+    }
+
+    #[test]
+    fn scan_failure_stderr_classifies_as_unreadable_input() {
+        // A real corrupt/incomplete download produces a HandBrake scan failure
+        // (moov atom → unrecognized type → 0 valid titles → no title), which must
+        // map to the dedicated unreadable-input reason, not a generic encoder fault.
+        let sample = "libav: moov atom not found\n\
+                      Unrecognized file type\n\
+                      No title found.\n";
+        assert!(is_unreadable_input_stderr(sample));
+        assert_eq!(
+            if is_unreadable_input_stderr(sample) { Reason::ErrorUnreadableInput } else { Reason::ErrorEncoder }.as_str(),
+            "error_unreadable_input",
+        );
+        // Case-insensitive + each signature on its own triggers.
+        assert!(is_unreadable_input_stderr("MOOV ATOM NOT FOUND"));
+        assert!(is_unreadable_input_stderr("scan: 0 valid title(s) found"));
+        assert!(is_unreadable_input_stderr("hb_scan: unrecognized file type"));
+        // A genuine encoder error (e.g. a codec/preset gripe) is NOT misclassified.
+        assert!(!is_unreadable_input_stderr("x264 [error]: invalid preset 'bogus'"));
+        assert!(!is_unreadable_input_stderr(""));
     }
 
     #[test]
