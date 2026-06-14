@@ -159,6 +159,9 @@ fn capture_version(path: &Path, args: &[&str]) -> Option<String> {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HandbrakeCaps {
     pub(crate) x265: bool,
+    /// CPU SVT-AV1 software encoder (the AV1 fallback). Tracked so an AV1 job on a
+    /// build without SVT-AV1 can be downgraded to x264 up front instead of failing.
+    pub(crate) svt_av1: bool,
     pub(crate) nvenc_h264: bool,
     pub(crate) nvenc_h265: bool,
     pub(crate) nvenc_av1: bool,
@@ -330,6 +333,7 @@ pub(crate) fn detect_handbrake_caps_and_raw(path: &Path) -> (HandbrakeCaps, bool
     let has = |needle: &str| t.contains(needle);
     let caps = HandbrakeCaps {
         x265: has("x265"),
+        svt_av1: has("svt_av1"),
         nvenc_h264: has("nvenc_h264"),
         nvenc_h265: has("nvenc_h265"),
         nvenc_av1: has("nvenc_av1"),

@@ -4,6 +4,21 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.4] - 2026-06-13
+
+A fix for a regression that made **every video fail** to compress (`error_encoder`, "encoder exited with code 2"), plus hardening so a bad encoder argument can never again wipe a whole batch.
+
+### Fixed
+
+- **100% video encoder failures (invalid HandBrake audio arguments)**: the v1.13.0 audio settings combined `-E copy` (audio passthrough) with a global `-B 160` (forced audio bitrate) — an invalid combination HandBrake rejects at job setup, so every video exited non-zero. This was masked until the v1.13.1 pool-halt fix let batches run to completion and exposed it as a wholesale failure. The audio arguments are now the valid passthrough form (`-E copy --audio-fallback av_aac --audio-copy-mask aac,ac3,eac3,mp3`) with **no `-B` alongside `copy`** — still passing through already-compact lossy tracks (AAC/AC3/E-AC3/MP3) and re-encoding the rest to AAC.
+- **`--optimize` only on MP4-family outputs**: HandBrake's `--optimize` (faststart) is an MP4/M4V/MOV-only flag; it is now gated on the output extension so MKV/WebM/AVI outputs (whose muxers reject it) never receive it.
+- **Encoder failures now show the real reason**: the per-file error (In Progress detail and the `compress-log.csv` `error` column) includes a trimmed tail of HandBrake's stderr, not just a bare exit code. Failing files are also written to `compress-debug.log` even when verbose logging is off (subject to the existing rotation cap).
+
+### Changed
+
+- **A bad argument can no longer wipe a whole batch (hardening)**: if an encode exits non-zero, it is retried **once** with a minimal, guaranteed-valid argument set (input/output/encoder/quality/preset, plus a downscale only when one is requested — no audio/optimize/encopts flags) before being reported as an error. Any future argument-compatibility drift now degrades to a plain encode instead of a hard failure.
+- **Up-front encoder validation**: the chosen software encoder token (`x265`, `svt_av1`) is validated against the installed HandBrake build's capabilities and downgraded to the always-present `x264` when unsupported, instead of spawning a doomed encode. Hardware (GPU) encoder attempts are unchanged — they may still be tried "assumed" from a detected adapter, and a genuine runtime GPU failure is still caught by the existing GPU→CPU fallback, which now also validates its CPU target.
+
 ## [1.13.3] - 2026-06-13
 
 A minimum-size threshold so files too small to meaningfully compress (especially videos with too few frames) are skipped instead of wastefully re-encoded.

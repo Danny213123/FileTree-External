@@ -1212,6 +1212,22 @@ fn process_and_record(
                 &job.id, i, &f.path, kind_str, orig, tool, &diag, "", 0,
                 "error", reason.as_str(), duration_ms, false, None, None,
             );
+            // Always persist a compact entry for FAILURES (even when verbose debug
+            // logging is off): a failing encode is exactly what a user needs the
+            // log for. Rotation still caps growth.
+            if !crate::compress_debug::enabled() {
+                let tail = safe_tail(diag.stderr_tail.trim(), 600).replace(['\r', '\n'], " ");
+                crate::compress_debug::log_force(&format!(
+                    "[file_error] job={} #{i} path={:?} kind={kind_str} reason={} exit={} msg={:?}{}{}",
+                    job.id,
+                    f.path,
+                    reason.as_str(),
+                    diag.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
+                    message,
+                    if diag.command.is_empty() { String::new() } else { format!(" cmd={:?}", diag.command) },
+                    if tail.trim().is_empty() { String::new() } else { format!(" stderr_tail={:?}", tail.trim()) },
+                ));
+            }
             job.emit(ev_error(i, &f.path, &message, reason.as_str()));
         }
         FileOutcome::Cancelled => {
@@ -2319,7 +2335,23 @@ fn run_video(
     meta.tool_version = hb_info.version.clone().unwrap_or_default();
 
     let hw = compress_tools::probe_gpu_hardware();
-    let enc = select_video_encoder(&job.encoder, &job.codec, job.use_gpu, caps, hw);
+    let mut enc = select_video_encoder(&job.encoder, &job.codec, job.use_gpu, caps, hw);
+    // Up-front token validation for CPU/software encoders (x265, svt_av1): if the
+    // installed build doesn't expose the chosen token, downgrade to x264 now
+    // rather than spawning a doomed encode. GPU tokens are deliberately left
+    // alone — they may be "assumed" from a detected adapter even when absent from
+    // the `-h` parse, and a genuine runtime GPU failure is still caught by the
+    // GPU→CPU fallback below. The two layers compose.
+    if !enc.is_gpu {
+        let valid = validate_encoder_token(&enc.hb, caps);
+        if valid != enc.hb {
+            crate::compress_debug::log(&format!(
+                "[encoder_validate] job={} #{index} encoder '{}' not supported by this HandBrake build; using x264",
+                job.id, enc.hb
+            ));
+            enc.hb = valid.to_string();
+        }
+    }
     let result = run_handbrake(job, index, hb, input, out, &job.preset, &enc, meta);
 
     // GPU encode failed → retry once on CPU, capturing WHY the GPU failed so it
@@ -2350,8 +2382,18 @@ fn run_video(
             ));
             meta.gpu_fallback = Some(detail);
             let _ = std::fs::remove_file(out);
-            // Fall back to the CPU software encoder for the chosen codec.
-            let cpu = cpu_fallback_encoder(&job.codec, caps);
+            // Fall back to the CPU software encoder for the chosen codec, itself
+            // validated against the build (e.g. svt_av1 → x264 when SVT-AV1 isn't
+            // present) so the fallback can't be doomed too.
+            let mut cpu = cpu_fallback_encoder(&job.codec, caps);
+            let valid = validate_encoder_token(&cpu.hb, caps);
+            if valid != cpu.hb {
+                crate::compress_debug::log(&format!(
+                    "[encoder_validate] job={} #{index} CPU fallback '{}' not supported; using x264",
+                    job.id, cpu.hb
+                ));
+                cpu.hb = valid.to_string();
+            }
             // run_handbrake overwrites meta.codec_params with the CPU encoder, so
             // `meta` ends up reflecting the genuine encoder actually used.
             return run_handbrake(job, index, hb, input, out, &job.preset, &cpu, meta);
@@ -2389,10 +2431,136 @@ fn fallback_stderr_suffix(tail: &str) -> String {
     format!(" — {}", snippet.replace(['\r', '\n'], " ").trim())
 }
 
+/// True when `out`'s extension is in the MP4 family (mp4/m4v/mov), the only
+/// containers whose muxer accepts HandBrake's `--optimize` (faststart) flag.
+/// MKV/WebM/AVI etc. reject it, so it must be gated on this.
+fn is_mp4_family(out: &Path) -> bool {
+    matches!(
+        out.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp4") | Some("m4v") | Some("mov")
+    )
+}
+
+/// Whether a HandBrake `-e` token is supported by the installed build, per the
+/// detected caps. `x264` is the always-present software baseline (HandBrake
+/// always ships it), so it is the guaranteed-valid fallback. An unknown token is
+/// treated as unsupported so the caller downgrades rather than spawning a doomed
+/// encode. NOTE: GPU tokens here reflect the `-h` parse only; the caller applies
+/// this check to CPU tokens and leaves GPU attempts to the runtime GPU→CPU
+/// fallback (so an "assumed from adapter" GPU encode is still attempted).
+fn encoder_token_supported(token: &str, caps: &HandbrakeCaps) -> bool {
+    match token {
+        "x264" => true,
+        "x265" => caps.x265,
+        "svt_av1" => caps.svt_av1,
+        "nvenc_h264" => caps.nvenc_h264,
+        "nvenc_h265" => caps.nvenc_h265,
+        "nvenc_av1" => caps.nvenc_av1,
+        "qsv_h264" => caps.qsv_h264,
+        "qsv_h265" => caps.qsv_h265,
+        "qsv_av1" => caps.qsv_av1,
+        "vce_h264" => caps.vce_h264,
+        "vce_h265" => caps.vce_h265,
+        "vce_av1" => caps.vce_av1,
+        _ => false,
+    }
+}
+
+/// Resolve a chosen `-e` token to one the build actually supports: returns the
+/// token unchanged when supported, else `x264` (the guaranteed-available CPU
+/// baseline). Pure so it is unit-testable.
+fn validate_encoder_token<'a>(token: &'a str, caps: &HandbrakeCaps) -> &'a str {
+    if encoder_token_supported(token, caps) { token } else { "x264" }
+}
+
+/// Assemble the HandBrake CLI argument vector for one encode. PURE (no spawn) so
+/// the argument logic is unit-testable without HandBrake installed.
+///
+/// `minimal` produces the guaranteed-valid retry arg set used after a
+/// first-attempt non-zero exit: input/output/encoder/quality/preset plus a
+/// downscale only when one is requested — and crucially NO audio, `--optimize`,
+/// or `--encopts` flags (the arg families most prone to compatibility drift).
+///
+/// In the normal (non-minimal) set the audio block uses passthrough with an AAC
+/// fallback and DOES NOT pass a global `-B` bitrate alongside `-E copy` (that
+/// combination is invalid and HandBrake rejects it at job setup — the v1.13.0
+/// regression that failed every video). `--optimize` is emitted only for
+/// MP4-family outputs.
+fn build_handbrake_args(
+    input: &Path,
+    out: &Path,
+    encoder: &str,
+    quality: &str,
+    enc_preset: &str,
+    max_height: Option<&str>,
+    is_gpu: bool,
+    cpu_threads: Option<usize>,
+    minimal: bool,
+) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    let push = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
+    push(&mut a, "-i");
+    a.push(input.to_string_lossy().into_owned());
+    push(&mut a, "-o");
+    a.push(out.to_string_lossy().into_owned());
+    push(&mut a, "-e");
+    push(&mut a, encoder);
+    push(&mut a, "-q");
+    push(&mut a, quality);
+    push(&mut a, "--encoder-preset");
+    push(&mut a, enc_preset);
+
+    if !minimal {
+        // Audio: pass through tracks ALREADY in a compact lossy codec
+        // (aac/ac3/eac3/mp3) instead of needlessly re-encoding them (wasted work +
+        // a generational quality loss); anything outside the mask — lossless PCM,
+        // FLAC, TrueHD, DTS-HD — falls back to AAC. HandBrake decides per track.
+        // INVARIANT: never pass `-B` together with `-E copy` (invalid combo).
+        push(&mut a, "-E");
+        push(&mut a, "copy");
+        push(&mut a, "--audio-fallback");
+        push(&mut a, "av_aac");
+        push(&mut a, "--audio-copy-mask");
+        push(&mut a, "aac,ac3,eac3,mp3");
+        // --optimize (mp4 faststart) is MP4/M4V/MOV-only.
+        if is_mp4_family(out) {
+            push(&mut a, "--optimize");
+        }
+        if !is_gpu {
+            if let Some(t) = cpu_threads {
+                // CPU tuning: let x264/x265 use the box's threads (the lane cap
+                // bounds concurrent encodes, so this won't oversubscribe).
+                push(&mut a, "--encopts");
+                a.push(format!("threads={t}"));
+            }
+        }
+    }
+    if let Some(h) = max_height {
+        push(&mut a, "--maxHeight");
+        push(&mut a, h);
+        push(&mut a, "--keep-display-aspect");
+    }
+    a
+}
+
+/// Whether a first encode attempt should be retried with the minimal arg set:
+/// only when it ran to completion but exited non-zero AND the job wasn't
+/// cancelled. A spawn failure (missing binary) or a cancel is never retried.
+/// Pure so the retry trigger is unit-testable without spawning HandBrake.
+fn should_retry_minimal(result: &EncodeResult, cancelled: bool) -> bool {
+    matches!(result, EncodeResult::Done { success: false, .. }) && !cancelled
+}
+
 /// HandBrake video pipeline for a resolved encoder. Presets map to a quality
 /// (RF/CQ/ICQ) + optional downscale + `--encoder-preset`; progress + fps are
 /// parsed from the encoder output. Acquires the encoder's global-budget lane for
-/// the duration of the encode (released on return).
+/// the duration of the encode (released on return). On a non-zero first exit it
+/// retries ONCE with a minimal, guaranteed-valid arg set (no audio/optimize/
+/// encopts flags) so any future arg-compatibility drift degrades to a plain
+/// encode instead of a hard failure.
 fn run_handbrake(
     job: &Arc<CompressJob>,
     index: usize,
@@ -2418,32 +2586,36 @@ fn run_handbrake(
         None => return EncodeResult::Cancelled,
     };
 
+    let cpu_threads = if enc.is_gpu {
+        None
+    } else {
+        Some(std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4))
+    };
+    let args = build_handbrake_args(
+        input, out, &enc.hb, &quality, enc_preset, max_height, enc.is_gpu, cpu_threads, false,
+    );
     let mut cmd = Command::new(hb);
-    cmd.arg("-i").arg(input).arg("-o").arg(out);
-    cmd.args(["-e", &enc.hb, "-q", &quality]);
-    // Audio: pass through tracks that are ALREADY in a compact lossy codec
-    // (aac/ac3/eac3/mp3) rather than needlessly re-encoding them (wasted work +
-    // a generational quality loss). Anything outside that mask — lossless PCM,
-    // FLAC, TrueHD, DTS-HD, etc., which are NOT compact — falls back to AAC @160k.
-    // HandBrake decides per track, so a file with a mix is handled correctly.
-    cmd.args([
-        "-E", "copy",
-        "-B", "160",
-        "--audio-fallback", "av_aac",
-        "--audio-copy-mask", "aac,ac3,eac3,mp3",
-        "--optimize",
-    ]);
-    cmd.args(["--encoder-preset", enc_preset]);
-    if !enc.is_gpu {
-        // CPU tuning: let x264/x265 use the box's threads for this encode (the
-        // lane cap bounds how many encodes run at once, so this won't oversubscribe).
-        let threads = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4);
-        cmd.args(["--encopts", &format!("threads={threads}")]);
+    cmd.args(&args);
+    let result = run_child(job, index, cmd);
+
+    // Retry once with the minimal arg set if the first attempt exited non-zero
+    // (and we weren't cancelled). This strips exactly the audio/optimize/encopts
+    // families most likely to be rejected by an arg-compat mismatch, so a build
+    // that chokes on them still produces a plain encode instead of failing.
+    if should_retry_minimal(&result, job.cancel.load(Ordering::Relaxed)) {
+        crate::compress_debug::log(&format!(
+            "[hb_retry] job={} #{index} first attempt exited non-zero; retrying with minimal args (encoder={})",
+            job.id, enc.hb
+        ));
+        let _ = std::fs::remove_file(out);
+        let margs = build_handbrake_args(
+            input, out, &enc.hb, &quality, enc_preset, max_height, enc.is_gpu, None, true,
+        );
+        let mut cmd2 = Command::new(hb);
+        cmd2.args(&margs);
+        return run_child(job, index, cmd2);
     }
-    if let Some(h) = max_height {
-        cmd.args(["--maxHeight", h, "--keep-display-aspect"]);
-    }
-    run_child(job, index, cmd)
+    result
 }
 
 /// ffmpeg image pipeline. Presets map to a JPEG-style quality (`-q:v`, lower =
@@ -3440,6 +3612,106 @@ mod encoder_tests {
         let h264 = cpu_fallback_encoder("h264", &with_x265);
         assert_eq!(h264.hb, "x264");
         assert!(!h264.is_gpu);
+    }
+
+    #[test]
+    fn handbrake_args_audio_copy_has_no_bitrate() {
+        use std::path::Path;
+        // The v1.13.0 regression: `-E copy` + a global `-B` is an invalid combo
+        // HandBrake rejects. Assert the normal arg set passes copy WITHOUT any -B.
+        let args = build_handbrake_args(
+            Path::new("in.mkv"), Path::new("out.mkv"), "x264", "24", "medium",
+            None, false, Some(8), false,
+        );
+        assert!(args.iter().any(|a| a == "copy"), "audio should be passthrough");
+        assert!(!args.iter().any(|a| a == "-B"), "no global -B may accompany -E copy");
+        // The passthrough mask + AAC fallback are present.
+        assert!(args.windows(2).any(|w| w[0] == "-E" && w[1] == "copy"));
+        assert!(args.windows(2).any(|w| w[0] == "--audio-fallback" && w[1] == "av_aac"));
+        assert!(args.windows(2).any(|w| w[0] == "--audio-copy-mask" && w[1] == "aac,ac3,eac3,mp3"));
+    }
+
+    #[test]
+    fn handbrake_args_optimize_only_for_mp4_family() {
+        use std::path::Path;
+        let has_optimize = |out: &str| {
+            build_handbrake_args(
+                Path::new("in.x"), Path::new(out), "x264", "24", "medium", None, false, Some(4), false,
+            )
+            .iter()
+            .any(|a| a == "--optimize")
+        };
+        // MP4 family (case-insensitive) gets faststart; others must not.
+        assert!(has_optimize("v.mp4"));
+        assert!(has_optimize("v.m4v"));
+        assert!(has_optimize("v.MOV"));
+        assert!(!has_optimize("v.mkv"));
+        assert!(!has_optimize("v.webm"));
+        assert!(!has_optimize("v.avi"));
+        assert!(!has_optimize("v"));
+    }
+
+    #[test]
+    fn handbrake_minimal_args_strip_audio_optimize_encopts() {
+        use std::path::Path;
+        // The retry arg set is the guaranteed-valid minimum: encoder/quality/preset
+        // and (when downscaling) maxHeight — but no audio, optimize, or encopts.
+        let args = build_handbrake_args(
+            Path::new("in.mp4"), Path::new("out.mp4"), "x264", "24", "medium",
+            Some("1080"), false, Some(8), true,
+        );
+        assert!(!args.iter().any(|a| a == "-E"), "minimal set has no audio flags");
+        assert!(!args.iter().any(|a| a == "--optimize"), "minimal set has no --optimize");
+        assert!(!args.iter().any(|a| a == "--encopts"), "minimal set has no --encopts");
+        assert!(args.windows(2).any(|w| w[0] == "-e" && w[1] == "x264"));
+        assert!(args.windows(2).any(|w| w[0] == "-q" && w[1] == "24"));
+        assert!(args.windows(2).any(|w| w[0] == "--encoder-preset" && w[1] == "medium"));
+        // Downscale is preserved (it's correctness, not a risky flag family).
+        assert!(args.windows(2).any(|w| w[0] == "--maxHeight" && w[1] == "1080"));
+        assert!(args.iter().any(|a| a == "--keep-display-aspect"));
+    }
+
+    #[test]
+    fn handbrake_cpu_threads_only_when_present_and_cpu() {
+        use std::path::Path;
+        // GPU encodes never get --encopts threads; CPU encodes do when a count is given.
+        let gpu = build_handbrake_args(
+            Path::new("i.mp4"), Path::new("o.mp4"), "nvenc_h264", "26", "quality", None, true, None, false,
+        );
+        assert!(!gpu.iter().any(|a| a == "--encopts"));
+        let cpu = build_handbrake_args(
+            Path::new("i.mp4"), Path::new("o.mp4"), "x264", "24", "medium", None, false, Some(6), false,
+        );
+        assert!(cpu.windows(2).any(|w| w[0] == "--encopts" && w[1] == "threads=6"));
+    }
+
+    #[test]
+    fn unsupported_encoder_token_resolves_to_x264() {
+        // x264 is the always-present baseline; svt_av1/x265 depend on the build.
+        let bare = HandbrakeCaps::default();
+        assert_eq!(validate_encoder_token("x264", &bare), "x264");
+        assert_eq!(validate_encoder_token("svt_av1", &bare), "x264", "no SVT-AV1 in build");
+        assert_eq!(validate_encoder_token("x265", &bare), "x264", "no x265 in build");
+        assert_eq!(validate_encoder_token("totally_unknown", &bare), "x264");
+        // Supported tokens pass through unchanged.
+        let rich = HandbrakeCaps { x265: true, svt_av1: true, nvenc_h264: true, ..Default::default() };
+        assert_eq!(validate_encoder_token("x265", &rich), "x265");
+        assert_eq!(validate_encoder_token("svt_av1", &rich), "svt_av1");
+        assert_eq!(validate_encoder_token("nvenc_h264", &rich), "nvenc_h264");
+    }
+
+    #[test]
+    fn minimal_retry_triggers_only_on_noncancelled_nonzero_exit() {
+        let fail = EncodeResult::Done { success: false, diag: EncodeDiag::default(), fps: None };
+        let ok = EncodeResult::Done { success: true, diag: EncodeDiag::default(), fps: None };
+        let spawn = EncodeResult::Spawn { error: "x".into(), command: "y".into() };
+        // Non-zero exit, not cancelled → retry.
+        assert!(should_retry_minimal(&fail, false));
+        // Cancelled, or success, or spawn failure → never retry.
+        assert!(!should_retry_minimal(&fail, true));
+        assert!(!should_retry_minimal(&ok, false));
+        assert!(!should_retry_minimal(&spawn, false));
+        assert!(!should_retry_minimal(&EncodeResult::Cancelled, false));
     }
 
     #[test]

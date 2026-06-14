@@ -81,6 +81,13 @@ pub(crate) fn log(entry: &str) {
     let _ = append(&log_path(), entry);
 }
 
+/// Append a debug entry REGARDLESS of the verbosity toggle (still respecting the
+/// rotation cap). Used for failing-file diagnostics, which are worth keeping even
+/// when verbose logging is otherwise disabled. Best-effort.
+pub(crate) fn log_force(entry: &str) {
+    let _ = append(&log_path(), entry);
+}
+
 fn append(path: &Path, entry: &str) -> io::Result<()> {
     // Serialize concurrent writers (several jobs can run at once, each on its own
     // thread) so entries never interleave; recover a poisoned lock — it's bytes.
