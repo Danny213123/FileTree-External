@@ -182,6 +182,10 @@ pub(crate) struct CompressJob {
     pub(crate) codec: String,
     /// Deflate level for the zip pipeline (0-9; 0 = store).
     pub(crate) zip_level: i64,
+    /// Minimum original size (bytes) to attempt compression. Files smaller than
+    /// this are skipped (`SkippedTooSmall`) untouched — small files, especially
+    /// videos with too few frames, rarely shrink. 0 = no minimum (compress all).
+    pub(crate) min_size_bytes: u64,
     /// "running" | "done" | "cancelled" | "error"
     pub(crate) status: Mutex<String>,
     pub(crate) total: usize,
@@ -262,6 +266,9 @@ pub(crate) struct CompressOptions {
     pub(crate) codec: String,
     /// -1 ⇒ default; otherwise 0..=9 Deflate level.
     pub(crate) zip_level: i64,
+    /// Minimum original size (bytes) to attempt compression; smaller files are
+    /// skipped untouched. 0 = no minimum (compress all).
+    pub(crate) min_size_bytes: u64,
 }
 
 impl Default for CompressOptions {
@@ -274,6 +281,7 @@ impl Default for CompressOptions {
             use_gpu: true,
             codec: "h264".to_string(),
             zip_level: -1,
+            min_size_bytes: 0,
         }
     }
 }
@@ -342,6 +350,7 @@ pub(crate) fn create_job(
         use_gpu: opts.use_gpu,
         codec: CompressOptions::norm_codec(&opts.codec),
         zip_level: opts.resolved_zip_level(),
+        min_size_bytes: opts.min_size_bytes,
         status: Mutex::new("running".to_string()),
         total,
         files,
@@ -423,6 +432,10 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         .and_then(|v| v.as_f64())
         .map(|n| n as i64)
         .unwrap_or(-1);
+    let min_size_bytes = root
+        .get("minSizeBytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let opts = CompressOptions {
         original_action,
         tag_filename,
@@ -431,6 +444,7 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         use_gpu,
         codec,
         zip_level,
+        min_size_bytes,
     };
     let files_arr = root.get("files").and_then(|v| v.as_array())?;
 
@@ -483,6 +497,7 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         use_gpu: opts.use_gpu,
         codec: CompressOptions::norm_codec(&opts.codec),
         zip_level: opts.resolved_zip_level(),
+        min_size_bytes: opts.min_size_bytes,
         status: Mutex::new("running".to_string()),
         total,
         files,
@@ -746,9 +761,9 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     // detected (path + version) so a "tool missing" outcome later is unambiguous.
     if crate::compress_debug::enabled() {
         let mut l = format!(
-            "[job_start] job={} preset={} originalAction={} tag={} files={} concurrency={} encoder={} codec={} useGpu={} zipLevel={}",
+            "[job_start] job={} preset={} originalAction={} tag={} files={} concurrency={} encoder={} codec={} useGpu={} zipLevel={} minSizeBytes={}",
             job.id, job.preset, job.original_action.as_str(), job.tag_filename, job.total,
-            job.concurrency, job.encoder, job.codec, job.use_gpu, job.zip_level
+            job.concurrency, job.encoder, job.codec, job.use_gpu, job.zip_level, job.min_size_bytes
         );
         l.push_str(&format!(" handbrake={}", tool_desc(&hb)));
         l.push_str(&format!(" image={}", tool_desc(&img)));
@@ -1113,15 +1128,15 @@ fn process_and_record(
                 "compressed", reason.as_str(), duration_ms, recycled,
                 disposition_error.as_deref(), Some(tagged),
             );
-            job.emit(ev_file_done(i, &out_path, orig, new_bytes, saved, recycled, disposition, "done"));
+            job.emit(ev_file_done(i, &out_path, orig, new_bytes, saved, recycled, disposition, reason.as_str(), "done"));
         }
-        FileOutcome::Skipped { new_bytes, diag, meta } => {
+        FileOutcome::Skipped { reason, new_bytes, diag, meta } => {
             let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
             let codec_params = if meta.codec_params.is_empty() { fallback_params.clone() } else { meta.codec_params.clone() };
             let tool_version = if meta.tool_version.is_empty() { fallback_version } else { meta.tool_version.as_str() };
             f.new_bytes.store(new_bytes, Ordering::Relaxed);
             *f.status.lock_recover() = "skipped".to_string();
-            *f.reason.lock_recover() = Reason::SkippedNoGain.as_str().to_string();
+            *f.reason.lock_recover() = reason.as_str().to_string();
             *f.encoder.lock_recover() = codec_params.clone();
             f.pct.store(100, Ordering::Relaxed);
             counts.skipped.fetch_add(1, Ordering::Relaxed);
@@ -1132,7 +1147,7 @@ fn process_and_record(
                 name: &name,
                 kind: kind_str,
                 preset: &job.preset,
-                status: "skipped_no_gain",
+                status: reason.as_str(),
                 orig_bytes: orig,
                 new_bytes,
                 saved_bytes: 0,
@@ -1144,7 +1159,7 @@ fn process_and_record(
                 out_path: "",
                 recycled: false,
                 error: "",
-                reason: Reason::SkippedNoGain.as_str(),
+                reason: reason.as_str(),
                 exit_code: diag.exit_code,
                 tool_version,
                 command: &diag.command,
@@ -1152,9 +1167,9 @@ fn process_and_record(
             });
             log_file_debug(
                 &job.id, i, &f.path, kind_str, orig, tool, &diag, "", new_bytes,
-                "skipped", Reason::SkippedNoGain.as_str(), duration_ms, false, None, None,
+                "skipped", reason.as_str(), duration_ms, false, None, None,
             );
-            job.emit(ev_file_done(i, "", orig, new_bytes, 0, false, "", "skipped_no_gain"));
+            job.emit(ev_file_done(i, "", orig, new_bytes, 0, false, "", reason.as_str(), "skipped"));
         }
         FileOutcome::Error { reason, message, diag, meta } => {
             let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
@@ -1302,6 +1317,9 @@ pub(crate) enum Reason {
     Success,
     /// Output produced but not smaller than the original (deleted, original kept).
     SkippedNoGain,
+    /// The original was below the user's minimum-size threshold, so no encode was
+    /// attempted (too small to meaningfully compress; e.g. a very short video).
+    SkippedTooSmall,
     /// The required external encoder (HandBrake / ffmpeg / ImageMagick) is missing.
     ErrorToolMissing,
     /// The file kind has no supported pipeline. Reserved in the taxonomy; the
@@ -1340,6 +1358,7 @@ impl Reason {
         match self {
             Reason::Success => "success",
             Reason::SkippedNoGain => "skipped_no_gain",
+            Reason::SkippedTooSmall => "skipped_too_small",
             Reason::ErrorToolMissing => "error_tool_missing",
             Reason::ErrorUnsupported => "error_unsupported",
             Reason::ErrorEncoder => "error_encoder",
@@ -1391,7 +1410,9 @@ enum FileOutcome {
         meta: EncodeMeta,
     },
     /// Output produced but not smaller than the original (deleted, original kept).
-    Skipped { new_bytes: u64, diag: EncodeDiag, meta: EncodeMeta },
+    /// Output not produced or not smaller; `reason` distinguishes a no-gain skip
+    /// from a too-small (below threshold) skip. Original untouched.
+    Skipped { reason: Reason, new_bytes: u64, diag: EncodeDiag, meta: EncodeMeta },
     Error { reason: Reason, message: String, diag: EncodeDiag, meta: EncodeMeta },
     /// Job cancelled mid-encode; partial output deleted, original untouched.
     Cancelled,
@@ -1521,6 +1542,34 @@ fn process_file(
         };
     }
     let orig = job.files[index].orig_bytes.load(Ordering::Relaxed);
+
+    // Minimum-size threshold: a file below the user's minimum is too small to
+    // meaningfully compress (especially a video with too few frames), so skip it
+    // BEFORE any encode work — no probe, no encoder, output untouched. Recorded
+    // as a terminal `skipped` (SkippedTooSmall) so it flows into the same skipped
+    // bucket the post==pre count reconciliation relies on.
+    if job.min_size_bytes > 0 && orig < job.min_size_bytes {
+        let mut meta = EncodeMeta::default();
+        meta.tool = match kind {
+            FileKind::Video => "handbrake",
+            FileKind::Image => "ffmpeg",
+            FileKind::Other => "zip",
+        }
+        .to_string();
+        meta.tool_version = "pre-skip".to_string();
+        meta.codec_params = format!("pre-skip: below min size ({orig} < {})", job.min_size_bytes);
+        return FileOutcome::Skipped {
+            reason: Reason::SkippedTooSmall,
+            new_bytes: orig,
+            diag: EncodeDiag {
+                command: format!("pre-skip (below min size {} bytes)", job.min_size_bytes),
+                exit_code: Some(0),
+                stderr_tail: String::new(),
+            },
+            meta,
+        };
+    }
+
     let out = output_path(&input, kind);
 
     // Pre-skip heuristic for the zip pipeline: a file whose container is already
@@ -1532,6 +1581,7 @@ fn process_file(
         meta.codec_params = "store (pre-skip: already compressed)".to_string();
         meta.tool_version = "built-in".to_string();
         return FileOutcome::Skipped {
+            reason: Reason::SkippedNoGain,
             new_bytes: orig,
             diag: EncodeDiag { command: "pre-skip (already compressed)".to_string(), exit_code: Some(0), stderr_tail: String::new() },
             meta,
@@ -1549,6 +1599,7 @@ fn process_file(
         meta.tool_version = "pre-skip".to_string();
         meta.codec_params = format!("pre-skip: {reason}");
         return FileOutcome::Skipped {
+            reason: Reason::SkippedNoGain,
             new_bytes: orig,
             diag: EncodeDiag {
                 command: format!("pre-skip ({reason})"),
@@ -1645,7 +1696,7 @@ fn process_file(
     // No gain → discard output, keep the original (never recycle).
     if new_bytes >= orig && orig > 0 {
         let _ = std::fs::remove_file(&out);
-        return FileOutcome::Skipped { new_bytes, diag, meta };
+        return FileOutcome::Skipped { reason: Reason::SkippedNoGain, new_bytes, diag, meta };
     }
 
     // Deep-verify gate (HARD): re-decode / CRC-check the produced output BEFORE
@@ -2834,6 +2885,8 @@ fn write_manifest(job: &CompressJob) {
     push_json_string(&mut s, &job.codec);
     s.push_str(",\"zipLevel\":");
     s.push_str(&job.zip_level.to_string());
+    s.push_str(",\"minSizeBytes\":");
+    s.push_str(&job.min_size_bytes.to_string());
     s.push_str(",\"total\":");
     s.push_str(&job.total.to_string());
     s.push_str(",\"savedBytes\":");
@@ -3249,6 +3302,7 @@ fn ev_file_done(
     saved: u64,
     recycled: bool,
     disposition: &str,
+    reason: &str,
     status: &str,
 ) -> String {
     let mut s = String::from("{\"type\":\"file_done\",\"index\":");
@@ -3265,6 +3319,8 @@ fn ev_file_done(
     s.push_str(if recycled { "true" } else { "false" });
     s.push_str(",\"disposition\":");
     push_json_string(&mut s, disposition);
+    s.push_str(",\"reason\":");
+    push_json_string(&mut s, reason);
     s.push_str(",\"status\":");
     push_json_string(&mut s, status);
     s.push_str("}\n");
@@ -3462,6 +3518,7 @@ mod manifest_tests {
             use_gpu: false,
             codec: "h265".to_string(),
             zip_level: 3,
+            min_size_bytes: 2_000_000,
         };
         let job = create_job(
             &["a.mp4".to_string(), "b.png".to_string(), "c.txt".to_string()],
@@ -3473,6 +3530,7 @@ mod manifest_tests {
         let back = job_from_manifest(&job.id).expect("manifest reloads");
         assert_eq!(back.preset, "high");
         assert_eq!(back.original_action, OriginalAction::Delete);
+        assert_eq!(back.min_size_bytes, 2_000_000);
         assert!(back.tag_filename);
         assert_eq!(back.concurrency, 4);
         assert_eq!(back.encoder, "qsv");
@@ -3578,7 +3636,7 @@ mod manifest_tests {
                         panic!("boom while holding events lock");
                     }
                     // A normal success path also touches the shared events lock.
-                    job.emit(ev_file_done(i, "", 10, 10, 0, false, "", "done"));
+                    job.emit(ev_file_done(i, "", 10, 10, 0, false, "", "success", "done"));
                     *f.status.lock_recover() = "done".to_string();
                     counts.done.fetch_add(1, O::Relaxed);
                 }));
@@ -3738,6 +3796,86 @@ mod manifest_tests {
             assert_eq!(job.original_action, expect);
         }
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Minimal `AppState` for driving `process_file` directly in a unit test.
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            initial_path: std::env::temp_dir(),
+            last_scan: std::sync::RwLock::new(None),
+            scan_cache: std::sync::RwLock::new(crate::model::ScanCache::new()),
+            icon_cache: Mutex::new(HashMap::new()),
+            thumbnail_cache: Mutex::new(HashMap::new()),
+            dupes_progress: Arc::new(crate::model::DupesProgress::default()),
+            dupes_cancel: Arc::new(AtomicBool::new(false)),
+            ignore_list: std::sync::RwLock::new(crate::model::IgnoreList::default()),
+            ignore_list_path: std::env::temp_dir().join("ft-test-ignore.json"),
+            hash_cache: Mutex::new(HashMap::new()),
+            hash_cache_path: std::env::temp_dir().join("ft-test-hash.json"),
+            auth_token: None,
+            scan_roots: std::sync::RwLock::new(Vec::new()),
+            compress_roots: std::sync::RwLock::new(Vec::new()),
+            compress_jobs: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// A file below the minimum-size threshold is skipped (`SkippedTooSmall`)
+    /// before any encode: the original is untouched, no output is written, and
+    /// the outcome is a terminal `skipped` (so the post==pre reconciliation still
+    /// holds). Also checks summary-level reconciliation on a mixed batch.
+    #[test]
+    fn too_small_file_skipped_untouched_no_output() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let dir = std::env::temp_dir().join(format!("ft-minsize-{}-{}", std::process::id(), new_job_id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let tiny = dir.join("tiny.bin");
+        std::fs::write(&tiny, b"only a few bytes").expect("write tiny");
+        let before = std::fs::read(&tiny).unwrap();
+
+        // Threshold well above the tiny file's size.
+        let opts = CompressOptions { min_size_bytes: 1_000_000, ..CompressOptions::default() };
+        let job = create_job(&[tiny.to_string_lossy().into_owned()], "balanced", &opts);
+        let state = test_state();
+        let none_tool = compress_tools::ToolInfo::default();
+
+        let outcome = process_file(&state, &job, 0, &none_tool, &none_tool, &none_tool, None, &HandbrakeCaps::default());
+        match outcome {
+            FileOutcome::Skipped { reason, .. } => assert_eq!(reason.as_str(), "skipped_too_small"),
+            _ => panic!("expected a SkippedTooSmall outcome"),
+        }
+        // Original untouched; no [COMPRESSED] output produced.
+        assert!(tiny.exists(), "original must be untouched");
+        assert_eq!(std::fs::read(&tiny).unwrap(), before, "original bytes unchanged");
+        let out = output_path(&tiny, FileKind::Other);
+        assert!(!out.exists(), "no output should be written for a too-small skip");
+
+        // Summary-level reconciliation: a manifest with a skipped_too_small entry
+        // is counted in the skipped bucket and done+skipped+error+pending==total.
+        let id = new_job_id();
+        let path = jobs_dir().join(format!("{id}.json"));
+        std::fs::create_dir_all(jobs_dir()).unwrap();
+        let manifest = format!(
+            "{{\"id\":\"{id}\",\"status\":\"done\",\"preset\":\"balanced\",\"minSizeBytes\":1000000,\"total\":3,\"files\":[\
+             {{\"index\":0,\"path\":\"a\",\"kind\":\"other\",\"status\":\"done\",\"reason\":\"success\",\"origBytes\":2000000,\"newBytes\":900000}},\
+             {{\"index\":1,\"path\":\"b\",\"kind\":\"video\",\"status\":\"skipped\",\"reason\":\"skipped_too_small\",\"origBytes\":50,\"newBytes\":50}},\
+             {{\"index\":2,\"path\":\"c\",\"kind\":\"other\",\"status\":\"skipped\",\"reason\":\"skipped_no_gain\",\"origBytes\":10,\"newBytes\":10}}\
+             ]}}"
+        );
+        std::fs::write(&path, manifest).unwrap();
+        let sum = summary_from_manifest(&id, &path).expect("summary");
+        assert_eq!(sum.total, 3);
+        assert_eq!(sum.done, 1);
+        assert_eq!(sum.skipped, 2, "both no-gain and too-small land in skipped");
+        assert_eq!(sum.errors, 0);
+        assert_eq!(sum.done + sum.skipped + sum.errors + sum.pending, sum.total);
+        // The threshold round-trips through the manifest.
+        let back = job_from_manifest(&id).expect("job reload");
+        assert_eq!(back.min_size_bytes, 1_000_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
     }
 

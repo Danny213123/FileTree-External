@@ -517,7 +517,7 @@ export interface CompressJobFile {
   origBytes: number;
   newBytes: number;
   error?: string;
-  /** Precise outcome code (e.g. `success`, `skipped_no_gain`, `skipped_precompressed`,
+  /** Precise outcome code (e.g. `success`, `skipped_no_gain`, `skipped_too_small`,
    *  `error_encoder`, `error_tool_missing`, `gpu_fallback`). Empty until terminal. */
   reason?: string;
   /** The genuine encoder + codec params actually used (e.g. `nvenc_h265 q=26
@@ -602,6 +602,9 @@ export interface CompressJobRequest {
   encoder?: CompressEncoder;
   /** Allow hardware (GPU) encoding when available (default true). */
   useGpu?: boolean;
+  /** Minimum original size in bytes to attempt compression; smaller files are
+   *  skipped untouched (`skipped_too_small`). 0 / omitted ⇒ no minimum. */
+  minSizeBytes?: number;
   /** Target video codec (default `h264`). */
   codec?: CompressCodec;
   /** Deflate level for the zip pipeline (0..9). -1 / omitted ⇒ server default. */
@@ -646,7 +649,12 @@ export interface CompressFileDoneEvent {
   recycled: boolean;
   /** What happened to the original: `recycled` | `deleted` | `kept` | "". */
   disposition?: string;
-  status: "done" | "skipped_no_gain";
+  /** Precise outcome code (e.g. `success`, `skipped_no_gain`, `skipped_too_small`,
+   *  `gpu_fallback`). Distinguishes skip variants for the live badge. */
+  reason?: string;
+  /** Coarse outcome: `done` for a successful compress, `skipped` for any skip.
+   *  (`skipped_no_gain` retained for back-compat with older servers.) */
+  status: "done" | "skipped" | "skipped_no_gain";
 }
 export interface CompressErrorEvent {
   type: "error";
@@ -708,7 +716,7 @@ export interface CompressLogRow {
   outPath: string;
   recycled: boolean;
   error: string;
-  /** Precise outcome code. One of: `success`, `skipped_no_gain`,
+  /** Precise outcome code. One of: `success`, `skipped_no_gain`, `skipped_too_small`,
    *  `error_tool_missing`, `error_unsupported`, `error_encoder`,
    *  `error_output_empty`, `error_source_missing`, `error_cloud_placeholder`,
    *  `error_spawn`, `error_internal`, `gpu_fallback`. Falls back to `status` for

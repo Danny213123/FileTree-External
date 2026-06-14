@@ -4,6 +4,15 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.3] - 2026-06-13
+
+A minimum-size threshold so files too small to meaningfully compress (especially videos with too few frames) are skipped instead of wastefully re-encoded.
+
+### Added
+
+- **Minimum-size threshold ("Skip files under X")**: a new range slider in the compression Performance panel lets you set a minimum original size below which files are skipped untouched — no probe, no encoder, no output written. Size is the proxy for "too small / too few frames", where a re-encode is unlikely to shrink the file (and risks growing it). The slider has discrete stops (No minimum, 256 KB, 512 KB, 1/2/5/10/25/50/100 MB), defaults to *No minimum* (compress all), and is remembered across sessions alongside the other performance settings.
+- **`skipped_too_small` outcome**: files below the threshold are recorded as a terminal *skipped* outcome with a new "Too small" badge + tooltip in the live progress rows, the per-file detail table, and History. They flow into the same skipped bucket as no-gain skips, so the post-job count still reconciles to the input count. The threshold (`minSizeBytes`) is carried in the job request and persisted in the job manifest (resume-safe).
+
 ## [1.13.2] - 2026-06-13
 
 A post-compression safety workflow so a good original is never removed behind a corrupt compressed output, plus an explicit choice of what happens to each original and a guarantee that every input file is accounted for in the final counts.

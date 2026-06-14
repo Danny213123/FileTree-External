@@ -103,6 +103,9 @@ interface CompressPerfSettings {
   codec: CompressCodec;
   /** -1 ⇒ server default Deflate level; otherwise 0..9. */
   zipLevel: number;
+  /** Minimum original size in bytes to attempt compression; smaller files are
+   *  skipped untouched. 0 ⇒ no minimum (compress all). */
+  minSizeBytes: number;
 }
 
 const DEFAULT_PERF: CompressPerfSettings = {
@@ -111,7 +114,44 @@ const DEFAULT_PERF: CompressPerfSettings = {
   useGpu: true,
   codec: "h264",
   zipLevel: -1,
+  minSizeBytes: 0,
 };
+
+/** Discrete stops for the minimum-size slider (bytes). Finer at the low end
+ *  where it matters most (tiny clips / thumbnails), coarser past 10 MB. */
+const MIN_SIZE_STOPS: number[] = [
+  0,
+  256 * 1024,
+  512 * 1024,
+  1024 * 1024,
+  2 * 1024 * 1024,
+  5 * 1024 * 1024,
+  10 * 1024 * 1024,
+  25 * 1024 * 1024,
+  50 * 1024 * 1024,
+  100 * 1024 * 1024,
+];
+
+/** Human label for a min-size stop value (bytes). 0 ⇒ "No minimum". */
+function minSizeLabel(bytes: number): string {
+  if (bytes <= 0) return "No minimum";
+  return `Skip files under ${formatBytes(bytes)}`;
+}
+
+/** Snap an arbitrary byte count to the nearest defined stop (so a persisted
+ *  custom value still maps onto the slider). */
+function nearestMinSizeStopIndex(bytes: number): number {
+  let best = 0;
+  let bestDiff = Infinity;
+  for (let i = 0; i < MIN_SIZE_STOPS.length; i++) {
+    const d = Math.abs(MIN_SIZE_STOPS[i] - bytes);
+    if (d < bestDiff) {
+      bestDiff = d;
+      best = i;
+    }
+  }
+  return best;
+}
 
 function loadPerf(): CompressPerfSettings {
   try {
@@ -126,6 +166,7 @@ function loadPerf(): CompressPerfSettings {
       useGpu: typeof p.useGpu === "boolean" ? p.useGpu : true,
       codec: p.codec === "h265" || p.codec === "av1" ? p.codec : "h264",
       zipLevel: typeof p.zipLevel === "number" && p.zipLevel >= -1 && p.zipLevel <= 9 ? Math.floor(p.zipLevel) : -1,
+      minSizeBytes: typeof p.minSizeBytes === "number" && p.minSizeBytes >= 0 ? Math.floor(p.minSizeBytes) : 0,
     };
   } catch {
     return { ...DEFAULT_PERF };
@@ -418,7 +459,7 @@ export function CompressView({
     } else {
       lines.push("Tools: not detected yet");
     }
-    lines.push(`Settings: encoder=${perf.encoder} codec=${perf.codec} useGpu=${perf.useGpu} concurrency=${perf.concurrency} zipLevel=${perf.zipLevel} preset=${preset}`);
+    lines.push(`Settings: encoder=${perf.encoder} codec=${perf.codec} useGpu=${perf.useGpu} concurrency=${perf.concurrency} zipLevel=${perf.zipLevel} minSizeBytes=${perf.minSizeBytes} preset=${preset}`);
     if (gpuTest) {
       lines.push(
         `GPU test: ${
@@ -760,12 +801,13 @@ export function CompressView({
               name: cur?.name ?? baseName(cur?.path ?? ""),
               kind: cur?.kind ?? "other",
               origBytes: ev.origBytes,
-              status: ev.status === "skipped_no_gain" ? "skipped" : "done",
+              status: ev.status === "skipped" || ev.status === "skipped_no_gain" ? "skipped" : "done",
               pct: 100,
               newBytes: ev.newBytes,
               savedBytes: ev.savedBytes,
               recycled: ev.recycled,
               disposition: ev.disposition,
+              reason: ev.reason ?? cur?.reason,
             });
             return next;
           });
@@ -996,6 +1038,7 @@ export function CompressView({
         useGpu: perf.useGpu,
         codec: perf.codec,
         zipLevel: perf.zipLevel,
+        minSizeBytes: perf.minSizeBytes,
         // Re-assert the scan root so a cache-served tree (no /api/scan this
         // session) still passes the server's scan-root containment check. Use
         // the genuine scanned root (`data.rootPath`), which is guaranteed to be
@@ -1379,6 +1422,22 @@ export function CompressView({
             />
             <span className="compress-perf-hint">-1 = default, 0-9</span>
           </div>
+          <div className="compress-perf-field compress-perf-field-wide">
+            <label htmlFor="cv-minsize">Minimum size</label>
+            <input
+              id="cv-minsize"
+              type="range"
+              min={0}
+              max={MIN_SIZE_STOPS.length - 1}
+              step={1}
+              value={nearestMinSizeStopIndex(perf.minSizeBytes)}
+              onChange={(e) => {
+                const idx = Math.max(0, Math.min(MIN_SIZE_STOPS.length - 1, Math.floor(Number(e.target.value) || 0)));
+                updatePerf({ minSizeBytes: MIN_SIZE_STOPS[idx] });
+              }}
+            />
+            <span className="compress-perf-hint">{minSizeLabel(perf.minSizeBytes)}</span>
+          </div>
           {tools?.handbrake.found && (
             <div className="compress-perf-diag">
               <div className="compress-perf-hint" title={tools.handbrake.path || undefined}>
@@ -1667,6 +1726,7 @@ export function CompressView({
 const STATUS_LABEL: Record<string, string> = {
   success: "Saved",
   skipped_no_gain: "No gain",
+  skipped_too_small: "Too small",
   error: "Error",
 };
 
@@ -1676,6 +1736,7 @@ const STATUS_LABEL: Record<string, string> = {
 const REASON_LABEL: Record<string, string> = {
   success: "Saved",
   skipped_no_gain: "Skipped — not smaller",
+  skipped_too_small: "Skipped — too small",
   error_tool_missing: "Error — tool missing",
   error_unsupported: "Error — unsupported",
   error_encoder: "Error — encoder failed",
@@ -1691,6 +1752,7 @@ const REASON_LABEL: Record<string, string> = {
 const REASON_TOOLTIP: Record<string, string> = {
   success: "Output was smaller; original replaced.",
   skipped_no_gain: "The re-encoded output wasn't smaller than the original, so it was discarded and the original kept.",
+  skipped_too_small: "The original was below the minimum-size threshold, so it was left untouched without attempting to compress (too small to meaningfully shrink — e.g. a video with too few frames).",
   error_tool_missing: "The required encoder (HandBrake for video, ffmpeg/ImageMagick for images) isn't installed.",
   error_unsupported: "This file type has no supported compression pipeline.",
   error_encoder: "The encoder ran but exited with an error. See the debug log / stderr excerpt for details.",
@@ -1707,7 +1769,8 @@ const REASON_TOOLTIP: Record<string, string> = {
  *  back to the coarse status). */
 function reasonClass(reason: string, status: string): string {
   if (reason === "success" || reason === "gpu_fallback" || status === "success") return "done";
-  if (reason === "skipped_no_gain" || status === "skipped_no_gain") return "skipped";
+  if (reason === "skipped_no_gain" || reason === "skipped_too_small" || status === "skipped" || status === "skipped_no_gain")
+    return "skipped";
   return "error";
 }
 
@@ -1719,6 +1782,9 @@ function progBadge(rf: FileProg): { label: string; title: string } {
     case "running":
       return { label: `${Math.round(rf.pct)}%`, title: "Encoding…" };
     case "skipped":
+      if (rf.reason === "skipped_too_small") {
+        return { label: "Too small", title: REASON_TOOLTIP.skipped_too_small };
+      }
       return { label: "No gain", title: REASON_TOOLTIP.skipped_no_gain };
     case "error":
       if (rf.reason && REASON_LABEL[rf.reason]) {

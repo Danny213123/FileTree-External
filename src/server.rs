@@ -3262,6 +3262,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     .and_then(|v| v.as_f64())
                     .map(|n| n as i64)
                     .unwrap_or(-1);
+                // Minimum original size (bytes) to attempt compression; smaller
+                // files are skipped untouched. 0 / absent = no minimum. Clamped
+                // to be non-negative.
+                let min_size_bytes = root
+                    .as_ref()
+                    .and_then(|v| v.get("minSizeBytes"))
+                    .and_then(|v| v.as_f64())
+                    .map(|n| n.max(0.0) as u64)
+                    .unwrap_or(0);
                 if paths.is_empty() {
                     return respond_text(&mut stream, 400, "Bad request", "Missing paths");
                 }
@@ -3342,6 +3351,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     use_gpu,
                     codec,
                     zip_level,
+                    min_size_bytes,
                 };
                 let job = crate::compress_job::create_job(&paths, &preset, &opts);
                 let id = job.id.clone();
