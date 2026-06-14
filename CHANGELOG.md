@@ -4,6 +4,18 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.9] - 2026-06-14
+
+Hardens the compression job runner so a fault can never end the job early and strand files as "pending". Backend-only.
+
+### Fixed
+
+- **A compression job can no longer terminate early and leave files stuck "pending"**: the per-file pipeline was already panic-isolated (a single bad file is recorded as an error and the worker pool continues), but `run_job` itself — the orchestration around the worker pool: encoder detection at startup, the schedule build, and the reconcile/finalize tail — ran on a bare thread with no panic protection. A panic anywhere in that orchestration would kill the job thread silently: the remaining files were left in `pending`/`running` forever, the job was never marked finished, and no terminal `done` event was emitted (the job appeared to "end early" with most files never attempted). `spawn_job` now wraps the runner in a top-level guard that, on any orchestration panic, force-finalizes the job — reconciling every non-terminal file to a terminal internal error (a user cancel still legitimately leaves files pending for resume), recomputing the tallies, persisting the manifest, emitting the terminal event, and marking the job finished — so no fault in the runner can ever abandon the batch. Cancellation behavior is unchanged: only an explicit user cancel stops the run early.
+
+### Added
+
+- **Regression tests** driving the real `run_job`/`spawn_job` end-to-end (previously only a hand-rolled mirror of the worker loop was tested): a mixed batch with failing inputs scheduled first proves every file reaches a terminal state with none left pending; a batch with files that panic mid-pipeline proves the per-file `catch_unwind` records them as `error_internal` while the rest of the batch completes; and an orchestration-panic case proves the new `spawn_job` guard still finalizes the job with nothing left pending.
+
 ## [1.13.8] - 2026-06-14
 
 Lets you save your own named compression presets. Frontend-only — saved presets resolve to the backend's existing `custom` preset (resolution + quality), available since v1.13.6.

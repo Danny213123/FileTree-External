@@ -791,8 +791,85 @@ fn ratio(orig: u64, new_bytes: u64) -> f64 {
 
 /// Spawn the dedicated worker thread for `job`. Returns immediately; the encode
 /// runs entirely off the HTTP connection thread.
+///
+/// `run_job` is wrapped in a top-level [`catch_unwind`]: the per-file pipeline
+/// has its OWN panic isolation (see the worker loop), but the orchestration
+/// around it — tool detection at startup, the schedule build, the reconcile/
+/// finalize tail, the manifest write — runs on this thread OUTSIDE that per-file
+/// catch. Were any of it to panic, the job thread would die with files left in
+/// `pending`/`running` FOREVER and the job never marked finished (no `done`
+/// event, `finished` never set) — i.e. the job "ends early" with most files
+/// stuck pending, the exact early-termination failure. The guard below
+/// guarantees the job is ALWAYS finalized: every non-terminal file is reconciled
+/// to a terminal internal error and the job is closed out, so no panic anywhere
+/// in the runner can ever strand the batch.
 pub(crate) fn spawn_job(state: Arc<AppState>, job: Arc<CompressJob>) {
-    std::thread::spawn(move || run_job(state, job));
+    std::thread::spawn(move || {
+        let guard_job = Arc::clone(&job);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_job(state, job)
+        }));
+        if let Err(payload) = outcome {
+            let msg = panic_message(payload.as_ref());
+            crate::compress_debug::log_force(&format!(
+                "[panic] job={} run_job orchestration panicked: {msg} — force-finalizing so no file is left pending",
+                guard_job.id
+            ));
+            force_finalize_job(&guard_job);
+        }
+    });
+}
+
+/// Safety net invoked only when [`run_job`] itself panicked (an orchestration
+/// fault, distinct from a per-file panic which the worker loop already handles).
+/// Reconciles every non-terminal file to a terminal internal error (unless the
+/// job was cancelled, which legitimately leaves files pending for resume),
+/// recomputes the tallies from the on-disk-equivalent file statuses, marks the
+/// job finished, persists the manifest, and emits the terminal `done` event so a
+/// stream reader is released. Uses poison-tolerant locks throughout so it stays
+/// correct even after a panic poisoned shared state.
+fn force_finalize_job(job: &Arc<CompressJob>) {
+    let cancelled = job.cancel.load(Ordering::SeqCst);
+    let counts = Arc::new(Counts::default());
+    if !cancelled {
+        for i in 0..job.files.len() {
+            let st = job.files[i].status.lock_recover().clone();
+            if st == "pending" || st == "running" {
+                record_internal_error(
+                    job,
+                    i,
+                    &counts,
+                    "the compression job runner aborted unexpectedly; this file was force-failed so the batch could finalize",
+                );
+            }
+        }
+    }
+
+    // Recompute the terminal tallies straight from the file statuses so the
+    // event/manifest are accurate regardless of how far run_job got before it
+    // panicked (the in-flight `Counts` it owned are gone with its stack).
+    let (mut done, mut error, mut skipped, mut verify_failed) = (0usize, 0usize, 0usize, 0usize);
+    for f in &job.files {
+        match f.status.lock_recover().as_str() {
+            "done" => done += 1,
+            "skipped" => skipped += 1,
+            "error" => {
+                error += 1;
+                if f.reason.lock_recover().as_str() == Reason::ErrorVerifyFailed.as_str() {
+                    verify_failed += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let status = if cancelled { "cancelled" } else { "error" };
+    *job.status.lock_recover() = status.to_string();
+    write_manifest(job);
+    let total_saved = job.saved_bytes.load(Ordering::Relaxed);
+    job.emit(ev_done(&job.id, done, error, skipped, verify_failed, job.total, total_saved));
+    job.finished.store(true, Ordering::SeqCst);
+    job.events_cv.notify_all();
 }
 
 /// Live outcome tallies shared across the parallel worker threads.
@@ -809,6 +886,15 @@ struct Counts {
 
 fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     job.emit(ev_job_start(&job.id, job.total));
+
+    // Test-only fault injection for the ORCHESTRATION path (distinct from the
+    // per-file injector in `process_file`): lets a test prove that a panic in
+    // run_job's own setup is contained by `spawn_job`'s guard and the job still
+    // finalizes with no file left pending. Compiled out of non-test builds.
+    #[cfg(test)]
+    if job.files.iter().any(|f| f.path.contains("__FORCE_ORCH_PANIC__")) {
+        panic!("forced orchestration panic for test");
+    }
 
     let hb = compress_tools::detect_handbrake();
     let (img, img_kind) = compress_tools::detect_image();
@@ -1606,6 +1692,14 @@ fn process_file(
         let f = &job.files[index];
         (f.path.clone(), f.kind)
     };
+    // Test-only fault injection: lets a unit test drive a GENUINE per-file panic
+    // through the real `run_job` worker pool (not a hand-rolled mirror) to prove
+    // the `catch_unwind` isolation records it as an internal error and the pool
+    // keeps going. Compiled out of all release/non-test builds.
+    #[cfg(test)]
+    if input_str.contains("__FORCE_PANIC__") {
+        panic!("forced per-file panic for test (path={input_str})");
+    }
     let input = PathBuf::from(&input_str);
     if !input.is_file() {
         return FileOutcome::Error {
@@ -4121,6 +4215,229 @@ mod manifest_tests {
         // The poisoned shared lock is still usable (would panic pre-fix).
         job.emit(ev_done(&job.id, 2, 1, 0, 0, 3, 0));
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// End-to-end early-termination guard: drive the REAL [`run_job`] worker pool
+    /// over a batch where many files fail per-file (nonexistent sources →
+    /// `ErrorSourceMissing`) interleaved with good compressible files. A per-file
+    /// error must NOT abort the worker, the pool, or the job: EVERY input must end
+    /// in a terminal state (done/skipped/error) with NONE left "pending"/"running",
+    /// and the job must actually finish (not stop early). This is the regression
+    /// test for the "job ends early, ~75% stuck pending" report.
+    #[test]
+    fn run_job_does_not_terminate_early_when_files_fail() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let dir = std::env::temp_dir()
+            .join(format!("ft-earlyexit-{}-{}", std::process::id(), new_job_id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+
+        // 24 files: every other one is a nonexistent source that fails per-file.
+        // The good ones are highly compressible `.bin` (built-in zip pipeline, no
+        // external tool needed) so they reach a terminal done/skipped offline.
+        let payload = vec![b'A'; 8 * 1024];
+        let mut paths: Vec<String> = Vec::new();
+        for n in 0..12 {
+            let good = dir.join(format!("good{n}.bin"));
+            std::fs::write(&good, &payload).expect("write good");
+            paths.push(good.to_string_lossy().into_owned());
+            // A source that does not exist → per-file ErrorSourceMissing.
+            paths.push(dir.join(format!("missing{n}.bin")).to_string_lossy().into_owned());
+        }
+        let total = paths.len();
+
+        // Keep originals (non-destructive); force concurrency=1 so a hypothetical
+        // early `break` on a non-cancel condition would strand the remainder —
+        // the most sensitive arrangement for catching an early-exit regression.
+        let opts = CompressOptions {
+            original_action: OriginalAction::Keep,
+            concurrency: 1,
+            ..CompressOptions::default()
+        };
+        let job = create_job(&paths, "balanced", &opts);
+
+        // Force the FAILING (nonexistent) files to sort FIRST in the schedule by
+        // giving them the largest sizes — the schedule orders by size desc. With
+        // concurrency=1 this means the worker hits the failures BEFORE the good
+        // files, so any early `break`/abort on a per-file failure would strand the
+        // good files that follow (the exact "rest of the batch left pending" bug).
+        for (i, f) in job.files.iter().enumerate() {
+            // Odd indices are the nonexistent sources (see the loop above).
+            f.orig_bytes
+                .store(if i % 2 == 1 { 10_000_000 } else { 8 * 1024 }, Ordering::Relaxed);
+        }
+
+        run_job(test_state(), Arc::clone(&job));
+
+        // The job actually finished and was NOT (spuriously) cancelled.
+        assert!(job.finished.load(Ordering::SeqCst), "job must finish");
+        assert_ne!(*job.status.lock_recover(), "cancelled", "no cancel happened");
+
+        // EVERY file reached a terminal state — none left pending/running.
+        let mut pending = Vec::new();
+        let (mut done, mut skipped, mut errors) = (0usize, 0usize, 0usize);
+        for (i, f) in job.files.iter().enumerate() {
+            match f.status.lock_recover().as_str() {
+                "done" => done += 1,
+                "skipped" => skipped += 1,
+                "error" => errors += 1,
+                other => pending.push(format!("#{i}={other}")),
+            }
+        }
+        assert!(
+            pending.is_empty(),
+            "every input must reach a terminal state; left behind: {pending:?}"
+        );
+        assert_eq!(done + skipped + errors, total, "post==pre: all files accounted for");
+
+        // The batch did NOT halt at the first failure: all 12 nonexistent files
+        // are errors AND all 12 good files progressed past their failing peers.
+        assert_eq!(errors, 12, "all nonexistent sources must be terminal errors");
+        assert_eq!(done + skipped, 12, "all good files must reach done/skipped");
+
+        // The live summary the UI reads must show zero pending after completion.
+        let sum = summary_from_live(&job);
+        assert_eq!(sum.pending, 0, "no file may linger as pending in the summary");
+        assert_eq!(sum.done + sum.skipped + sum.errors, sum.total);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// End-to-end panic isolation through the REAL [`run_job`] worker pool: some
+    /// files panic mid-pipeline (via the `#[cfg(test)]` fault injector). A panic
+    /// must NOT kill the worker, poison the pool, or abandon the rest of the batch
+    /// as pending — each panicking file is recorded as a terminal `error_internal`
+    /// and EVERY other file still reaches a terminal state with the job finishing.
+    /// With `concurrency=1` and the panicking files scheduled FIRST, a broken
+    /// `catch_unwind` would strand all the good files (done==0); this asserts they
+    /// all complete.
+    #[test]
+    fn run_job_isolates_panicking_files_and_finishes_batch() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let dir = std::env::temp_dir()
+            .join(format!("ft-panic-iso-{}-{}", std::process::id(), new_job_id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+
+        let payload = vec![b'A'; 8 * 1024];
+        let mut paths: Vec<String> = Vec::new();
+        for n in 0..8 {
+            // A real, compressible file whose NAME trips the panic injector.
+            let boom = dir.join(format!("__FORCE_PANIC__{n}.bin"));
+            std::fs::write(&boom, &payload).expect("write boom");
+            paths.push(boom.to_string_lossy().into_owned());
+            // A normal compressible file that must still complete.
+            let good = dir.join(format!("good{n}.bin"));
+            std::fs::write(&good, &payload).expect("write good");
+            paths.push(good.to_string_lossy().into_owned());
+        }
+        let total = paths.len();
+
+        let opts = CompressOptions {
+            original_action: OriginalAction::Keep,
+            concurrency: 1,
+            ..CompressOptions::default()
+        };
+        let job = create_job(&paths, "balanced", &opts);
+
+        // Panicking files schedule FIRST (largest), so a single worker meets them
+        // before any good file — the most sensitive layout for an isolation bug.
+        for (i, f) in job.files.iter().enumerate() {
+            f.orig_bytes
+                .store(if i % 2 == 0 { 10_000_000 } else { 8 * 1024 }, Ordering::Relaxed);
+        }
+
+        run_job(test_state(), Arc::clone(&job));
+
+        assert!(job.finished.load(Ordering::SeqCst), "job must finish");
+        assert_ne!(*job.status.lock_recover(), "cancelled", "no cancel happened");
+
+        let mut pending = Vec::new();
+        let (mut done, mut skipped, mut internal_errors, mut other_errors) = (0, 0, 0, 0);
+        for (i, f) in job.files.iter().enumerate() {
+            let st = f.status.lock_recover().clone();
+            let reason = f.reason.lock_recover().clone();
+            match st.as_str() {
+                "done" => done += 1,
+                "skipped" => skipped += 1,
+                "error" if reason == Reason::ErrorInternal.as_str() => internal_errors += 1,
+                "error" => other_errors += 1,
+                other => pending.push(format!("#{i}={other}")),
+            }
+        }
+        assert!(pending.is_empty(), "no file may be left pending/running: {pending:?}");
+        assert_eq!(done + skipped + internal_errors + other_errors, total);
+        // All 8 panicking files were caught and recorded as internal errors…
+        assert_eq!(internal_errors, 8, "every panicking file must be error_internal");
+        // …and the 8 good files that FOLLOW them in the schedule still completed —
+        // proving the panic did not halt the pool (would be 0 if isolation broke).
+        assert_eq!(done + skipped, 8, "all good files must reach a terminal success");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Orchestration-level safety net: if [`run_job`] ITSELF panics (a fault in
+    /// job setup/finalize, OUTSIDE the per-file `catch_unwind`), the bare worker
+    /// thread used to die and leave every file stuck `pending` with the job never
+    /// finalized — the "job ends early, files stuck pending" report. [`spawn_job`]
+    /// now wraps the runner so the job is ALWAYS finalized: no file is left
+    /// pending and `finished` is set even on an orchestration panic.
+    #[test]
+    fn orchestration_panic_still_finalizes_job() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let dir = std::env::temp_dir()
+            .join(format!("ft-orch-{}-{}", std::process::id(), new_job_id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+
+        // Real files; one name trips the orchestration-panic injector at the very
+        // top of run_job (before any file is even scheduled).
+        let payload = vec![b'A'; 4096];
+        let mut paths = Vec::new();
+        let boom = dir.join("__FORCE_ORCH_PANIC__.bin");
+        std::fs::write(&boom, &payload).unwrap();
+        paths.push(boom.to_string_lossy().into_owned());
+        for n in 0..5 {
+            let p = dir.join(format!("f{n}.bin"));
+            std::fs::write(&p, &payload).unwrap();
+            paths.push(p.to_string_lossy().into_owned());
+        }
+        let total = paths.len();
+
+        let job = create_job(&paths, "balanced", &CompressOptions::default());
+        spawn_job(test_state(), Arc::clone(&job));
+
+        // Wait (bounded) for the guard to finalize the job.
+        let mut waited = 0;
+        while !job.finished.load(Ordering::SeqCst) && waited < 5000 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            waited += 25;
+        }
+        assert!(job.finished.load(Ordering::SeqCst), "job must be finalized even after an orchestration panic");
+
+        // No file may be left pending/running; the job did not silently abandon
+        // the batch. (run_job panicked before scheduling, so all are force-failed.)
+        let pending = job
+            .files
+            .iter()
+            .filter(|f| matches!(f.status.lock_recover().as_str(), "pending" | "running"))
+            .count();
+        assert_eq!(pending, 0, "no file may remain pending after force-finalize");
+        let terminal = job
+            .files
+            .iter()
+            .filter(|f| matches!(f.status.lock_recover().as_str(), "done" | "skipped" | "error"))
+            .count();
+        assert_eq!(terminal, total, "every file must reach a terminal state");
+        assert_eq!(*job.status.lock_recover(), "error", "an aborted run finalizes as a resumable error");
+
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
     }
 
