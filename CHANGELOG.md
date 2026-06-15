@@ -4,6 +4,14 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.13] - 2026-06-15
+
+Lets you compress whole folders (and multi-selections of them) from the table's right-click menu. Frontend-only.
+
+### Fixed
+
+- **Right-click "Compress..." now works on folders and multi-selections**: selecting one or more folders (or a mix of folders and files) and choosing Compress opened the Compress page with nothing pre-checked, because the context-menu handler discarded directory paths instead of expanding them. `handleCompressFromContext` now walks each selected folder's descendants via the active pane's scan tree (BFS, files only, deduped and order-stable) and pre-checks every contained compressible file, mirroring the per-row zip button. Paths outside the current scan are still surfaced via the existing "not in scan" notice.
+
 ## [1.13.12] - 2026-06-14
 
 Overhauls the Compress page so its tables look and behave like the main file table, and lets you hide the parts of the toolbar you don't need. Frontend-only.

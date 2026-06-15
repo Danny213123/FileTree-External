@@ -828,19 +828,47 @@ export default function App() {
     }
     if (paths.length === 0) return;
 
-    // Filter out paths we can positively identify as folders in the current
-    // scan. Unknown paths are kept so CompressView can surface a "not found"
+    // Expand any selected folders to their descendant files (BFS over the
+    // active pane's nodeById children), mirroring WorkspaceTab.handleCompress.
+    // Unknown paths are kept verbatim so CompressView can surface a "not found"
     // notice rather than silently dropping them.
     const nodeById = getActiveRef()?.getNodeById();
     const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-    const dirSet = new Set<string>();
+    const pathToNode = new Map<string, NodeRecord>();
     if (nodeById) {
       for (const node of nodeById.values()) {
-        if (node.dir && node.path) dirSet.add(norm(node.path));
+        if (node.path) pathToNode.set(norm(node.path), node);
       }
     }
-    const filePaths = paths.filter((p) => !dirSet.has(norm(p)));
-    openCompressWith(filePaths.length > 0 ? filePaths : paths);
+
+    const result: string[] = [];
+    const seen = new Set<string>();
+    const pushFile = (node: NodeRecord) => {
+      if (node.dir || node.id < 0 || !node.path || seen.has(node.path)) return;
+      seen.add(node.path);
+      result.push(node.path);
+    };
+    for (const p of paths) {
+      const node = pathToNode.get(norm(p));
+      if (!node) {
+        // Path not in the current scan — keep it raw for CompressView's notice.
+        if (!seen.has(p)) { seen.add(p); result.push(p); }
+        continue;
+      }
+      if (!node.dir) {
+        pushFile(node);
+        continue;
+      }
+      // Folder: walk descendants, collecting every file underneath it.
+      const queue = [node.id];
+      for (let qi = 0; qi < queue.length; qi++) {
+        const cur = nodeById?.get(queue[qi]);
+        if (!cur) continue;
+        if (!cur.dir) { pushFile(cur); continue; }
+        for (const childId of cur.children) queue.push(childId);
+      }
+    }
+    openCompressWith(result);
   }, [getActiveRef, openCompressWith]);
 
   // Quick "Compress" button (TreeTable row action): WorkspaceTab has already
