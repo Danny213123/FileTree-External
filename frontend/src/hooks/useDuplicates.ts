@@ -13,6 +13,7 @@ import {
   dupeIgnorePair,
   fetchDupesHash,
   fetchDupesProgress,
+  hardlinkPairs,
   scanStreamUrl,
   type DupeHashFile,
 } from "../api/client";
@@ -38,6 +39,37 @@ import {
 
 export type DupeScanState = "idle" | "scanning" | "done" | "error" | "canceled";
 export type DupePhase = "idle" | "aggregating" | "hashing" | "grouping" | "done";
+
+/** #24 duplicate auto-pick strategies (which copy to KEEP per group). */
+export type KeepStrategy = "first" | "newest" | "oldest" | "shortestPath" | "drive";
+
+/** Uppercase drive letter of a Windows path (e.g. "C"), or "" when none. */
+function driveLetterOf(p: string): string {
+  const m = /^([a-zA-Z]):/.exec(p);
+  return m ? m[1].toUpperCase() : "";
+}
+
+/** Pick the path to KEEP within a group per the chosen strategy. Falls back to
+ *  the current reference (so a strategy never checks every copy in a group). */
+function pickSurvivor(files: DupeGroupV2["files"], strategy: KeepStrategy, drive?: string): string {
+  const current = (files.find((f) => f.ref) ?? files[0]).path;
+  if (files.length === 0) return current;
+  switch (strategy) {
+    case "first":
+      return current;
+    case "newest":
+      return files.reduce((a, b) => (b.modified > a.modified ? b : a)).path;
+    case "oldest":
+      return files.reduce((a, b) => (b.modified < a.modified ? b : a)).path;
+    case "shortestPath":
+      return files.reduce((a, b) => (b.path.length < a.path.length ? b : a)).path;
+    case "drive": {
+      const onDrive = files.filter((f) => driveLetterOf(f.path) === (drive ?? "").toUpperCase());
+      if (onDrive.length === 0) return current; // none on the preferred drive: keep the current copy
+      return onDrive.reduce((a, b) => (b.path.length < a.path.length ? b : a)).path;
+    }
+  }
+}
 
 export interface DupeProgress {
   scanned: number;
@@ -119,6 +151,10 @@ export interface DuplicatesController {
   unselectAll: () => void;
   invertSelection: () => void;
   keepFirst: () => void;
+  /** #24 auto-pick: choose the kept survivor per group by a strategy, make it the
+   *  reference, and check every other copy for removal. `drive` (e.g. "C") is
+   *  required only for the "drive" strategy. */
+  keepStrategy: (strategy: KeepStrategy, drive?: string) => void;
 
   // Group actions
   makeRef: (group: DupeGroupV2, refPath: string) => void;
@@ -130,6 +166,8 @@ export interface DuplicatesController {
   deleteSelected: () => Promise<void>;
   moveSelected: () => Promise<void>;
   copySelected: () => Promise<void>;
+  /** #26: replace the checked duplicates with hard/symlinks to their reference. */
+  linkSelected: (mode: "hardlink" | "symlink") => Promise<void>;
   exportCsv: () => void;
 
   // Derived stats
@@ -371,6 +409,23 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     [allDupPaths],
   );
   const keepFirst = useCallback(() => setSelected(new Set(allDupPaths)), [allDupPaths]);
+  // #24: auto-pick — per group choose the survivor by strategy, make it the
+  // reference, then check every other copy for removal. Rebuilding the reference
+  // reuses the same engine path as "Make Ref" / "Re-prioritize references".
+  const keepStrategy = useCallback((strategy: KeepStrategy, drive?: string) => {
+    const rebuilt = groups.map((g) =>
+      rebuildWithReference(
+        g,
+        pickSurvivor(g.files, strategy, drive),
+        criteriaRef.current,
+        criteriaRef.current.content.enabled,
+      ),
+    );
+    const sel = new Set<string>();
+    for (const g of rebuilt) for (const f of g.files) if (!f.ref) sel.add(f.path);
+    setGroups(sortGroupsByWaste(rebuilt));
+    setSelected(sel);
+  }, [groups]);
 
   // ── Group actions ───────────────────────────────────────────────────────────
   // Groups are matched by their member-set signature (not object identity): the
@@ -471,6 +526,51 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     invalidateAffected([], destPath.trim());
   }, [selected, destPath, invalidateAffected]);
 
+  const linkSelected = useCallback(async (mode: "hardlink" | "symlink") => {
+    const paths = [...selected];
+    if (!paths.length) return;
+    // Map each checked duplicate to the reference (kept original) of its group.
+    const refByDup = new Map<string, string>();
+    for (const g of groups) {
+      const ref = g.files.find((f) => f.ref) ?? g.files[0];
+      if (!ref) continue;
+      for (const f of g.files) {
+        if (!f.ref && selected.has(f.path)) refByDup.set(f.path, ref.path);
+      }
+    }
+    const pairs = paths
+      .filter((p) => refByDup.has(p))
+      .map((p) => ({ original: refByDup.get(p)!, link: p }));
+    if (!pairs.length) {
+      toast.warn("Couldn't match the checked duplicates to a reference.");
+      return;
+    }
+    const proceed = await confirmDialog({
+      title: mode === "symlink" ? "Replace with symlinks" : "Replace with hard links",
+      message:
+        `Replace ${pairs.length} duplicate file${pairs.length > 1 ? "s" : ""} with a ` +
+        `${mode === "symlink" ? "symbolic" : "hard"} link to the kept original?\n\n` +
+        `This modifies files: each duplicate is sent to the Recycle Bin and replaced by a link, ` +
+        `reclaiming its space while keeping the file accessible.` +
+        (mode === "symlink" ? "\n\nSymlinks may require Developer Mode or elevation on Windows." : ""),
+      confirmLabel: mode === "symlink" ? "Create symlinks" : "Create hard links",
+      danger: true,
+    });
+    if (!proceed) return;
+    const res = await hardlinkPairs(pairs, mode);
+    if (res.errors.length) toast.error(`Some links could not be created:\n${res.errors.join("\n")}`);
+    if (res.ok || res.errors.length < pairs.length) {
+      // Linked duplicates no longer count as reclaimable — drop them from groups.
+      const removed = new Set(paths.map(normalizeForKey));
+      setGroups((prev) =>
+        sortGroupsByWaste(pruneGroups(prev, removed, criteriaRef.current, repriRef.current, criteriaRef.current.content.enabled)),
+      );
+      setSelected(new Set());
+      invalidateAffected(paths);
+      if (res.ok) toast.success(`Replaced ${pairs.length} duplicate${pairs.length > 1 ? "s" : ""} with link${pairs.length > 1 ? "s" : ""}.`);
+    }
+  }, [selected, groups, invalidateAffected]);
+
   const exportCsv = useCallback(() => {
     const esc = (s: string) => `"${s.replace(/"/g, '""')}"`;
     const lines = ["Role,Name,Folder,Size,Last Modified,Match %"];
@@ -510,9 +610,9 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     scanState, phase, progress, startScan, stopScan,
     groups, errors, ignoredCount,
     selected, collapsed, toggleFile, toggleGroup, toggleCollapse,
-    selectAll, unselectAll, invertSelection, keepFirst,
+    selectAll, unselectAll, invertSelection, keepFirst, keepStrategy,
     makeRef, ignoreGroup, clearIgnoreList, reprioritizeApply,
-    deleteSelected, moveSelected, copySelected, exportCsv,
+    deleteSelected, moveSelected, copySelected, linkSelected, exportCsv,
     totalWaste, totalFiles, selectedCount, canScan,
   };
 }

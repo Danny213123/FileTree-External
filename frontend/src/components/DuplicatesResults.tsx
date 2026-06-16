@@ -1,13 +1,14 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { DupeFileV2, DupeGroupV2 } from "../api/types";
-import type { DuplicatesController } from "../hooks/useDuplicates";
+import type { DuplicatesController, KeepStrategy } from "../hooks/useDuplicates";
 import { formatBytes } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
 import { openPath, revealPath } from "../api/client";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
 import { FixedDropdown } from "./ConfigureColumnsMenu";
+import { DupeGroupPreview } from "./DupeGroupPreview";
 
 const ROW_HEIGHT = 24;
 const GUTTER = 42;
@@ -75,6 +76,28 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
   const [deltaValues, setDeltaValues] = useState(false);
   const [colsMenuOpen, setColsMenuOpen] = useState(false);
   const colsBtnRef = useRef<HTMLDivElement>(null);
+  const [linkMode, setLinkMode] = useState<"hardlink" | "symlink">("hardlink");
+  const [previewGroup, setPreviewGroup] = useState<DupeGroupV2 | null>(null);
+
+  // Drive letters present across all groups (for the "keep on drive" strategy).
+  const driveLetters = useMemo(() => {
+    const set = new Set<string>();
+    for (const g of ctrl.groups) {
+      for (const f of g.files) {
+        const m = /^([a-zA-Z]):/.exec(f.path);
+        if (m) set.add(m[1].toUpperCase());
+      }
+    }
+    return [...set].sort();
+  }, [ctrl.groups]);
+
+  // #24: apply an auto-pick strategy from the dropdown, then reset it to the
+  // placeholder (it's an action, not a persistent mode).
+  const onStrategy = useCallback((value: string) => {
+    if (!value) return;
+    if (value.startsWith("drive:")) ctrl.keepStrategy("drive", value.slice("drive:".length));
+    else ctrl.keepStrategy(value as KeepStrategy);
+  }, [ctrl]);
 
   const widthOf = useCallback((c: DupeCol) => widths[c.key] ?? c.width, [widths]);
   const cols = useMemo(() => COLUMNS.filter((c) => c.key === "name" || visibleCols.has(c.key)), [visibleCols]);
@@ -238,6 +261,25 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
         </div>
         <div className="df-toolbar-sep" />
         <div className="df-toolbar-group">
+          <select
+            className="df-select df-select-sm"
+            value=""
+            disabled={!ctrl.groups.length}
+            onChange={(e) => { onStrategy(e.target.value); e.target.value = ""; }}
+            title="Auto-pick which copy to keep in every group; the rest are checked for removal"
+          >
+            <option value="" disabled>Auto-pick…</option>
+            <option value="first">Keep first (reference)</option>
+            <option value="newest">Keep newest</option>
+            <option value="oldest">Keep oldest</option>
+            <option value="shortestPath">Keep shortest path</option>
+            {driveLetters.map((d) => (
+              <option key={d} value={`drive:${d}`}>Keep on {d}:</option>
+            ))}
+          </select>
+        </div>
+        <div className="df-toolbar-sep" />
+        <div className="df-toolbar-group">
           <button className="df-tool-btn df-tool-btn-danger" onClick={() => void ctrl.deleteSelected()} disabled={!ctrl.selectedCount}>
             <Icon name="trash" size={12} /> Delete ({ctrl.selectedCount})
           </button>
@@ -250,6 +292,26 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
         <div className="df-toolbar-group">
           <button className="df-tool-btn" onClick={() => void ctrl.moveSelected()} disabled={!ctrl.selectedCount} title="Move checked files to destination">Move</button>
           <button className="df-tool-btn" onClick={() => void ctrl.copySelected()} disabled={!ctrl.selectedCount} title="Copy checked files to destination">Copy</button>
+        </div>
+        <div className="df-toolbar-sep" />
+        <div className="df-toolbar-group">
+          <button
+            className="df-tool-btn"
+            onClick={() => void ctrl.linkSelected(linkMode)}
+            disabled={!ctrl.selectedCount}
+            title="Reclaim space: replace checked duplicates with a link to the kept original"
+          >
+            <Icon name="link" size={12} /> Link ({ctrl.selectedCount})
+          </button>
+          <select
+            className="df-select df-select-sm"
+            value={linkMode}
+            onChange={(e) => setLinkMode(e.target.value as "hardlink" | "symlink")}
+            title="Hard link (same volume) or symbolic link (across volumes)"
+          >
+            <option value="hardlink">Hard link</option>
+            <option value="symlink">Symlink</option>
+          </select>
         </div>
         <div className="df-toolbar-sep" />
         <button className="df-tool-btn" onClick={ctrl.exportCsv} disabled={!ctrl.groups.length}>Export CSV</button>
@@ -363,6 +425,9 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
                     <span className="df-grp-name" title={refFile?.path}>{refFile?.name ?? "—"}</span>
                     <span className="df-grp-count">{g.files.length} copies</span>
                     <span className="df-grp-waste">−{formatBytes(g.waste, "auto")}</span>
+                    <button className="df-grp-ignore" title="Preview the files in this group before deleting" onClick={() => setPreviewGroup(g)}>
+                      <Icon name="image" size={11} /> Preview
+                    </button>
                     <button className="df-grp-ignore" title="Ignore this group" onClick={() => ctrl.ignoreGroup(g)}>
                       <Icon name="x" size={11} /> Ignore
                     </button>
@@ -415,6 +480,10 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
         {scanning && <span>{ctrl.phase === "hashing" ? "Hashing…" : ctrl.phase === "grouping" ? "Grouping…" : "Scanning…"}</span>}
         {ctrl.errors.length > 0 && <span className="df-status-errors">{ctrl.errors.length} error{ctrl.errors.length !== 1 ? "s" : ""}</span>}
       </div>
+
+      {previewGroup && (
+        <DupeGroupPreview group={previewGroup} onClose={() => setPreviewGroup(null)} />
+      )}
     </div>
   );
 }

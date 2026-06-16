@@ -390,8 +390,11 @@ function showFallbackContextMenu(win: BrowserWindow | null, filePath: string, x:
 
   const fileTreeSubmenu: Electron.MenuItemConstructorOptions[] = [
     { label: "Open in new tab", enabled: isDir, click: () => win?.webContents.send("contextMenuAction", "open-new-tab", filePath) },
+    { label: "Open in new split", enabled: isDir, click: () => win?.webContents.send("contextMenuAction", "open-split", filePath) },
     { label: "Show in Explorer", click: () => shell.showItemInFolder(filePath) },
-    { label: "Compress...", enabled: !isDir, click: () => win?.webContents.send("contextMenuAction", "compress", JSON.stringify([filePath])) },
+    // Compress is enabled for folders too — the renderer expands a folder to its
+    // contained files (handleCompressFromContext) before loading the Compress view.
+    { label: "Compress...", enabled: true, click: () => win?.webContents.send("contextMenuAction", "compress", JSON.stringify([filePath])) },
     { type: "separator" },
     { label: "Copy full path", click: () => clipboard.writeText(filePath) },
     { label: "Copy name", click: () => clipboard.writeText(path.basename(filePath)) },
@@ -1588,6 +1591,9 @@ ipcMain.handle("shellContextMenu", async (event, paths: string[] | string, x: nu
           break;
         case "open-new-tab":
           handleFileTreeContextAction(win, list[0], "open-new-tab");
+          break;
+        case "open-split":
+          win?.webContents.send("contextMenuAction", "open-split", list[0]);
           break;
         // Reveal the right-clicked item in Explorer with it selected.
         case "show-in-explorer":

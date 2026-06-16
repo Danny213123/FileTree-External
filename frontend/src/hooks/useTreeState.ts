@@ -3,6 +3,41 @@ import type { NodeRecord, SortKey, Metric, Unit } from "../api/types";
 import { type FilterRule, type CompiledRule, compileRules, applyCompiledRules } from "./useFilterRules";
 import { attributeLetters } from "../lib/attributes";
 
+// ── Quick-filter chips ───────────────────────────────────────────────────────
+// Toolbar toggle chips that each contribute a predicate ANDed onto the active
+// filter (text box / advanced rules). They're expressed as ordinary FilterRules
+// so they flow through the SAME compile + apply pipeline as everything else —
+// no parallel filtering path. Multiple active chips combine with AND.
+export type ChipKey = "size100mb" | "size1gb" | "videos" | "images" | "old1y";
+
+const CHIP_VIDEO_EXTS = "mp4,mkv,mov,avi,wmv,flv,webm,m4v,mpg,mpeg,m2ts,ts";
+const CHIP_IMAGE_EXTS = "jpg,jpeg,png,webp,bmp,tiff,tif,gif,heic,avif,svg";
+
+// Build the FilterRule set for the currently-active chips. The ">1 year old"
+// chip is resolved against "now" each time the chip set changes (good enough —
+// a stale-by-minutes cutoff is harmless for a 365-day boundary).
+function buildChipRules(chips: Set<ChipKey>): FilterRule[] {
+  const rules: FilterRule[] = [];
+  const push = (r: Omit<FilterRule, "id" | "join"> & { key: ChipKey }) => {
+    const { key, ...rest } = r;
+    rules.push({ id: `chip:${key}`, join: "and", ...rest });
+  };
+  if (chips.has("size100mb")) push({ key: "size100mb", field: "size", operator: "greaterThan", value: "100", sizeUnit: "mb" });
+  if (chips.has("size1gb")) push({ key: "size1gb", field: "size", operator: "greaterThan", value: "1", sizeUnit: "gb" });
+  // Videos/Images are extension matches; when both are on, union their sets into
+  // ONE type rule so the two read as OR (a file is video OR image) rather than an
+  // impossible AND (no file is both) that would empty the table.
+  const mediaExts: string[] = [];
+  if (chips.has("videos")) mediaExts.push(CHIP_VIDEO_EXTS);
+  if (chips.has("images")) mediaExts.push(CHIP_IMAGE_EXTS);
+  if (mediaExts.length > 0) push({ key: "videos", field: "type", operator: "isOneOf", value: mediaExts.join(",") });
+  if (chips.has("old1y")) {
+    const cutoff = new Date(Date.now() - 365 * 86_400_000).toISOString().slice(0, 10);
+    push({ key: "old1y", field: "date", operator: "before", value: cutoff });
+  }
+  return rules;
+}
+
 export interface TreeState {
   expanded: Set<number>;
   expandedAll: boolean;
@@ -23,6 +58,10 @@ export interface TreeState {
 
 export interface UseTreeStateReturn extends TreeState {
   setColumnWidth: (key: SortKey, width: number) => void;
+  /** Replace ALL per-tab column widths at once (per-folder restore, #5). */
+  setColumnWidthsAll: (widths: Partial<Record<SortKey, number>>) => void;
+  /** Set sort key AND direction directly (no toggle) — per-folder restore (#5). */
+  setSort: (key: SortKey, dir: 1 | -1) => void;
   toggleExpand: (id: number) => void;
   ensureExpanded: (id: number) => void;
   expandToLevel: (level: number) => void;
@@ -33,6 +72,10 @@ export interface UseTreeStateReturn extends TreeState {
   setFilter: (f: string) => void;
   setFilterRules: (rules: FilterRule[]) => void;
   setShowFiles: (v: boolean) => void;
+  /** Active quick-filter chips (toolbar toggles). */
+  chips: Set<ChipKey>;
+  /** Toggle a quick-filter chip on/off. */
+  toggleChip: (key: ChipKey) => void;
   resetForNewScan: () => void;
   // Merge new nodes into the tree, preserving expansion/selection state by path.
   // Used by smart-refresh so the tree doesn't blank during a background rescan.
@@ -217,6 +260,7 @@ function collectVisibleRows(
   filter: string,
   compiledRules: CompiledRule[],
   showFiles: boolean,
+  chipRules: CompiledRule[],
 ): NodeRecord[] {
   const root = nodeById.get(0);
   if (!root) return [];
@@ -233,18 +277,23 @@ function collectVisibleRows(
   // rule is active; compiledRules already holds ONLY the active rules (their
   // RegExps precompiled once), so a non-empty list means rule-mode is on.
   const hasActiveRules = compiledRules.length > 0;
+  // The simple text filter and the advanced rule set are mutually exclusive
+  // (rules win) — but the quick-filter chips AND on top of EITHER, so a chip can
+  // narrow a text-filtered or rule-filtered view rather than fighting it.
+  const hasChips = chipRules.length > 0;
   const hasSimpleFilter = !hasActiveRules && filter.length > 0;
   // A filter or rule set is active. When so, the walk surfaces matching FILES
   // inline (the bundle system is bypassed) and treats every directory as open,
   // so deep matches show like a real filter rather than only matching folders.
-  const filtering = hasSimpleFilter || hasActiveRules;
+  const filtering = hasSimpleFilter || hasActiveRules || hasChips;
   // Normalize the simple-filter needle ONCE per recompute instead of calling
   // filter.toLowerCase() for every node in passesFilter (the per-row hot path).
   const filterLower = hasSimpleFilter ? filter.toLowerCase() : "";
 
   const passesFilter = (node: NodeRecord): boolean => {
-    if (hasActiveRules) return applyCompiledRules(compiledRules, node);
-    if (hasSimpleFilter) return node.name.toLowerCase().includes(filterLower);
+    if (hasActiveRules && !applyCompiledRules(compiledRules, node)) return false;
+    if (hasSimpleFilter && !node.name.toLowerCase().includes(filterLower)) return false;
+    if (hasChips && !applyCompiledRules(chipRules, node)) return false;
     return true;
   };
 
@@ -335,6 +384,7 @@ export function useTreeState(): UseTreeStateReturn {
   const [sortDir, setSortDir] = useState<1 | -1>(-1);
   const [filter, setFilter] = useState("");
   const [filterRules, setFilterRules] = useState<FilterRule[]>([]);
+  const [chips, setChips] = useState<Set<ChipKey>>(new Set());
   const [metric, setMetric] = useState<Metric>("size");
   const [unit, setUnit] = useState<Unit>("auto");
   const [showFiles, setShowFiles] = useState(true);
@@ -342,6 +392,19 @@ export function useTreeState(): UseTreeStateReturn {
 
   const setColumnWidth = useCallback((key: SortKey, width: number) => {
     setColumnWidths((prev) => (prev[key] === width ? prev : { ...prev, [key]: width }));
+  }, []);
+
+  // Replace the whole width map (per-folder restore). A fresh object so a memo
+  // keyed on columnWidths recomputes.
+  const setColumnWidthsAll = useCallback((widths: Partial<Record<SortKey, number>>) => {
+    setColumnWidths({ ...(widths ?? {}) });
+  }, []);
+
+  // Apply a saved key+dir together (no toggle), unlike setSortKey which flips
+  // the direction when the key is unchanged.
+  const setSort = useCallback((key: SortKey, dir: 1 | -1) => {
+    setSortKeyState(key);
+    setSortDir(dir);
   }, []);
 
   const nodeById = useMemo(() => {
@@ -392,13 +455,28 @@ export function useTreeState(): UseTreeStateReturn {
   const compiledRules = useMemo(() => compileRules(filterRules), [filterRules]);
   const dCompiledRules = useDeferredValue(compiledRules);
 
+  // Quick-filter chips compile through the SAME rule engine, then defer their
+  // consumption by the row walk (like the advanced rules) so toggling a chip on
+  // a large tree never blocks the click.
+  const compiledChipRules = useMemo(() => compileRules(buildChipRules(chips)), [chips]);
+  const dCompiledChipRules = useDeferredValue(compiledChipRules);
+
   const visibleRows = useMemo(
     () => collectVisibleRows(
       nodeById, dExpanded, dExpandedAll, dCollapsedOverrides,
-      dirCache, dFilter, dCompiledRules, dShowFiles,
+      dirCache, dFilter, dCompiledRules, dShowFiles, dCompiledChipRules,
     ),
-    [nodeById, dExpanded, dExpandedAll, dCollapsedOverrides, dirCache, dFilter, dCompiledRules, dShowFiles],
+    [nodeById, dExpanded, dExpandedAll, dCollapsedOverrides, dirCache, dFilter, dCompiledRules, dShowFiles, dCompiledChipRules],
   );
+
+  const toggleChip = useCallback((key: ChipKey) => {
+    setChips((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
 
   const toggleExpand = useCallback((id: number) => {
     if (expandedAll && id >= 0) {
@@ -478,6 +556,7 @@ export function useTreeState(): UseTreeStateReturn {
     setSelectedId(0);
     setFilter("");
     setFilterRules([]);
+    setChips(new Set());
   }, []);
 
   // Replace nodes while preserving expansion/selection by path.
@@ -676,6 +755,8 @@ export function useTreeState(): UseTreeStateReturn {
     showFiles,
     columnWidths,
     setColumnWidth,
+    setColumnWidthsAll,
+    setSort,
     toggleExpand,
     ensureExpanded,
     expandToLevel,
@@ -686,6 +767,8 @@ export function useTreeState(): UseTreeStateReturn {
     setFilter,
     setFilterRules,
     setShowFiles,
+    chips,
+    toggleChip,
     resetForNewScan,
     mergeNodes,
     patchDirectory,

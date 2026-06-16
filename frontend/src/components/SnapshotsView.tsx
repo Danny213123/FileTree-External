@@ -8,6 +8,8 @@ import { confirmDialog } from "../lib/dialogs";
 import { toast } from "../lib/toast";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
+import { isAutoSnapshot } from "../lib/autoSnapshot";
+import { SnapshotTrend } from "./SnapshotTrend";
 
 // Scan Snapshots + historical diff (F2). Save a compact snapshot of the current
 // scan, then diff two saved points in time to see which folders were added /
@@ -41,8 +43,10 @@ function bucketOf(status: DiffStatus): DiffBucket {
 }
 
 function snapshotLabel(meta: SnapshotMeta): string {
-  // createdAt is unix SECONDS; formatDate wants ms.
-  return `${meta.path} · ${formatBytes(meta.total)} · ${formatDate(meta.createdAt * 1000)}`;
+  // createdAt is unix SECONDS; formatDate wants ms. Auto-snapshots (#36) are
+  // marked so they're distinguishable from manual saves in the pickers/list.
+  const tag = isAutoSnapshot(meta.id) ? " · auto" : "";
+  return `${meta.path} · ${formatBytes(meta.total)} · ${formatDate(meta.createdAt * 1000)}${tag}`;
 }
 
 /** Signed, human byte delta, e.g. "+1.2 GB" / "−340 MB". */
@@ -253,6 +257,8 @@ export function SnapshotsView({ data, nodeById, onNavigate }: SnapshotsViewProps
           </ul>
         </details>
       )}
+
+      <SnapshotTrend snapshots={snapshots} rootPath={rootPath} />
 
       {diff ? (
         <div className="snap-results">

@@ -19,6 +19,8 @@ import {
 import type { AppSettings } from "./api/client";
 import type { DriveEntry, SpecialFolder, SortKey, Unit, ScanResult, TagEntry, SmartFolder, NodeRecord } from "./api/types";
 import { isActiveRule } from "./hooks/useFilterRules";
+import { EMPTY_FILTERS, type SearchFilters } from "./lib/search";
+import { loadSearchHistory, addSearchHistory, clearSearchHistory } from "./lib/searchHistory";
 import { useDuplicatesController, type DuplicatesController } from "./hooks/useDuplicates";
 import { createWorkbenchStore, useWorkbench, type WorkbenchStore, type WorkbenchSnapshot } from "./hooks/useWorkbench";
 import { DEFAULT_VISIBLE_COLUMNS } from "./components/TreeTable";
@@ -33,6 +35,20 @@ import { loadChatIndex, newChatSessionId } from "./lib/chatSessions";
 import { undoLast } from "./lib/undo";
 import { ToastProvider, toast } from "./lib/toast";
 import { DialogProvider, promptDialog } from "./lib/dialogs";
+import { ShortcutsDialog } from "./components/ShortcutsDialog";
+import { AppearanceDialog } from "./components/AppearanceDialog";
+import {
+  type ShortcutBindings,
+  loadBindings,
+  saveBindings as persistBindings,
+  buildChordToId,
+  chordFromEvent,
+} from "./lib/shortcuts";
+import {
+  initAppearance,
+  loadAccent,
+  loadScale,
+} from "./lib/appearance";
 import { ActivityBar, type ViewId } from "./components/ActivityBar";
 import { SideBar } from "./components/SideBar";
 import { CommandPalette, type PaletteCommand } from "./components/CommandPalette";
@@ -40,6 +56,8 @@ import { TransfersPanel } from "./components/TransfersPanel";
 import { InspectorPane } from "./components/InspectorPane";
 import { ScheduleWizard } from "./components/ScheduleWizard";
 import { LazyView } from "./components/LazyView";
+import { recordSample as recordDriveSample } from "./lib/driveForecast";
+import { checkGrowthAlerts } from "./lib/autoSnapshot";
 
 // Heavy, not-always-visible views are code-split via React.lazy so they leave
 // the main bundle and load on first use (xterm rides along with TerminalPanel;
@@ -75,6 +93,43 @@ interface TabEntry {
   id: string;
   initialPath: string;
   ref: React.RefObject<WorkspaceTabHandle>;
+  // #49 Tab QoL (all optional / persisted): a user override label (else the
+  // derived folder name), a color-label accent, and pinned state.
+  customLabel?: string;
+  color?: string;
+  pinned?: boolean;
+}
+
+// Persisted per-tab metadata, parallel to `openTabs` by index (#49). Kept as a
+// separate array so the existing `openTabs: string[]` + `paneGroups` index
+// scheme stays backward-compatible with older saved settings.
+interface TabMeta {
+  label?: string;
+  color?: string;
+  pinned?: boolean;
+}
+
+// Small palette of color labels for tabs (#49). Empty string clears the color.
+const TAB_COLORS = ["#e05c4c", "#ea9d36", "#e0c04c", "#56c45a", "#4ca6f0", "#a78bfa", "#ec6cb9"];
+
+// Synchronous, non-debounced crash backup of the open-tab set (#49). The server
+// settings save is debounced (700ms), so on an abnormal exit the last change
+// could be lost; this localStorage mirror is written on every tab change and
+// used as a fallback when the server returns no openTabs.
+const TAB_BACKUP_KEY = "filetree_open_tabs_backup";
+function writeTabBackup(paths: string[], meta: TabMeta[]): void {
+  try { localStorage.setItem(TAB_BACKUP_KEY, JSON.stringify({ openTabs: paths, tabMeta: meta })); } catch { /* ignore */ }
+}
+function readTabBackup(): { openTabs: string[]; tabMeta: TabMeta[] } | null {
+  try {
+    const raw = localStorage.getItem(TAB_BACKUP_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { openTabs?: string[]; tabMeta?: TabMeta[] };
+    if (!Array.isArray(parsed.openTabs) || parsed.openTabs.length === 0) return null;
+    return { openTabs: parsed.openTabs, tabMeta: Array.isArray(parsed.tabMeta) ? parsed.tabMeta : [] };
+  } catch {
+    return null;
+  }
 }
 
 // An editor group is one column in the split layout: an ordered list of open
@@ -142,6 +197,7 @@ const EMPTY_WORKBENCH_SNAPSHOT: WorkbenchSnapshot = {
   status: "idle",
   errorMessage: "",
   visibleCount: 0,
+  selectionSummary: { count: 0, bytes: 0 },
   progressStore: null,
 };
 
@@ -155,6 +211,7 @@ function buildWorkbenchSnapshot(ref: WorkspaceTabHandle | null): WorkbenchSnapsh
     status: ref.getStatus(),
     errorMessage: ref.getErrorMessage(),
     visibleCount: ref.getVisibleCount(),
+    selectionSummary: ref.getSelectionSummary(),
     progressStore: ref.getProgressStore(),
   };
 }
@@ -185,6 +242,18 @@ export default function App() {
   const [specialFolders, setSpecialFolders] = useState<SpecialFolder[]>([]);
   const [darkMode, setDarkModeState] = useState(true);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
+  // #47 customizable shortcuts: persisted override map (localStorage) overlaying
+  // the built-in defaults, plus the editor dialog's open state. A ref mirror is
+  // read by the (stable) global keydown handler so rebinds take effect live.
+  const [shortcutBindings, setShortcutBindings] = useState<ShortcutBindings>(() => loadBindings());
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const chordToIdRef = useRef(buildChordToId(shortcutBindings));
+  useEffect(() => { chordToIdRef.current = buildChordToId(shortcutBindings); }, [shortcutBindings]);
+  // #50 theme customization: accent color + UI scale (localStorage-persisted via
+  // the appearance lib). Held in state only to drive the dialog + menu state.
+  const [accent, setAccent] = useState<string>(() => loadAccent());
+  const [uiScale, setUiScale] = useState<number>(() => loadScale());
+  const [appearanceOpen, setAppearanceOpen] = useState(false);
   const [treemapDetail] = useState(3);
   const [tmShowSingleFiles] = useState(true);
   const [tmShow3D, setTmShow3D] = useState(false);
@@ -196,6 +265,41 @@ export default function App() {
   // server-side like metric/unit. `unit` stays per-tab (in useTreeState).
   const [decimals, setDecimals] = useState(2);
   const [visibleColumns, setVisibleColumns] = useState<Set<SortKey>>(DEFAULT_VISIBLE_COLUMNS);
+  // #7: folder double-click action — open in File Explorer (default) vs drill in.
+  // #9: size heat-tint on table rows. Both are simple localStorage-backed UI
+  // toggles (no server round-trip), initialized once from localStorage.
+  const [folderDblClickExplorer, setFolderDblClickExplorer] = useState(() => {
+    try { return localStorage.getItem("filetree_folder_dblclick_explorer") !== "0"; } catch { return true; }
+  });
+  const [heatTint, setHeatTint] = useState(() => {
+    try { return localStorage.getItem("filetree_heat_tint") === "1"; } catch { return false; }
+  });
+  // #39: show grew/shrank/new badges on Explorer folder rows vs. the latest
+  // saved snapshot of the current root. Default off to avoid clutter.
+  const [showGrowthBadges, setShowGrowthBadges] = useState(() => {
+    try { return localStorage.getItem("filetree_growth_badges") === "1"; } catch { return false; }
+  });
+  const handleToggleFolderDblClick = useCallback(() => {
+    setFolderDblClickExplorer((v) => {
+      const next = !v;
+      try { localStorage.setItem("filetree_folder_dblclick_explorer", next ? "1" : "0"); } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
+  const handleToggleGrowthBadges = useCallback(() => {
+    setShowGrowthBadges((v) => {
+      const next = !v;
+      try { localStorage.setItem("filetree_growth_badges", next ? "1" : "0"); } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
+  const handleToggleHeatTint = useCallback(() => {
+    setHeatTint((v) => {
+      const next = !v;
+      try { localStorage.setItem("filetree_heat_tint", next ? "1" : "0"); } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
 
   // VS Code workbench layout
   const [activeView, setActiveView] = useState<ViewId>("explorer");
@@ -209,6 +313,21 @@ export default function App() {
     const t = setTimeout(() => setDebouncedSearchQuery(searchQuery), 180);
     return () => clearTimeout(t);
   }, [searchQuery]);
+  // Inline search filters + regex toggle (#31) and cross-scan toggle (#32),
+  // lifted alongside searchQuery so BOTH the sidebar Search view and each
+  // pane's flat results table apply the same narrowing predicates.
+  const [searchFilters, setSearchFilters] = useState<SearchFilters>(EMPTY_FILTERS);
+  const [searchGlobal, setSearchGlobal] = useState(false);
+  // Search history (#33): committed queries (localStorage, deduped, capped).
+  const [searchHistory, setSearchHistory] = useState<string[]>(() => loadSearchHistory());
+  // Record a query in history once it settles (debounced via committed query),
+  // so we don't spam an entry on every keystroke.
+  useEffect(() => {
+    const q = debouncedSearchQuery.trim();
+    if (q.length < 2) return;
+    setSearchHistory(addSearchHistory(q));
+  }, [debouncedSearchQuery]);
+  const handleClearSearchHistory = useCallback(() => setSearchHistory(clearSearchHistory()), []);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(260);
   const [panelOpen, setPanelOpen] = useState(false);
@@ -372,6 +491,9 @@ export default function App() {
       showFiles: rs?.showFiles ?? true,
       recentPaths: loadRecentPaths(),
       openTabs: tabs.map((t) => t.ref.current?.getScanPath() ?? t.initialPath),
+      // #49: per-tab metadata parallel to openTabs by index (custom label /
+      // color / pinned). Kept separate so old index-based paneGroups still work.
+      tabMeta: tabs.map((t) => ({ label: t.customLabel, color: t.color, pinned: t.pinned })),
       visibleColumns: Array.from(visibleColumns),
       decimals,
       // Split-pane layout as indices into openTabs (best-effort; load falls back
@@ -403,6 +525,19 @@ export default function App() {
      visibleColumns, decimals,
      activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth,
      previewOpen, detailsOpen, inspectorWidth, lowSpaceAlerts, lowSpaceThreshold]);
+
+  // #49 crash-safe restore: mirror the open-tab set to localStorage on every
+  // tab change (synchronous, unlike the 700ms-debounced server save), so an
+  // abnormal exit can still restore the last-known tabs with their meta. `tick`
+  // is included so freshly-resolved scan paths are captured too.
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    writeTabBackup(
+      tabs.map((t) => t.ref.current?.getScanPath() ?? t.initialPath),
+      tabs.map((t) => ({ label: t.customLabel, color: t.color, pinned: t.pinned })),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabs, settingsLoaded, tick]);
 
   const handleSaveSession = useCallback(() => {
     const paths = tabs.map((t) => t.ref.current?.getScanPath() ?? t.initialPath).filter(Boolean);
@@ -471,6 +606,46 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // #50: apply the persisted accent color + UI scale once on mount (the helpers
+  // write CSS variables on :root / a zoom on <body>).
+  useLayoutEffect(() => { initAppearance(); }, []);
+
+  // #47: persist + apply a new shortcut binding map from the editor dialog.
+  const handleApplyShortcuts = useCallback((next: ShortcutBindings) => {
+    setShortcutBindings(next);
+    persistBindings(next);
+  }, []);
+
+  // ── #49 Tab QoL: rename / color / pin ──────────────────────────────────────
+  const handleRenameTab = useCallback(async (id: string) => {
+    const t = tabsRef.current.find((x) => x.id === id);
+    if (!t) return;
+    const path = t.ref.current?.getScanPath() ?? t.initialPath;
+    const derived = path ? path.split(/[/\\]/).filter(Boolean).pop() ?? path : "New tab";
+    const name = await promptDialog({
+      title: "Rename Tab",
+      label: "Tab name",
+      initialValue: t.customLabel ?? derived,
+      placeholder: derived,
+    });
+    if (name === null) return;
+    const trimmed = name.trim();
+    setTabs((prev) => prev.map((x) =>
+      x.id === id ? { ...x, customLabel: trimmed && trimmed !== derived ? trimmed : undefined } : x));
+  }, []);
+
+  const handleSetTabColor = useCallback((id: string, color: string) => {
+    setTabs((prev) => prev.map((x) => (x.id === id ? { ...x, color: color || undefined } : x)));
+  }, []);
+
+  const handleTogglePinTab = useCallback((id: string) => {
+    setTabs((prev) => prev.map((x) => (x.id === id ? { ...x, pinned: !x.pinned } : x)));
+  }, []);
+
+  const handleResetTabName = useCallback((id: string) => {
+    setTabs((prev) => prev.map((x) => (x.id === id ? { ...x, customLabel: undefined } : x)));
+  }, []);
+
   // Fetch the running build's version once on mount for the title bar.
   useEffect(() => {
     let alive = true;
@@ -522,12 +697,40 @@ export default function App() {
       }
 
       setDrives(driveList.drives ?? []);
+      // #15: record a free-space sample per fixed drive on startup so the
+      // drive-bar forecast accumulates a trend even before the Explorer side
+      // bar (where the bars render) is opened.
+      for (const d of driveList.drives ?? []) {
+        if (d.total > 0) recordDriveSample(d.root, d.free, d.total);
+      }
       setSpecialFolders(folderList.folders ?? []);
       setBookmarkList(savedBookmarks);
 
-      const savedPaths = settings.openTabs?.filter(Boolean);
-      if (savedPaths && savedPaths.length > 0) {
-        const restoredTabs = savedPaths.map((p) => ({ id: newTabId(), initialPath: p, ref: createRef<WorkspaceTabHandle>() }));
+      // #49: pair each saved path with its meta (label/color/pinned) by index,
+      // dropping empty-path tabs together so the two stay aligned. When the
+      // server has no openTabs (e.g. an abnormal exit before the debounced save
+      // flushed), fall back to the synchronous localStorage crash backup.
+      let pairs = (settings.openTabs ?? [])
+        .map((p, i) => ({ p, m: settings.tabMeta?.[i] as TabMeta | undefined }))
+        .filter((x) => Boolean(x.p));
+      if (pairs.length === 0) {
+        const backup = readTabBackup();
+        if (backup) {
+          pairs = backup.openTabs
+            .map((p, i) => ({ p, m: backup.tabMeta[i] }))
+            .filter((x) => Boolean(x.p));
+        }
+      }
+      const savedPaths = pairs.map((x) => x.p);
+      if (savedPaths.length > 0) {
+        const restoredTabs = pairs.map((x) => ({
+          id: newTabId(),
+          initialPath: x.p,
+          ref: createRef<WorkspaceTabHandle>(),
+          customLabel: x.m?.label,
+          color: x.m?.color,
+          pinned: x.m?.pinned,
+        }));
         setTabs(restoredTabs);
 
         // Rebuild the split layout from paneGroups (indices into openTabs).
@@ -665,6 +868,16 @@ export default function App() {
     });
   }, []);
 
+  // Select every matching search/filter result in the focused pane (#35) so the
+  // user can act on them with the existing file ops. Paths from another (cached)
+  // scan that aren't in the focused pane simply don't resolve to a row there.
+  const handleSelectAllSearchResults = useCallback((paths: string[]) => {
+    if (paths.length === 0) { toast.info("No results to select."); return; }
+    const n = getActiveRef()?.doSelectPaths(paths) ?? 0;
+    if (n === 0) toast.info("None of these results are in the focused scan.");
+    else toast.success(`Selected ${n} result${n === 1 ? "" : "s"} in the focused pane.`);
+  }, [getActiveRef]);
+
   // ── Low-space monitor + alerts (F9) ───────────────────────────────────────
   // Poll drive free space on an interval while enabled and raise ONE native
   // notification when a drive first crosses below the threshold. De-dupes via a
@@ -701,6 +914,12 @@ export default function App() {
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [lowSpaceAlerts, lowSpaceThreshold]);
 
+  // #40: on app start, evaluate any saved growth-alert thresholds against the
+  // accumulated snapshot history and raise a native notification for breaches
+  // (de-duped per triggering snapshot). See checkGrowthAlerts for the runtime
+  // boundary FLAG (this runs in-app, not inside the headless scheduled task).
+  useEffect(() => { void checkGrowthAlerts(); }, []);
+
   // Cycle the low-space threshold through a few sensible presets (View menu).
   const cycleLowSpaceThreshold = useCallback(() => {
     const presets = [5, 10, 15, 20];
@@ -731,6 +950,31 @@ export default function App() {
   // land in the currently focused pane.
   const handleOpenInNewTab = useCallback((path: string) => {
     openTabInGroup(focusedGroupIdRef.current, path);
+  }, [openTabInGroup]);
+
+  // Open `path` in a NEW split pane immediately right of the focused group. When
+  // the layout is already at MAX_GROUPS panes, fall back to a new tab in the
+  // focused pane so the action is never a silent no-op. Mirrors the fresh-tab
+  // half of handleSplitFromGroup (always opens the dropped folder, never moves
+  // an existing tab).
+  const handleOpenInSplit = useCallback((path: string) => {
+    const prev = groupsRef.current;
+    if (prev.length >= MAX_GROUPS) {
+      openTabInGroup(focusedGroupIdRef.current, path);
+      return;
+    }
+    const id = newTabId();
+    const ref = createRef<WorkspaceTabHandle>();
+    const newGid = newGroupId();
+    setTabs((tp) => [...tp, { id, initialPath: path, ref }]);
+    setGroups((cur) => {
+      const srcIdx = cur.findIndex((g) => g.id === focusedGroupIdRef.current);
+      const next = [...cur];
+      next.splice(srcIdx >= 0 ? srcIdx + 1 : next.length, 0, { id: newGid, tabIds: [id], activeTabId: id, width: DEFAULT_GROUP_WIDTH });
+      next[next.length - 1] = { ...next[next.length - 1], width: undefined };
+      return next;
+    });
+    setFocusedGroupId(newGid);
   }, [openTabInGroup]);
 
   // Open a folder in a new tab of a SPECIFIC group (used when a native folder
@@ -887,11 +1131,12 @@ export default function App() {
       else if (action === "delete") getActiveRef()?.doDeletePaths([message]);
       else if (action === "refresh") getActiveRef()?.doScan();
       else if (action === "open-new-tab") handleOpenInNewTab(message);
+      else if (action === "open-split") handleOpenInSplit(message);
       else if (action === "compress") handleCompressFromContext(message);
       else if (action === "error") toast.error(message);
     });
     return typeof cleanup === "function" ? cleanup : undefined;
-  }, [getActiveRef, handleOpenInNewTab, handleCompressFromContext]);
+  }, [getActiveRef, handleOpenInNewTab, handleOpenInSplit, handleCompressFromContext]);
 
   // Phase 6 in-app undo: reverse the most recent reversible file op (move back,
   // rename back, restore from the Recycle Bin) and toast the outcome in the
@@ -920,45 +1165,53 @@ export default function App() {
       return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || node.isContentEditable === true;
     };
     const onKey = (e: KeyboardEvent) => {
-      const k = e.key.toLowerCase();
-      // Command palette (F6): Ctrl+Shift+P → commands, Ctrl+P → file jump. Checked
-      // first (and shift before non-shift) so they win over other Ctrl bindings.
-      if (e.ctrlKey && !e.altKey && e.shiftKey && k === "p") { e.preventDefault(); setPaletteMode("commands"); return; }
-      if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "p") { e.preventDefault(); setPaletteMode("files"); return; }
-      if (e.ctrlKey && e.altKey && k === "b") { e.preventDefault(); setChatOpen((v) => !v); }
-      else if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "b") { e.preventDefault(); setSidebarOpen((v) => !v); }
-      else if (e.ctrlKey && k === "j") { e.preventDefault(); setPanelOpen((v) => !v); }
-      else if (e.ctrlKey && k === "t") { e.preventDefault(); handleOpenInNewTab(""); }
-      else if (e.ctrlKey && (k === "`" || e.code === "Backquote")) { e.preventDefault(); handleToggleTerminal(); }
-      // Per-tab navigation history (acts on the focused pane).
-      else if (e.altKey && !e.ctrlKey && !e.shiftKey && k === "arrowleft") { e.preventDefault(); getActiveRef()?.doBack(); }
-      else if (e.altKey && !e.ctrlKey && !e.shiftKey && k === "arrowright") { e.preventDefault(); getActiveRef()?.doForward(); }
-      else if (e.altKey && !e.ctrlKey && !e.shiftKey && k === "arrowup") { e.preventDefault(); getActiveRef()?.doNavigateParent(); }
-      // Inspector pane toggles (mirror Explorer): Alt+P preview, Alt+Shift+P details.
-      else if (e.altKey && !e.ctrlKey && !e.shiftKey && k === "p") { e.preventDefault(); setPreviewOpen((v) => !v); }
-      else if (e.altKey && !e.ctrlKey && e.shiftKey && k === "p") { e.preventDefault(); setDetailsOpen((v) => !v); }
-      else if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "z") {
-        if (inEditable(e.target) || inEditable(document.activeElement)) return;
-        e.preventDefault();
-        void handleUndo();
-      }
-      // Clipboard file ops (#9). Never hijack a text edit, and never steal Ctrl+C
-      // when the user has a real text selection (let the browser copy that text).
-      else if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "c") {
-        if (inEditable(e.target) || inEditable(document.activeElement)) return;
-        if ((window.getSelection()?.toString() ?? "") !== "") return;
-        e.preventDefault();
-        getActiveRef()?.doCopyFiles();
-      }
-      else if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "x") {
-        if (inEditable(e.target) || inEditable(document.activeElement)) return;
-        e.preventDefault();
-        getActiveRef()?.doCutFiles();
-      }
-      else if (e.ctrlKey && !e.altKey && !e.shiftKey && k === "v") {
-        if (inEditable(e.target) || inEditable(document.activeElement)) return;
-        e.preventDefault();
-        getActiveRef()?.doPaste();
+      // #47: resolve the pressed combo to a rebindable command id via the live
+      // binding map (defaults overlaid with the user's overrides). An unbound
+      // combo (or a lone modifier) returns null and we let it pass through.
+      const chord = chordFromEvent(e);
+      if (!chord) return;
+      const cmd = chordToIdRef.current.get(chord);
+      if (!cmd) return;
+      switch (cmd) {
+        case "palette.commands": e.preventDefault(); setPaletteMode("commands"); break;
+        case "palette.files": e.preventDefault(); setPaletteMode("files"); break;
+        case "toggle.chat": e.preventDefault(); setChatOpen((v) => !v); break;
+        case "toggle.sidebar": e.preventDefault(); setSidebarOpen((v) => !v); break;
+        case "toggle.panel": e.preventDefault(); setPanelOpen((v) => !v); break;
+        case "tab.new": e.preventDefault(); handleOpenInNewTab(""); break;
+        case "toggle.terminal": e.preventDefault(); handleToggleTerminal(); break;
+        // Per-tab navigation history (acts on the focused pane).
+        case "nav.back": e.preventDefault(); getActiveRef()?.doBack(); break;
+        case "nav.forward": e.preventDefault(); getActiveRef()?.doForward(); break;
+        case "nav.up": e.preventDefault(); getActiveRef()?.doNavigateParent(); break;
+        // Inspector pane toggles (mirror Explorer): Alt+P preview, Alt+Shift+P details.
+        case "toggle.preview": e.preventDefault(); setPreviewOpen((v) => !v); break;
+        case "toggle.details": e.preventDefault(); setDetailsOpen((v) => !v); break;
+        case "edit.undo":
+          // Ctrl+Z must never hijack text-editing undo.
+          if (inEditable(e.target) || inEditable(document.activeElement)) return;
+          e.preventDefault();
+          void handleUndo();
+          break;
+        // Clipboard file ops (#9). Never hijack a text edit, and never steal the
+        // copy chord when the user has a real text selection (let the browser
+        // copy that text).
+        case "edit.copy":
+          if (inEditable(e.target) || inEditable(document.activeElement)) return;
+          if ((window.getSelection()?.toString() ?? "") !== "") return;
+          e.preventDefault();
+          getActiveRef()?.doCopyFiles();
+          break;
+        case "edit.cut":
+          if (inEditable(e.target) || inEditable(document.activeElement)) return;
+          e.preventDefault();
+          getActiveRef()?.doCutFiles();
+          break;
+        case "edit.paste":
+          if (inEditable(e.target) || inEditable(document.activeElement)) return;
+          e.preventDefault();
+          getActiveRef()?.doPaste();
+          break;
       }
     };
     window.addEventListener("keydown", onKey);
@@ -1236,8 +1489,13 @@ export default function App() {
   const metaById = useMemo(() => new Map<string, WorkspaceTabMeta>(tabs.map((t) => {
     const handle = t.ref.current;
     const path = handle?.getScanPath() ?? t.initialPath;
-    const label = path ? path.split(/[/\\]/).filter(Boolean).pop() ?? path : "New tab";
-    return [t.id, { id: t.id, label, path, scanning: handle?.getScanning() ?? false }];
+    // #49: a user rename overrides the derived folder name.
+    const derived = path ? path.split(/[/\\]/).filter(Boolean).pop() ?? path : "New tab";
+    const label = t.customLabel?.trim() ? t.customLabel : derived;
+    return [t.id, {
+      id: t.id, label, path, scanning: handle?.getScanning() ?? false,
+      color: t.color, pinned: t.pinned,
+    }];
   })),
   // eslint-disable-next-line react-hooks/exhaustive-deps
   [tabs, tick]);
@@ -1300,7 +1558,14 @@ export default function App() {
         { label: "Copy", kbd: "Ctrl+C", onClick: () => getActiveRef()?.doCopyFiles() },
         { label: "Paste", kbd: "Ctrl+V", onClick: () => getActiveRef()?.doPaste() },
         { label: "Move to…", onClick: () => getActiveRef()?.doMoveTo() },
+        { label: "Copy to…", onClick: () => getActiveRef()?.doCopyTo() },
         { label: "Copy Path", onClick: () => getActiveRef()?.doCopyPath() },
+        { separator: true },
+        { label: "Edit Attributes & Dates…", onClick: () => getActiveRef()?.doEditAttributes() },
+        { separator: true },
+        { label: "Send to ▸ Compressed (.zip)", onClick: () => getActiveRef()?.doCompress() },
+        { label: "Send to ▸ Mail recipient", onClick: () => getActiveRef()?.doSendToMail() },
+        { label: "Send to ▸ Run command…", onClick: () => getActiveRef()?.doSendToCommand() },
         { separator: true },
         { label: "Compress to .zip…", onClick: () => getActiveRef()?.doCompress() },
         { label: "Extract here", onClick: () => getActiveRef()?.doExtract() },
@@ -1322,7 +1587,13 @@ export default function App() {
         { separator: true },
         { label: "Configure Columns…", opensColumns: true },
         { separator: true },
+        { label: "Double-click opens folder in Explorer", checked: folderDblClickExplorer, onClick: handleToggleFolderDblClick },
+        { label: "Size heat-tint rows", checked: heatTint, onClick: handleToggleHeatTint },
+        { label: "Snapshot change badges", checked: showGrowthBadges, onClick: handleToggleGrowthBadges },
+        { separator: true },
         { label: "Dark Theme", checked: darkMode, onClick: handleToggleDark },
+        { label: "Appearance…", onClick: () => setAppearanceOpen(true) },
+        { label: "Keyboard Shortcuts…", onClick: () => setShortcutsOpen(true) },
         { separator: true },
         { label: "Low-space Alerts", checked: lowSpaceAlerts, onClick: () => setLowSpaceAlerts((v) => !v) },
         { label: `Low-space Threshold: ${lowSpaceThreshold}% free`, onClick: cycleLowSpaceThreshold },
@@ -1361,6 +1632,7 @@ export default function App() {
     tmShowLabels, tmShowHierarchy, tmShowLegend, navState.canBack, navState.canForward,
     statusData, tabs.length, focusedGroupId, focusedTabId,
     lowSpaceAlerts, lowSpaceThreshold, cycleLowSpaceThreshold,
+    folderDblClickExplorer, heatTint, showGrowthBadges, handleToggleFolderDblClick, handleToggleHeatTint, handleToggleGrowthBadges,
     handleOpenInNewTab, handleCloseTab, handleSaveSession, handleLoadSession,
     handleToggleTerminal, handleToggleChat, handleToggleDark, handleToggleSidebar,
     handleTogglePanel, handleTogglePreview, handleToggleDetails, handleToggleTmLabels,
@@ -1391,6 +1663,46 @@ export default function App() {
     handleToggleDark, handleAbout, getActiveRef,
   ]);
 
+  // ── Exclude from scans (#12) ───────────────────────────────────────────────
+  // `exclude` is a comma-separated string in settings; surface it as a pattern
+  // list and let any pane exclude a folder by its absolute path (the backend
+  // exclude matcher treats a pattern as a path/name substring, so the full path
+  // excludes that folder and everything under it). Adding/removing offers a
+  // one-click rescan so the change takes effect immediately.
+  const excludePatterns = useMemo(
+    () => exclude.split(",").map((s) => s.trim()).filter(Boolean),
+    [exclude],
+  );
+
+  const handleExcludePath = useCallback((path: string) => {
+    const pattern = path.trim();
+    if (!pattern) return;
+    const exists = excludePatterns.some((p) => p.toLowerCase() === pattern.toLowerCase());
+    if (exists) {
+      toast.info(`Already excluded: ${pattern}`);
+      return;
+    }
+    setExclude([...excludePatterns, pattern].join(","));
+    toast.success(`Excluded from scans: ${pattern}`, {
+      action: { label: "Rescan", onClick: () => getActiveRef()?.refresh() },
+    });
+  }, [excludePatterns, getActiveRef]);
+
+  const handleRemoveExclude = useCallback((pattern: string) => {
+    setExclude(excludePatterns.filter((p) => p !== pattern).join(","));
+    toast.success("Removed exclude.", {
+      action: { label: "Rescan", onClick: () => getActiveRef()?.refresh() },
+    });
+  }, [excludePatterns, getActiveRef]);
+
+  const handleClearExcludes = useCallback(() => {
+    if (excludePatterns.length === 0) return;
+    setExclude("");
+    toast.success("Cleared all excludes.", {
+      action: { label: "Rescan", onClick: () => getActiveRef()?.refresh() },
+    });
+  }, [excludePatterns, getActiveRef]);
+
   // Curated command list for the palette's command mode (F6). Each `run` reads
   // the focused pane live via getActiveRef so it acts on whatever tab is active
   // when the command fires (the palette defers run() until after it closes).
@@ -1415,10 +1727,16 @@ export default function App() {
       { id: "expand", title: "Expand All", keywords: "tree open", run: () => getActiveRef()?.doExpand(Infinity) },
       { id: "collapse", title: "Collapse All", keywords: "tree close", run: () => getActiveRef()?.doExpand(0) },
       { id: "new-folder", title: "New Folder", keywords: "create mkdir", run: () => getActiveRef()?.doNewFolder() },
+      { id: "move-to", title: "Move to\u2026", keywords: "destination folder relocate recent", run: () => getActiveRef()?.doMoveTo() },
+      { id: "copy-to", title: "Copy to\u2026", keywords: "destination folder duplicate recent", run: () => getActiveRef()?.doCopyTo() },
+      { id: "edit-attributes", title: "Edit Attributes & Dates\u2026", keywords: "readonly hidden timestamp modified created accessed metadata", run: () => getActiveRef()?.doEditAttributes() },
+      { id: "send-to-mail", title: "Send to: Mail recipient", keywords: "email mailto share send", run: () => getActiveRef()?.doSendToMail() },
+      { id: "send-to-command", title: "Send to: Run command\u2026", keywords: "send custom script shell open with external tool", run: () => getActiveRef()?.doSendToCommand() },
       { id: "bulk-rename", title: "Bulk Rename\u2026", keywords: "batch", run: () => getActiveRef()?.doBulkRename() },
       { id: "compress", title: "Compress to .zip\u2026", keywords: "zip archive", run: () => getActiveRef()?.doCompress() },
       { id: "extract", title: "Extract here", keywords: "unzip archive", run: () => getActiveRef()?.doExtract() },
       { id: "checksum", title: "Copy checksum (SHA-256)", keywords: "hash sha md5 verify", run: () => getActiveRef()?.doChecksum() },
+      { id: "copy-as-table", title: "Copy as table", keywords: "tsv excel sheets clipboard rows export", run: () => getActiveRef()?.doCopyAsTable() },
       { id: "hidden", title: "Toggle Hidden Files", keywords: "dotfiles include", run: () => setIncludeHidden((v) => !v) },
       { id: "terminal", title: "Open Terminal", hint: "Ctrl+`", keywords: "shell console", run: () => handleToggleTerminal() },
       { id: "undo", title: "Undo Last Action", hint: "Ctrl+Z", keywords: "revert", run: () => { void handleUndo(); } },
@@ -1433,6 +1751,10 @@ export default function App() {
         },
       },
       { id: "save-smart-folder", title: "Save Smart Folder\u2026", keywords: "search filter", run: () => { void handleSaveSmartFolder(); } },
+      { id: "search-select-all", title: "Search: Select All Results", hint: "Search", keywords: "filter results selection select-all", run: () => { getActiveRef()?.doSelectSearchResults(); } },
+      { id: "search-export-csv", title: "Search: Export Results (CSV)", hint: "Search", keywords: "filter results download export csv", run: () => { getActiveRef()?.doExportSearchResults("csv"); } },
+      { id: "search-export-json", title: "Search: Export Results (JSON)", hint: "Search", keywords: "filter results download export json", run: () => { getActiveRef()?.doExportSearchResults("json"); } },
+      { id: "search-global", title: "Search: Toggle Cross-scan (all cached scans)", hint: "Search", keywords: "filter global multi root cross scan", run: () => setSearchGlobal((v) => !v) },
       { id: "sidebar", title: "Toggle Side Bar", hint: "Ctrl+B", keywords: "panel", run: () => handleToggleSidebar() },
       { id: "assistant", title: "Toggle AI Assistant", hint: "Ctrl+Alt+B", keywords: "chat", run: () => handleToggleChat() },
       { id: "chat-new", title: "Chat: New Session", keywords: "ai assistant conversation start", run: () => handleNewAgentSession() },
@@ -1440,12 +1762,27 @@ export default function App() {
       { id: "chat-clear", title: "Chat: Clear", keywords: "ai assistant reset empty", run: () => { setChatOpen(true); chatControllerRef.current?.clear(); } },
       { id: "chat-switch", title: "Chat: Switch Session\u2026", keywords: "ai assistant history sessions open", run: () => { setChatOpen(true); setChatHistoryReq((n) => n + 1); } },
       { id: "low-space", title: "Toggle Low-space Alerts", keywords: "disk monitor", run: () => setLowSpaceAlerts((v) => !v) },
+      { id: "shortcuts", title: "Keyboard Shortcuts\u2026", keywords: "keybindings rebind chord customize hotkey", run: () => setShortcutsOpen(true) },
+      { id: "appearance", title: "Appearance\u2026", keywords: "accent color theme font size scale ui zoom", run: () => setAppearanceOpen(true) },
+      {
+        id: "exclude-folder", title: "Exclude Selected Folder from Scans", hint: "Scan", keywords: "ignore skip filter",
+        run: () => {
+          const node = getActiveRef()?.getSidebarModel().selectedNode;
+          const path = node?.path;
+          if (!path) { toast.info("Select a folder in the tree first."); return; }
+          handleExcludePath(path);
+        },
+      },
+      {
+        id: "smart-refresh", title: "Smart Refresh (incremental)", hint: "Tree", keywords: "reload reuse cache changed mtime",
+        run: () => { void getActiveRef()?.smartRefresh(); },
+      },
       ...views.map((v) => ({
         id: `view:${v.id}`, title: `Go to ${v.label}`, hint: "View", keywords: "switch open",
         run: () => handleSelectView(v.id),
       })),
     ];
-  }, [getActiveRef, handleToggleTerminal, handleUndo, handleSaveSmartFolder, handleToggleSidebar, handleToggleChat, handleSelectView, handleNewAgentSession]);
+  }, [getActiveRef, handleToggleTerminal, handleUndo, handleSaveSmartFolder, handleToggleSidebar, handleToggleChat, handleSelectView, handleNewAgentSession, handleExcludePath]);
 
   return (
     <div className="vscode">
@@ -1500,6 +1837,13 @@ export default function App() {
                 dupes={dupes}
                 searchQuery={searchQuery}
                 onSearchQueryChange={setSearchQuery}
+                searchFilters={searchFilters}
+                onSearchFiltersChange={setSearchFilters}
+                searchGlobal={searchGlobal}
+                onSearchGlobalChange={setSearchGlobal}
+                searchHistory={searchHistory}
+                onClearSearchHistory={handleClearSearchHistory}
+                onSelectAllSearchResults={handleSelectAllSearchResults}
                 tagEntries={tagEntries}
                 activeTagFilter={activeTagFilter}
                 onSelectTag={handleSelectTag}
@@ -1507,6 +1851,9 @@ export default function App() {
                 onApplySmartFolder={handleApplySmartFolder}
                 onSaveSmartFolder={handleSaveSmartFolder}
                 onDeleteSmartFolder={handleDeleteSmartFolder}
+                excludePatterns={excludePatterns}
+                onRemoveExclude={handleRemoveExclude}
+                onClearExcludes={handleClearExcludes}
               />
             </div>
             <div className="resizer-x" onMouseDown={handleSidebarResize} />
@@ -1549,6 +1896,11 @@ export default function App() {
                     toolbarVisible={!group.toolbarHidden}
                     onToggleToolbar={() => handleToggleToolbar(group.id)}
                     canCloseLast={groups.length > 1}
+                    onRenameTab={handleRenameTab}
+                    onResetTabName={handleResetTabName}
+                    onSetTabColor={handleSetTabColor}
+                    onTogglePinTab={handleTogglePinTab}
+                    tabColors={TAB_COLORS}
                   />
                   {group.tabIds.map((tabId) => {
                     const tab = tabs.find((t) => t.id === tabId);
@@ -1564,6 +1916,7 @@ export default function App() {
                         onOpenTerminal={handleOpenTerminal}
                         activeView={activeView}
                         searchQuery={debouncedSearchQuery}
+                        searchFilters={searchFilters}
                         toolbarVisible={!group.toolbarHidden}
                         darkMode={darkMode}
                         panelOpen={panelOpen}
@@ -1588,6 +1941,9 @@ export default function App() {
                         visibleColumns={visibleColumns}
                         onVisibleColumnsChange={setVisibleColumns}
                         onDecimalsChange={setDecimals}
+                        folderDblClickExplorer={folderDblClickExplorer}
+                        heatTint={heatTint}
+                        showGrowthBadges={showGrowthBadges}
                         onClose3D={handleClose3D}
                         onToggleBookmark={handleToggleBookmark}
                         onCompress={handleCompressPaths}
@@ -1672,6 +2028,7 @@ export default function App() {
               showDetails={detailsOpen}
               onClosePreview={() => setPreviewOpen(false)}
               onCloseDetails={() => setDetailsOpen(false)}
+              onExclude={handleExcludePath}
             />
           </>
         )}
@@ -1744,6 +2101,26 @@ export default function App() {
         />
       )}
 
+      {/* #47 keyboard-shortcut editor + #50 appearance settings. */}
+      {shortcutsOpen && (
+        <ShortcutsDialog
+          bindings={shortcutBindings}
+          onApply={handleApplyShortcuts}
+          onClose={() => setShortcutsOpen(false)}
+        />
+      )}
+      {appearanceOpen && (
+        <AppearanceDialog
+          accent={accent}
+          scale={uiScale}
+          darkMode={darkMode}
+          onAccentChange={setAccent}
+          onScaleChange={setUiScale}
+          onToggleDark={handleToggleDark}
+          onClose={() => setAppearanceOpen(false)}
+        />
+      )}
+
       {/* App-wide overlays: themed confirm/prompt modals + the toast stack. */}
       <DialogProvider />
       <ToastProvider />
@@ -1762,8 +2139,11 @@ export default function App() {
 function WorkbenchSideBar({
   store, view, drives, specialFolders, bookmarkList, onRemoveBookmark, dupes,
   searchQuery, onSearchQueryChange,
+  searchFilters, onSearchFiltersChange, searchGlobal, onSearchGlobalChange,
+  searchHistory, onClearSearchHistory, onSelectAllSearchResults,
   tagEntries, activeTagFilter, onSelectTag,
   smartFolders, onApplySmartFolder, onSaveSmartFolder, onDeleteSmartFolder,
+  excludePatterns, onRemoveExclude, onClearExcludes,
 }: {
   store: WorkbenchStore;
   view: ViewId;
@@ -1774,6 +2154,13 @@ function WorkbenchSideBar({
   dupes: DuplicatesController;
   searchQuery: string;
   onSearchQueryChange: (q: string) => void;
+  searchFilters: SearchFilters;
+  onSearchFiltersChange: (f: SearchFilters) => void;
+  searchGlobal: boolean;
+  onSearchGlobalChange: (v: boolean) => void;
+  searchHistory: string[];
+  onClearSearchHistory: () => void;
+  onSelectAllSearchResults: (paths: string[]) => void;
   tagEntries: TagEntry[];
   activeTagFilter: string | null;
   onSelectTag: (tag: string | null) => void;
@@ -1781,6 +2168,9 @@ function WorkbenchSideBar({
   onApplySmartFolder: (sf: SmartFolder) => void;
   onSaveSmartFolder: () => void;
   onDeleteSmartFolder: (id: string) => void;
+  excludePatterns: string[];
+  onRemoveExclude: (pattern: string) => void;
+  onClearExcludes: () => void;
 }) {
   const { sidebar: m } = useWorkbench(store);
   return (
@@ -1791,6 +2181,13 @@ function WorkbenchSideBar({
       unit={m.unit}
       searchQuery={searchQuery}
       onSearchQueryChange={onSearchQueryChange}
+      searchFilters={searchFilters}
+      onSearchFiltersChange={onSearchFiltersChange}
+      searchGlobal={searchGlobal}
+      onSearchGlobalChange={onSearchGlobalChange}
+      searchHistory={searchHistory}
+      onClearSearchHistory={onClearSearchHistory}
+      onSelectAllSearchResults={onSelectAllSearchResults}
       tagEntries={tagEntries}
       activeTagFilter={activeTagFilter}
       onSelectTag={onSelectTag}
@@ -1824,6 +2221,9 @@ function WorkbenchSideBar({
       onScanPath={m.onScanPath}
       onRemoveBookmark={onRemoveBookmark}
       dupes={dupes}
+      excludePatterns={excludePatterns}
+      onRemoveExclude={onRemoveExclude}
+      onClearExcludes={onClearExcludes}
     />
   );
 }
@@ -1837,6 +2237,7 @@ function WorkbenchStatusBar({ store, onUndo }: { store: WorkbenchStore; onUndo: 
       errorMessage={snap.errorMessage}
       progressStore={snap.progressStore}
       visibleCount={snap.visibleCount}
+      selectionSummary={snap.selectionSummary}
       scanPath={snap.sidebar.scanPath}
       onUndo={onUndo}
     />
@@ -1844,7 +2245,7 @@ function WorkbenchStatusBar({ store, onUndo }: { store: WorkbenchStore; onUndo: 
 }
 
 function WorkbenchInspector({
-  store, width, bookmarks, showPreview, showDetails, onClosePreview, onCloseDetails,
+  store, width, bookmarks, showPreview, showDetails, onClosePreview, onCloseDetails, onExclude,
 }: {
   store: WorkbenchStore;
   width: number;
@@ -1853,6 +2254,7 @@ function WorkbenchInspector({
   showDetails: boolean;
   onClosePreview: () => void;
   onCloseDetails: () => void;
+  onExclude: (path: string) => void;
 }) {
   const { sidebar: m } = useWorkbench(store);
   return (
@@ -1870,6 +2272,7 @@ function WorkbenchInspector({
       onOpen={m.onOpen}
       onReveal={m.onReveal}
       onCopyPath={m.onCopyPath}
+      onExclude={onExclude}
     />
   );
 }

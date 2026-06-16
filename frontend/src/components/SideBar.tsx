@@ -9,7 +9,18 @@ import { Icon } from "./Icon";
 import { DuplicatesConfigPanel } from "./DuplicatesConfigPanel";
 import { DriveCapacityBar } from "./DriveCapacityBar";
 import type { DuplicatesController } from "../hooks/useDuplicates";
-import { searchNodes } from "../lib/search";
+import {
+  searchNodesAdvanced, compileNameMatcher, makeFilterPredicate, filtersActive,
+  EMPTY_FILTERS, FILE_CATEGORIES, AGE_PRESETS,
+  type SearchFilters, type FileCategory, type AgePreset,
+} from "../lib/search";
+import { getAllCached } from "../lib/scanCache";
+import { exportResults } from "../lib/exportRows";
+import { revealPath } from "../api/client";
+import { compareNodes } from "../hooks/useTreeState";
+import { loadPresets, addPreset, removePreset, type ScanPreset } from "../lib/scanPresets";
+import { promptDialog } from "../lib/dialogs";
+import { toast } from "../lib/toast";
 
 const VIEW_TITLES: Record<ViewId, string> = {
   explorer: "Explorer",
@@ -43,6 +54,16 @@ export interface SideBarProps {
   // searchQuery so the sidebar list and the main-area results table stay in sync.
   searchQuery: string;
   onSearchQueryChange: (q: string) => void;
+  // Inline filters + regex toggle (#31), cross-scan toggle (#32), history (#33),
+  // and select-all results (#35). All lifted in App so the pane's flat results
+  // table stays in sync with what this sidebar Search view shows.
+  searchFilters: SearchFilters;
+  onSearchFiltersChange: (f: SearchFilters) => void;
+  searchGlobal: boolean;
+  onSearchGlobalChange: (v: boolean) => void;
+  searchHistory: string[];
+  onClearSearchHistory: () => void;
+  onSelectAllSearchResults: (paths: string[]) => void;
   onNavigate: (id: number) => void;
   // explorer: scan controls
   scanPath: string;
@@ -85,6 +106,11 @@ export interface SideBarProps {
   onDeleteSmartFolder: (id: string) => void;
   // duplicates page controller (shared with the app-level results view)
   dupes?: DuplicatesController;
+  // exclude patterns (#12): the persisted scan-exclude list (parsed from the
+  // comma-separated AppSettings.exclude) plus remove/clear actions and a rescan.
+  excludePatterns?: string[];
+  onRemoveExclude?: (pattern: string) => void;
+  onClearExcludes?: () => void;
 }
 
 const SIDEBAR_FOLDER_ROW_H = 22; // keep in sync with .folder-row height in global.css
@@ -195,6 +221,144 @@ function SmartFoldersSection({
   );
 }
 
+// ── Quick scan presets (#13) ─────────────────────────────────────────────────
+// Compact one-click scan targets: "This PC", each fixed drive, the special
+// folders, and user-saved named presets (localStorage). The backend scan takes
+// a SINGLE root, so "This PC" is scoped to the primary/system drive (flagged in
+// its tooltip) and multi-path presets scan their first path.
+function QuickScanSection({
+  drives, specialFolders, scanPath, onOpenLocation,
+}: {
+  drives: DriveEntry[];
+  specialFolders: SpecialFolder[];
+  scanPath: string;
+  onOpenLocation: (path: string) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  const [presets, setPresets] = useState<ScanPreset[]>(() => loadPresets());
+
+  // "This PC" can't be a single backend root, so scan the primary/system drive.
+  const systemDrive = drives[0]?.root;
+
+  const saveCurrent = async () => {
+    const path = scanPath.trim();
+    if (!path) { toast.info("Enter or scan a folder first, then save it as a preset."); return; }
+    const name = await promptDialog({
+      title: "Save scan preset",
+      label: "Preset name",
+      initialValue: path.split(/[/\\]/).filter(Boolean).pop() || path,
+      placeholder: "My preset",
+      confirmLabel: "Save",
+    });
+    if (name == null) return;
+    setPresets(addPreset(name, [path]));
+    toast.success("Scan preset saved.");
+  };
+
+  return (
+    <>
+      <div className={`explorer-section-title${open ? "" : " collapsed"}`} onClick={() => setOpen((v) => !v)}>
+        <span className="chev"><Icon name="chevron-down" size={11} /></span> Quick Scan
+      </div>
+      {open && (
+        <div className="quickscan-list">
+          <div className="quickscan-targets">
+            {systemDrive && (
+              <button
+                className="quickscan-chip"
+                title={`Scan this PC — scoped to the system drive (${systemDrive}); multi-drive scanning isn't supported by the scan API.`}
+                onClick={() => onOpenLocation(systemDrive)}
+              >
+                <Icon name="hdd" size={12} /> This PC
+              </button>
+            )}
+            {drives.map((d) => (
+              <button
+                key={d.root}
+                className="quickscan-chip"
+                title={`Scan ${d.label || d.root}`}
+                onClick={() => onOpenLocation(d.root)}
+              >
+                <Icon name="hdd" size={12} /> {d.root.replace(/\\$/, "")}
+              </button>
+            ))}
+            {specialFolders.slice(0, 6).map((f) => (
+              <button
+                key={f.path}
+                className="quickscan-chip"
+                title={`Scan ${f.path}`}
+                onClick={() => onOpenLocation(f.path)}
+              >
+                <Icon name="folder" size={12} /> {f.label}
+              </button>
+            ))}
+          </div>
+          <button className="quickscan-save" title="Save the current scan path as a named preset" onClick={() => { void saveCurrent(); }}>
+            <Icon name="plus" size={11} /> Save current path…
+          </button>
+          {presets.map((p) => (
+            <div key={p.id} className="quickscan-preset">
+              <button
+                className="quickscan-preset-open"
+                title={`Scan ${p.paths.join(", ")}`}
+                onClick={() => onOpenLocation(p.paths[0])}
+              >
+                <Icon name="star-fill" size={11} />
+                <span className="quickscan-preset-name">{p.name}</span>
+              </button>
+              <button
+                className="quickscan-preset-del"
+                title="Delete preset"
+                onClick={() => setPresets(removePreset(p.id))}
+              >
+                <Icon name="x" size={10} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+// ── Excluded patterns list (#12) ─────────────────────────────────────────────
+// Shows the persisted scan-exclude patterns as removable chips, with a one-click
+// rescan so a change takes effect immediately. The list is empty (section hidden)
+// until the user excludes a folder/pattern.
+function ExcludesSection({
+  patterns, onRemove, onClear,
+}: {
+  patterns: string[];
+  onRemove: (pattern: string) => void;
+  onClear: () => void;
+}) {
+  const [open, setOpen] = useState(true);
+  if (patterns.length === 0) return null;
+  return (
+    <>
+      <div className={`explorer-section-title${open ? "" : " collapsed"}`} onClick={() => setOpen((v) => !v)}>
+        <span className="chev"><Icon name="chevron-down" size={11} /></span> Excluded From Scans
+      </div>
+      {open && (
+        <div className="excludes-list">
+          {patterns.map((p) => (
+            <div key={p} className="exclude-item" title={p}>
+              <Icon name="funnel" size={11} />
+              <span className="exclude-name">{p}</span>
+              <button className="exclude-del" title="Remove this exclude" onClick={() => onRemove(p)}>
+                <Icon name="x" size={10} />
+              </button>
+            </div>
+          ))}
+          <button className="excludes-clear" onClick={onClear}>
+            <Icon name="x" size={11} /> Clear all excludes
+          </button>
+        </div>
+      )}
+    </>
+  );
+}
+
 function ExplorerView(props: SideBarProps) {
   const [locOpen, setLocOpen] = useState(true);
   const [foldersOpen, setFoldersOpen] = useState(true);
@@ -271,7 +435,7 @@ function ExplorerView(props: SideBarProps) {
                 <span className="loc-ico"><Icon name="hdd" size={14} /></span>
                 <span className="loc-name">{d.label || d.root}</span>
               </div>
-              <DriveCapacityBar total={d.total} free={d.free} />
+              <DriveCapacityBar total={d.total} free={d.free} root={d.root} />
             </div>
           ))}
           {props.specialFolders.map((f) => (
@@ -288,6 +452,19 @@ function ExplorerView(props: SideBarProps) {
           ))}
         </div>
       )}
+
+      <QuickScanSection
+        drives={props.drives}
+        specialFolders={props.specialFolders}
+        scanPath={props.scanPath}
+        onOpenLocation={props.onOpenLocation}
+      />
+
+      <ExcludesSection
+        patterns={props.excludePatterns ?? []}
+        onRemove={(p) => props.onRemoveExclude?.(p)}
+        onClear={() => props.onClearExcludes?.()}
+      />
 
       {hasScan && (
         <>
@@ -353,26 +530,209 @@ function ExplorerView(props: SideBarProps) {
   );
 }
 
+const SEARCH_RESULT_CAP = 300;
+
+// Bytes for a size value entered in a unit (used by the size filter inputs).
+const SIZE_UNIT_BYTES: Record<string, number> = { KB: 1024, MB: 1024 * 1024, GB: 1024 * 1024 * 1024 };
+
+// One flat search hit, tagged with the scan ROOT it came from and whether that
+// root is the focused pane's current scan (cross-scan / global search, #32).
+interface SearchHit {
+  node: NodeRecord;
+  root: string;
+  isCurrent: boolean;
+}
+
+function rootLabel(root: string): string {
+  return root.split(/[/\\]/).filter(Boolean).pop() || root;
+}
+
+function normRoot(p: string): string {
+  return p.replace(/\\/g, "/").toLowerCase().replace(/\/$/, "");
+}
+
+// ── Inline filters panel (#31) ───────────────────────────────────────────────
+function SearchFiltersPanel({
+  filters, onChange,
+}: {
+  filters: SearchFilters;
+  onChange: (f: SearchFilters) => void;
+}) {
+  const [sizeUnit, setSizeUnit] = useState<keyof typeof SIZE_UNIT_BYTES>("MB");
+  const set = (patch: Partial<SearchFilters>) => onChange({ ...filters, ...patch });
+
+  const bytesToUnit = (b?: number) => (b == null ? "" : String(+(b / SIZE_UNIT_BYTES[sizeUnit]).toFixed(3)));
+  const unitToBytes = (v: string): number | undefined => {
+    const n = parseFloat(v);
+    return Number.isFinite(n) && v.trim() !== "" ? Math.round(n * SIZE_UNIT_BYTES[sizeUnit]) : undefined;
+  };
+  // <input type=date> wants yyyy-mm-dd; convert to/from epoch ms.
+  const msToDate = (ms?: number) => (ms == null ? "" : new Date(ms).toISOString().slice(0, 10));
+  const dateToMs = (v: string, endOfDay: boolean): number | undefined => {
+    if (!v) return undefined;
+    const d = new Date(v + (endOfDay ? "T23:59:59.999" : "T00:00:00"));
+    return Number.isNaN(d.getTime()) ? undefined : d.getTime();
+  };
+
+  return (
+    <div className="search-filters">
+      <div className="search-filter-row">
+        <label className="search-filter-label">Size</label>
+        <input
+          type="number" min="0" inputMode="decimal" placeholder="min"
+          className="search-filter-num"
+          value={bytesToUnit(filters.minSize)}
+          onChange={(e) => set({ minSize: unitToBytes(e.target.value) })}
+        />
+        <span className="search-filter-dash">–</span>
+        <input
+          type="number" min="0" inputMode="decimal" placeholder="max"
+          className="search-filter-num"
+          value={bytesToUnit(filters.maxSize)}
+          onChange={(e) => set({ maxSize: unitToBytes(e.target.value) })}
+        />
+        <select value={sizeUnit} onChange={(e) => setSizeUnit(e.target.value as keyof typeof SIZE_UNIT_BYTES)}>
+          <option value="KB">KB</option>
+          <option value="MB">MB</option>
+          <option value="GB">GB</option>
+        </select>
+      </div>
+
+      <div className="search-filter-row">
+        <label className="search-filter-label">Modified</label>
+        <select
+          value={filters.agePreset}
+          onChange={(e) => set({ agePreset: e.target.value as AgePreset })}
+        >
+          {AGE_PRESETS.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
+        </select>
+      </div>
+
+      <div className="search-filter-row">
+        <label className="search-filter-label">After</label>
+        <input
+          type="date" className="search-filter-date"
+          value={msToDate(filters.modifiedAfter)}
+          onChange={(e) => set({ modifiedAfter: dateToMs(e.target.value, false) })}
+        />
+        <label className="search-filter-label">Before</label>
+        <input
+          type="date" className="search-filter-date"
+          value={msToDate(filters.modifiedBefore)}
+          onChange={(e) => set({ modifiedBefore: dateToMs(e.target.value, true) })}
+        />
+      </div>
+
+      <div className="search-filter-row">
+        <label className="search-filter-label">Type</label>
+        <select
+          value={filters.category}
+          onChange={(e) => set({ category: e.target.value as FileCategory })}
+        >
+          {FILE_CATEGORIES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
+        </select>
+        <input
+          type="text" spellCheck={false} placeholder="ext: jpg, png…"
+          className="search-filter-ext"
+          value={filters.ext}
+          onChange={(e) => set({ ext: e.target.value })}
+        />
+      </div>
+
+      {filtersActive(filters) && (
+        <button
+          className="search-filter-reset"
+          onClick={() => onChange({ ...EMPTY_FILTERS, regex: filters.regex })}
+        >
+          <Icon name="x" size={11} /> Clear filters
+        </button>
+      )}
+    </div>
+  );
+}
+
 function SearchView(props: SideBarProps) {
   const [query, setQuery] = useState("");
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const hasScan = props.data !== null;
+  const { searchFilters, searchGlobal } = props;
 
   // Input is controlled by App's lifted searchQuery; debounce a local copy so
   // the shared matcher doesn't re-walk the node map on every keystroke.
   useEffect(() => {
-    const t = setTimeout(() => setQuery(props.searchQuery.trim().toLowerCase()), 180);
+    const t = setTimeout(() => setQuery(props.searchQuery.trim()), 180);
     return () => clearTimeout(t);
   }, [props.searchQuery]);
 
-  // Shared name+path matcher, sorted largest-first to mirror the main table.
-  const results = useMemo(
-    () => searchNodes(props.nodeById, query, "size", -1, 300),
-    [query, props.nodeById],
+  const matcher = useMemo(
+    () => compileNameMatcher(query, searchFilters.regex),
+    [query, searchFilters.regex],
   );
+  const regexInvalid = searchFilters.regex && matcher.invalid;
+  const anyFilter = filtersActive(searchFilters);
+  const active = query.length >= 2 || anyFilter;
+
+  // Local (current-scan) results via the shared advanced matcher, largest-first
+  // to mirror the main table. Skipped when global search is on (handled below).
+  const localResults = useMemo(
+    () => (searchGlobal ? [] : searchNodesAdvanced(props.nodeById, query, searchFilters, "size", -1, SEARCH_RESULT_CAP)),
+    [searchGlobal, props.nodeById, query, searchFilters],
+  );
+
+  // Cross-scan / global results (#32): match across EVERY cached scan plus the
+  // focused pane's live tree, tagging each hit with its root. SAFE scope — this
+  // searches only already-scanned trees (no filesystem-wide index).
+  const globalResults = useMemo<SearchHit[]>(() => {
+    if (!searchGlobal || (!active || matcher.invalid)) return [];
+    const predicate = makeFilterPredicate(searchFilters);
+    const nameMatchAll = query.length < 2;
+    const currentRoot = props.data?.rootPath ?? "";
+    const seenRoots = new Set<string>();
+    const hits: SearchHit[] = [];
+
+    const consider = (node: NodeRecord, root: string, isCurrent: boolean) => {
+      if (node.id < 0) return;
+      if (!nameMatchAll && !matcher.test(node.name, node.path || "")) return;
+      if (!predicate(node)) return;
+      hits.push({ node, root, isCurrent });
+    };
+
+    // Focused pane's live tree first.
+    if (currentRoot) seenRoots.add(normRoot(currentRoot));
+    for (const node of props.nodeById.values()) consider(node, currentRoot, true);
+
+    // Then every other cached scan (skip the one we already walked live).
+    for (const { path, result } of getAllCached()) {
+      const root = result.rootPath || path;
+      if (seenRoots.has(normRoot(root))) continue;
+      seenRoots.add(normRoot(root));
+      for (const node of result.nodes) consider(node, root, false);
+    }
+
+    hits.sort((a, b) => compareNodes(a.node, b.node, "size", -1));
+    return hits.slice(0, SEARCH_RESULT_CAP);
+  }, [searchGlobal, active, matcher, searchFilters, query, props.nodeById, props.data]);
+
+  const results: SearchHit[] = searchGlobal
+    ? globalResults
+    : localResults.map((node) => ({ node, root: props.data?.rootPath ?? "", isCurrent: true }));
+
+  const allPaths = useMemo(() => results.map((r) => r.node.path).filter(Boolean), [results]);
+
+  const handleClickResult = (hit: SearchHit) => {
+    if (hit.isCurrent) {
+      props.onNavigate(hit.node.id);
+    } else {
+      // Foreign scan: ids aren't valid in the focused pane, so reveal the file
+      // in File Explorer (always correct) — see FLAG in the search header note.
+      revealPath(hit.node.path).catch(() => {});
+    }
+  };
 
   return (
     <div className="sidebar-content search-view">
-      <div className="search-box">
+      <div className={`search-box${regexInvalid ? " invalid" : ""}`}>
         <span className="search-box-ico"><Icon name="search" size={13} /></span>
         <input
           autoFocus
@@ -381,43 +741,107 @@ function SearchView(props: SideBarProps) {
           placeholder={hasScan ? "Search files and folders…" : "Run a scan first…"}
           onChange={(e) => props.onSearchQueryChange(e.target.value)}
         />
-        {props.searchQuery && (
-          <button className="search-save" title="Save this search as a smart folder" onClick={props.onSaveSmartFolder}>
-            <Icon name="funnel" size={12} />
-          </button>
+        <button
+          className={`search-tool${searchFilters.regex ? " active" : ""}${regexInvalid ? " invalid" : ""}`}
+          title={regexInvalid ? "Invalid regular expression" : "Match name as a regular expression"}
+          onClick={() => props.onSearchFiltersChange({ ...searchFilters, regex: !searchFilters.regex })}
+        >.*</button>
+        <button
+          className={`search-tool${anyFilter ? " active" : ""}${filtersOpen ? " open" : ""}`}
+          title="Filters (size, date, type)"
+          onClick={() => setFiltersOpen((v) => !v)}
+        ><Icon name="funnel" size={12} /></button>
+        {props.searchHistory.length > 0 && (
+          <button
+            className={`search-tool${historyOpen ? " open" : ""}`}
+            title="Recent searches"
+            onClick={() => setHistoryOpen((v) => !v)}
+          ><Icon name="chevron-down" size={12} /></button>
         )}
         {props.searchQuery && (
-          <button className="search-clear" title="Clear" onClick={() => props.onSearchQueryChange("")}>
+          <button className="search-tool" title="Clear" onClick={() => props.onSearchQueryChange("")}>
             <Icon name="x" size={12} />
           </button>
         )}
       </div>
 
-      {query.length >= 2 && (
+      {historyOpen && props.searchHistory.length > 0 && (
+        <div className="search-history">
+          {props.searchHistory.map((q) => (
+            <button
+              key={q}
+              className="search-history-item"
+              title={`Search “${q}”`}
+              onClick={() => { props.onSearchQueryChange(q); setHistoryOpen(false); }}
+            >
+              <Icon name="search" size={11} />
+              <span className="search-history-q">{q}</span>
+            </button>
+          ))}
+          <button
+            className="search-history-clear"
+            onClick={() => { props.onClearSearchHistory(); setHistoryOpen(false); }}
+          >
+            <Icon name="x" size={11} /> Clear history
+          </button>
+        </div>
+      )}
+
+      {filtersOpen && (
+        <SearchFiltersPanel filters={searchFilters} onChange={props.onSearchFiltersChange} />
+      )}
+
+      <div className="search-options">
+        <label className="search-global-toggle" title="Search across every scan cached this session (multiple roots), not just the current one. This is not a filesystem-wide index.">
+          <input
+            type="checkbox"
+            checked={searchGlobal}
+            onChange={(e) => props.onSearchGlobalChange(e.target.checked)}
+          />
+          Search all cached scans
+        </label>
+        {props.searchQuery && (
+          <button className="search-link" title="Save this search as a smart folder" onClick={props.onSaveSmartFolder}>
+            Save
+          </button>
+        )}
+      </div>
+
+      {active && (
         <div className="search-count">
-          {results.length}{results.length >= 300 ? "+" : ""} result{results.length === 1 ? "" : "s"}
+          <span>{results.length}{results.length >= SEARCH_RESULT_CAP ? "+" : ""} result{results.length === 1 ? "" : "s"}</span>
+          {results.length > 0 && (
+            <span className="search-count-actions">
+              <button title="Select all results in the focused pane" onClick={() => props.onSelectAllSearchResults(allPaths)}>Select all</button>
+              <button title="Export results to CSV" onClick={() => exportResults(results.map((r) => r.node), "csv")}>CSV</button>
+              <button title="Export results to JSON" onClick={() => exportResults(results.map((r) => r.node), "json")}>JSON</button>
+            </span>
+          )}
         </div>
       )}
 
       <div className="search-results">
-        {results.map((node) => (
+        {results.map((hit, i) => (
           <button
-            key={node.id}
+            key={`${hit.root}:${hit.node.id}:${i}`}
             className="search-result"
-            title={node.path}
-            onClick={() => props.onNavigate(node.id)}
+            title={hit.isCurrent ? hit.node.path : `${hit.node.path}\n(in ${hit.root} — opens in File Explorer)`}
+            onClick={() => handleClickResult(hit)}
           >
-            <FileIcon ext={node.extension ?? ""} isDir={node.dir} isBundle={false} />
-            <span className="sr-name">{node.name}</span>
-            <span className="sr-size">{fmtSize(node.size)}</span>
-            <span className="sr-path">{node.path}</span>
+            <FileIcon ext={hit.node.extension ?? ""} isDir={hit.node.dir} isBundle={false} />
+            <span className="sr-name">{hit.node.name}</span>
+            <span className="sr-size">{fmtSize(hit.node.size)}</span>
+            <span className="sr-path">{hit.node.path}</span>
+            {searchGlobal && (
+              <span className={`sr-root${hit.isCurrent ? " current" : ""}`} title={hit.root}>{rootLabel(hit.root)}</span>
+            )}
           </button>
         ))}
-        {query.length >= 2 && results.length === 0 && (
-          <div className="empty">No matches{hasScan ? "" : " — run a scan first"}.</div>
+        {active && results.length === 0 && (
+          <div className="empty">{regexInvalid ? "Invalid regular expression." : `No matches${hasScan || searchGlobal ? "" : " — run a scan first"}.`}</div>
         )}
-        {query.length < 2 && (
-          <div className="empty">Type at least 2 characters to search the current scan.</div>
+        {!active && (
+          <div className="empty">Type at least 2 characters{searchGlobal ? "" : " to search the current scan"}, or set a filter.</div>
         )}
       </div>
     </div>

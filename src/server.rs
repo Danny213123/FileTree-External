@@ -416,6 +416,68 @@ fn path_within_scan_root(state: &AppState, requested: &Path) -> bool {
     classify_path_against_roots(&roots, requested) == PathScanStatus::WithinRoot
 }
 
+/// Shared body builder for the metadata-mutation routes (#43:
+/// `/api/set-attributes`, `/api/set-times`). For each path: gate it to a scanned
+/// root, run `apply`, audit the outcome, invalidate the parent's scan cache on
+/// success, and emit one `{path, ok, error?}` result. Returns the full
+/// `{"results":[…]}` JSON body.
+fn set_metadata_results<F>(
+    state: &AppState,
+    paths: &[String],
+    op: &'static str,
+    apply: F,
+) -> String
+where
+    F: Fn(&Path) -> std::io::Result<()>,
+{
+    let mut out = String::from("{\"results\":[");
+    for (i, p) in paths.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"path\":");
+        push_json_string(&mut out, p);
+        let pb = PathBuf::from(p);
+        if !path_within_scan_root(state, &pb) {
+            out.push_str(",\"ok\":false,\"error\":");
+            push_json_string(&mut out, "Path is outside the scanned directories");
+            out.push('}');
+            continue;
+        }
+        let result = apply(&pb);
+        let err_text = result
+            .as_ref()
+            .err()
+            .map(|e| crate::preflight::describe_fs_error(e, &pb));
+        crate::audit::record(crate::audit::Entry {
+            op,
+            src: std::slice::from_ref(p),
+            error: err_text.as_deref(),
+            by: "server",
+            ..Default::default()
+        });
+        match result {
+            Ok(_) => {
+                if let Some(parent) = pb.parent() {
+                    state
+                        .scan_cache
+                        .write()
+                        .expect("scan_cache lock")
+                        .invalidate(&parent.to_string_lossy());
+                }
+                out.push_str(",\"ok\":true}");
+            }
+            Err(_) => {
+                out.push_str(",\"ok\":false,\"error\":");
+                push_json_string(&mut out, err_text.as_deref().unwrap_or("failed"));
+                out.push('}');
+            }
+        }
+    }
+    out.push_str("]}");
+    out
+}
+
 /// Classify `requested` for the COMPRESS routes: accepted when it resolves under
 /// `scan_roots` ∪ `compress_roots`. Keeps the compress allowlist separate from
 /// the content-read confinement.
@@ -777,6 +839,207 @@ fn extract_rename_ops(body: &str) -> Vec<(String, String)> {
             }
         }
     }
+    out
+}
+
+/// Parse the #26 hard/symlink payload `{"pairs":[{"original","link"}, ...]}` into
+/// `(original, link)` pairs. `original` is the kept reference; `link` is the
+/// duplicate path to be replaced by a link. Entries missing either field, or
+/// with an empty value, are dropped.
+fn extract_link_pairs(body: &str) -> Vec<(String, String)> {
+    let Some(root) = crate::json::parse(body) else {
+        return Vec::new();
+    };
+    let Some(arr) = root.get("pairs").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let original = v.get("original").and_then(|x| x.as_str());
+        let link = v.get("link").and_then(|x| x.as_str());
+        if let (Some(o), Some(l)) = (original, link) {
+            if !o.is_empty() && !l.is_empty() {
+                out.push((o.to_string(), l.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Drive letter of a path's canonicalized location (lowercased), e.g. `c`. Used
+/// to require same-volume for hard links. `None` when it can't be determined.
+fn volume_letter(p: &Path) -> Option<char> {
+    let canon = fs::canonicalize(p).ok()?;
+    let s = canon.to_string_lossy();
+    let chars: Vec<char> = s.chars().collect();
+    for i in 0..chars.len().saturating_sub(1) {
+        if chars[i].is_ascii_alphabetic() && chars[i + 1] == ':' {
+            return Some(chars[i].to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// Create a link at `dest` pointing to `original`: a hard link by default, or a
+/// file symbolic link when `symlink` is true.
+#[cfg(windows)]
+fn make_link(original: &Path, dest: &Path, symlink: bool) -> std::io::Result<()> {
+    if symlink {
+        std::os::windows::fs::symlink_file(original, dest)
+    } else {
+        fs::hard_link(original, dest)
+    }
+}
+
+#[cfg(not(windows))]
+fn make_link(original: &Path, dest: &Path, symlink: bool) -> std::io::Result<()> {
+    if symlink {
+        std::os::unix::fs::symlink(original, dest)
+    } else {
+        fs::hard_link(original, dest)
+    }
+}
+
+/// Replace the duplicate at `link` with a hard/symlink to `original` (#26).
+///
+/// Conservative + atomic-ish: validate both paths (under a scanned root, both
+/// regular files, not the same file, same volume for a hard link), create the
+/// link at a temp name beside the duplicate, verify it, recycle the duplicate
+/// (recoverable), then move the temp link into the duplicate's place. On any
+/// failure the temp link is cleaned up and a clear message is returned.
+fn link_duplicate(
+    state: &AppState,
+    original: &str,
+    link: &str,
+    symlink: bool,
+) -> Result<(), String> {
+    let orig = PathBuf::from(original);
+    let lnk = PathBuf::from(link);
+
+    if !path_within_scan_root(state, &orig) {
+        return Err("original is outside the scanned directories".to_string());
+    }
+    if !path_within_scan_root(state, &lnk) {
+        return Err("duplicate is outside the scanned directories".to_string());
+    }
+    let om = fs::symlink_metadata(&orig).map_err(|e| format!("original unreadable: {e}"))?;
+    if !om.is_file() {
+        return Err("original is not a regular file".to_string());
+    }
+    let lm = fs::symlink_metadata(&lnk).map_err(|e| format!("duplicate unreadable: {e}"))?;
+    if !lm.is_file() {
+        return Err("duplicate is not a regular file".to_string());
+    }
+    if let (Ok(a), Ok(b)) = (fs::canonicalize(&orig), fs::canonicalize(&lnk)) {
+        if a == b {
+            return Err("original and duplicate are the same file".to_string());
+        }
+    }
+    if !symlink {
+        match (volume_letter(&orig), volume_letter(&lnk)) {
+            (Some(a), Some(b)) if a == b => {}
+            _ => {
+                return Err(
+                    "hard link requires the same volume — use a symlink across drives".to_string(),
+                )
+            }
+        }
+    }
+
+    let parent = lnk
+        .parent()
+        .ok_or_else(|| "duplicate has no parent directory".to_string())?;
+    let pid = std::process::id();
+    let mut tmp = parent.join(format!(".filetree-link-{pid}.tmp"));
+    let mut n = 0u32;
+    while tmp.exists() {
+        n += 1;
+        tmp = parent.join(format!(".filetree-link-{pid}-{n}.tmp"));
+    }
+
+    make_link(&orig, &tmp, symlink).map_err(|e| format!("could not create link: {e}"))?;
+    if !tmp.exists() {
+        let _ = fs::remove_file(&tmp);
+        return Err("link verification failed".to_string());
+    }
+
+    if let Err(e) = crate::recycle::recycle_path(&lnk) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "could not recycle the duplicate: {}",
+            crate::preflight::describe_fs_error(&e, &lnk)
+        ));
+    }
+    if let Err(e) = fs::rename(&tmp, &lnk) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "link created but could not replace the duplicate: {e}"
+        ));
+    }
+
+    let link_owned = link.to_string();
+    let orig_owned = original.to_string();
+    crate::audit::record(crate::audit::Entry {
+        op: if symlink { "symlink" } else { "hardlink" },
+        disposition: "recycle",
+        src: std::slice::from_ref(&link_owned),
+        dst: &orig_owned,
+        by: "server",
+        ..Default::default()
+    });
+    Ok(())
+}
+
+/// Build the `GET /api/audit-recycled` response (#30): the paths FileTree itself
+/// sent to the Recycle Bin, newest-first, parsed from the append-only audit log.
+/// Only successful recycle-disposition deletes are listed (not permanent deletes
+/// or links). Never throws — an unreadable/absent log yields an empty list.
+fn audit_recycled_json() -> String {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    if let Some(p) = crate::audit::log_file_path() {
+        if let Ok(content) = fs::read_to_string(&p) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let Some(v) = crate::json::parse(line) else {
+                    continue;
+                };
+                let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("");
+                let disp = v.get("disposition").and_then(|x| x.as_str()).unwrap_or("");
+                let result = v.get("result").and_then(|x| x.as_str()).unwrap_or("");
+                if result != "ok" || disp != "recycle" {
+                    continue;
+                }
+                if op != "delete" && op != "recycle" {
+                    continue;
+                }
+                let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                if let Some(arr) = v.get("src").and_then(|x| x.as_array()) {
+                    for s in arr {
+                        if let Some(sp) = s.as_str() {
+                            entries.push((ts.clone(), sp.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    entries.reverse(); // newest-first
+    entries.truncate(500);
+    let mut out = String::from("{\"items\":[");
+    for (i, (ts, path)) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"ts\":");
+        push_json_string(&mut out, ts);
+        out.push_str(",\"path\":");
+        push_json_string(&mut out, path);
+        out.push('}');
+    }
+    out.push_str("]}");
     out
 }
 
@@ -1222,7 +1485,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         // appdata-writing snapshot save/delete — all POST-only + session-token
         // gated like every other mutation route.
         "/api/recycle-items",
+        // Replace duplicate copies with a hard/symlink to the kept original
+        // (deletes the duplicate, creates the link): POST-only + token-gated.
+        "/api/hardlink",
         "/api/bulk-rename",
+        // #43: batch attribute + timestamp editing. Both only modify metadata of
+        // an existing path (gated to a scanned root, audited) — POST-only +
+        // session-token like every other mutation.
+        "/api/set-attributes",
+        "/api/set-times",
         "/api/compress",
         "/api/extract",
         "/api/snapshots-save",
@@ -3123,6 +3394,53 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             out.push_str("]}");
             respond_json(&mut stream, 200, "OK", &out)
         }
+        // #26: replace checked duplicate copies with a hard link (same volume) or
+        // a symbolic link to the kept original — reclaims the duplicate's bytes
+        // without losing the file. Each pair is {original (the kept reference),
+        // link (the duplicate path to replace)}. The duplicate is recycled
+        // (recoverable) and a fresh link is moved into its place. Both paths must
+        // sit under a scanned root (same gating as every other write op).
+        "/api/hardlink" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let pairs = extract_link_pairs(&body_str);
+            if pairs.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing pairs");
+            }
+            let symlink = extract_json_str(&body_str, "mode")
+                .map(|m| m.eq_ignore_ascii_case("symlink"))
+                .unwrap_or(false);
+            let mut errors: Vec<String> = Vec::new();
+            for (original, link) in &pairs {
+                match link_duplicate(&state, original, link, symlink) {
+                    Ok(_) => {
+                        let lp = PathBuf::from(link);
+                        if let Some(parent) = lp.parent() {
+                            state
+                                .scan_cache
+                                .write()
+                                .expect("scan_cache lock")
+                                .invalidate(&parent.to_string_lossy());
+                        }
+                    }
+                    Err(e) => errors.push(format!("{link}: {e}")),
+                }
+            }
+            let mut out = String::from("{\"ok\":");
+            out.push_str(if errors.is_empty() { "true" } else { "false" });
+            out.push_str(",\"errors\":[");
+            for (i, e) in errors.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(&mut out, e);
+            }
+            out.push_str("]}");
+            respond_json(&mut stream, 200, "OK", &out)
+        }
+        // #30: list items FileTree itself sent to the Recycle Bin (parsed from the
+        // append-only audit log). Read-only; restore happens via the existing
+        // native Recycle Bin restore path on the client.
+        "/api/audit-recycled" => respond_json(&mut stream, 200, "OK", &audit_recycled_json()),
         // F3: batch rename within each item's own directory (two-phase via temp
         // names so a→b / b→a swaps don't transiently collide). Collisions with
         // files outside the batch are rejected.
@@ -3151,6 +3469,57 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             }
             out.push_str("]}");
             respond_json(&mut stream, 200, "OK", &out)
+        }
+        // #43: batch attribute editor. Toggle read-only / hidden on a set of
+        // paths. Each path must sit under a scanned root (same gating as every
+        // other write op); per-path outcomes are echoed back and audited.
+        // Body: {"paths":[…], "readonly":bool?, "hidden":bool?}. A missing flag
+        // leaves that attribute unchanged.
+        "/api/set-attributes" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let paths = extract_json_str_array(&body_str, "paths");
+            if paths.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing paths");
+            }
+            let parsed = crate::json::parse(&body_str);
+            let readonly = parsed.as_ref().and_then(|v| v.get("readonly")).and_then(|v| v.as_bool());
+            let hidden = parsed.as_ref().and_then(|v| v.get("hidden")).and_then(|v| v.as_bool());
+            if readonly.is_none() && hidden.is_none() {
+                return respond_text(&mut stream, 400, "Bad request", "Nothing to change");
+            }
+            let body = set_metadata_results(&state, &paths, "set-attributes", |pb| {
+                crate::fileattr::set_attributes(pb, readonly, hidden)
+            });
+            respond_json(&mut stream, 200, "OK", &body)
+        }
+        // #43: batch timestamp editor. Set created / modified / accessed times
+        // (epoch ms; a missing field is left unchanged). Same gating + audit as
+        // /api/set-attributes. Body: {"paths":[…], "modified":ms?, "created":ms?,
+        // "accessed":ms?}.
+        "/api/set-times" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let paths = extract_json_str_array(&body_str, "paths");
+            if paths.is_empty() {
+                return respond_text(&mut stream, 400, "Bad request", "Missing paths");
+            }
+            let parsed = crate::json::parse(&body_str);
+            let read_ms = |key: &str| -> Option<i64> {
+                parsed
+                    .as_ref()
+                    .and_then(|v| v.get(key))
+                    .and_then(|v| v.as_f64())
+                    .map(|n| n as i64)
+            };
+            let created = read_ms("created");
+            let modified = read_ms("modified");
+            let accessed = read_ms("accessed");
+            if created.is_none() && modified.is_none() && accessed.is_none() {
+                return respond_text(&mut stream, 400, "Bad request", "Nothing to change");
+            }
+            let body = set_metadata_results(&state, &paths, "set-times", |pb| {
+                crate::fileattr::set_times(pb, created, modified, accessed)
+            });
+            respond_json(&mut stream, 200, "OK", &body)
         }
         // F4: multi-tag + color labels store, dual-mode like /api/bookmarks.
         "/api/tags" => {
@@ -3343,6 +3712,27 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         }
                     }
                 }
+                // "Output to folder" destination (optional). When present and a
+                // real directory, register it as an allowed compress root (so the
+                // worker may write into it) and thread it into the job. An empty
+                // / absent value keeps the historical in-place behavior.
+                let output_dir = extract_json_str(&body_str, "outputDir")
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default();
+                if !output_dir.is_empty() {
+                    let candidate = Path::new(&output_dir);
+                    if !candidate.is_dir() {
+                        let mut body = String::from("{\"error\":");
+                        push_json_string(
+                            &mut body,
+                            &format!("Output folder does not exist: {output_dir}"),
+                        );
+                        body.push('}');
+                        return respond_json(&mut stream, 400, "Bad request", &body);
+                    }
+                    register_compress_root(&state, candidate);
+                }
                 let opts = crate::compress_job::CompressOptions {
                     original_action,
                     tag_filename: tag,
@@ -3354,6 +3744,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     min_size_bytes,
                     custom_max_height,
                     custom_quality,
+                    output_dir,
                 };
                 let job = crate::compress_job::create_job(&paths, &preset, &opts);
                 let id = job.id.clone();
@@ -3717,6 +4108,21 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     409,
                     "Conflict",
                     "{\"error\":\"No scan is loaded for this path — scan it first, then save a snapshot.\"}",
+                ),
+            }
+        }
+        // #39: return one saved snapshot's raw JSON (incl. its dir size map) so
+        // the Explorer can diff the latest snapshot against the live tree
+        // client-side. Read-only GET (the id is validated in `raw_json`).
+        "/api/snapshots-get" => {
+            let id = query.get("id").cloned().unwrap_or_default();
+            match crate::snapshots::raw_json(&id) {
+                Some(body) => respond_json(&mut stream, 200, "OK", &body),
+                None => respond_json(
+                    &mut stream,
+                    404,
+                    "Not found",
+                    "{\"error\":\"Snapshot not found\"}",
                 ),
             }
         }

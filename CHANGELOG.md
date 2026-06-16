@@ -4,6 +4,29 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.14] - 2026-06-15
+
+A large quality-of-life release implementing the full QoL backlog across selection/table UX, the Compress page, scanning, duplicates & cleanup, search, snapshots/reports, file operations, and app-wide polish. Frontend-led with safe, gated backend additions.
+
+### Added
+
+- **Selection & table UX**: live selection summary (count + total size) in the status bar; copy-selection-as-table; quick-filter chips; open in new split/tab; size heat-tint; type-to-find; range/Ctrl/Shift multi-select across tables; recent-path dropdown in the breadcrumb.
+- **Compress page**: drag-and-drop to enqueue, estimated-savings preview, job queueing, per-file retry, last-used preset remembered per file type, in-place vs output-folder selection (collision-safe output naming), and a completion toast.
+- **Scanning & freshness**: scan presets, exclude-pattern list, smart refresh, and freshness indicators.
+- **Duplicates & cleanup**: duplicate detection with auto-pick strategies, group preview, hardlink/symlink dedupe; safe-clean cleanup mode with dry-run totals and empty-folder finder; partial Recycle Bin viewer for FileTree's own deletes with restore.
+- **Search & filtering**: inline filters, regex support, search history dropdown, and cross-scan search.
+- **Snapshots, reports & insights**: snapshot auto-save, growth-trend charts, folder diffs, treemap image export, change badges, and scheduled snapshot alerts.
+- **File operations**: conflict dialog, pausable/resumable transfer queue, move/copy with recent destinations, batch attribute/timestamp editing, and Send-to commands.
+- **App-wide polish**: full shortcuts editor (conflict-warned), activity/notification center with unread badge, tab QoL (rename, color labels, pin), and theme customization (accent presets/custom color + 90–130% UI scale).
+
+### Changed
+
+- Unified open and native right-click behavior, and visual tokens, across the app's tables.
+
+### Notes / limitations
+
+- Transfer pause/resume is between files (in-flight native moves/copies can't be paused mid-file); Send-to "mail" can't auto-attach (zip-then-attach workflow); incremental scanning uses a pragmatic smart-refresh; Recycle Bin viewer is scoped to FileTree's own deletes; shortcut conflicts are warned (not blocked); tab crash-restore collapses to a single pane on the localStorage fallback path; font scaling uses body `zoom`.
+
 ## [1.13.13] - 2026-06-15
 
 Lets you compress whole folders (and multi-selections of them) from the table's right-click menu. Frontend-only.

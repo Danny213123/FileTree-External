@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { Icon } from "./Icon";
 
 interface WorkspaceTab {
@@ -6,6 +6,10 @@ interface WorkspaceTab {
   label: string;
   path: string;
   scanning: boolean;
+  /** #49 color label (hex) shown as an accent on the tab. */
+  color?: string;
+  /** #49 pinned tabs sort first and render compact/marked. */
+  pinned?: boolean;
 }
 
 interface TabBarProps {
@@ -31,12 +35,41 @@ interface TabBarProps {
   onToggleToolbar?: () => void;
   /** Allow closing the very last tab in this group (closes the pane). */
   canCloseLast?: boolean;
+  // #49 Tab QoL actions (context menu + double-click rename).
+  onRenameTab?: (id: string) => void;
+  onResetTabName?: (id: string) => void;
+  onSetTabColor?: (id: string, color: string) => void;
+  onTogglePinTab?: (id: string) => void;
+  /** Palette of color labels offered in the context menu. */
+  tabColors?: string[];
 }
 
-export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, onMoveTab, onFolderDrop, onSplit, toolbarVisible = true, onToggleToolbar, canCloseLast }: TabBarProps) {
+interface TabMenuState { id: string; x: number; y: number; }
+
+export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, onMoveTab, onFolderDrop, onSplit, toolbarVisible = true, onToggleToolbar, canCloseLast, onRenameTab, onResetTabName, onSetTabColor, onTogglePinTab, tabColors = [] }: TabBarProps) {
   const draggingTabIdRef = useRef<string | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
   const nativeDragPathRef = useRef<string | null>(null);
+  // #49 right-click context menu (which tab + where).
+  const [tabMenu, setTabMenu] = useState<TabMenuState | null>(null);
+
+  // Pinned tabs sort first (stable within each partition). Display-only — the
+  // underlying id order (and drag reorder) is unchanged.
+  const orderedTabs = useMemo(() => {
+    const pinned = tabs.filter((t) => t.pinned);
+    const rest = tabs.filter((t) => !t.pinned);
+    return [...pinned, ...rest];
+  }, [tabs]);
+
+  // Dismiss the context menu on any outside click / Escape.
+  useEffect(() => {
+    if (!tabMenu) return;
+    const close = () => setTabMenu(null);
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setTabMenu(null); };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    return () => { window.removeEventListener("mousedown", close); window.removeEventListener("keydown", onKey); };
+  }, [tabMenu]);
   // Index before which to show reorder indicator
   const [reorderInsertIdx, setReorderInsertIdx] = useState<number | null>(null);
   // Index before which to show folder ghost (tabs.length = append at end)
@@ -78,7 +111,7 @@ export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, on
       nativeDragPathRef.current = null;
       setFolderInsertIdx(null);
       if (path !== null && idx !== null) {
-        const beforeTab = tabs[idx];
+        const beforeTab = orderedTabs[idx];
         onFolderDrop(path, beforeTab?.id);
       }
     });
@@ -156,7 +189,7 @@ export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, on
           e.preventDefault();
           e.stopPropagation();
           const fromId = e.dataTransfer.getData("application/x-tab-id");
-          const beforeTab = tabs[insertIdxForBar(e.clientX)];
+          const beforeTab = orderedTabs[insertIdxForBar(e.clientX)];
           clearAll();
           draggingTabIdRef.current = null;
           if (fromId) onMoveTab(fromId, groupId, beforeTab?.id);
@@ -166,12 +199,12 @@ export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, on
         e.preventDefault();
         e.stopPropagation();
         const path = folderPathFromDrag(e);
-        const beforeTab = tabs[insertIdxForBar(e.clientX)];
+        const beforeTab = orderedTabs[insertIdxForBar(e.clientX)];
         clearAll();
         if (path) onFolderDrop(path, beforeTab?.id);
       }}
     >
-      {tabs.map((tab, idx) => {
+      {orderedTabs.map((tab, idx) => {
         const isThisTabDragging = draggingTabIdRef.current === tab.id;
         // Reorder: show blue line BEFORE this tab
         const showReorderLine = reorderInsertIdx === idx;
@@ -191,9 +224,20 @@ export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, on
                 "wtab",
                 tab.id === activeId ? "wtab-active" : "",
                 isThisTabDragging ? "wtab-dragging" : "",
+                tab.pinned ? "wtab-pinned" : "",
+                tab.color ? "wtab-colored" : "",
               ].filter(Boolean).join(" ")}
+              // #49: color label as a left accent bar via a CSS variable.
+              style={tab.color ? ({ ["--wtab-color" as string]: tab.color } as React.CSSProperties) : undefined}
               draggable
               onClick={() => { if (!isThisTabDragging) onActivate(tab.id); }}
+              onDoubleClick={(e) => { e.stopPropagation(); onRenameTab?.(tab.id); }}
+              onContextMenu={(e) => {
+                if (!onRenameTab && !onSetTabColor && !onTogglePinTab) return;
+                e.preventDefault();
+                e.stopPropagation();
+                setTabMenu({ id: tab.id, x: e.clientX, y: e.clientY });
+              }}
               title={tab.path || "New tab"}
               onDragStart={(e) => {
                 draggingTabIdRef.current = tab.id;
@@ -231,17 +275,18 @@ export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, on
                   // beforeId is the tab currently at insertIdx in THIS group's
                   // raw list; App removes fromId first, then inserts before it
                   // (works for both reorder and cross-group moves).
-                  if (fromId) onMoveTab(fromId, groupId, tabs[insertIdx]?.id);
+                  if (fromId) onMoveTab(fromId, groupId, orderedTabs[insertIdx]?.id);
                 } else if (isFolderDrag(e)) {
                   e.preventDefault();
                   const path = folderPathFromDrag(e);
                   const insertIdx = insertIdxFor(e, idx);
                   clearAll();
-                  const beforeTab = tabs[insertIdx];
+                  const beforeTab = orderedTabs[insertIdx];
                   if (path) onFolderDrop(path, beforeTab?.id);
                 }
               }}
             >
+              {tab.pinned && <span className="wtab-pin" title="Pinned"><Icon name="star" size={10} /></span>}
               {tab.scanning && <span className="wtab-spinner" />}
               <span className="wtab-label">{tab.label || "New tab"}</span>
               {(tabs.length > 1 || canCloseLast) && (
@@ -297,6 +342,54 @@ export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, on
           )}
         </div>
       )}
+
+      {tabMenu && (() => {
+        const t = tabs.find((x) => x.id === tabMenu.id);
+        if (!t) return null;
+        return (
+          <div
+            className="wtab-context-menu"
+            style={{ left: tabMenu.x, top: tabMenu.y }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            {onRenameTab && (
+              <div className="wtab-ctx-item" onClick={() => { setTabMenu(null); onRenameTab(t.id); }}>Rename…</div>
+            )}
+            {onResetTabName && (
+              <div className="wtab-ctx-item" onClick={() => { setTabMenu(null); onResetTabName(t.id); }}>Use Folder Name</div>
+            )}
+            {onTogglePinTab && (
+              <div className="wtab-ctx-item" onClick={() => { setTabMenu(null); onTogglePinTab(t.id); }}>{t.pinned ? "Unpin Tab" : "Pin Tab"}</div>
+            )}
+            {onSetTabColor && (
+              <>
+                <div className="wtab-ctx-sep" />
+                <div className="wtab-ctx-colors">
+                  <button
+                    className={`wtab-ctx-swatch wtab-ctx-none${!t.color ? " active" : ""}`}
+                    title="No color"
+                    onClick={() => { setTabMenu(null); onSetTabColor(t.id, ""); }}
+                  ><Icon name="x" size={10} /></button>
+                  {tabColors.map((c) => (
+                    <button
+                      key={c}
+                      className={`wtab-ctx-swatch${t.color?.toLowerCase() === c.toLowerCase() ? " active" : ""}`}
+                      style={{ background: c }}
+                      title={c}
+                      onClick={() => { setTabMenu(null); onSetTabColor(t.id, c); }}
+                    />
+                  ))}
+                </div>
+              </>
+            )}
+            <div className="wtab-ctx-sep" />
+            <div className="wtab-ctx-item" onClick={() => { setTabMenu(null); onNew(); }}>New Tab</div>
+            {(tabs.length > 1 || canCloseLast) && (
+              <div className="wtab-ctx-item" onClick={() => { setTabMenu(null); onClose(t.id); }}>Close Tab</div>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 }

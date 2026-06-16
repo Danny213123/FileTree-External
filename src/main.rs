@@ -10,6 +10,7 @@ mod compress_tools;
 mod diff;
 mod dupes;
 mod export;
+mod fileattr;
 mod io;
 mod json;
 mod model;

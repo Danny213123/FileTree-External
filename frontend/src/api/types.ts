@@ -261,6 +261,13 @@ export interface SnapshotDiff {
   changed: SnapshotChangedEntry[];
 }
 
+/** One saved snapshot's full on-disk JSON (GET /api/snapshots-get?id=). The
+ *  `dirs` map is absolute-dir-path → size (bytes); used by the Explorer "what
+ *  changed since last snapshot" badges (#39) to diff against the live tree. */
+export interface SnapshotData extends SnapshotMeta {
+  dirs: Record<string, number>;
+}
+
 // The types below are a CLIENT-SIDE view model the diff views render. The
 // client (`fetchSnapshotDiff`) adapts the raw `SnapshotDiff` buckets above into
 // these rows + summary: `added`/`removed` map straight through and `changed`
@@ -617,6 +624,11 @@ export interface CompressJobRequest {
   /** Custom-preset video quality (RF base, 16..40; lower = better). 0 / omitted
    *  ⇒ backend default (26). Only consulted when `preset === "custom"`. */
   customQuality?: number;
+  /** "Output to folder" destination directory. When set, every compressed copy
+   *  is written into this single folder (collision-safe naming) and the
+   *  originals are always left untouched. Empty / omitted ⇒ in-place (outputs
+   *  beside each original, originals disposed per `originalAction`). */
+  outputDir?: string;
   /** Scan root the selected files belong to. Sent so the server can (re-)register
    *  it as an allowed read root before validating the source paths — covers the
    *  case where the tree was served from the renderer's cache and the current

@@ -262,6 +262,18 @@ pub(crate) fn delete_snapshot(id: &str) -> bool {
 
 // ── Load + diff ──────────────────────────────────────────────
 
+/// Raw on-disk JSON for a snapshot id
+/// (`{id,createdAt,path,total,fileCount,dirs:{<dir>:size}}`), or `None` if the
+/// id is invalid or the file is missing. Used by the Explorer "what changed
+/// since last snapshot" badges (#39): the client loads the latest snapshot's
+/// directory size map and diffs it against the live tree entirely client-side.
+pub(crate) fn raw_json(id: &str) -> Option<String> {
+    if !is_safe_id(id) {
+        return None;
+    }
+    fs::read_to_string(snapshot_file(id)).ok()
+}
+
 /// Load a saved snapshot's meta + directory map. `None` if the id is
 /// unknown/invalid or the file is missing/corrupt.
 pub(crate) fn load_snapshot(id: &str) -> Option<SnapData> {

@@ -196,7 +196,7 @@ export function CompareTab({ data, nodeById, onNavigate }: CompareTabProps) {
   );
 }
 
-function DiffView({
+export function DiffView({
   diff,
   onRevealRow,
   canReveal,

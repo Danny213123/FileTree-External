@@ -11,6 +11,9 @@ export interface WorkbenchSnapshot {
   status: ScanStatus;
   errorMessage: string;
   visibleCount: number;
+  /** The focused pane's current table-selection summary (count + total bytes),
+   *  shown in the status bar. */
+  selectionSummary: { count: number; bytes: number };
   /** The focused pane's live scan-progress store (stable per tab), forwarded to
    *  the status bar so its counter subscribes independently. */
   progressStore: ProgressStore | null;

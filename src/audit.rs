@@ -76,6 +76,12 @@ fn log_path() -> Option<PathBuf> {
     Some(PathBuf::from(base).join("FileTree").join("operations.log"))
 }
 
+/// Public accessor for the audit log path so readers (e.g. the in-app Recycle
+/// Bin viewer that lists what FileTree itself recycled) can parse it.
+pub(crate) fn log_file_path() -> Option<PathBuf> {
+    log_path()
+}
+
 fn format_line(e: &Entry) -> String {
     let mut s = String::with_capacity(256);
     s.push_str("{\"ts\":");

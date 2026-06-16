@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
+import { loadRecentPaths } from "./RibbonBar";
+
+/** Trailing folder name of a path, for the recent-locations list labels. */
+function baseLabel(p: string): string {
+  const parts = p.replace(/[/\\]+$/, "").split(/[/\\]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : p;
+}
 
 interface Segment {
   label: string;
@@ -65,6 +72,15 @@ export function Breadcrumb({ path, scanning, canBack, canForward, canUp, onNavig
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(path);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Recent-locations dropdown (#6). The list is read fresh from the recent-paths
+  // store each time it opens so it always reflects the latest navigation.
+  const [recentOpen, setRecentOpen] = useState(false);
+  const [recents, setRecents] = useState<string[]>([]);
+
+  const openRecents = () => {
+    setRecents(loadRecentPaths().slice(0, 10));
+    setRecentOpen(true);
+  };
 
   // Keep the draft synced to the live path while NOT editing (so navigation
   // elsewhere updates the box); leave it alone mid-edit so typing isn't lost.
@@ -93,6 +109,43 @@ export function Breadcrumb({ path, scanning, canBack, canForward, canUp, onNavig
         <button className="bc-btn" title="Up one level (Alt+Up)" disabled={!canUp} onClick={onUp} aria-label="Up one level">
           <Icon name="arrow-up" size={14} />
         </button>
+        <div className="bc-recent-wrap">
+          <button
+            className="bc-btn"
+            title="Recent locations"
+            aria-label="Recent locations"
+            aria-haspopup="menu"
+            aria-expanded={recentOpen}
+            onClick={() => (recentOpen ? setRecentOpen(false) : openRecents())}
+          >
+            <Icon name="caret-down" size={12} />
+          </button>
+          {recentOpen && (
+            <>
+              {/* Transparent backdrop closes the menu on an outside click. */}
+              <div className="bc-recent-backdrop" onClick={() => setRecentOpen(false)} />
+              <div className="bc-recent-menu" role="menu">
+                {recents.length === 0 ? (
+                  <div className="bc-recent-empty">No recent locations</div>
+                ) : (
+                  recents.map((p) => (
+                    <button
+                      key={p}
+                      className="bc-recent-item"
+                      role="menuitem"
+                      title={p}
+                      onClick={() => { setRecentOpen(false); if (p !== path) onNavigate(p); }}
+                    >
+                      <Icon name="folder" size={12} className="bc-recent-ico" />
+                      <span className="bc-recent-name">{baseLabel(p)}</span>
+                      <span className="bc-recent-path">{p}</span>
+                    </button>
+                  ))
+                )}
+              </div>
+            </>
+          )}
+        </div>
       </div>
 
       {editing ? (

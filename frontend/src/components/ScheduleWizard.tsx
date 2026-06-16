@@ -6,6 +6,12 @@ import {
   type ScheduledTask,
   type ScheduleFormat,
 } from "../api/client";
+import {
+  getAlertConfigs,
+  upsertAlertConfig,
+  removeAlertConfig,
+  type GrowthAlertConfig,
+} from "../lib/autoSnapshot";
 
 interface ScheduleWizardProps {
   /** Active tab's scanned path, used to prefill the scan target. */
@@ -34,6 +40,12 @@ export function ScheduleWizard({ initialPath, onClose }: ScheduleWizardProps) {
   const [outDir, setOutDir] = useState("");
   const [format, setFormat] = useState<ScheduleFormat>("html");
 
+  // #40: optional "save snapshot + alert on growth" attached to the schedule.
+  const [alertEnabled, setAlertEnabled] = useState(false);
+  const [alertPct, setAlertPct] = useState("10");
+  const [alertGb, setAlertGb] = useState("");
+  const [alertConfigs, setAlertConfigs] = useState<GrowthAlertConfig[]>([]);
+
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -47,6 +59,12 @@ export function ScheduleWizard({ initialPath, onClose }: ScheduleWizardProps) {
     } finally {
       setLoading(false);
     }
+    setAlertConfigs(getAlertConfigs());
+  }, []);
+
+  const handleRemoveAlert = useCallback((p: string) => {
+    removeAlertConfig(p);
+    setAlertConfigs(getAlertConfigs());
   }, []);
 
   useEffect(() => {
@@ -78,6 +96,19 @@ export function ScheduleWizard({ initialPath, onClose }: ScheduleWizardProps) {
         outDir: outDir.trim(),
         format,
       });
+      // #40: persist the growth-alert definition for this folder alongside the
+      // task. The alert is evaluated in-app against the snapshot history (see
+      // the FLAG note below), not inside the headless task itself.
+      if (alertEnabled) {
+        const pct = Number(alertPct);
+        const gb = Number(alertGb);
+        upsertAlertConfig({
+          path: path.trim(),
+          enabled: true,
+          thresholdPct: Number.isFinite(pct) && pct > 0 ? pct : 0,
+          thresholdBytes: Number.isFinite(gb) && gb > 0 ? Math.round(gb * 1e9) : 0,
+        });
+      }
       setNotice(`Created scheduled task "${full}".`);
       await refresh();
     } catch (e) {
@@ -164,7 +195,56 @@ export function ScheduleWizard({ initialPath, onClose }: ScheduleWizardProps) {
                 {FORMATS.map((f) => <option key={f} value={f}>{f.toUpperCase()}</option>)}
               </select>
             </div>
+
+            <div className="sched-row">
+              <span className="sched-label">Growth alert</span>
+              <div className="sched-inline">
+                <label className="sched-check">
+                  <input type="checkbox" checked={alertEnabled}
+                    onChange={(e) => setAlertEnabled(e.target.checked)} />
+                  Alert when this folder grows by
+                </label>
+                <input className="fd-value sched-thresh" type="number" min={0} step={1}
+                  value={alertPct} disabled={!alertEnabled}
+                  onChange={(e) => setAlertPct(e.target.value)} />
+                <span className="sched-at">% or</span>
+                <input className="fd-value sched-thresh" type="number" min={0} step={0.5}
+                  value={alertGb} disabled={!alertEnabled} placeholder="GB"
+                  onChange={(e) => setAlertGb(e.target.value)} />
+                <span className="sched-at">GB</span>
+              </div>
+            </div>
           </div>
+
+          {alertEnabled && (
+            <p className="sched-hint">
+              The growth alert is checked <strong>inside FileTree</strong> (on app start and after each
+              auto-snapshot) by comparing this folder's two most recent snapshots — not by the headless
+              scheduled task, which only scans and exports. So a breach is surfaced the next time the app
+              is open and a new snapshot for this folder lands.
+            </p>
+          )}
+
+          {alertConfigs.length > 0 && (
+            <div className="sched-alert-list">
+              <div className="sched-list-head"><span>Folders with a growth alert</span></div>
+              {alertConfigs.map((c) => (
+                <div className="sched-task" key={c.path}>
+                  <div className="sched-task-main">
+                    <span className="sched-task-name" title={c.path}>{c.path}</span>
+                    <span className="sched-task-sub">
+                      {c.thresholdPct > 0 ? `≥ ${c.thresholdPct}%` : ""}
+                      {c.thresholdPct > 0 && c.thresholdBytes > 0 ? " or " : ""}
+                      {c.thresholdBytes > 0 ? `≥ ${(c.thresholdBytes / 1e9).toFixed(1)} GB` : ""}
+                    </span>
+                  </div>
+                  <button className="fd-clear sched-del" onClick={() => handleRemoveAlert(c.path)} disabled={busy}>
+                    Remove
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
 
           {error && <div className="sched-msg sched-err">{error}</div>}
           {notice && <div className="sched-msg sched-ok">{notice}</div>}

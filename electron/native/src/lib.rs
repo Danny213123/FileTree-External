@@ -539,6 +539,7 @@ pub struct ContextMenuResult {
     ///   "rename"       — start inline rename of the item
     ///   "new-folder"   — create a new folder in the target dir
     ///   "open-new-tab" — open the folder in a new tab
+    ///   "open-split"   — open the folder in a new split pane
     ///   "compress"     — open the Compress view pre-loaded with the selection
     /// Empty when the shell already handled the chosen command (Open, Copy, Cut,
     /// Delete, Properties, Send to, third-party verbs, …) or the menu was dismissed.
@@ -1577,6 +1578,7 @@ mod windows_impl {
     const FT_OPEN_NEW_TAB: u32 = 0x9002;
     const FT_REVEAL: u32 = 0x9003;
     const FT_COMPRESS: u32 = 0x9004;
+    const FT_OPEN_SPLIT: u32 = 0x9005;
 
     static MENU_CLASS_ONCE: std::sync::Once = std::sync::Once::new();
     const MENU_CLASS: PCWSTR = w!("FileTreeShellMenuHost");
@@ -1738,6 +1740,13 @@ mod windows_impl {
                 let _ =
                     AppendMenuW(hmenu, MF_STRING, FT_OPEN_NEW_TAB as usize, w!("Open in new tab"));
                 index += 1;
+                let _ = AppendMenuW(
+                    hmenu,
+                    MF_STRING,
+                    FT_OPEN_SPLIT as usize,
+                    w!("Open in new split"),
+                );
+                index += 1;
             }
             // Reveal works for any single selection — file or folder — so it is
             // not gated on `single_dir` like "Open in new tab".
@@ -1817,6 +1826,9 @@ mod windows_impl {
         }
         if cmd == FT_OPEN_NEW_TAB {
             return "open-new-tab".to_string();
+        }
+        if cmd == FT_OPEN_SPLIT {
+            return "open-split".to_string();
         }
         if cmd == FT_REVEAL {
             return "show-in-explorer".to_string();

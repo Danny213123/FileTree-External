@@ -7,6 +7,10 @@ import { ExtensionsTab } from "./ExtensionsTab";
 import { AgeTab } from "./AgeTab";
 import { ByOwnerTab } from "./ByOwnerTab";
 import { CompareTab } from "./CompareTab";
+import { FolderDiffTab } from "./FolderDiffTab";
+import { EmptyFoldersTab } from "./EmptyFoldersTab";
+import { StaleFilesTab } from "./StaleFilesTab";
+import { RecycleBinTab } from "./RecycleBinTab";
 import { EmptyState } from "./EmptyState";
 
 // TreeSize-style analytics reports. All data is computed server-side and shipped
@@ -14,7 +18,9 @@ import { EmptyState } from "./EmptyState";
 // this view is pure presentation over the focused tab's ScanResult. Clicking a
 // Top Files / Largest Folders entry reveals it in the tree (via onNavigate).
 // "Compare" (roadmap #5) and "By Owner" (roadmap #7) are hosted here too.
-type ReportId = "top-files" | "largest-folders" | "by-type" | "by-age" | "by-owner" | "compare";
+type ReportId =
+  | "top-files" | "largest-folders" | "by-type" | "by-age" | "by-owner" | "compare"
+  | "folder-diff" | "empty-folders" | "stale-files" | "recycle-bin";
 
 const TABS: { id: ReportId; label: string }[] = [
   { id: "top-files", label: "Top Files" },
@@ -23,6 +29,10 @@ const TABS: { id: ReportId; label: string }[] = [
   { id: "by-age", label: "By Age" },
   { id: "by-owner", label: "By Owner" },
   { id: "compare", label: "Compare" },
+  { id: "folder-diff", label: "Folder Diff" },
+  { id: "empty-folders", label: "Empty Folders" },
+  { id: "stale-files", label: "Stale Files" },
+  { id: "recycle-bin", label: "Recycle Bin" },
 ];
 
 interface ReportsViewProps {
@@ -85,6 +95,10 @@ export function ReportsView({ data, nodeById, onNavigate }: ReportsViewProps) {
         {tab === "by-age" && <AgeTab ageStats={data.ageStats ?? []} />}
         {tab === "by-owner" && <ByOwnerTab data={data} />}
         {tab === "compare" && <CompareTab data={data} nodeById={nodeById} onNavigate={onNavigate} />}
+        {tab === "folder-diff" && <FolderDiffTab data={data} nodeById={nodeById} onNavigate={onNavigate} />}
+        {tab === "empty-folders" && <EmptyFoldersTab nodeById={nodeById} onNavigate={onNavigate} />}
+        {tab === "stale-files" && <StaleFilesTab nodeById={nodeById} onNavigate={onNavigate} />}
+        {tab === "recycle-bin" && <RecycleBinTab />}
       </div>
     </div>
   );

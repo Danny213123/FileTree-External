@@ -1,10 +1,11 @@
 import { useSyncExternalStore } from "react";
-import { formatCount } from "../utils/formatBytes";
+import { formatBytes, formatCount } from "../utils/formatBytes";
 import { formatDuration } from "../utils/formatDate";
 import type { ScanResult } from "../api/types";
 import type { ScanStatus, ProgressStore } from "../hooks/useScan";
 import { subscribeUndo, undoVersion, undoDepth, peekUndoLabel } from "../lib/undo";
 import { Icon } from "./Icon";
+import { ActivityCenter } from "./ActivityCenter";
 
 interface StatusBarProps {
   scanResult: ScanResult | null;
@@ -14,6 +15,9 @@ interface StatusBarProps {
    *  Subscribed below so scan-progress ticks re-render only this bar. */
   progressStore: ProgressStore | null;
   visibleCount: number;
+  /** Focused pane's table selection: row count + total bytes. The selection
+   *  segment shows only when count >= 1. */
+  selectionSummary?: { count: number; bytes: number };
   scanPath?: string;
   /** Run the unified undo (the same handler Ctrl+Z runs). Renders the Undo pill. */
   onUndo?: () => void;
@@ -30,6 +34,7 @@ export function StatusBar({
   errorMessage,
   progressStore,
   visibleCount,
+  selectionSummary,
   scanPath,
   onUndo,
 }: StatusBarProps) {
@@ -77,6 +82,11 @@ export function StatusBar({
             <Icon name="arrow-repeat" size={12} /> Undo
           </button>
         )}
+        {selectionSummary && selectionSummary.count >= 1 && (
+          <span className="sb-item" title="Current selection">
+            {formatCount(selectionSummary.count)} selected · {formatBytes(selectionSummary.bytes)}
+          </span>
+        )}
         {scanResult && status !== "scanning" && (
           <>
             <span className="sb-item">{formatCount(visibleCount)} shown</span>
@@ -84,6 +94,7 @@ export function StatusBar({
           </>
         )}
         {scanPath && <span className="sb-item" title={scanPath}>{scanPath}</span>}
+        <ActivityCenter />
       </div>
     </div>
   );

@@ -13,6 +13,7 @@
 
 import { useEffect, useSyncExternalStore } from "react";
 import { Icon, type IconName } from "../components/Icon";
+import { logActivity } from "./activity";
 
 export type ToastVariant = "success" | "warn" | "error" | "info";
 
@@ -74,6 +75,9 @@ function show(message: string, opts: ToastOptions = {}): number {
   const id = nextId++;
   items = [...items, { id, message, variant, duration, action: opts.action }];
   emit();
+  // Centrally feed the activity center (#48): every toast becomes a logged
+  // event so the bell panel keeps a history without touching call sites.
+  logActivity(message, variant);
   return id;
 }
 

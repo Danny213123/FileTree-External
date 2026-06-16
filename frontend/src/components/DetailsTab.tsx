@@ -13,6 +13,9 @@ interface DetailsTabProps {
   onOpen: () => void;
   onReveal: () => void;
   onCopyPath: () => void;
+  /** Exclude the selected folder's path from scans (#12). When omitted, the
+   *  button is hidden. */
+  onExclude?: (path: string) => void;
 }
 
 function attributesOf(node: NodeRecord): string {
@@ -20,7 +23,7 @@ function attributesOf(node: NodeRecord): string {
   return list.length ? list.join(", ") : "—";
 }
 
-export function DetailsTab({ data, selectedNode, nodeById, onOpen, onReveal, onCopyPath }: DetailsTabProps) {
+export function DetailsTab({ data, selectedNode, nodeById, onOpen, onReveal, onCopyPath, onExclude }: DetailsTabProps) {
   const root = data?.nodes[0];
 
   const parent = selectedNode?.parent != null ? nodeById?.get(selectedNode.parent) : undefined;
@@ -96,6 +99,12 @@ export function DetailsTab({ data, selectedNode, nodeById, onOpen, onReveal, onC
             <button onClick={onOpen}>Open</button>
             <button onClick={onReveal}>Reveal in Explorer</button>
             <button onClick={onCopyPath}>Copy Path</button>
+            {onExclude && selectedNode.dir && selectedNode.id !== 0 && selectedNode.path && (
+              <button
+                title="Add this folder to the scan exclude list (offers a rescan)"
+                onClick={() => onExclude(selectedNode.path)}
+              >Exclude from scans</button>
+            )}
           </div>
         </section>
       )}

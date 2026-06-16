@@ -15,7 +15,10 @@
 import { useSyncExternalStore } from "react";
 
 export type TransferKind = "move" | "copy";
-export type TransferStatus = "running" | "done" | "error";
+// "queued" — waiting in the serial queue (e.g. while the queue is paused or an
+// earlier transfer is still running); "running" — the underlying op is in
+// flight; then terminal "done"/"error".
+export type TransferStatus = "queued" | "running" | "done" | "error";
 
 export interface TransferItem {
   id: number;
@@ -31,14 +34,121 @@ export interface TransferItem {
   endedAt?: number;
 }
 
+/** Outcome a queued transfer's worker resolves with. */
+export interface TransferResult {
+  ok: boolean;
+  error?: string;
+}
+
 let items: TransferItem[] = [];
 let nextId = 1;
 const listeners = new Set<() => void>();
+
+// ── Queue + pause/resume state ──────────────────────────────────────────────
+// Move/copy operations enqueue here and run ONE AT A TIME. `paused` gates the
+// START of the next queued transfer only — an already-running native shell
+// transfer keeps going (the OS owns its progress; the native mover has no
+// mid-file pause hook). See enqueueTransfer / pauseTransfers below.
+let paused = false;
+let processing = false;
+const workers = new Map<number, () => Promise<TransferResult>>();
+const resolvers = new Map<number, (r: TransferResult) => void>();
 
 function emit() {
   // Replace the array reference so useSyncExternalStore sees a new snapshot.
   items = items.slice();
   for (const l of listeners) l();
+}
+
+function setStatus(id: number, status: TransferStatus, error?: string): void {
+  const idx = items.findIndex((t) => t.id === id);
+  if (idx < 0) return;
+  const ended = status === "done" || status === "error";
+  items[idx] = {
+    ...items[idx],
+    status,
+    error: status === "error" ? (error || "failed") : items[idx].error,
+    ...(ended ? { endedAt: Date.now() } : {}),
+  };
+  emit();
+}
+
+/**
+ * Drive the serial queue: while not paused, pick the oldest "queued" transfer,
+ * run its worker to completion, then move on. Re-entrancy-guarded so multiple
+ * enqueues / a resume can't start parallel pumps. The currently-running worker
+ * is never interrupted by a pause — pause only stops us from starting the next.
+ */
+async function processQueue(): Promise<void> {
+  if (processing) return;
+  processing = true;
+  try {
+    while (!paused) {
+      const next = items.find((t) => t.status === "queued" && workers.has(t.id));
+      if (!next) break;
+      const worker = workers.get(next.id)!;
+      workers.delete(next.id);
+      setStatus(next.id, "running");
+      let result: TransferResult;
+      try {
+        result = await worker();
+      } catch (e) {
+        result = { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+      setStatus(next.id, result.ok ? "done" : "error", result.error);
+      const resolve = resolvers.get(next.id);
+      resolvers.delete(next.id);
+      resolve?.(result);
+    }
+  } finally {
+    processing = false;
+  }
+}
+
+/**
+ * Enqueue a move/copy operation. The `worker` performs the actual transfer and
+ * resolves with its outcome; the queue marks the entry running/done/error and
+ * serializes it behind any earlier transfers (and behind a pause). Returns the
+ * worker's result so callers can run their follow-up (rescan, undo, toast).
+ */
+export function enqueueTransfer(
+  kind: TransferKind,
+  label: string,
+  count: number,
+  worker: () => Promise<TransferResult>,
+): Promise<TransferResult> {
+  const id = nextId++;
+  items.push({ id, kind, label, count, status: "queued", startedAt: Date.now() });
+  workers.set(id, worker);
+  const promise = new Promise<TransferResult>((resolve) => resolvers.set(id, resolve));
+  emit();
+  void processQueue();
+  return promise;
+}
+
+/** Pause the queue: no further queued transfers start until {@link resumeTransfers}. */
+export function pauseTransfers(): void {
+  if (paused) return;
+  paused = true;
+  emit();
+}
+
+/** Resume the queue and pump any transfers that were held back. */
+export function resumeTransfers(): void {
+  if (!paused) return;
+  paused = false;
+  emit();
+  void processQueue();
+}
+
+/** True when the queue is paused (no new transfers will start). */
+export function isPaused(): boolean {
+  return paused;
+}
+
+/** Subscribe to the paused flag (for the panel's Pause/Resume control). */
+export function useTransfersPaused(): boolean {
+  return useSyncExternalStore(subscribe, isPaused);
 }
 
 /** Open a new running transfer; returns its id to finish later. */
@@ -65,9 +175,9 @@ export function dismissTransfer(id: number): void {
   emit();
 }
 
-/** Drop every finished (done/error) transfer, keeping any still running. */
+/** Drop every finished (done/error) transfer, keeping any running or queued. */
 export function clearFinishedTransfers(): void {
-  const next = items.filter((t) => t.status === "running");
+  const next = items.filter((t) => t.status === "running" || t.status === "queued");
   if (next.length === items.length) return;
   items = next;
   emit();

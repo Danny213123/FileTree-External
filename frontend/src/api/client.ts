@@ -373,6 +373,9 @@ export interface AppSettings {
   sortKey?: string;
   sortDir?: number;
   openTabs?: string[];
+  /** Per-tab metadata parallel to `openTabs` by index (#49): custom label,
+   *  color label, and pinned state. */
+  tabMeta?: { label?: string; color?: string; pinned?: boolean }[];
   recentPaths?: string[];
   // Details-list columns (global, shared by all tabs/panes)
   visibleColumns?: string[];
@@ -496,6 +499,24 @@ export async function saveSnapshot(path: string): Promise<SnapshotMeta[]> {
   const r = await postMutation("/api/snapshots-save", { path });
   if (!r.ok) throw new Error(mutateErrorText(r));
   return fetchSnapshots();
+}
+
+/**
+ * Load one saved snapshot's full data (meta + its absolute-dir→size map) via
+ * GET /api/snapshots-get?id=. Used by the Explorer "what changed since last
+ * snapshot" badges (#39). Never throws — returns null on any failure.
+ */
+export async function fetchSnapshotData(
+  id: string,
+  signal?: AbortSignal,
+): Promise<import("./types").SnapshotData | null> {
+  try {
+    const res = await fetch(`/api/snapshots-get?id=${encodeURIComponent(id)}`, { signal });
+    if (!res.ok) return null;
+    return (await res.json()) as import("./types").SnapshotData;
+  } catch {
+    return null;
+  }
 }
 
 /** Delete a saved snapshot by id; returns the updated list (newest first). */
@@ -850,6 +871,68 @@ export async function renameItem(path: string, newName: string): Promise<{ ok: b
   return { ok: false, error: mutateErrorText(r) };
 }
 
+// ── Batch attributes + timestamps (#43) ──────────────────────────────────────
+// Both routes modify only the metadata of existing paths (gated to a scanned
+// root + audited server-side) and echo a per-path result so the dialog can
+// surface partial failures. Omitted fields are left unchanged.
+
+/** Per-path outcome echoed by /api/set-attributes and /api/set-times. */
+export interface MetadataResultItem {
+  path: string;
+  ok: boolean;
+  error?: string;
+}
+export interface MetadataResult {
+  /** True when every path succeeded. */
+  ok: boolean;
+  results: MetadataResultItem[];
+  /** Joined per-path errors, if any. */
+  error?: string;
+}
+
+function adaptMetadataResult(r: MutateResponse): MetadataResult {
+  if (!r.ok) return { ok: false, results: [], error: mutateErrorText(r) };
+  const data = (r.data ?? {}) as { results?: MetadataResultItem[] };
+  const results = data.results ?? [];
+  const failed = results.filter((x) => !x.ok);
+  return {
+    ok: failed.length === 0,
+    results,
+    error: failed.length > 0
+      ? failed.map((x) => `${x.path}: ${x.error ?? "failed"}`).join("; ")
+      : undefined,
+  };
+}
+
+/**
+ * Set/clear the read-only and/or hidden attribute on each path. Pass `undefined`
+ * (or omit) to leave an attribute unchanged.
+ */
+export async function setAttributes(
+  paths: string[],
+  attrs: { readonly?: boolean; hidden?: boolean },
+): Promise<MetadataResult> {
+  const body: Record<string, unknown> = { paths };
+  if (attrs.readonly !== undefined) body.readonly = attrs.readonly;
+  if (attrs.hidden !== undefined) body.hidden = attrs.hidden;
+  return adaptMetadataResult(await postMutation("/api/set-attributes", body));
+}
+
+/**
+ * Set the created / modified / accessed times (epoch milliseconds) on each path.
+ * Omit a field to leave that timestamp unchanged.
+ */
+export async function setTimes(
+  paths: string[],
+  times: { created?: number; modified?: number; accessed?: number },
+): Promise<MetadataResult> {
+  const body: Record<string, unknown> = { paths };
+  if (times.created !== undefined) body.created = times.created;
+  if (times.modified !== undefined) body.modified = times.modified;
+  if (times.accessed !== undefined) body.accessed = times.accessed;
+  return adaptMetadataResult(await postMutation("/api/set-times", body));
+}
+
 export type MoveConflictChoice = "replace" | "keep-both" | "skip";
 
 export interface MoveConflict {
@@ -1158,6 +1241,48 @@ export async function dupeAction(
   });
   if (!r.ok) return { ok: false, errors: [mutateErrorText(r)] };
   return (r.data as { ok: boolean; errors: string[] } | null) ?? { ok: false, errors: ["Invalid response"] };
+}
+
+/**
+ * #26: replace checked duplicate copies with a hard link (same volume) or a
+ * symbolic link to the kept original. Each pair is `{original, link}` where
+ * `original` is the kept reference and `link` is the duplicate path to replace.
+ * The server recycles the duplicate (recoverable) and moves a fresh link into
+ * its place. Returns `{ok, errors}` like {@link dupeAction}.
+ */
+export async function hardlinkPairs(
+  pairs: { original: string; link: string }[],
+  mode: "hardlink" | "symlink",
+): Promise<{ ok: boolean; errors: string[] }> {
+  const r = await postMutation("/api/hardlink", { mode, pairs });
+  if (!r.ok) return { ok: false, errors: [mutateErrorText(r)] };
+  const d = (r.data ?? {}) as { ok?: boolean; errors?: string[] };
+  return { ok: d.ok ?? false, errors: d.errors ?? [] };
+}
+
+/** One item FileTree recycled, as recorded in the audit log (#30). */
+export interface RecycledItem {
+  /** ISO-8601 UTC timestamp the item was recycled. */
+  ts: string;
+  /** Original absolute path before it was sent to the Recycle Bin. */
+  path: string;
+}
+
+/**
+ * #30: list items FileTree itself sent to the Recycle Bin (parsed from the
+ * append-only audit log, newest-first). Never throws — returns [] on failure.
+ * Full system Recycle Bin enumeration is intentionally NOT done here (see the
+ * Recycle Bin viewer notes); restore reuses the native Recycle Bin restore.
+ */
+export async function fetchRecycledLog(signal?: AbortSignal): Promise<RecycledItem[]> {
+  try {
+    const res = await fetch("/api/audit-recycled", { signal });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { items?: RecycledItem[] };
+    return data.items ?? [];
+  } catch {
+    return [];
+  }
 }
 
 export async function dupeMakeRef(

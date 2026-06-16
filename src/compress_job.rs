@@ -12,6 +12,7 @@
 //! already `done`.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -190,6 +191,16 @@ pub(crate) struct CompressJob {
     pub(crate) custom_max_height: u32,
     /// Custom preset video quality (RF base). 0 = use the default (26).
     pub(crate) custom_quality: u32,
+    /// Destination directory for compressed outputs ("output to folder" mode).
+    /// Empty ⇒ in-place: outputs are written beside each original as
+    /// `name [COMPRESSED].ext` (the historical behavior). When set, every output
+    /// is written into this single directory with collision-safe naming and the
+    /// originals are always left untouched (the disposition is forced to Keep).
+    pub(crate) output_dir: String,
+    /// Output paths already claimed by a worker in this job, so concurrent
+    /// workers writing into a shared `output_dir` never collide on a name. Only
+    /// consulted when `output_dir` is set.
+    pub(crate) out_reserve: Mutex<HashSet<String>>,
     /// "running" | "done" | "cancelled" | "error"
     pub(crate) status: Mutex<String>,
     pub(crate) total: usize,
@@ -279,6 +290,11 @@ pub(crate) struct CompressOptions {
     /// Custom preset video quality (RF base). 0 = use the default (26). Only
     /// consulted when the preset is `custom`.
     pub(crate) custom_quality: u32,
+    /// Destination directory for "output to folder" mode. Empty ⇒ in-place
+    /// (outputs written beside each original; originals disposed per
+    /// `original_action`). When set, all outputs land in this folder and the
+    /// originals are forced to Keep.
+    pub(crate) output_dir: String,
 }
 
 impl Default for CompressOptions {
@@ -294,6 +310,7 @@ impl Default for CompressOptions {
             min_size_bytes: 0,
             custom_max_height: 0,
             custom_quality: 0,
+            output_dir: String::new(),
         }
     }
 }
@@ -352,10 +369,19 @@ pub(crate) fn create_job(
         })
         .collect();
     let total = files.len();
+    let output_dir = opts.output_dir.trim().to_string();
+    // "Output to folder" never touches the originals: force Keep regardless of
+    // what the client requested, so a misbehaving caller can't recycle/delete
+    // sources when it only asked for copies in a separate folder.
+    let original_action = if output_dir.is_empty() {
+        opts.original_action
+    } else {
+        OriginalAction::Keep
+    };
     Arc::new(CompressJob {
         id: id.clone(),
         preset: normalize_preset(preset),
-        original_action: opts.original_action,
+        original_action,
         tag_filename: opts.tag_filename,
         concurrency: opts.resolved_concurrency(),
         encoder: CompressOptions::norm_encoder(&opts.encoder),
@@ -365,6 +391,8 @@ pub(crate) fn create_job(
         min_size_bytes: opts.min_size_bytes,
         custom_max_height: opts.custom_max_height,
         custom_quality: opts.custom_quality,
+        output_dir,
+        out_reserve: Mutex::new(HashSet::new()),
         status: Mutex::new("running".to_string()),
         total,
         files,
@@ -460,6 +488,12 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         .and_then(|v| v.as_u64())
         .map(|n| n as u32)
         .unwrap_or(0);
+    let output_dir = root
+        .get("outputDir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let opts = CompressOptions {
         original_action,
         tag_filename,
@@ -471,6 +505,7 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         min_size_bytes,
         custom_max_height,
         custom_quality,
+        output_dir,
     };
     let files_arr = root.get("files").and_then(|v| v.as_array())?;
 
@@ -526,6 +561,8 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         min_size_bytes: opts.min_size_bytes,
         custom_max_height: opts.custom_max_height,
         custom_quality: opts.custom_quality,
+        output_dir: opts.output_dir.clone(),
+        out_reserve: Mutex::new(HashSet::new()),
         status: Mutex::new("running".to_string()),
         total,
         files,
@@ -1794,7 +1831,11 @@ fn process_file(
         };
     }
 
-    let out = output_path(&input, kind);
+    let out = if job.output_dir.trim().is_empty() {
+        output_path(&input, kind)
+    } else {
+        reserved_output_in_dir(job, &input, kind)
+    };
 
     // Pre-skip heuristic for the zip pipeline: a file whose container is already
     // entropy-coded (zip/7z/jpg/mp4/office…) won't shrink under Deflate, so skip
@@ -2527,6 +2568,48 @@ fn output_path(input: &Path, kind: FileKind) -> PathBuf {
         format!("{stem} [COMPRESSED].{ext}")
     };
     parent.join(name)
+}
+
+/// "Output to folder" target for `input`: `<output_dir>/name [COMPRESSED].ext`,
+/// made collision-safe by appending ` (n)` before the extension when the name is
+/// already taken — either on disk or already claimed by another worker in this
+/// job. Reservation is serialized through `job.out_reserve` so two concurrent
+/// workers compressing same-named files from different folders never pick the
+/// same destination. Falls back to the in-place name when `output_dir` is empty.
+fn reserved_output_in_dir(job: &CompressJob, input: &Path, kind: FileKind) -> PathBuf {
+    let dir = Path::new(&job.output_dir);
+    let _ = std::fs::create_dir_all(dir);
+    let base = output_path(input, kind);
+    let file_name = base
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output [COMPRESSED]".to_string());
+    let (stem, ext) = match file_name.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (file_name.clone(), String::new()),
+    };
+    let mut reserved = job.out_reserve.lock_recover();
+    let mut n = 0u32;
+    loop {
+        let candidate = if n == 0 {
+            dir.join(&file_name)
+        } else {
+            dir.join(format!("{stem} ({n}){ext}"))
+        };
+        let key = candidate.to_string_lossy().to_ascii_lowercase();
+        if !reserved.contains(&key) && !candidate.exists() {
+            reserved.insert(key);
+            return candidate;
+        }
+        n += 1;
+        if n > 100_000 {
+            // Pathological collision storm — fall back to a unique-ish suffix so
+            // we never spin forever.
+            let unique = dir.join(format!("{stem} ({}){ext}", crate::io::now_ms()));
+            reserved.insert(unique.to_string_lossy().to_ascii_lowercase());
+            return unique;
+        }
+    }
 }
 
 // ── Pipelines ──────────────────────────────────────────────────────────────
@@ -3387,6 +3470,8 @@ fn write_manifest(job: &CompressJob) {
     s.push_str(&job.custom_max_height.to_string());
     s.push_str(",\"customQuality\":");
     s.push_str(&job.custom_quality.to_string());
+    s.push_str(",\"outputDir\":");
+    push_json_string(&mut s, &job.output_dir);
     s.push_str(",\"total\":");
     s.push_str(&job.total.to_string());
     s.push_str(",\"savedBytes\":");
@@ -4193,6 +4278,7 @@ mod manifest_tests {
             min_size_bytes: 2_000_000,
             custom_max_height: 720,
             custom_quality: 28,
+            output_dir: String::new(),
         };
         let job = create_job(
             &["a.mp4".to_string(), "b.png".to_string(), "c.txt".to_string()],

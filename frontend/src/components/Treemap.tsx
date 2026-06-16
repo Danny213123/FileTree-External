@@ -3,6 +3,7 @@ import type { NodeRecord, Metric, Unit } from "../api/types";
 import { layoutTreemap } from "../utils/treeLayout";
 import { formatBytes, formatCount } from "../utils/formatBytes";
 import { NodeTooltip } from "./NodeTooltip";
+import { Icon } from "./Icon";
 import { isNoOpMove } from "../lib/agent";
 
 // The 3D treemap modal (its own isometric SVG renderer) is only shown on demand
@@ -589,6 +590,39 @@ export const Treemap = memo(function Treemap({
     }
   }, [dragDrop, getHit, nodeById]);
 
+  // #38: export the treemap as a PNG. The treemap is CANVAS-based (a base layer
+  // + a transparent overlay for hover/selection), so we composite both onto an
+  // offscreen canvas over a solid theme backdrop (covers any transparent gaps)
+  // and download via toBlob — entirely self-contained, no new deps. (There is no
+  // SVG variant to serialize; the main treemap renderer is pure canvas.)
+  const handleExportPng = useCallback(() => {
+    const base = canvasRef.current;
+    if (!base) return;
+    const w = base.width;
+    const h = base.height;
+    if (w === 0 || h === 0) return;
+    const out = document.createElement("canvas");
+    out.width = w;
+    out.height = h;
+    const ctx = out.getContext("2d");
+    if (!ctx) return;
+    ctx.fillStyle = darkMode ? "#1f2430" : "#ffffff";
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(base, 0, 0);
+    if (overlayRef.current) ctx.drawImage(overlayRef.current, 0, 0);
+    out.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `treemap-${Date.now()}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }, "image/png");
+  }, [darkMode]);
+
   const handleMouseUp = useCallback(async () => {
     if (!isDraggingRef.current) return;
     isDraggingRef.current = false;
@@ -633,6 +667,13 @@ export const Treemap = memo(function Treemap({
     )}
     <div className="treemap-shell">
       <div className="treemap-body">
+        <button
+          className="treemap-export"
+          title="Export the treemap as a PNG image"
+          onClick={handleExportPng}
+        >
+          <Icon name="image" size={13} /> PNG
+        </button>
         <div className="treemap" ref={containerRef}>
           <canvas
             ref={canvasRef}

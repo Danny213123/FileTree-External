@@ -72,6 +72,24 @@ export function setCached(path: string, result: ScanResult): void {
   evictToCap(key);
 }
 
+/** Every currently-cached, non-expired scan, newest-used first. Powers the
+ *  cross-scan / "global" search (#32): the search can span all roots the user
+ *  has scanned this session without re-walking the filesystem. Expired entries
+ *  are pruned as a side effect. */
+export function getAllCached(): { path: string; result: ScanResult }[] {
+  const now = Date.now();
+  const out: { path: string; result: ScanResult; used: number }[] = [];
+  for (const [key, entry] of cache.entries()) {
+    if (now - entry.ts > CACHE_TTL_MS) {
+      cache.delete(key);
+      continue;
+    }
+    out.push({ path: entry.result.rootPath || key, result: entry.result, used: entry.used });
+  }
+  out.sort((a, b) => b.used - a.used);
+  return out.map(({ path, result }) => ({ path, result }));
+}
+
 /** Remove the path, any sub-path entries, and any ancestor entries. */
 export function invalidate(path: string): void {
   const key = normalizePath(path);

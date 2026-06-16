@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle, useSyncExternalStore, memo } from "react";
 import { useScan, fetchScanStream } from "../hooks/useScan";
-import { useTreeState } from "../hooks/useTreeState";
+import { useTreeState, type ChipKey } from "../hooks/useTreeState";
 import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import {
   revealPath, openPath, shellContextMenu, createFolder,
@@ -9,6 +9,8 @@ import {
   exportUrl, printReportAsPdf, webFetch, webSearch,
   clipboardWriteFiles, clipboardReadFiles, copyItemsNative, hasNativeCopy,
   compress, extract, checksum, copyText,
+  setAttributes, setTimes,
+  fetchSnapshots, fetchSnapshotData,
 } from "../api/client";
 import type { ScanOptions, ExportFormat } from "../api/client";
 import type { NodeRecord, SortKey, TagEntry } from "../api/types";
@@ -16,9 +18,13 @@ import type { FilterRule } from "../hooks/useFilterRules";
 import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow, type AgentApi } from "../lib/agent";
 import { confirmRisky, isCrossDrive } from "../lib/confirmRisky";
 import { pushUndo, parentDir } from "../lib/undo";
-import { beginTransfer, finishTransfer } from "../lib/transfers";
-import { searchNodes } from "../lib/search";
+import { beginTransfer, finishTransfer, enqueueTransfer } from "../lib/transfers";
+import { searchNodesAdvanced, filtersActive, type SearchFilters } from "../lib/search";
+import { exportResults } from "../lib/exportRows";
+import { loadFolderPref, saveFolderPref, normFolderKey } from "../lib/folderPrefs";
 import { compareNodes } from "../hooks/useTreeState";
+import { formatBytes } from "../utils/formatBytes";
+import { formatDate } from "../utils/formatDate";
 import { toast, type ToastAction } from "../lib/toast";
 import { promptDialog } from "../lib/dialogs";
 import { TreeTable } from "./TreeTable";
@@ -26,8 +32,13 @@ import { BulkRenameDialog } from "./BulkRenameDialog";
 import { TagPopover } from "./TagPopover";
 import { ConfigureColumnsMenu } from "./ConfigureColumnsMenu";
 import { Treemap } from "./Treemap";
+import { maybeAutoSnapshot, checkGrowthAlerts, rootKey } from "../lib/autoSnapshot";
 import type { ViewId } from "./ActivityBar";
 import { ConflictDialog, type ConflictChoice } from "./ConflictDialog";
+import { MoveToDialog } from "./MoveToDialog";
+import { AttributesDialog, type AttributesPayload } from "./AttributesDialog";
+import { SendToDialog } from "./SendToDialog";
+import { getRecentDestinations, recordRecentDestination, removeRecentDestination } from "../lib/recentDestinations";
 import { FilterDialog } from "./FilterDialog";
 import { Breadcrumb } from "./Breadcrumb";
 import { Icon } from "./Icon";
@@ -43,6 +54,12 @@ export interface WorkspaceTabHandle {
   getProgressStore: () => ProgressStore;
   getErrorMessage: () => string;
   getVisibleCount: () => number;
+  /** Current table selection summary for the status bar: number of selected
+   *  rows and their total size (parent-aware — a selected folder's descendants
+   *  that are also selected aren't double-counted). */
+  getSelectionSummary: () => { count: number; bytes: number };
+  /** Copy the current selection to the clipboard as a TSV table (Copy as table). */
+  doCopyAsTable: () => void;
   getScanPath: () => string;
   getScanning: () => boolean;
   getNodeById: () => Map<number, NodeRecord>;
@@ -65,6 +82,13 @@ export interface WorkspaceTabHandle {
   doOpenFilter: () => void;
   doReveal: () => void;
   doExport: (format: ExportFormat) => void;
+  /** Select all current search/filter result rows by path; returns how many
+   *  resolved to rows in THIS pane's scan (#35). */
+  doSelectPaths: (paths: string[]) => number;
+  /** Select every current flat search/filter result row in this pane (#35). */
+  doSelectSearchResults: () => void;
+  /** Export the current flat search/filter result rows to CSV/JSON (#35). */
+  doExportSearchResults: (format: "csv" | "json") => void;
   /** Cut the selection to the clipboard as CF_HDROP (paste = move). #9 */
   doCutFiles: () => void;
   /** Paste CF_HDROP clipboard files into the focused folder (move or copy). #9 */
@@ -78,6 +102,14 @@ export interface WorkspaceTabHandle {
   doDelete: () => void;
   doDeletePaths: (paths: string[]) => void;
   doMoveTo: () => void;
+  /** Open the "Copy to…" destination picker for the current selection (#42). */
+  doCopyTo: () => void;
+  /** Open the batch attribute + timestamp editor for the selection (#43). */
+  doEditAttributes: () => void;
+  /** "Send to → Mail recipient": open the default mail client (#44). */
+  doSendToMail: () => void;
+  /** "Send to → Run command…": open the custom-command runner (#44). */
+  doSendToCommand: () => void;
   doCopyPath: () => void;
   doCopyFiles: () => void;
   /** Compress the current selection into a .zip beside it (F5). */
@@ -97,6 +129,9 @@ export interface WorkspaceTabHandle {
   showNotice: (message: string) => void;
   /** Force a fresh rescan of this pane (used after an undo changes the tree). */
   refresh: () => void;
+  /** #14: incremental "smart refresh" — re-walk only the expanded folders,
+   *  reusing collapsed subtrees; falls back to a full rescan when appropriate. */
+  smartRefresh: () => Promise<void>;
   /** Reveal/select a node by id (command palette file jump, F6). */
   doNavigateId: (id: number) => void;
   /** Current advanced filter rules — captured when saving a smart folder (F7). */
@@ -204,10 +239,31 @@ function itemsLabel(n: number): string {
   return n === 1 ? "1 item" : `${n} items`;
 }
 
+// Quick-filter chips shown above the table — label + tree-state chip key. Each
+// toggles a predicate ANDed onto the active filter (see useTreeState.toggleChip).
+const QUICK_FILTER_CHIPS: { key: ChipKey; label: string }[] = [
+  { key: "size100mb", label: ">100 MB" },
+  { key: "size1gb", label: ">1 GB" },
+  { key: "videos", label: "Videos" },
+  { key: "images", label: "Images" },
+  { key: "old1y", label: ">1 year old" },
+];
+
 // Filesystem-watch tuning. Patching is O(n) over the whole node array, so on big
 // scans we throttle hard and only patch folders the user actually has open.
 const WATCH_DEBOUNCE_MS = 700;
 const WATCH_MAX_BATCH = 6;
+
+// #11 diff-on-rescan: how long the added/changed row tint lingers before fading,
+// and the largest tree we'll snapshot per-path sizes for (keeps the diff cheap
+// on huge scans — beyond this we skip the highlight rather than retain a giant map).
+const DIFF_HIGHLIGHT_MS = 4000;
+const DIFF_MAX_NODES = 200_000;
+
+// #14 smart refresh: re-walk at most this many currently-expanded directories
+// (each a cheap maxDepth=1 shallow rescan + patch). Beyond this it's cheaper to
+// just do a normal full rescan.
+const SMART_REFRESH_MAX_DIRS = 50;
 const WATCH_LARGE_TREE = 50_000;
 
 interface WorkspaceTabProps {
@@ -219,6 +275,9 @@ interface WorkspaceTabProps {
   // Activity-bar Search query (already debounced in App). When activeView ===
   // "search" and this has >= 2 chars, the main table renders flat search results.
   searchQuery: string;
+  // Inline search filters + regex toggle (#31), lifted in App so the pane's flat
+  // results table applies the same narrowing the sidebar Search view shows.
+  searchFilters: SearchFilters;
   // Whether the per-pane controls toolbar row (under the tabs) is shown. Toggled
   // from the tab bar's toolbar button; per-editor-group, defaults to visible.
   toolbarVisible: boolean;
@@ -255,6 +314,14 @@ interface WorkspaceTabProps {
   visibleColumns: Set<SortKey>;
   onVisibleColumnsChange: (cols: Set<SortKey>) => void;
   onDecimalsChange: (d: number) => void;
+  /** #7: when true (default) double-clicking a FOLDER opens it in File Explorer;
+   *  when false it drills into the folder in-app (navigates this pane). */
+  folderDblClickExplorer: boolean;
+  /** #9: tint table rows by size relative to the largest visible row. */
+  heatTint: boolean;
+  /** #39: annotate Explorer folder rows with grew/shrank/new badges vs. the
+   *  latest saved snapshot of the current root. Default off (set in App). */
+  showGrowthBadges: boolean;
   onClose3D: () => void;
   onToggleBookmark: (path: string) => void;
   // Quick-load file(s) into the Compress page. Receives concrete file paths
@@ -279,13 +346,14 @@ interface WorkspaceTabProps {
 
 const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(function WorkspaceTab(
   {
-    tabId, initialPath, active, activeView, searchQuery, toolbarVisible, darkMode,
+    tabId, initialPath, active, activeView, searchQuery, searchFilters, toolbarVisible, darkMode,
     panelOpen, onPanelOpenChange, panelHeight, onPanelHeightChange,
     bookmarkList, tagsByPath, activeTagFilter, onSetTags, onClearTagFilter,
     threads, includeHidden, followLinks, collectOwners, onCollectOwnersChange, exclude,
     treemapDetail,
     tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
+    folderDblClickExplorer, heatTint, showGrowthBadges,
     onClose3D, onToggleBookmark, onCompress, onScanPath, onStateChange, onWorkbenchChange, onOpenTerminal,
     onOpenFolderInTab, onUndo,
   }: WorkspaceTabProps,
@@ -314,9 +382,17 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const selectedIdsRef = useRef(selectedIds);
   selectedIdsRef.current = selectedIds;
   const selectionAnchorIdRef = useRef<number>(0);
+  // Latest flat search/filter results, mirrored into a ref so the imperative
+  // handle (defined above the memo) can read them lazily at call time (#35).
+  const searchResultsRef = useRef<NodeRecord[]>([]);
   const isFirstChunkRef = useRef(true);
   const lastCompletedPathRef = useRef<string>("");
   const lastScanWasRefreshRef = useRef(false);
+  // #5: normalized folder key whose sort/widths the per-folder store currently
+  // tracks, plus a one-shot guard so applying a restored entry doesn't trigger
+  // an immediate re-save of what we just loaded.
+  const folderPrefsKeyRef = useRef<string>("");
+  const skipFolderSaveRef = useRef(false);
   const bookmarkSet = useMemo(() => new Set(bookmarkList), [bookmarkList]);
 
   // Per-tab navigation history: the sequence of scanned root paths the user
@@ -341,6 +417,21 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   }, [filterInput]);
   useEffect(() => { setFilterInput(tree.filter); }, [tree.filter]);
 
+  // #10: set when the fs-events watcher detects changes in parts of the tree
+  // that aren't auto-patched (collapsed/off-screen subtrees, or a burst that
+  // exceeded the patch batch cap), so the results may no longer match disk.
+  // Cleared whenever the user refreshes/rescans.
+  const [resultsStale, setResultsStale] = useState(false);
+  // #11: transient per-node-id highlight (added / size-changed) applied right
+  // after a same-root refresh completes; fades after DIFF_HIGHLIGHT_MS.
+  const [diffHighlight, setDiffHighlight] = useState<Map<number, "added" | "changed"> | null>(null);
+  // #39: directory node id → grew/shrank/new badge vs. the latest saved snapshot
+  // of the current root. Computed when `showGrowthBadges` is on (default off).
+  const [growthMap, setGrowthMap] = useState<Map<number, { dir: "grew" | "shrank" | "new"; delta: number }> | null>(null);
+  // #11: prior scan's path→size snapshot, captured just before a refresh starts.
+  const prevSizeByPathRef = useRef<Map<string, number> | null>(null);
+  const diffTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const fsEventsRef = useRef<EventSource | null>(null);
   const watchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingChangesRef = useRef<Set<string>>(new Set());
@@ -363,11 +454,26 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       nocache: forceFresh || undefined,
     };
     const isRefresh = p.trim() === lastCompletedPathRef.current;
+    // The user explicitly (re)scanned, so any "results stale" badge no longer
+    // applies; clear it now (it re-arms if the watcher sees new off-screen churn).
+    setResultsStale(false);
     if (isRefresh) {
       lastScanWasRefreshRef.current = true;
+      // #11: snapshot the current tree's per-path sizes so we can diff-highlight
+      // new/changed rows once this same-root refresh lands. Skip on very large
+      // trees to keep the snapshot cheap.
+      const cur = treeRef.current.nodeById;
+      if (cur.size > 0 && cur.size <= DIFF_MAX_NODES) {
+        const snap = new Map<string, number>();
+        for (const n of cur.values()) if (n.path) snap.set(n.path, n.size);
+        prevSizeByPathRef.current = snap;
+      } else {
+        prevSizeByPathRef.current = null;
+      }
       startRefresh(opts);
     } else {
       lastScanWasRefreshRef.current = false;
+      prevSizeByPathRef.current = null;
       startScan(opts);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -401,6 +507,26 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     } else if (lastScanWasRefreshRef.current) {
       tree.setNodes(data.nodes ?? []);
       suppressWatchRef.current = false;
+      // #11: diff the freshly-refreshed nodes against the pre-refresh snapshot
+      // and tint new (added) and size-changed rows; the tint fades on a timer.
+      const prev = prevSizeByPathRef.current;
+      if (prev && data.nodes && data.nodes.length <= DIFF_MAX_NODES) {
+        const marks = new Map<number, "added" | "changed">();
+        for (const n of data.nodes) {
+          if (!n.path || n.id < 0) continue;
+          const old = prev.get(n.path);
+          if (old === undefined) marks.set(n.id, "added");
+          else if (old !== n.size) marks.set(n.id, "changed");
+        }
+        if (diffTimerRef.current) clearTimeout(diffTimerRef.current);
+        if (marks.size > 0) {
+          setDiffHighlight(marks);
+          diffTimerRef.current = setTimeout(() => setDiffHighlight(null), DIFF_HIGHLIGHT_MS);
+        } else {
+          setDiffHighlight(null);
+        }
+      }
+      prevSizeByPathRef.current = null;
     } else {
       tree.setNodes(data.nodes ?? []);
       if (isFirstChunkRef.current) {
@@ -433,7 +559,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // onStateChange above (which keeps the shell's scan-level state in sync too).
   useEffect(() => {
     if (active) onWorkbenchChange();
-  }, [active, tree.visibleRows, tree.expanded, tree.selectedId, tree.nodeById, scanPath, onWorkbenchChange]);
+  }, [active, tree.visibleRows, tree.expanded, tree.selectedId, tree.nodeById, selectedIds, scanPath, onWorkbenchChange]);
 
   const startWatch = useCallback((rootPath: string) => {
     if (fsEventsRef.current) { fsEventsRef.current.close(); fsEventsRef.current = null; }
@@ -464,15 +590,20 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
 
       // Gate: keep only changed dirs that are loaded AND currently expanded, so
       // background churn in unopened folders is ignored (reflected on next scan).
+      // #10: a change in a loaded-but-collapsed (off-screen) subtree isn't
+      // auto-patched, so the displayed results may be stale — flag it.
       const dirs: string[] = [];
+      let offscreenChanged = false;
       for (const d of pendingChangesRef.current) {
         const node = byPath.get(d);
         if (!node) continue; // dir isn't in our tree → nothing visible to update
         const isOpen = node.id === 0
           || (t.expandedAll ? !bigTree : t.expanded.has(node.id));
         if (isOpen) dirs.push(d);
+        else offscreenChanged = true;
       }
       pendingChangesRef.current.clear();
+      if (offscreenChanged) setResultsStale(true);
       if (dirs.length === 0) return;
 
       // Coalesce nested dirs and cap the batch so one flush can't stall the UI.
@@ -483,6 +614,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           toScan.push(d);
         if (toScan.length >= WATCH_MAX_BATCH) break;
       }
+      // #10: more distinct open dirs changed than we patched this flush — the
+      // remainder won't be reflected until the next flush/refresh, so flag stale.
+      if (dirs.length > toScan.length) setResultsStale(true);
 
       patchInFlightRef.current = true;
       try {
@@ -526,10 +660,30 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   useEffect(() => {
     if (status === "done" && data) {
       lastCompletedPathRef.current = data.rootPath;
+      // #5: when navigating into a DIFFERENT folder, restore its saved sort +
+      // column widths (if any). Same-folder refreshes keep the user's current
+      // sort untouched. The skip guard prevents the restore from re-saving.
+      const prefsKey = normFolderKey(data.rootPath);
+      if (prefsKey !== folderPrefsKeyRef.current) {
+        folderPrefsKeyRef.current = prefsKey;
+        const saved = loadFolderPref(prefsKey);
+        if (saved) {
+          skipFolderSaveRef.current = true;
+          treeRef.current.setSort(saved.sortKey, saved.sortDir);
+          treeRef.current.setColumnWidthsAll(saved.columnWidths ?? {});
+          setTimeout(() => { skipFolderSaveRef.current = false; }, 0);
+        }
+      }
       if (active) startWatch(data.rootPath);
       // Seed history with the very first completed root (initial/restored scan).
       // Subsequent navigations push via openLocation; this only fires once.
       setNavHistory((prev) => (prev.index === -1 ? { stack: [data.rootPath], index: 0 } : prev));
+      // #36/#40: throttled auto-snapshot of the completed root so a growth
+      // history accumulates without user action, then evaluate growth alerts
+      // against the refreshed history. Never throws; throttle caps frequency.
+      void maybeAutoSnapshot(data.rootPath).then((list) => {
+        if (list) void checkGrowthAlerts(list);
+      });
     }
     if (status === "scanning") {
       fsEventsRef.current?.close();
@@ -537,6 +691,63 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
+
+  // #39: compute "what changed since last snapshot" folder badges when enabled.
+  // Loads the latest saved snapshot for the current root and diffs its
+  // directory size map against the live tree (directories only, so it stays
+  // cheap on large trees). Cleared when the toggle is off or no snapshot exists.
+  useEffect(() => {
+    if (!showGrowthBadges || !data) { setGrowthMap(null); return; }
+    let cancelled = false;
+    const root = data.rootPath;
+    void (async () => {
+      try {
+        const key = rootKey(root);
+        const list = await fetchSnapshots();
+        const latest = list
+          .filter((s) => rootKey(s.path) === key)
+          .sort((a, b) => b.createdAt - a.createdAt)[0];
+        if (!latest) { if (!cancelled) setGrowthMap(null); return; }
+        const snap = await fetchSnapshotData(latest.id);
+        if (cancelled || !snap) { if (!cancelled) setGrowthMap(null); return; }
+        const prevByPath = new Map<string, number>();
+        for (const [k, v] of Object.entries(snap.dirs)) prevByPath.set(k.toLowerCase(), v);
+        const map = new Map<number, { dir: "grew" | "shrank" | "new"; delta: number }>();
+        let budget = 50000; // cap work on very large trees
+        for (const node of treeRef.current.nodeById.values()) {
+          if (budget-- <= 0) break;
+          if (!node.dir || !node.path || node.id < 0) continue;
+          const prev = prevByPath.get(node.path.toLowerCase());
+          if (prev === undefined) {
+            map.set(node.id, { dir: "new", delta: node.size });
+          } else if (node.size !== prev) {
+            const delta = node.size - prev;
+            map.set(node.id, { dir: delta >= 0 ? "grew" : "shrank", delta });
+          }
+        }
+        if (!cancelled) setGrowthMap(map);
+      } catch {
+        if (!cancelled) setGrowthMap(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  // treeRef.current is read at run time; recompute on data identity + toggle.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showGrowthBadges, data]);
+
+  // #5: persist this folder's sort + column widths whenever the user changes
+  // them. Skipped while a restore is being applied (above) and before any scan
+  // has completed (no folder key yet). Capped LRU store lives in folderPrefs.
+  useEffect(() => {
+    if (skipFolderSaveRef.current) return;
+    const key = folderPrefsKeyRef.current;
+    if (!key) return;
+    saveFolderPref(key, {
+      sortKey: tree.sortKey,
+      sortDir: tree.sortDir,
+      columnWidths: tree.columnWidths,
+    });
+  }, [tree.sortKey, tree.sortDir, tree.columnWidths]);
 
   useEffect(() => {
     if (!active) {
@@ -651,6 +862,18 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     t.setSelectedId(id);
   }, []);
 
+  // Ctrl+A from the table: select every currently-visible selectable row (#2).
+  // TreeTable supplies the id list (scoped to its rendered rows), so this works
+  // for the tree, search and tag-filtered views alike. Anchor the range at the
+  // first row and make the last the active/primary so a following Shift+Arrow
+  // extends sensibly.
+  const handleSelectAllRows = useCallback((ids: number[]) => {
+    if (ids.length === 0) return;
+    selectionAnchorIdRef.current = ids[0];
+    setSelectedIds(new Set(ids));
+    treeRef.current.setSelectedId(ids[ids.length - 1]);
+  }, []);
+
   const handleContextMenu = useCallback((id: number, x: number, y: number) => {
     const t = treeRef.current;
     const selIds = selectedIdsRef.current;
@@ -700,14 +923,23 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     if (filePaths.length > 0) onCompress(filePaths);
   }, [onCompress]);
 
+  // Latest value of the configurable double-click action, read inside the stable
+  // handleDblClick callback without re-creating it (#7).
+  const folderDblClickExplorerRef = useRef(folderDblClickExplorer);
+  folderDblClickExplorerRef.current = folderDblClickExplorer;
+
   const handleDblClick = useCallback((id: number) => {
     const node = treeRef.current.nodeById.get(id);
     if (!node) return;
-    // Double-clicking a folder opens it in a real File Explorer window (#11);
-    // in-app drill-in stays available via the expand chevron / breadcrumb /
-    // "Open in new tab". Files open in their default app, unchanged.
+    // #7: a folder double-click either opens File Explorer (default) or drills
+    // into the folder in-app, per the user's setting. Files always open in their
+    // default app.
+    if (node.dir && !folderDblClickExplorerRef.current) {
+      openLocation(node.path);
+      return;
+    }
     openPath(node.path);
-  }, []);
+  }, [openLocation]);
 
   const handleSortChange = useCallback((k: SortKey) => { treeRef.current.setSortKey(k); }, []);
 
@@ -786,6 +1018,48 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     () => dedupeNestedPaths(selectedNodes.map((node) => node.path), nodeByPath),
     [nodeByPath, selectedNodes],
   );
+
+  // Selection summary for the status bar. Count is every selected row; total
+  // size sums only top-level-selected nodes (those whose parent is NOT also
+  // selected) so a folder + its selected descendants aren't double-counted.
+  const selectionSummary = useMemo(() => {
+    let count = 0;
+    let bytes = 0;
+    for (const id of selectedIds) {
+      const node = tree.nodeById.get(id);
+      if (!node || node.id < 0 || !node.path) continue;
+      count++;
+      if (node.parent != null && selectedIds.has(node.parent)) continue;
+      bytes += node.size;
+    }
+    return { count, bytes };
+  }, [selectedIds, tree.nodeById]);
+
+  // Copy the current selection to the clipboard as a TSV table (header + one row
+  // per selected node, in the active sort order) — pastes cleanly into Excel /
+  // Sheets. Sourced from the same selection the status-bar summary uses.
+  const runCopyAsTable = useCallback(() => {
+    const t = treeRef.current;
+    const nodes = Array.from(selectedIdsRef.current)
+      .map((id) => t.nodeById.get(id))
+      .filter((n): n is NodeRecord => !!n && n.id >= 0 && !!n.path);
+    if (nodes.length === 0) { toast.info("Select one or more items to copy."); return; }
+    nodes.sort((a, b) => compareNodes(a, b, t.sortKey, t.sortDir));
+    const header = ["Name", "Size", "Type", "Modified", "Full path"];
+    const lines = [header.join("\t")];
+    for (const n of nodes) {
+      const type = n.dir ? "Folder" : (n.extension ? n.extension.toLowerCase() : "File");
+      const modified = n.modified ? formatDate(n.modified) : "";
+      // Strip tabs/newlines from cell values so the TSV grid stays intact.
+      const cells = [n.name, formatBytes(n.size, t.unit), type, modified, n.path]
+        .map((c) => String(c).replace(/[\t\r\n]+/g, " "));
+      lines.push(cells.join("\t"));
+    }
+    const tsv = lines.join("\r\n");
+    navigator.clipboard.writeText(tsv)
+      .then(() => toast.success(`Copied ${nodes.length} row${nodes.length === 1 ? "" : "s"}`))
+      .catch(() => toast.error("Could not copy to the clipboard."));
+  }, []);
 
   useEffect(() => {
     const node = tree.nodeById.get(tree.selectedId);
@@ -905,7 +1179,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
 
   const [conflictPrompt, setConflictPrompt] = useState<{
     names: string[];
-    resolve: (choice: ConflictChoice) => void;
+    index?: number;
+    total?: number;
+    resolve: (result: { choice: ConflictChoice; applyToAll: boolean }) => void;
   } | null>(null);
   const [moveNotice, setMoveNotice] = useState<string | null>(null);
 
@@ -916,22 +1192,50 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   }, [moveNotice]);
 
   const askConflict = useCallback(
-    (names: string[]) => new Promise<ConflictChoice>((resolve) => setConflictPrompt({ names, resolve })),
+    (names: string[], index?: number, total?: number) =>
+      new Promise<{ choice: ConflictChoice; applyToAll: boolean }>((resolve) =>
+        setConflictPrompt({ names, index, total, resolve }),
+      ),
     [],
   );
-  const handleConflictChoice = useCallback((choice: ConflictChoice) => {
-    setConflictPrompt((prev) => { prev?.resolve(choice); return null; });
+  const handleConflictChoice = useCallback((choice: ConflictChoice, applyToAll: boolean) => {
+    setConflictPrompt((prev) => { prev?.resolve({ choice, applyToAll }); return null; });
   }, []);
 
+  // Conflict-resolution for the non-native (browser/dev) move path: the server's
+  // /api/move-items first runs in "detect" mode (moves clean items, reports
+  // collisions without overwriting), then we resolve the collisions per the
+  // user's choice. With "Apply to all" (default) one choice resolves every
+  // remaining collision in a single batched call; unchecked, we re-prompt for
+  // each item in turn (Skip/Overwrite/Rename) until done or Cancel.
+  // NOTE: in the Electron app, moves go through the native shell (IFileOperation)
+  // which presents Windows' OWN Replace/Skip/Keep-both dialog, so this dialog is
+  // the dev/browser fallback. (See handleInternalMove.)
   const runMoveWithConflicts = useCallback(
     async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string }> => {
       const detected = await moveItems(sources, destination);
       const allErrors = [...detected.errors];
-      if (detected.conflicts.length > 0) {
-        const choice = await askConflict(detected.conflicts.map((c) => c.name));
-        if (choice === "replace" || choice === "keep-both") {
-          const resolved = await moveItems(detected.conflicts.map((c) => c.src), destination, choice);
-          allErrors.push(...resolved.errors);
+      const conflicts = detected.conflicts;
+      if (conflicts.length > 0) {
+        let start = 0;
+        while (start < conflicts.length) {
+          const isFirst = start === 0;
+          // First prompt lists all collisions (apply-to-all is the default);
+          // per-item prompts show just the current item with an "X of N" header.
+          const view = isFirst ? conflicts : [conflicts[start]];
+          const { choice, applyToAll } = await askConflict(
+            view.map((c) => c.name),
+            isFirst ? undefined : start + 1,
+            conflicts.length,
+          );
+          if (choice === "cancel") break;
+          const targets = applyToAll ? conflicts.slice(start) : [conflicts[start]];
+          if (choice === "replace" || choice === "keep-both") {
+            const resolved = await moveItems(targets.map((c) => c.src), destination, choice);
+            allErrors.push(...resolved.errors);
+          }
+          if (applyToAll) break;
+          start += 1;
         }
       } else if (detected.alreadyThere.length > 0 && detected.moved.length === 0) {
         const n = detected.alreadyThere.length;
@@ -979,25 +1283,35 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     });
     if (!proceed) { setMoveNotice("Paste canceled."); return; }
     if (!hasNativeCopy()) { setMoveNotice("Paste-copy requires the FileTree desktop app."); return; }
-    // F10: track the copy in the transfer queue.
-    const xferId = beginTransfer("copy", `${itemsLabel(sources.length)} → \u201C${basenameFromPath(destination)}\u201D`, sources.length);
-    try {
-      suppressWatchRef.current = true;
-      const res = await copyItemsNative(sources, destination);
-      if (res.failed > 0) {
-        setMoveNotice(`${res.failed} item${res.failed === 1 ? "" : "s"} could not be copied${res.aborted ? " (canceled)" : ""}.`);
-      } else if (res.moved === 0 && res.skipped > 0) {
-        setMoveNotice("Nothing to paste here.");
-      }
-      finishTransfer(xferId, res.failed === 0, res.failed > 0 ? `${res.failed} item${res.failed === 1 ? "" : "s"} failed` : undefined);
-      invalidateAllScanCache();
-      doScan(undefined, undefined, true);
-    } catch (e) {
-      suppressWatchRef.current = false;
-      const message = e instanceof Error ? e.message : String(e);
-      finishTransfer(xferId, false, message);
-      setMoveNotice(`Paste failed: ${message}`);
-    }
+    // F10: track the copy in the transfer queue. The queue serializes transfers
+    // and honors a Pause (between transfers) — see lib/transfers.
+    await enqueueTransfer(
+      "copy",
+      `${itemsLabel(sources.length)} → \u201C${basenameFromPath(destination)}\u201D`,
+      sources.length,
+      async () => {
+        try {
+          suppressWatchRef.current = true;
+          const res = await copyItemsNative(sources, destination);
+          if (res.failed > 0) {
+            setMoveNotice(`${res.failed} item${res.failed === 1 ? "" : "s"} could not be copied${res.aborted ? " (canceled)" : ""}.`);
+          } else if (res.moved === 0 && res.skipped > 0) {
+            setMoveNotice("Nothing to paste here.");
+          }
+          invalidateAllScanCache();
+          doScan(undefined, undefined, true);
+          return {
+            ok: res.failed === 0,
+            error: res.failed > 0 ? `${res.failed} item${res.failed === 1 ? "" : "s"} failed` : undefined,
+          };
+        } catch (e) {
+          suppressWatchRef.current = false;
+          const message = e instanceof Error ? e.message : String(e);
+          setMoveNotice(`Paste failed: ${message}`);
+          return { ok: false, error: message };
+        }
+      },
+    );
   }, [doScan]);
 
   const handleInternalMove = useCallback(async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string }> => {
@@ -1033,60 +1347,64 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       return { ok: true };
     }
     // F10: track this move in the transfer queue (status surfaces near the
-    // status bar). The native shell op shows its own granular progress dialog.
-    const xferId = beginTransfer("move", `${itemsLabel(realSources.length)} → \u201C${basenameFromPath(destination)}\u201D`, realSources.length);
-    try {
-      suppressWatchRef.current = true;
-      let outcome: { ok: boolean; error?: string };
-      let didMove = false;
-      if (hasNativeMove()) {
-        const res = await moveItemsNative(realSources, destination);
-        // Honor the native result instead of assuming success. A fully cancelled
-        // dialog (nothing moved, nothing failed) is just a no-op notice, while
-        // any item that didn't make it — a per-item failure or a "Skip" in the
-        // native collision dialog — is surfaced so the caller can report it.
-        if (res.aborted && res.moved === 0 && res.failed === 0) {
-          setMoveNotice("Move canceled.");
-          outcome = { ok: true };
-        } else if (res.failed > 0) {
-          didMove = res.moved > 0;
-          outcome = {
-            ok: false,
-            error: `${res.failed} item${res.failed === 1 ? "" : "s"} could not be moved${res.aborted ? " (move canceled)" : ""}.`,
-          };
-        } else {
-          didMove = res.moved > 0;
-          outcome = { ok: true };
+    // status bar). The queue serializes transfers and honors a Pause between
+    // transfers; the native shell op shows its own granular progress dialog.
+    return enqueueTransfer(
+      "move",
+      `${itemsLabel(realSources.length)} → \u201C${basenameFromPath(destination)}\u201D`,
+      realSources.length,
+      async () => {
+        try {
+          suppressWatchRef.current = true;
+          let outcome: { ok: boolean; error?: string };
+          let didMove = false;
+          if (hasNativeMove()) {
+            const res = await moveItemsNative(realSources, destination);
+            // Honor the native result instead of assuming success. A fully
+            // cancelled dialog (nothing moved, nothing failed) is just a no-op
+            // notice, while any item that didn't make it — a per-item failure or
+            // a "Skip" in the native collision dialog — is surfaced.
+            if (res.aborted && res.moved === 0 && res.failed === 0) {
+              setMoveNotice("Move canceled.");
+              outcome = { ok: true };
+            } else if (res.failed > 0) {
+              didMove = res.moved > 0;
+              outcome = {
+                ok: false,
+                error: `${res.failed} item${res.failed === 1 ? "" : "s"} could not be moved${res.aborted ? " (move canceled)" : ""}.`,
+              };
+            } else {
+              didMove = res.moved > 0;
+              outcome = { ok: true };
+            }
+          } else {
+            outcome = await runMoveWithConflicts(realSources, destination);
+            didMove = outcome.ok;
+          }
+          // Phase 6 undo: record the reverse move (each item back to its original
+          // parent) when at least one item actually moved. The executor only
+          // moves back items still present at the destination, so partial moves
+          // are safe.
+          if (didMove) {
+            pushUndo({
+              kind: "move",
+              destination,
+              items: realSources.map((s) => ({ name: basenameFromPath(s), originalParent: parentDir(s) })),
+            });
+            if (outcome.ok) {
+              toast.success(`Moved ${itemsLabel(realSources.length)} to \u201C${basenameFromPath(destination)}\u201D.`, { action: undoAction });
+            }
+          }
+          invalidateAllScanCache();
+          doScan(undefined, undefined, true);
+          return outcome;
+        } catch (error) {
+          suppressWatchRef.current = false;
+          const message = error instanceof Error ? error.message : String(error);
+          return { ok: false, error: message };
         }
-      } else {
-        outcome = await runMoveWithConflicts(realSources, destination);
-        didMove = outcome.ok;
-      }
-      // Phase 6 undo: record the reverse move (each item back to its original
-      // parent) when at least one item actually moved. The executor only moves
-      // back items still present at the destination, so partial moves are safe.
-      if (didMove) {
-        pushUndo({
-          kind: "move",
-          destination,
-          items: realSources.map((s) => ({ name: basenameFromPath(s), originalParent: parentDir(s) })),
-        });
-        // Reversible move — offer Undo on a clean success (partial failures are
-        // surfaced by the caller, so we don't also claim success there).
-        if (outcome.ok) {
-          toast.success(`Moved ${itemsLabel(realSources.length)} to \u201C${basenameFromPath(destination)}\u201D.`, { action: undoAction });
-        }
-      }
-      finishTransfer(xferId, outcome.ok, outcome.error);
-      invalidateAllScanCache();
-      doScan(undefined, undefined, true);
-      return outcome;
-    } catch (error) {
-      suppressWatchRef.current = false;
-      const message = error instanceof Error ? error.message : String(error);
-      finishTransfer(xferId, false, message);
-      return { ok: false, error: message };
-    }
+      },
+    );
   }, [doScan, runMoveWithConflicts, undoAction]);
 
   // Paste CF_HDROP files into the focused folder. A Cut pastes as a MOVE through
@@ -1121,23 +1439,66 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     }
   }, [handleInternalMove, runPasteCopy]);
 
-  // "Move to..." (ribbon / context action). Route through handleInternalMove so
-  // that in Electron it uses the native shell move (IFileOperation) with the real
-  // Windows progress + conflict dialog — exactly like drag, treemap and the AI
-  // agent already do. The /api/move-items path stays only as the !hasNativeMove()
-  // (browser / dev) fallback, which handleInternalMove selects internally.
-  const runMoveTo = useCallback(async () => {
-    if (selectedPaths.length === 0) return;
-    const dest = await promptDialog({
-      title: "Move to folder",
-      label: "Destination folder",
-      placeholder: "C:\\path\\to\\folder",
-      confirmLabel: "Move",
-    });
-    if (dest == null) return; // canceled
-    const outcome = await handleInternalMove(selectedPaths, dest.trim());
-    if (!outcome.ok) { toast.error(`Move failed: ${outcome.error ?? "unknown error"}`); return; }
-  }, [selectedPaths, handleInternalMove]);
+  // "Move to…" / "Copy to…" (ribbon / context / palette). #42: a richer dialog
+  // with recent destinations + an inline "New folder…" affordance replaces the
+  // old plain text prompt. Move routes through handleInternalMove (native shell
+  // move in Electron, /api/move-items fallback in dev); Copy routes through the
+  // guarded native copy (runPasteCopy). The chosen destination is recorded as a
+  // recent on confirm so it's one click away next time.
+  const [moveToPrompt, setMoveToPrompt] = useState<{ mode: "move" | "copy" } | null>(null);
+
+  const runMoveTo = useCallback(() => {
+    if (selectedPaths.length === 0) { toast.info("Select one or more items first."); return; }
+    setMoveToPrompt({ mode: "move" });
+  }, [selectedPaths]);
+
+  const runCopyTo = useCallback(() => {
+    if (selectedPaths.length === 0) { toast.info("Select one or more items first."); return; }
+    setMoveToPrompt({ mode: "copy" });
+  }, [selectedPaths]);
+
+  // Default the dialog's destination field to the lone selected folder, else the
+  // scanned root, so "New folder…" has a sensible parent to start from.
+  const moveToInitialPath = useMemo(() => {
+    if (selectedPaths.length === 1) {
+      const node = nodeByPath.get(selectedPaths[0]);
+      if (node?.dir) return node.path;
+    }
+    return data?.rootPath ?? "";
+  }, [selectedPaths, nodeByPath, data]);
+
+  const handleMoveToConfirm = useCallback(async (destination: string) => {
+    const mode = moveToPrompt?.mode ?? "move";
+    setMoveToPrompt(null);
+    const target = destination.trim();
+    if (!target) return;
+    // Record the destination as recent (the user explicitly chose it). Recording
+    // on confirm — rather than waiting for the async transfer to settle — keeps
+    // the MRU responsive and is harmless if the transfer is later canceled.
+    recordRecentDestination(target);
+    if (mode === "move") {
+      const outcome = await handleInternalMove(selectedPaths, target);
+      if (!outcome.ok) toast.error(`Move failed: ${outcome.error ?? "unknown error"}`);
+    } else {
+      await runPasteCopy(selectedPaths, target);
+    }
+  }, [moveToPrompt, selectedPaths, handleInternalMove, runPasteCopy]);
+
+  // Create `name` under `parent` for the dialog's inline "New folder…". Reuses
+  // the audited create-folder API + pushes an undo entry like handleNewFolder.
+  const handleMoveToCreateFolder = useCallback(async (parent: string, name: string) => {
+    const sep = parent.includes("/") && !parent.includes("\\") ? "/" : "\\";
+    const full = `${parent.replace(/[\\/]+$/, "")}${sep}${name}`;
+    try {
+      await createFolder(full);
+      pushUndo({ kind: "mkdir", path: full });
+      invalidateAllScanCache();
+      doScan(undefined, undefined, true);
+      return { ok: true, path: full };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }, [doScan]);
 
   // ── F5: archive (zip) + checksum on the current selection ────────────────
   // The table's right-click opens the native Explorer menu, so these actions
@@ -1211,6 +1572,80 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     }
   }, [selectedNode, doScan]);
 
+  // #43: batch attribute + timestamp editor on the current selection. Opens a
+  // dialog; the apply handler routes through the audited, root-gated backend
+  // endpoints and rescans so the new attributes/dates show immediately.
+  const [attrDialogOpen, setAttrDialogOpen] = useState(false);
+
+  const runEditAttributes = useCallback(() => {
+    if (selectedPaths.length === 0) { toast.info("Select one or more items first."); return; }
+    setAttrDialogOpen(true);
+  }, [selectedPaths]);
+
+  const applyAttributes = useCallback(async (payload: AttributesPayload): Promise<{ ok: boolean; error?: string }> => {
+    const paths = selectedPaths;
+    if (paths.length === 0) return { ok: true };
+    const errors: string[] = [];
+    if (payload.attrs.readonly !== undefined || payload.attrs.hidden !== undefined) {
+      const r = await setAttributes(paths, payload.attrs);
+      if (!r.ok && r.error) errors.push(r.error);
+    }
+    if (payload.times.created !== undefined || payload.times.modified !== undefined || payload.times.accessed !== undefined) {
+      const r = await setTimes(paths, payload.times);
+      if (!r.ok && r.error) errors.push(r.error);
+    }
+    invalidateAllScanCache();
+    doScan(undefined, undefined, true);
+    if (errors.length > 0) return { ok: false, error: errors.join("; ") };
+    toast.success(`Updated ${itemsLabel(paths.length)}.`);
+    return { ok: true };
+  }, [selectedPaths, doScan]);
+
+  // #44: "Send to" actions on the selection. Compress reuses runCompress; Mail
+  // opens the default mail client via a mailto: URL (attachments aren't possible
+  // through mailto — FLAGGED — so we offer a one-click "Compress to .zip" so the
+  // user can attach the archive); custom commands run via the SendToDialog.
+  const [sendToOpen, setSendToOpen] = useState(false);
+
+  const runSendToMail = useCallback(async () => {
+    const paths = selectedPaths;
+    if (paths.length === 0) { toast.info("Select one or more items first."); return; }
+    const names = paths.map((p) => basenameFromPath(p));
+    const subject = encodeURIComponent(
+      paths.length === 1 ? `Sharing ${names[0]}` : `Sharing ${paths.length} files`,
+    );
+    const body = encodeURIComponent(
+      `I'd like to share the following:\n\n${names.join("\n")}\n\n` +
+      `(Files can't be attached automatically from a mailto link — please attach them manually.)`,
+    );
+    const url = `mailto:?subject=${subject}&body=${body}`;
+    try {
+      // Open the user's default mail client. Start-Process resolves the mailto:
+      // protocol handler; the URL is fully encoded so the shell can't mis-parse it.
+      await runCommand(`Start-Process "${url}"`, scanPath, { shell: "powershell" });
+      toast.info("Opened your mail client. Attachments must be added manually.", {
+        action: { label: "Compress to .zip", onClick: () => { void runCompress(); } },
+      });
+    } catch (e) {
+      toast.error(`Couldn't open the mail client: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  // runCompress is defined just above; referenced lazily so the closure is fine.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPaths, scanPath]);
+
+  const runSendToCommand = useCallback(() => {
+    if (selectedPaths.length === 0) { toast.info("Select one or more items first."); return; }
+    setSendToOpen(true);
+  }, [selectedPaths]);
+
+  // Run a substituted Send-to command, then rescan (it may create/modify files).
+  const sendToRunCommand = useCallback(async (command: string) => {
+    const res = await runCommand(command, scanPath);
+    invalidateAllScanCache();
+    doScan(undefined, undefined, true);
+    return res;
+  }, [scanPath, doScan]);
+
   const runChecksum = useCallback(async () => {
     const node = selectedNode;
     if (!node || node.dir) { toast.info("Select a file to checksum."); return; }
@@ -1230,6 +1665,76 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     invalidateAllScanCache();
     doScan(undefined, undefined, true);
   }, [doScan]);
+
+  // #14 Smart refresh (pragmatic incremental). Rather than a full deep rescan,
+  // re-walk only the directories the user currently has EXPANDED — each a cheap
+  // maxDepth=1 shallow rescan that `patchDirectory` splices in while PRESERVING
+  // the (unchanged) collapsed subtrees beneath them. So unscanned/collapsed
+  // subtrees keep their cached sizes (reused, not re-walked) and only the
+  // visible parts are refreshed.
+  //
+  // FLAGGED simplification: true incremental scanning (reuse-by-mtime across the
+  // whole tree) would need deep changes to the Rust walker / cache, so it's
+  // deferred. The old mtime-poll endpoint (/api/watch) was replaced by the SSE
+  // fs-events watcher, so this reuses the same shallow-rescan+patch machinery the
+  // watcher already uses. Changes inside collapsed folders aren't picked up here
+  // (use Refresh for a full deep rescan); if too many folders are open it falls
+  // back to a full rescan.
+  const doSmartRefresh = useCallback(async () => {
+    const t = treeRef.current;
+    const root = lastCompletedPathRef.current;
+    if (!root || status === "scanning") { doScan(undefined, undefined, true); return; }
+
+    // Currently-expanded directories that are real, loaded nodes (skip the root's
+    // synthetic bundle ids and unscanned stubs).
+    const openDirs: string[] = [];
+    for (const node of t.nodeById.values()) {
+      if (!node.dir || node.id < 0 || !node.path) continue;
+      if (node.id === 0 || t.expanded.has(node.id)) openDirs.push(node.path);
+    }
+    if (openDirs.length === 0 || openDirs.length > SMART_REFRESH_MAX_DIRS) {
+      doScan(undefined, undefined, true);
+      return;
+    }
+
+    // Coalesce nested dirs: re-walking a parent already covers its visible
+    // children, so keep only the topmost of each open chain.
+    openDirs.sort((a, b) => a.length - b.length);
+    const toScan: string[] = [];
+    for (const d of openDirs) {
+      if (!toScan.some((q) => d === q || d.startsWith(q + "\\") || d.startsWith(q + "/"))) {
+        toScan.push(d);
+      }
+    }
+
+    const excludePatterns = exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [];
+    suppressWatchRef.current = true;
+    patchInFlightRef.current = true;
+    let patched = 0;
+    try {
+      for (const dir of toScan) {
+        invalidateScanCache(dir);
+        try {
+          const result = await fetchScanStream({
+            path: dir,
+            threads,
+            includeHidden,
+            followLinks,
+            collectOwners,
+            excludePatterns,
+            maxDepth: 1,
+            nocache: true,
+          });
+          if (result?.nodes?.length) { treeRef.current.patchDirectory(dir, result.nodes); patched++; }
+        } catch { /* ignore per-dir network errors */ }
+      }
+    } finally {
+      patchInFlightRef.current = false;
+      suppressWatchRef.current = false;
+    }
+    setResultsStale(false);
+    toast.success(`Smart refresh updated ${patched} visible folder${patched === 1 ? "" : "s"}.`);
+  }, [status, threads, includeHidden, followLinks, collectOwners, exclude, doScan]);
 
   // ── Agent API facade (used by the right-side ChatPanel) ──────────────────
   const agentApi = useMemo<AgentApi>(() => ({
@@ -1293,6 +1798,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     getProgressStore: () => progressStore,
     getErrorMessage: () => errorMessage,
     getVisibleCount: () => tree.visibleRows.length,
+    getSelectionSummary: () => selectionSummary,
+    doCopyAsTable: runCopyAsTable,
     getScanPath: () => scanPath,
     getScanning: () => status === "scanning",
     getNodeById: () => tree.nodeById,
@@ -1350,6 +1857,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     doDelete: runDelete,
     doDeletePaths: (paths) => { void runDeletePaths(paths); },
     doMoveTo: runMoveTo,
+    doCopyTo: runCopyTo,
+    doEditAttributes: runEditAttributes,
+    doSendToMail: () => { void runSendToMail(); },
+    doSendToCommand: runSendToCommand,
     doCopyPath: runCopyPath,
     doCopyFiles: runCopyFiles,
     doCompress: () => { void runCompress(); },
@@ -1376,6 +1887,29 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       a.click();
       document.body.removeChild(a);
     },
+    doSelectPaths: (paths) => {
+      const byPath = new Map<string, number>();
+      for (const n of treeRef.current.nodeById.values()) {
+        if (n.id >= 0 && n.path) byPath.set(n.path.toLowerCase(), n.id);
+      }
+      const ids: number[] = [];
+      for (const p of paths) {
+        const id = byPath.get(p.toLowerCase());
+        if (id != null) ids.push(id);
+      }
+      if (ids.length > 0) handleSelectAllRows(ids);
+      return ids.length;
+    },
+    doSelectSearchResults: () => {
+      const ids = searchResultsRef.current.map((n) => n.id);
+      if (ids.length === 0) { setMoveNotice("No results to select."); return; }
+      handleSelectAllRows(ids);
+    },
+    doExportSearchResults: (format) => {
+      const rows = searchResultsRef.current;
+      if (rows.length === 0) { setMoveNotice("No results to export."); return; }
+      exportResults(rows, format);
+    },
     getRibbonState: () => ({
       scanPath,
       scanning: status === "scanning",
@@ -1398,15 +1932,17 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     },
     showNotice: (message) => setMoveNotice(message),
     refresh: () => { invalidateAllScanCache(); doScan(undefined, undefined, true); },
+    smartRefresh: doSmartRefresh,
     doNavigateId: (id) => handleNavigate(id),
     getFilterRules: () => treeRef.current.filterRules,
     setFilterRules: (rules) => treeRef.current.setFilterRules(rules),
   }), [status, data, progressStore, errorMessage, scanPath, tree, cancelScan, agentApi,
        doScan, handleNavigate, handleNavigateParent, handleExpand, handleNewFolder, selectedNode,
        openLocation, goBack, goForward, navHistory, runOpen, runReveal, onScanPath,
-       runRename, runRenamePath, runDelete, runDeletePaths, runMoveTo, runCopyPath, runCopyFiles,
-       runCompress, runExtract, runChecksum,
-       runCutFiles, runPaste, dropExternalInto]);
+       runRename, runRenamePath, runDelete, runDeletePaths, runMoveTo, runCopyTo, runEditAttributes,
+       runSendToMail, runSendToCommand, runCopyPath, runCopyFiles,
+       runCompress, runExtract, runChecksum, selectionSummary, runCopyAsTable,
+       runCutFiles, runPaste, dropExternalInto, doSmartRefresh]);
 
   // Bottom-panel (treemap) vertical resize.
   const handlePanelResize = useCallback((e: React.MouseEvent) => {
@@ -1435,10 +1971,13 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // table (replacing the tree rows) when the Search view is active with a >= 2
   // char query; re-sorts automatically because it reads the active sortKey/dir.
   const searchResults = useMemo(
-    () => searchNodes(tree.nodeById, searchQuery, tree.sortKey, tree.sortDir, 2000),
-    [tree.nodeById, searchQuery, tree.sortKey, tree.sortDir],
+    () => searchNodesAdvanced(tree.nodeById, searchQuery, searchFilters, tree.sortKey, tree.sortDir, 2000),
+    [tree.nodeById, searchQuery, searchFilters, tree.sortKey, tree.sortDir],
   );
-  const searching = activeView === "search" && searchQuery.trim().length >= 2;
+  searchResultsRef.current = searchResults;
+  // Show flat results when searching (>=2 char query) OR a pure size/type/date
+  // filter is active (lets filters alone list results with an empty query).
+  const searching = activeView === "search" && (searchQuery.trim().length >= 2 || filtersActive(searchFilters));
 
   // Tag filter (F4): when a tag is active, flatten the table to the tagged paths
   // (same flat-list treatment as Search). A lightweight predicate over the live
@@ -1501,6 +2040,27 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           onForward={goForward}
           onUp={handleNavigateParent}
         />
+        {resultsStale && status !== "scanning" && (
+          <div className="stale-bar" role="status">
+            <Icon name="warning" size={12} />
+            <span>Results may be stale — the watched folder changed.</span>
+            <span className="spacer" />
+            <button
+              className="stale-bar-refresh"
+              title="Rescan this folder to refresh the results"
+              onClick={() => doScan(undefined, undefined, true)}
+            >
+              <Icon name="refresh" size={12} /> Refresh
+            </button>
+            <button
+              className="stale-bar-dismiss"
+              title="Dismiss"
+              onClick={() => setResultsStale(false)}
+            >
+              <Icon name="x" size={12} />
+            </button>
+          </div>
+        )}
         {tagFiltering && (
           <div className="tag-filter-bar" role="status">
             <Icon name="funnel-fill" size={12} />
@@ -1629,6 +2189,47 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             </div>
             )}
 
+            {toolbarVisible && (
+            <div className="editor-toolbar quick-filter-chips">
+              {QUICK_FILTER_CHIPS.map((chip) => (
+                <button
+                  key={chip.key}
+                  type="button"
+                  className={`compress-chip${tree.chips.has(chip.key) ? " active" : ""}`}
+                  onClick={() => tree.toggleChip(chip.key)}
+                  title={`Show only ${chip.label}`}
+                >
+                  {chip.label}
+                </button>
+              ))}
+            </div>
+            )}
+
+            {searching && (
+              <div className="editor-toolbar search-results-bar">
+                <Icon name="search" size={12} />
+                <span className="search-results-count">
+                  {searchResults.length}{searchResults.length >= 2000 ? "+" : ""} result{searchResults.length === 1 ? "" : "s"}
+                </span>
+                <span className="spacer" />
+                <button
+                  onClick={() => { const ids = searchResults.map((n) => n.id); if (ids.length) handleSelectAllRows(ids); }}
+                  disabled={searchResults.length === 0}
+                  title="Select every matching result row"
+                >Select all</button>
+                <button
+                  onClick={() => { if (searchResults.length) exportResults(searchResults, "csv"); }}
+                  disabled={searchResults.length === 0}
+                  title="Export the result rows to CSV"
+                >Export CSV</button>
+                <button
+                  onClick={() => { if (searchResults.length) exportResults(searchResults, "json"); }}
+                  disabled={searchResults.length === 0}
+                  title="Export the result rows to JSON"
+                >Export JSON</button>
+              </div>
+            )}
+
             <div className="editor-stack">
               <div className="editor-main">
                 <TreeTable
@@ -1648,6 +2249,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   onColumnResize={tree.setColumnWidth}
                   onToggleExpand={tree.toggleExpand}
                   onSelect={handleSelectRow}
+                  onSelectAll={handleSelectAllRows}
+                  selectionSummary={selectionSummary}
+                  heatTint={heatTint}
+                  diffHighlight={diffHighlight}
+                  growth={growthMap}
                   onDoubleClick={handleDblClick}
                   onContextMenu={handleContextMenu}
                   onCopySelected={runCopyFiles}
@@ -1729,6 +2335,22 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         />
       )}
 
+      {attrDialogOpen && (
+        <AttributesDialog
+          nodes={selectedNodes}
+          onApply={applyAttributes}
+          onClose={() => setAttrDialogOpen(false)}
+        />
+      )}
+
+      {sendToOpen && (
+        <SendToDialog
+          paths={selectedPaths}
+          onRunCommand={sendToRunCommand}
+          onClose={() => setSendToOpen(false)}
+        />
+      )}
+
       {tagPopover && (
         <TagPopover
           path={tagPopover.path}
@@ -1741,7 +2363,25 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       )}
 
       {conflictPrompt && (
-        <ConflictDialog names={conflictPrompt.names} onChoice={handleConflictChoice} />
+        <ConflictDialog
+          names={conflictPrompt.names}
+          index={conflictPrompt.index}
+          total={conflictPrompt.total}
+          onChoice={handleConflictChoice}
+        />
+      )}
+
+      {moveToPrompt && (
+        <MoveToDialog
+          title={moveToPrompt.mode === "move" ? "Move to folder" : "Copy to folder"}
+          confirmLabel={moveToPrompt.mode === "move" ? "Move" : "Copy"}
+          initialPath={moveToInitialPath}
+          recents={getRecentDestinations()}
+          onCreateFolder={handleMoveToCreateFolder}
+          onRemoveRecent={removeRecentDestination}
+          onConfirm={(dest) => { void handleMoveToConfirm(dest); }}
+          onCancel={() => setMoveToPrompt(null)}
+        />
       )}
 
       {moveNotice && <div className="move-toast" role="status">{moveNotice}</div>}

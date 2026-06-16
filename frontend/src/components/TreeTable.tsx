@@ -87,6 +87,24 @@ interface TreeTableProps {
   onEditTags?: (path: string, x: number, y: number) => void;
   onToggleExpand: (id: number) => void;
   onSelect: (id: number, mode: "single" | "toggle" | "range") => void;
+  /** Select every currently-visible (rendered) selectable row — Ctrl+A (#2).
+   *  TreeTable computes the id list from its own `rows` so it stays scoped to
+   *  the focused pane's visible list (tree / search / tag results). */
+  onSelectAll?: (ids: number[]) => void;
+  /** Parent-aware selection summary for the footer band (#4). When count >= 1
+   *  the footer shows the selection totals instead of the visible-rows totals. */
+  selectionSummary?: { count: number; bytes: number };
+  /** Tint each row's background by its size relative to the largest visible row
+   *  (#9). Subtle, theme-aware accent; off renders rows normally. */
+  heatTint?: boolean;
+  /** #11: transient diff highlight applied right after a same-root refresh —
+   *  node id → "added" (new entry) | "changed" (size delta). Fades upstream. */
+  diffHighlight?: Map<number, "added" | "changed"> | null;
+  /** #39: "what changed since last snapshot" badges — directory node id →
+   *  {dir, delta} vs. the latest saved snapshot of the current root. When
+   *  present, matching folder rows show a subtle grew/shrank/new indicator with
+   *  a size-delta tooltip. Computed upstream and capped to directories. */
+  growth?: Map<number, { dir: "grew" | "shrank" | "new"; delta: number }> | null;
   onDoubleClick: (id: number) => void;
   onContextMenu: (id: number, x: number, y: number) => void;
   onSortChange: (key: SortKey) => void;
@@ -220,6 +238,11 @@ function TreeTableInner({
   onEditTags,
   onToggleExpand,
   onSelect,
+  onSelectAll,
+  selectionSummary,
+  heatTint,
+  diffHighlight,
+  growth,
   onDoubleClick,
   onContextMenu,
   onSortChange,
@@ -512,6 +535,85 @@ function TreeTableInner({
     overscan: 20,
   });
 
+  // ── Type-to-find (#1) ──────────────────────────────────────────────────────
+  // Accumulate printable keystrokes into a buffer that resets ~800ms after the
+  // last key; jump to the first visible row whose name starts with the buffer
+  // (falling back to a contains match). F3 / n cycle forward, Shift+F3 / N back,
+  // and pressing the same single letter repeatedly also cycles. Esc clears.
+  const typeBufferRef = useRef("");
+  const typeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastMatchIndexRef = useRef(-1);
+
+  const scrollIndexIntoView = useCallback((index: number) => {
+    try { virtualizer.scrollToIndex(index, { align: "auto" }); } catch { /* ignore */ }
+  }, [virtualizer]);
+
+  // Find a match for `prefix` scanning from `fromIndex` in direction `dir`
+  // (wrapping). Prefix matches win; a contains match is the fallback. On a hit
+  // it selects the row, scrolls it into view and remembers the index for cycling.
+  const runTypeFind = useCallback((prefix: string, fromIndex: number, dir: 1 | -1) => {
+    const n = rows.length;
+    if (!prefix || n === 0) return;
+    const scan = (test: (name: string) => boolean): number => {
+      for (let s = 0; s < n; s++) {
+        const idx = (((fromIndex + dir * s) % n) + n) % n;
+        const r = rows[idx];
+        if (!r || r.id < 0 || !r.path) continue;
+        if (test(r.name.toLowerCase())) return idx;
+      }
+      return -1;
+    };
+    let found = scan((name) => name.startsWith(prefix));
+    if (found < 0) found = scan((name) => name.includes(prefix));
+    if (found >= 0) {
+      lastMatchIndexRef.current = found;
+      onSelect(rows[found].id, "single");
+      scrollIndexIntoView(found);
+    }
+  }, [rows, onSelect, scrollIndexIntoView]);
+
+  // Index of the active (primary-selected) row within the current visible list.
+  const activeRowIndex = useCallback(() => rows.findIndex((r) => r.id === selectedId), [rows, selectedId]);
+
+  // Move the active row by `dir`, skipping bundle/empty pseudo-rows. With Shift
+  // it extends the selection as a range from the anchor (#2); otherwise it's a
+  // plain single selection (which also re-anchors). Scrolls the new active row
+  // into view (the list is virtualized).
+  const moveActive = useCallback((dir: 1 | -1, extend: boolean) => {
+    const cur = activeRowIndex();
+    let target = -1;
+    if (cur < 0) {
+      for (let i = 0; i < rows.length; i++) { if (rows[i].id >= 0 && rows[i].path) { target = i; break; } }
+    } else {
+      for (let i = cur + dir; i >= 0 && i < rows.length; i += dir) {
+        if (rows[i].id >= 0 && rows[i].path) { target = i; break; }
+      }
+    }
+    if (target < 0 || target === cur) return;
+    onSelect(rows[target].id, extend ? "range" : "single");
+    scrollIndexIntoView(target);
+  }, [rows, activeRowIndex, onSelect, scrollIndexIntoView]);
+
+  // ── Visible-rows totals + heat-tint max (#4 / #9) ──────────────────────────
+  // Count of real (non-bundle) rows and their parent-aware total bytes (a
+  // visible child whose parent is also visible isn't double-counted). The max
+  // visible row size drives the heat-tint alpha.
+  const visibleTotals = useMemo(() => {
+    const visibleIds = new Set<number>();
+    for (const r of rows) if (r.id >= 0) visibleIds.add(r.id);
+    let count = 0;
+    let bytes = 0;
+    let maxSize = 0;
+    for (const r of rows) {
+      if (r.id < 0 || !r.path) continue;
+      count++;
+      if (r.size > maxSize) maxSize = r.size;
+      if (r.parent != null && visibleIds.has(r.parent)) continue;
+      bytes += r.size;
+    }
+    return { count, bytes, maxSize };
+  }, [rows]);
+
   const rootNode = nodeById.get(0);
   const selectedDragNodes = useMemo(
     () => dedupeNestedNodes(
@@ -651,9 +753,60 @@ function TreeTableInner({
       style={{ outline: "none" }}
       onMouseDown={(e) => { (e.currentTarget as HTMLElement).focus(); }}
       onKeyDown={(e) => {
-        if ((e.ctrlKey || e.metaKey) && e.key === "c" && onCopySelected) {
+        const ctrl = e.ctrlKey || e.metaKey;
+        if (ctrl && e.key.toLowerCase() === "c" && onCopySelected) {
           e.preventDefault();
           onCopySelected();
+          return;
+        }
+        // Ctrl+A: select all currently-visible rows (#2).
+        if (ctrl && e.key.toLowerCase() === "a") {
+          e.preventDefault();
+          onSelectAll?.(rows.filter((r) => r.id >= 0 && r.path).map((r) => r.id));
+          return;
+        }
+        // Arrow navigation + Shift range-extend (#2).
+        if (!ctrl && !e.altKey && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+          e.preventDefault();
+          moveActive(e.key === "ArrowDown" ? 1 : -1, e.shiftKey);
+          return;
+        }
+        // F3 / Shift+F3 cycle the current type-to-find match (#1).
+        if (e.key === "F3") {
+          e.preventDefault();
+          const buf = typeBufferRef.current;
+          if (buf) runTypeFind(buf, lastMatchIndexRef.current + (e.shiftKey ? -1 : 1), e.shiftKey ? -1 : 1);
+          return;
+        }
+        // n / N cycle while a find buffer is active (#1). Only when a buffer is
+        // live so typing a name that contains "n" still works once the buffer
+        // has cleared.
+        if (!ctrl && !e.altKey && (e.key === "n" || e.key === "N") && typeBufferRef.current) {
+          e.preventDefault();
+          const back = e.shiftKey || e.key === "N";
+          runTypeFind(typeBufferRef.current, lastMatchIndexRef.current + (back ? -1 : 1), back ? -1 : 1);
+          return;
+        }
+        if (e.key === "Escape") {
+          if (typeBufferRef.current) { typeBufferRef.current = ""; e.stopPropagation(); }
+          return;
+        }
+        // Printable character → type-to-find buffer (#1). Ignore a leading space.
+        if (!ctrl && !e.altKey && e.key.length === 1) {
+          if (e.key === " " && !typeBufferRef.current) return;
+          e.preventDefault();
+          const ch = e.key.toLowerCase();
+          if (typeTimerRef.current) clearTimeout(typeTimerRef.current);
+          typeTimerRef.current = setTimeout(() => { typeBufferRef.current = ""; }, 800);
+          const prev = typeBufferRef.current;
+          if (prev.length === 1 && prev === ch) {
+            // Same single letter repeated → cycle to the next match (#1).
+            runTypeFind(prev, lastMatchIndexRef.current + 1, 1);
+          } else {
+            const next = prev + ch;
+            typeBufferRef.current = next;
+            runTypeFind(next, 0, 1);
+          }
         }
       }}
     >
@@ -718,14 +871,25 @@ function TreeTableInner({
             const isDraggable = !isBundle && !!node.path && node.id !== renamingId;
             const isSelected = !isBundle && selectedIds.has(node.id);
             const isDropTarget = dropTargetId === node.id;
+            // #9: alpha proportional to this row's size vs. the largest visible
+            // row, capped at 0.12; CSS turns it into a theme-aware accent tint.
+            const heat = heatTint && !isBundle && visibleTotals.maxSize > 0
+              ? (node.size / visibleTotals.maxSize) * 0.12
+              : 0;
+            const rowStyle: React.CSSProperties = { position: "absolute", top: vItem.start, left: 0, right: 0, height: ROW_HEIGHT, gridTemplateColumns: gridTemplate };
+            if (heat > 0) (rowStyle as Record<string, string | number>)["--heat"] = heat;
+            // #11: transient added/changed tint right after a same-root refresh.
+            const diffMark = !isBundle && diffHighlight ? diffHighlight.get(node.id) : undefined;
+            // #39: "what changed since last snapshot" badge for this folder.
+            const growthMark = !isBundle && growth ? growth.get(node.id) : undefined;
             return (
               <div
                 key={node.id}
                 data-index={vItem.index}
                 data-node-path={node.path ?? ""}
                 data-node-dir={node.dir && !isBundle ? "1" : "0"}
-                className={`row${isSelected ? " selected" : ""}${selectedId === node.id ? " primary-selected" : ""}${node.hidden ? " hidden-entry" : ""}${isDropTarget ? " drop-target" : ""}`}
-                style={{ position: "absolute", top: vItem.start, left: 0, right: 0, height: ROW_HEIGHT, gridTemplateColumns: gridTemplate }}
+                className={`row${isSelected ? " selected" : ""}${selectedId === node.id ? " primary-selected" : ""}${node.hidden ? " hidden-entry" : ""}${isDropTarget ? " drop-target" : ""}${heat > 0 ? " heat" : ""}${diffMark ? ` diff-${diffMark}` : ""}`}
+                style={rowStyle}
                 draggable={isDraggable}
                 onClick={(e) => {
                   if (isBundle) { onToggleExpand(node.id); return; }
@@ -872,6 +1036,16 @@ function TreeTableInner({
                   ) : (
                     <span className={`name-text${isBundle ? " bundle-label" : ""}`}>{node.name}</span>
                   )}
+                  {growthMark && (
+                    <span
+                      className={`growth-badge ${growthMark.dir}`}
+                      title={growthMark.dir === "new"
+                        ? "New since last snapshot"
+                        : `${growthMark.delta >= 0 ? "+" : "\u2212"}${formatBytes(Math.abs(growthMark.delta))} since last snapshot`}
+                    >
+                      {growthMark.dir === "new" ? "NEW" : growthMark.dir === "grew" ? "\u25B2" : "\u25BC"}
+                    </span>
+                  )}
                   {!isBundle && node.path && onEditTags && (() => {
                     const tagEntry = tags?.get(node.path);
                     const tagged = !!tagEntry && (tagEntry.tags.length > 0 || !!tagEntry.color);
@@ -914,6 +1088,19 @@ function TreeTableInner({
             );
           })}
         </div>
+      </div>
+      {/* Sticky totals footer (#4): visible-rows count + size, or the current
+          selection's totals when something is selected. */}
+      <div className="table-footer" role="status">
+        {selectionSummary && selectionSummary.count >= 1 ? (
+          <span>
+            {formatCount(selectionSummary.count)} selected · {formatBytes(selectionSummary.bytes, unit, decimals)}
+          </span>
+        ) : (
+          <span>
+            {formatCount(visibleTotals.count)} item{visibleTotals.count === 1 ? "" : "s"} · {formatBytes(visibleTotals.bytes, unit, decimals)}
+          </span>
+        )}
       </div>
       {tooltip && (
         <NodeTooltip

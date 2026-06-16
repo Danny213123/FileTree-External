@@ -40,6 +40,8 @@ interface InspectorPaneProps {
   onOpen: () => void;
   onReveal: () => void;
   onCopyPath: () => void;
+  /** Exclude a folder path from scans (#12); forwarded to the Details pane. */
+  onExclude?: (path: string) => void;
 }
 
 // Right-side, toggleable inspector that mirrors the Explorer "Preview" and
@@ -48,7 +50,7 @@ interface InspectorPaneProps {
 export function InspectorPane({
   width, node, data, nodeById, bookmarks, unit,
   showPreview, showDetails, onClosePreview, onCloseDetails,
-  onOpen, onReveal, onCopyPath,
+  onOpen, onReveal, onCopyPath, onExclude,
 }: InspectorPaneProps) {
   return (
     <div className="inspector-pane" style={{ width, flex: `0 0 ${width}px` }}>
@@ -82,6 +84,7 @@ export function InspectorPane({
               onOpen={onOpen}
               onReveal={onReveal}
               onCopyPath={onCopyPath}
+              onExclude={onExclude}
             />
           </div>
         </section>

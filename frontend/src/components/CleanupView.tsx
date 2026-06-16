@@ -21,6 +21,10 @@ import { EmptyState } from "./EmptyState";
 
 type ScanState = "idle" | "scanning" | "done" | "error";
 
+// #28 Safe-clean profile: the conservative, low-risk cleanup categories only.
+// Mirrors the category ids emitted by `src/cleanup.rs`.
+const SAFE_CATEGORY_IDS = new Set(["temp", "browser-cache", "recycle-bin"]);
+
 const CAT_ROW_H = 48;
 const ITEM_ROW_H = 26;
 
@@ -135,6 +139,47 @@ export function CleanupView({ scanPath }: CleanupViewProps) {
     });
   }, []);
 
+  // #28 Safe clean: a one-click profile that targets only the conservative,
+  // low-risk categories (temp files, browser caches, Recycle Bin) — never the
+  // ambiguous ones (build artifacts, old downloads, duplicates). Shows a dry-run
+  // total BEFORE the move-to-Recycle-Bin and requires an explicit confirm.
+  const handleSafeClean = useCallback(async () => {
+    const safeCats = categories.filter((c) => SAFE_CATEGORY_IDS.has(c.id));
+    const paths: string[] = [];
+    for (const c of safeCats) for (const it of c.items) paths.push(it.path);
+    const bytes = paths.reduce((s, p) => s + (sizeByPath.get(p) ?? 0), 0);
+    const aggregate = safeCats.reduce((s, c) => s + c.total, 0);
+    if (paths.length === 0) {
+      toast.info("Nothing in the safe-clean categories to remove.");
+      return;
+    }
+    setSelected(new Set(paths)); // reflect the profile in the list
+    const ok = await confirmDialog({
+      title: "Safe clean",
+      message:
+        `Safe clean targets low-risk categories only (temporary files, browser caches, Recycle Bin) — ` +
+        `never build artifacts, downloads or duplicates.\n\n` +
+        `Reclaimable in these categories: ${formatBytes(aggregate)}.\n` +
+        `Ready to move now: ${formatBytes(bytes)} across ${paths.length.toLocaleString()} item${paths.length === 1 ? "" : "s"}.\n\n` +
+        `Move them to the Recycle Bin? You can restore them from there if needed.`,
+      confirmLabel: "Move to Recycle Bin",
+      danger: true,
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const res = await recycleItems(paths);
+      if (res.ok) {
+        toast.success(`Safe clean moved ${paths.length.toLocaleString()} item${paths.length === 1 ? "" : "s"} to the Recycle Bin.`);
+        await runScan();
+      } else {
+        toast.error(res.error ?? "Safe clean failed.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }, [categories, sizeByPath, runScan]);
+
   const handleRecycle = useCallback(async () => {
     const paths = Array.from(selected);
     if (paths.length === 0) return;
@@ -193,6 +238,14 @@ export function CleanupView({ scanPath }: CleanupViewProps) {
           title="Re-scan for reclaimable space"
         >
           <Icon name="refresh" size={13} /> {scanState === "scanning" ? "Scanning…" : "Rescan"}
+        </button>
+        <button
+          className="cleanup-btn"
+          onClick={() => void handleSafeClean()}
+          disabled={scanState !== "done" || busy}
+          title="One-click clean of low-risk categories only (temp, caches, Recycle Bin) with a dry-run total"
+        >
+          <Icon name="check" size={13} /> Safe clean
         </button>
         <button
           className="cleanup-btn danger"
