@@ -61,6 +61,12 @@ export interface ScanResult {
   nodeCount: number;
   errorCount: number;
   nodes: NodeRecord[];
+  /** True when the scan was ingested in LAZY mode: `nodes` holds only the root
+   *  (and whatever directories the user has since expanded), not the whole tree.
+   *  Set by `readNdjsonStream` when `nodeCount` exceeds the lazy threshold so the
+   *  renderer never materializes a >10M-node tree. Absent/false for normal scans,
+   *  which keep their exact full-materialization behavior. */
+  lazy?: boolean;
   topFiles: number[];
   /** Node ids of the largest directories (computed server-side, capped at 100).
    *  Streamed in the scan meta line; reused by the Reports "Largest Folders" view. */

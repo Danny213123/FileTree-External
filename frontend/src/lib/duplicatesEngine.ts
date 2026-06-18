@@ -63,6 +63,9 @@ export function bestSourceForTarget(target: string, pool: ScanResult[]): ScanRes
   const t = normalizePath(target);
   for (const r of pool) {
     if (!r?.rootPath) continue;
+    // Skip LAZY scans: they hold only the root node, so they don't actually
+    // cover the target's files — the caller must scan it fully instead.
+    if (r.lazy) continue;
     const root = normalizePath(r.rootPath);
     if (t === root || t.startsWith(root + "/")) {
       if (root.length > bestLen) {

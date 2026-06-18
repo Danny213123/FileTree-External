@@ -292,8 +292,12 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
           try {
             const res = await fetch(scanStreamUrl({ path: target, includeHidden, threads }), { signal });
             if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+            // forceFull: duplicate detection must see every file, so override the
+            // lazy-ingest threshold here (the result is consumed for candidate
+            // metadata and not held as the persistent tree).
             const result = await readNdjsonStream(res.body.getReader(), (n) =>
               setProgress((prev) => ({ ...prev, scanned: n })),
+              { forceFull: true },
             );
             setCached(target, result);
             pool.push(result);

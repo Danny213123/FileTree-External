@@ -110,6 +110,43 @@ export function filtersActive(f: SearchFilters): boolean {
   );
 }
 
+/** Server-side search parameters derived from a {@link SearchFilters} set.
+ *  Used in LAZY mode where the renderer can't iterate every node and search runs
+ *  against the backend's cached scan (GET /api/search). The agePreset is folded
+ *  into modifiedAfter/Before (epoch ms) here so the server stays preset-agnostic,
+ *  mirroring {@link makeFilterPredicate}. */
+export interface ServerSearchParams {
+  regex?: boolean;
+  minSize?: number;
+  maxSize?: number;
+  modifiedAfter?: number;
+  modifiedBefore?: number;
+  ext?: string;
+  category?: string;
+}
+
+/** Translate the renderer's SearchFilters into GET /api/search params, resolving
+ *  the relative agePreset into an absolute modifiedAfter/Before window (ms). */
+export function toServerSearchParams(filters: SearchFilters, now = Date.now()): ServerSearchParams {
+  const ageCut = agePresetCutoff(filters.agePreset, now);
+  const after = Math.max(filters.modifiedAfter ?? 0, ageCut.after ?? 0) || undefined;
+  const before = (() => {
+    const a = filters.modifiedBefore;
+    const b = ageCut.before;
+    if (a != null && b != null) return Math.min(a, b);
+    return a ?? b;
+  })();
+  return {
+    regex: filters.regex || undefined,
+    minSize: filters.minSize,
+    maxSize: filters.maxSize,
+    modifiedAfter: after,
+    modifiedBefore: before,
+    ext: filters.ext.trim() || undefined,
+    category: filters.category !== "any" ? filters.category : undefined,
+  };
+}
+
 /** A compiled name matcher: `test(name, path)` plus an `invalid` flag set when a
  *  regex query failed to compile (callers show a subtle invalid state). */
 export interface NameMatcher {

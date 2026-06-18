@@ -1,7 +1,8 @@
-import { useState, useCallback, useMemo, useDeferredValue } from "react";
+import { useState, useCallback, useMemo, useDeferredValue, useRef } from "react";
 import type { NodeRecord, SortKey, Metric, Unit } from "../api/types";
 import { type FilterRule, type CompiledRule, compileRules, applyCompiledRules } from "./useFilterRules";
 import { attributeLetters } from "../lib/attributes";
+import { fetchChildren, ScanStaleError } from "../api/client";
 
 // ── Quick-filter chips ───────────────────────────────────────────────────────
 // Toolbar toggle chips that each contribute a predicate ANDed onto the active
@@ -86,6 +87,27 @@ export interface UseTreeStateReturn extends TreeState {
   visibleRows: NodeRecord[];
   nodeById: Map<number, NodeRecord>;
   setNodes: (nodes: NodeRecord[]) => void;
+  /** LAZY mode: fetch (if not already loaded) the children of directory `dirId`
+   *  from the backend's cached scan and merge them into the partial tree. A
+   *  no-op in full mode or for already-loaded / bundle dirs. Returns when the
+   *  merge is committed (or immediately for a no-op). Errors are swallowed
+   *  (logged); a stale-scan 409 invokes the configured `onStale` callback. */
+  ensureChildren: (dirId: number) => void;
+  /** Set of directory ids whose children have been loaded in lazy mode. Empty
+   *  in full mode. Drives "is this folder still loading?" UI affordances. */
+  loadedDirs: Set<number>;
+}
+
+/** Lazy-mode configuration handed to {@link useTreeState}. When `enabled`, the
+ *  hook serves children incrementally from the backend's cached scan rather than
+ *  assuming the whole tree is in `nodes`. */
+export interface LazyOptions {
+  enabled: boolean;
+  rootPath: string;
+  scannedAt: number;
+  /** Called when the backend reports the cached scan changed (409) — the host
+   *  should refetch the scan. */
+  onStale?: () => void;
 }
 
 export function compareNodes(
@@ -374,8 +396,18 @@ function collectVisibleRows(
   return result;
 }
 
-export function useTreeState(): UseTreeStateReturn {
+export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
   const [nodes, setNodesState] = useState<NodeRecord[]>([]);
+  // ── Lazy-load bookkeeping ──────────────────────────────────────────────────
+  // `loadedDirs` (state) drives UI; `loadedDirsRef`/`loadingDirsRef` are the
+  // synchronous guards so concurrent expand bursts don't double-fetch a dir.
+  // `lazyRef` mirrors the current lazy config for the stable ensureChildren cb.
+  const [loadedDirs, setLoadedDirs] = useState<Set<number>>(new Set());
+  const loadedDirsRef = useRef<Set<number>>(loadedDirs);
+  loadedDirsRef.current = loadedDirs;
+  const loadingDirsRef = useRef<Set<number>>(new Set());
+  const lazyRef = useRef<LazyOptions | undefined>(lazy);
+  lazyRef.current = lazy;
   const [expanded, setExpanded] = useState<Set<number>>(new Set([0]));
   const [expandedAll, setExpandedAll] = useState(false);
   const [collapsedOverrides, setCollapsedOverrides] = useState<Set<number>>(new Set());
@@ -478,7 +510,56 @@ export function useTreeState(): UseTreeStateReturn {
     });
   }, []);
 
+  // LAZY mode: fetch + merge a directory's children on demand. No-op in full
+  // mode (the whole tree is already in `nodes`) or for bundle/loaded dirs.
+  const ensureChildren = useCallback((dirId: number) => {
+    const lz = lazyRef.current;
+    if (!lz?.enabled || dirId < 0) return;
+    if (loadedDirsRef.current.has(dirId) || loadingDirsRef.current.has(dirId)) return;
+    loadingDirsRef.current.add(dirId);
+    void fetchChildren({ rootPath: lz.rootPath, dirId, scannedAt: lz.scannedAt })
+      .then((fetched) => {
+        setNodesState((prev) => {
+          const byId = new Map<number, NodeRecord>();
+          for (const n of prev) byId.set(n.id, n);
+          const dir = byId.get(dirId);
+          if (!dir) return prev;
+          const existing = new Set(dir.children);
+          const childIds = [...dir.children];
+          const added: NodeRecord[] = [];
+          for (const n of fetched) {
+            if (byId.has(n.id)) continue; // already present (re-entrancy guard)
+            added.push({ ...n, children: n.children ?? [] });
+            if (!existing.has(n.id)) { childIds.push(n.id); existing.add(n.id); }
+          }
+          if (added.length === 0 && childIds.length === dir.children.length) return prev;
+          const next = prev.map((x) => (x.id === dirId ? { ...x, children: childIds } : x));
+          next.push(...added);
+          return next;
+        });
+      })
+      .catch((err: unknown) => {
+        if (err instanceof ScanStaleError) {
+          lazyRef.current?.onStale?.();
+        } else {
+          console.warn("ensureChildren failed for dir", dirId, err);
+        }
+      })
+      .finally(() => {
+        loadingDirsRef.current.delete(dirId);
+        setLoadedDirs((prev) => {
+          if (prev.has(dirId)) return prev;
+          const next = new Set(prev);
+          next.add(dirId);
+          return next;
+        });
+      });
+  }, []);
+
   const toggleExpand = useCallback((id: number) => {
+    // LAZY: opening a real directory pulls its children if not yet loaded. Safe
+    // to call unconditionally — ensureChildren no-ops in full mode / when loaded.
+    if (id >= 0) ensureChildren(id);
     if (expandedAll && id >= 0) {
       setCollapsedOverrides((prev) => {
         const next = new Set(prev);
@@ -494,10 +575,11 @@ export function useTreeState(): UseTreeStateReturn {
         return next;
       });
     }
-  }, [expandedAll]);
+  }, [expandedAll, ensureChildren]);
 
   // Only opens a node — never collapses it. Used by navigate-to operations.
   const ensureExpanded = useCallback((id: number) => {
+    if (id >= 0) ensureChildren(id);
     if (expandedAll) {
       setCollapsedOverrides((prev) => {
         if (!prev.has(id)) return prev;
@@ -513,7 +595,7 @@ export function useTreeState(): UseTreeStateReturn {
         return next;
       });
     }
-  }, [expandedAll]);
+  }, [expandedAll, ensureChildren]);
 
   const expandToLevel = useCallback((level: number) => {
     if (level === Infinity) {
@@ -547,6 +629,10 @@ export function useTreeState(): UseTreeStateReturn {
 
   const setNodes = useCallback((newNodes: NodeRecord[]) => {
     setNodesState(newNodes);
+    // A fresh node set (new scan / lazy root) invalidates lazy-load bookkeeping.
+    loadingDirsRef.current = new Set();
+    loadedDirsRef.current = new Set();
+    setLoadedDirs(new Set());
   }, []);
 
   const resetForNewScan = useCallback(() => {
@@ -557,6 +643,9 @@ export function useTreeState(): UseTreeStateReturn {
     setFilter("");
     setFilterRules([]);
     setChips(new Set());
+    loadingDirsRef.current = new Set();
+    loadedDirsRef.current = new Set();
+    setLoadedDirs(new Set());
   }, []);
 
   // Replace nodes while preserving expansion/selection by path.
@@ -775,5 +864,7 @@ export function useTreeState(): UseTreeStateReturn {
     visibleRows,
     nodeById,
     setNodes,
+    ensureChildren,
+    loadedDirs,
   };
 }

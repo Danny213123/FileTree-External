@@ -230,6 +230,87 @@ pub(crate) fn write_scan_result_ndjson<W: Write>(w: &mut W, result: &ScanResult)
     Ok(())
 }
 
+/// Serialize one node as an NDJSON `node` line WITH its absolute `path`
+/// populated (reconstructed via [`node_abs_path`] for interned file nodes), so a
+/// lazy-mode client can use it directly without the BFS `reconstructChildren`
+/// pass. Mirrors the per-node field set emitted by [`write_scan_result_ndjson`].
+/// The line is appended (with a trailing newline) to `buf`; the caller flushes.
+pub(crate) fn push_node_ndjson_line_with_path(
+    buf: &mut Vec<u8>,
+    nodes: &[crate::model::NodeRecord],
+    id: usize,
+) {
+    let Some(node) = nodes.get(id) else { return };
+    macro_rules! e {
+        ($($arg:tt)*) => {{ let _ = write!(buf, $($arg)*); }}
+    }
+    e!("{{\"type\":\"node\"");
+    e!(",\"id\":{}", node.id);
+    match node.parent {
+        Some(p) => { e!(",\"parent\":{p}"); }
+        None => { e!(",\"parent\":null"); }
+    }
+    e!(",\"name\":"); emit_json_str(buf, &node.name);
+    e!(",\"path\":"); emit_json_str(buf, &node_abs_path(nodes, id));
+    e!(",\"dir\":{}", if node.is_dir { "true" } else { "false" });
+    e!(",\"link\":{}", if node.is_link { "true" } else { "false" });
+    e!(",\"hidden\":{}", if node.hidden { "true" } else { "false" });
+    e!(",\"readonly\":{}", if node.readonly { "true" } else { "false" });
+    e!(",\"size\":{}", node.size);
+    e!(",\"allocated\":{}", node.allocated);
+    e!(",\"files\":{}", node.files);
+    e!(",\"folders\":{}", node.folders);
+    e!(",\"modified\":{}", node.modified_ms);
+    e!(",\"created\":{}", node.created_ms);
+    e!(",\"accessed\":{}", node.accessed_ms);
+    e!(",\"depth\":{}", node.depth);
+    e!(",\"errors\":{}", node.errors);
+    e!(",\"extension\":"); emit_json_str(buf, &node.extension);
+    e!(",\"owner\":"); emit_json_str(buf, &node.owner);
+    e!(",\"attributes\":{}", node.attributes);
+    e!("}}");
+    buf.push(b'\n');
+}
+
+/// Serialize one node as a standalone JSON object WITH `path` populated (no
+/// `type` discriminator, no trailing newline) — for embedding in a JSON array
+/// (e.g. the lazy `/api/search` results). Appended to `buf`.
+pub(crate) fn push_node_json_object_with_path(
+    buf: &mut Vec<u8>,
+    nodes: &[crate::model::NodeRecord],
+    id: usize,
+) {
+    let Some(node) = nodes.get(id) else { return };
+    macro_rules! e {
+        ($($arg:tt)*) => {{ let _ = write!(buf, $($arg)*); }}
+    }
+    e!("{{\"id\":{}", node.id);
+    match node.parent {
+        Some(p) => { e!(",\"parent\":{p}"); }
+        None => { e!(",\"parent\":null"); }
+    }
+    e!(",\"name\":"); emit_json_str(buf, &node.name);
+    e!(",\"path\":"); emit_json_str(buf, &node_abs_path(nodes, id));
+    e!(",\"dir\":{}", if node.is_dir { "true" } else { "false" });
+    e!(",\"link\":{}", if node.is_link { "true" } else { "false" });
+    e!(",\"hidden\":{}", if node.hidden { "true" } else { "false" });
+    e!(",\"readonly\":{}", if node.readonly { "true" } else { "false" });
+    e!(",\"size\":{}", node.size);
+    e!(",\"allocated\":{}", node.allocated);
+    e!(",\"files\":{}", node.files);
+    e!(",\"folders\":{}", node.folders);
+    e!(",\"modified\":{}", node.modified_ms);
+    e!(",\"created\":{}", node.created_ms);
+    e!(",\"accessed\":{}", node.accessed_ms);
+    e!(",\"depth\":{}", node.depth);
+    e!(",\"errors\":{}", node.errors);
+    e!(",\"extension\":"); emit_json_str(buf, &node.extension);
+    e!(",\"owner\":"); emit_json_str(buf, &node.owner);
+    e!(",\"attributes\":{}", node.attributes);
+    e!(",\"children\":[]");
+    e!("}}");
+}
+
 /// One live-scan progress ping for the `/api/scan-stream` NDJSON protocol.
 ///
 /// MUST carry the `"type":"scanning"` discriminator, exactly like every other
@@ -249,6 +330,13 @@ pub(crate) fn scan_result_to_json(result: &ScanResult) -> String {
     let mut buf = Vec::with_capacity(result.nodes.len().saturating_mul(400));
     write_scan_result_json(&mut buf, result).expect("vec write cannot fail");
     String::from_utf8(buf).expect("json is valid utf8")
+}
+
+/// Public wrapper over the internal byte-buffer JSON string emitter, for
+/// callers that build a JSON body directly in a `Vec<u8>` (e.g. the lazy
+/// `/api/subtree-files` path list).
+pub(crate) fn push_json_string_vec(buf: &mut Vec<u8>, value: &str) {
+    emit_json_str(buf, value);
 }
 
 fn emit_json_str(buf: &mut Vec<u8>, value: &str) {

@@ -19,12 +19,13 @@ use crate::dupes::{
     action_delete, action_move, action_copy,
 };
 use crate::export::{
-    app_config_json, drives_json, push_json_string, scan_progress_ndjson_line,
-    scan_result_to_html, scan_result_to_xlsx, special_folders_json, write_scan_result_csv,
-    write_scan_result_json, write_scan_result_ndjson, write_scan_result_xml,
+    app_config_json, drives_json, push_json_string, push_node_json_object_with_path,
+    push_node_ndjson_line_with_path,
+    scan_progress_ndjson_line, scan_result_to_html, scan_result_to_xlsx, special_folders_json,
+    write_scan_result_csv, write_scan_result_json, write_scan_result_ndjson, write_scan_result_xml,
 };
 use crate::io::{default_thread_count, open_path, parse_bool, reveal_path, split_patterns};
-use crate::model::{AppState, DupesProgress, HttpRequest, ScanOptions};
+use crate::model::{node_abs_path, AppState, DupesProgress, HttpRequest, ScanOptions};
 use crate::scan::{scan_path, scan_path_with_progress};
 
 /// The built renderer (`frontend/dist`) is compiled into the binary so the
@@ -1419,6 +1420,153 @@ fn find_current_scan(
     last.as_ref()
         .filter(|result| result.root_path.replace('\\', "/").to_lowercase() == cache_key)
         .map(Arc::clone)
+}
+
+/// Order two child nodes for the lazy `/api/children` endpoint. Mirrors the
+/// frontend `compareNodes` (hooks/useTreeState.ts) for the common sort keys so a
+/// page's order matches what the client would compute. `dir` is +1 (ascending)
+/// or -1 (descending). The renderer re-sorts loaded children through its own
+/// `buildDirCache`, so this only needs to be sensible for paging — keys it
+/// doesn't special-case fall back to size.
+fn compare_child_nodes(
+    a: &crate::model::NodeRecord,
+    b: &crate::model::NodeRecord,
+    key: &str,
+    dir: i32,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let ord = match key {
+        "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        "type" => {
+            let la = if a.is_dir { String::new() } else { a.extension.to_lowercase() };
+            let lb = if b.is_dir { String::new() } else { b.extension.to_lowercase() };
+            la.cmp(&lb)
+        }
+        "owner" => a.owner.to_lowercase().cmp(&b.owner.to_lowercase()),
+        "allocated" => a.allocated.cmp(&b.allocated),
+        "files" => a.files.cmp(&b.files),
+        "folders" => a.folders.cmp(&b.folders),
+        "modified" => a.modified_ms.cmp(&b.modified_ms),
+        "created" => a.created_ms.cmp(&b.created_ms),
+        "accessed" => a.accessed_ms.cmp(&b.accessed_ms),
+        "dirLevel" => a.depth.cmp(&b.depth),
+        "pathLength" => a.name.len().cmp(&b.name.len()),
+        "avgFileSize" => {
+            let av = if a.files > 0 { a.size as f64 / a.files as f64 } else { 0.0 };
+            let bv = if b.files > 0 { b.size as f64 / b.files as f64 } else { 0.0 };
+            av.partial_cmp(&bv).unwrap_or(Ordering::Equal)
+        }
+        // "size", "percent", "path", "folderPath", "attributes",
+        // "compressionRate", and anything unknown: order by size.
+        _ => a.size.cmp(&b.size),
+    };
+    if dir < 0 { ord.reverse() } else { ord }
+}
+
+/// Coarse file-category extension sets, mirroring `lib/search.ts` CATEGORY_EXTS
+/// so server-side search matches the renderer's category filter semantics.
+fn category_exts(category: &str) -> Option<&'static [&'static str]> {
+    match category {
+        "image" => Some(&["jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff", "svg", "heic", "heif", "ico", "raw", "cr2", "nef", "arw", "dng"]),
+        "video" => Some(&["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "ts", "m2ts", "3gp"]),
+        "audio" => Some(&["mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "aiff", "alac", "opus", "mid"]),
+        "document" => Some(&["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf", "odt", "ods", "odp", "md", "csv", "epub", "pages"]),
+        "archive" => Some(&["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "cab", "tgz", "zst", "lz"]),
+        "code" => Some(&["js", "ts", "jsx", "tsx", "py", "rs", "go", "java", "c", "cpp", "h", "hpp", "cs", "rb", "php", "html", "css", "json", "xml", "yaml", "yml", "sh", "sql", "swift", "kt", "lua", "vue"]),
+        "executable" => Some(&["exe", "msi", "dll", "bat", "cmd", "com", "ps1", "app", "sys", "scr"]),
+        _ => None,
+    }
+}
+
+/// Build the JSON body for `GET /api/search`: scan the cached `result.nodes`
+/// case-insensitively over name + path, narrowed by the optional size/date/
+/// type/ext filters (combined with AND, mirroring `searchNodesAdvanced`), sort
+/// size-descending, and cap. Each match is serialized with `path` populated.
+fn build_search_json(
+    result: &crate::model::ScanResult,
+    query: &HashMap<String, String>,
+) -> String {
+    let q = query.get("q").map(|s| s.trim().to_lowercase()).unwrap_or_default();
+    let min_size = query.get("minSize").and_then(|v| v.parse::<u64>().ok());
+    let max_size = query.get("maxSize").and_then(|v| v.parse::<u64>().ok());
+    // modifiedAfter / modifiedBefore are epoch MILLISECONDS on the wire (like the
+    // renderer); node times are stored in ms too, so compare directly.
+    let mod_after = query.get("modifiedAfter").and_then(|v| v.parse::<u64>().ok());
+    let mod_before = query.get("modifiedBefore").and_then(|v| v.parse::<u64>().ok());
+    let category = query.get("category").map(String::as_str).unwrap_or("any");
+    let cat_exts = category_exts(category);
+    let want_folder = category == "folder";
+    let exts: Vec<String> = query
+        .get("ext")
+        .map(|raw| {
+            raw.split([',', ' ', '\t'])
+                .map(|e| e.trim().trim_start_matches(['.', '*']).to_lowercase())
+                .filter(|e| !e.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&l| l > 0)
+        .unwrap_or(2000)
+        .min(20_000);
+
+    let has_filters = min_size.is_some() || max_size.is_some() || mod_after.is_some()
+        || mod_before.is_some() || category != "any" || !exts.is_empty();
+    // Mirror the renderer: need a 2+ char query OR an active narrowing filter.
+    if q.len() < 2 && !has_filters {
+        return String::from("{\"matches\":[],\"total\":0,\"capped\":false}");
+    }
+    let name_match_all = q.len() < 2;
+
+    let mut matched: Vec<usize> = Vec::new();
+    for (id, node) in result.nodes.iter().enumerate() {
+        // Name/path substring match (case-insensitive). Reconstructing every
+        // file's absolute path would be costly; node.name covers the name match
+        // and dir/root paths are stored, so match against name OR stored path.
+        if !name_match_all {
+            let name_hit = node.name.to_lowercase().contains(&q);
+            let path_hit = !node.path.is_empty() && node.path.to_lowercase().contains(&q);
+            if !name_hit && !path_hit {
+                continue;
+            }
+        }
+        if let Some(m) = min_size { if node.size < m { continue; } }
+        if let Some(m) = max_size { if node.size > m { continue; } }
+        if mod_after.is_some() || mod_before.is_some() {
+            if let Some(a) = mod_after { if node.modified_ms < a { continue; } }
+            if let Some(b) = mod_before { if node.modified_ms > b { continue; } }
+        }
+        if want_folder && !node.is_dir { continue; }
+        if let Some(set) = cat_exts {
+            if node.is_dir { continue; }
+            let ext = node.extension.trim_start_matches('.').to_lowercase();
+            if !set.contains(&ext.as_str()) { continue; }
+        }
+        if !exts.is_empty() {
+            if node.is_dir { continue; }
+            let ext = node.extension.trim_start_matches('.').to_lowercase();
+            if !exts.iter().any(|e| e == &ext) { continue; }
+        }
+        matched.push(id);
+    }
+
+    // Size-descending so the cap keeps the largest/most-relevant matches. The
+    // renderer re-sorts the returned array by the active table sort.
+    matched.sort_by(|&a, &b| result.nodes[b].size.cmp(&result.nodes[a].size));
+    let total = matched.len();
+    let capped = total > limit;
+    matched.truncate(limit);
+
+    let mut buf: Vec<u8> = Vec::with_capacity(matched.len() * 256 + 64);
+    buf.extend_from_slice(b"{\"matches\":[");
+    for (i, &id) in matched.iter().enumerate() {
+        if i > 0 { buf.push(b','); }
+        push_node_json_object_with_path(&mut buf, &result.nodes, id);
+    }
+    let _ = write!(buf, "],\"total\":{total},\"capped\":{}}}", if capped { "true" } else { "false" });
+    String::from_utf8(buf).unwrap_or_else(|_| String::from("{\"matches\":[],\"total\":0,\"capped\":false}"))
 }
 
 /// Read a string parameter from the query string, falling back to the JSON
@@ -3121,6 +3269,196 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 }
             }
             write_final_chunk(&mut stream)
+        }
+        // ── Lazy tree loading: serve one directory's children on demand ────
+        // GET /api/children?path=<scanRoot>&id=<dirId>&sort=<key>&dir=<asc|desc>
+        //                   &offset=<n>&limit=<n>&scannedAt=<ms>
+        // Slices a directory's children out of the already-cached scan (via
+        // find_current_scan + node_abs_path), sorts + pages them server-side, and
+        // streams each as an NDJSON `node` line WITH `path` populated so the lazy
+        // renderer never has to materialize (or BFS) the whole tree. The leading
+        // line carries paging metadata (`total`, `hasMore`). This is the core of
+        // the >10M-node black-screen fix.
+        "/api/children" => {
+            let path = query
+                .get("path")
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| state.initial_path.clone());
+            let Some(result) = find_current_scan(&state, &path) else {
+                return respond_json(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    "{\"error\":\"No scan is loaded for this path\"}",
+                );
+            };
+            // Stale-reference guard: if the client passes the scannedAt it holds
+            // and it no longer matches the cached scan, tell it to refetch (409).
+            if let Some(client_at) = query.get("scannedAt").and_then(|v| v.parse::<u64>().ok()) {
+                if client_at != 0 && client_at != result.scanned_at_ms {
+                    return respond_json(
+                        &mut stream,
+                        409,
+                        "Conflict",
+                        "{\"error\":\"Scan changed since this reference; refetch.\"}",
+                    );
+                }
+            }
+            let dir_id = query.get("id").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            let Some(dir) = result.nodes.get(dir_id) else {
+                return respond_json(&mut stream, 404, "Not Found", "{\"error\":\"Unknown node id\"}");
+            };
+            let sort_key = query.get("sort").map(String::as_str).unwrap_or("size");
+            let sort_dir = match query.get("dir").map(String::as_str) {
+                Some("asc") => 1,
+                Some("desc") => -1,
+                // Sensible default direction: ascending for name/type/owner, else
+                // descending (largest first), matching the frontend defaults.
+                _ => match sort_key {
+                    "name" | "type" | "owner" | "path" | "folderPath"
+                    | "attributes" | "pathLength" => 1,
+                    _ => -1,
+                },
+            };
+            // Sort a copy of the child id list (the cached scan is shared+immutable).
+            let mut child_ids: Vec<usize> = dir.children.clone();
+            child_ids.sort_by(|&a, &b| {
+                match (result.nodes.get(a), result.nodes.get(b)) {
+                    (Some(na), Some(nb)) => compare_child_nodes(na, nb, sort_key, sort_dir),
+                    _ => std::cmp::Ordering::Equal,
+                }
+            });
+            let total = child_ids.len();
+            let offset = query.get("offset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            let limit = query
+                .get("limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&l| l > 0)
+                .unwrap_or(50_000)
+                .min(200_000);
+            let end = offset.saturating_add(limit).min(total);
+            let slice = if offset < total { &child_ids[offset..end] } else { &[][..] };
+            let has_more = end < total;
+
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut cw = ChunkedWriter::new(&mut stream);
+            let mut buf = Vec::with_capacity(65536);
+            write!(
+                buf,
+                "{{\"type\":\"children\",\"id\":{dir_id},\"scannedAt\":{},\"offset\":{offset},\"total\":{total},\"hasMore\":{}}}\n",
+                result.scanned_at_ms,
+                if has_more { "true" } else { "false" }
+            )?;
+            for (i, &cid) in slice.iter().enumerate() {
+                push_node_ndjson_line_with_path(&mut buf, &result.nodes, cid);
+                if i % 4096 == 4095 {
+                    cw.write_all(&buf)?;
+                    buf.clear();
+                }
+            }
+            cw.write_all(&buf)?;
+            cw.finish()
+        }
+        // GET /api/subtree-files?path=<scanRoot>&id=<dirId>&limit=<n>
+        // Server-side BFS over the cached scan returning every descendant FILE's
+        // absolute path under `id`. Replaces the renderer-side BFS in
+        // `handleCompressFromContext` when in lazy mode (the renderer no longer
+        // holds the whole tree). Capped to bound the response.
+        "/api/subtree-files" => {
+            let path = query
+                .get("path")
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| state.initial_path.clone());
+            let Some(result) = find_current_scan(&state, &path) else {
+                return respond_json(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    "{\"error\":\"No scan is loaded for this path\"}",
+                );
+            };
+            let dir_id = query.get("id").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            if result.nodes.get(dir_id).is_none() {
+                return respond_json(&mut stream, 404, "Not Found", "{\"error\":\"Unknown node id\"}");
+            }
+            let cap = query
+                .get("limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&l| l > 0)
+                .unwrap_or(1_000_000)
+                .min(5_000_000);
+
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut cw = ChunkedWriter::new(&mut stream);
+            let mut buf: Vec<u8> = Vec::with_capacity(65536);
+            buf.extend_from_slice(b"{\"paths\":[");
+            let mut emitted = 0usize;
+            let mut truncated = false;
+            let mut bfs: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+            bfs.push_back(dir_id);
+            'walk: while let Some(cur) = bfs.pop_front() {
+                let Some(node) = result.nodes.get(cur) else { continue };
+                if node.is_dir {
+                    for &c in &node.children {
+                        bfs.push_back(c);
+                    }
+                } else if cur != dir_id {
+                    if emitted >= cap {
+                        truncated = true;
+                        break 'walk;
+                    }
+                    if emitted > 0 {
+                        buf.push(b',');
+                    }
+                    crate::export::push_json_string_vec(&mut buf, &node_abs_path(&result.nodes, cur));
+                    emitted += 1;
+                    if buf.len() >= 32 * 1024 {
+                        cw.write_all(&buf)?;
+                        buf.clear();
+                    }
+                }
+            }
+            write!(buf, "],\"truncated\":{},\"count\":{emitted}}}", if truncated { "true" } else { "false" })?;
+            cw.write_all(&buf)?;
+            cw.finish()
+        }
+        // GET /api/search?path=<scanRoot>&q=<query>&regex=0|1&minSize=&maxSize=
+        //               &modifiedAfter=&modifiedBefore=&ext=&category=&limit=
+        // Server-side scan of the cached nodes returning capped matches (mirrors
+        // the renderer's searchNodesAdvanced). Used in lazy mode where the
+        // renderer doesn't hold every node. Each match is a `node` JSON object
+        // with `path` populated. Results are size-descending then capped.
+        "/api/search" => {
+            let path = query
+                .get("path")
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| state.initial_path.clone());
+            let Some(result) = find_current_scan(&state, &path) else {
+                return respond_json(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    "{\"error\":\"No scan is loaded for this path\"}",
+                );
+            };
+            let body = build_search_json(&result, &query);
+            // Potentially large (up to the cap), so stream it chunked.
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut cw = ChunkedWriter::new(&mut stream);
+            cw.write_all(body.as_bytes())?;
+            cw.finish()
         }
         // ── Scan snapshots + growth diff (roadmap #5) ──────────────────────
         "/api/snapshots" => {

@@ -1,6 +1,6 @@
 {
   "name": "filetree",
-  "version": "1.13.14",
+  "version": "1.13.15",
   "description": "FileTree disk-usage explorer",
   "author": "Danny213123",
   "main": "dist/main.js",

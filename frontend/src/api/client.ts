@@ -1,4 +1,5 @@
 import type {
+  NodeRecord,
   ScanResult,
   DriveList,
   DriveEntry,
@@ -205,6 +206,132 @@ export async function fetchScan(
   signal?: AbortSignal,
 ): Promise<ScanResult> {
   return getJson<ScanResult>(scanUrl(opts), signal);
+}
+
+// ── Lazy tree loading (>10M-node support) ───────────────────────────────────
+// These back LAZY mode (see hooks/useScan LAZY_THRESHOLD): the renderer holds
+// only the root and pulls each directory's children / searches / subtree files
+// from the backend's already-cached scan, so it never materializes the whole
+// tree. No-ops for normal scans, which keep the full in-memory tree.
+
+/** Thrown by {@link fetchChildren} when the cached scan changed under us (409),
+ *  so the caller can refetch the scan. */
+export class ScanStaleError extends Error {
+  constructor() {
+    super("Scan changed since this reference");
+    this.name = "ScanStaleError";
+  }
+}
+
+/**
+ * Load all children of one directory from the cached scan via GET /api/children,
+ * following the server's paging (`hasMore`) until the directory is fully read.
+ * Each returned node has `path` populated (server-side) and an empty
+ * `children: []` (filled lazily when that child is itself expanded). The page is
+ * a few thousand small JSON lines at most, so parsing one page's text is cheap.
+ */
+export async function fetchChildren(opts: {
+  rootPath: string;
+  dirId: number;
+  scannedAt?: number;
+  sort?: string;
+  dir?: "asc" | "desc";
+  signal?: AbortSignal;
+}): Promise<NodeRecord[]> {
+  const out: NodeRecord[] = [];
+  let offset = 0;
+  // Bound the page loop defensively so a misbehaving server can't spin forever.
+  for (let guard = 0; guard < 100_000; guard++) {
+    const params = new URLSearchParams({
+      path: opts.rootPath,
+      id: String(opts.dirId),
+      offset: String(offset),
+      limit: "50000",
+    });
+    if (opts.sort) params.set("sort", opts.sort);
+    if (opts.dir) params.set("dir", opts.dir);
+    if (opts.scannedAt) params.set("scannedAt", String(opts.scannedAt));
+    const res = await fetch(`/api/children?${params}`, { signal: opts.signal });
+    if (res.status === 409) throw new ScanStaleError();
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    let hasMore = false;
+    let pageCount = 0;
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const obj = JSON.parse(trimmed) as { type?: string; hasMore?: boolean } & Record<string, unknown>;
+      if (obj.type === "children") { hasMore = !!obj.hasMore; continue; }
+      if (obj.type === "node") {
+        const { type: _t, ...node } = obj;
+        const rec = node as unknown as NodeRecord;
+        rec.children = [];
+        out.push(rec);
+        pageCount++;
+      }
+    }
+    offset += pageCount;
+    if (!hasMore || pageCount === 0) break;
+  }
+  return out;
+}
+
+/**
+ * Server-side BFS returning every descendant FILE path under a directory node in
+ * the cached scan (GET /api/subtree-files). Used by the Compress-from-context
+ * flow in lazy mode, where the renderer doesn't hold the whole subtree.
+ */
+export async function fetchSubtreeFiles(
+  rootPath: string,
+  dirId: number,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const params = new URLSearchParams({ path: rootPath, id: String(dirId) });
+  const res = await fetch(`/api/subtree-files?${params}`, { signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = (await res.json()) as { paths?: string[] };
+  return data.paths ?? [];
+}
+
+export interface ServerSearchResult {
+  matches: NodeRecord[];
+  total: number;
+  capped: boolean;
+}
+
+/**
+ * Server-side search over the cached scan (GET /api/search), used in lazy mode
+ * where the renderer can't iterate every node. Mirrors searchNodesAdvanced:
+ * case-insensitive name/path match plus optional size/date/type/ext filters.
+ */
+export async function fetchServerSearch(opts: {
+  rootPath: string;
+  query: string;
+  regex?: boolean;
+  minSize?: number;
+  maxSize?: number;
+  modifiedAfter?: number;
+  modifiedBefore?: number;
+  ext?: string;
+  category?: string;
+  limit?: number;
+  signal?: AbortSignal;
+}): Promise<ServerSearchResult> {
+  const params = new URLSearchParams({ path: opts.rootPath });
+  if (opts.query) params.set("q", opts.query);
+  if (opts.regex) params.set("regex", "1");
+  if (opts.minSize != null) params.set("minSize", String(opts.minSize));
+  if (opts.maxSize != null) params.set("maxSize", String(opts.maxSize));
+  if (opts.modifiedAfter != null) params.set("modifiedAfter", String(opts.modifiedAfter));
+  if (opts.modifiedBefore != null) params.set("modifiedBefore", String(opts.modifiedBefore));
+  if (opts.ext) params.set("ext", opts.ext);
+  if (opts.category && opts.category !== "any") params.set("category", opts.category);
+  if (opts.limit != null) params.set("limit", String(opts.limit));
+  const res = await fetch(`/api/search?${params}`, { signal: opts.signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = (await res.json()) as { matches?: NodeRecord[]; total?: number; capped?: boolean };
+  const matches = (data.matches ?? []).map((n) => ({ ...n, children: n.children ?? [] }));
+  return { matches, total: data.total ?? matches.length, capped: !!data.capped };
 }
 
 export async function fetchDrives(): Promise<DriveList> {

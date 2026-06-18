@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle, useSyncExternalStore, memo } from "react";
 import { useScan, fetchScanStream } from "../hooks/useScan";
-import { useTreeState, type ChipKey } from "../hooks/useTreeState";
+import { useTreeState, type ChipKey, type LazyOptions } from "../hooks/useTreeState";
 import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import {
   revealPath, openPath, shellContextMenu, createFolder,
@@ -11,6 +11,7 @@ import {
   compress, extract, checksum, copyText,
   setAttributes, setTimes,
   fetchSnapshots, fetchSnapshotData,
+  fetchServerSearch, fetchSubtreeFiles,
 } from "../api/client";
 import type { ScanOptions, ExportFormat } from "../api/client";
 import type { NodeRecord, SortKey, TagEntry } from "../api/types";
@@ -19,7 +20,7 @@ import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow
 import { confirmRisky, isCrossDrive } from "../lib/confirmRisky";
 import { pushUndo, parentDir } from "../lib/undo";
 import { beginTransfer, finishTransfer, enqueueTransfer } from "../lib/transfers";
-import { searchNodesAdvanced, filtersActive, type SearchFilters } from "../lib/search";
+import { searchNodesAdvanced, filtersActive, toServerSearchParams, type SearchFilters } from "../lib/search";
 import { exportResults } from "../lib/exportRows";
 import { loadFolderPref, saveFolderPref, normFolderKey } from "../lib/folderPrefs";
 import { compareNodes } from "../hooks/useTreeState";
@@ -266,6 +267,12 @@ const DIFF_MAX_NODES = 200_000;
 const SMART_REFRESH_MAX_DIRS = 50;
 const WATCH_LARGE_TREE = 50_000;
 
+// Phase 0 safety net: a scan with more nodes than this surfaces a non-blocking
+// "very large scan" banner warning that performance may degrade while loading
+// continues. Purely advisory — loading is never truncated. Kept below the lazy
+// threshold so a heavy (but not yet lazy) scan still gives the user a heads-up.
+const VERY_LARGE_SCAN_NODES = 2_000_000;
+
 interface WorkspaceTabProps {
   tabId: string;
   initialPath: string;
@@ -373,11 +380,29 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const dragStartRef = useRef<{ y: number; h: number } | null>(null);
 
   const { data, status, errorMessage, progressStore, startScan, startRefresh, cancelScan } = useScan();
-  const tree = useTreeState();
+  // LAZY mode (very large scans): when useScan flags the result `lazy`, the
+  // renderer holds only the root and useTreeState fetches each directory's
+  // children on demand from the backend's cached scan. onStale fires when the
+  // backend reports the cached scan changed under us (409) — we force a fresh
+  // rescan via the ref below (doScan is defined later).
+  const onStaleRef = useRef<() => void>(() => {});
+  const lazyOptions = useMemo<LazyOptions | undefined>(() => {
+    if (!data?.lazy) return undefined;
+    return {
+      enabled: true,
+      rootPath: data.rootPath,
+      scannedAt: data.scannedAt,
+      onStale: () => onStaleRef.current(),
+    };
+  }, [data?.lazy, data?.rootPath, data?.scannedAt]);
+  const tree = useTreeState(lazyOptions);
   // Latest tree snapshot for stable callbacks / async watch handlers (avoids
   // recreating callbacks every render and reading stale expansion state).
   const treeRef = useRef(tree);
   treeRef.current = tree;
+  // Latest scan result for stable callbacks (lazy flag / rootPath at call time).
+  const dataRef = useRef(data);
+  dataRef.current = data;
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set([0]));
   const selectedIdsRef = useRef(selectedIds);
   selectedIdsRef.current = selectedIds;
@@ -422,6 +447,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // exceeded the patch batch cap), so the results may no longer match disk.
   // Cleared whenever the user refreshes/rescans.
   const [resultsStale, setResultsStale] = useState(false);
+  // Phase 0: dismissal flag for the non-blocking "very large scan" banner. Reset
+  // whenever a fresh scan result arrives (see the data effect) so each big scan
+  // re-warns once.
+  const [largeScanDismissed, setLargeScanDismissed] = useState(false);
   // #11: transient per-node-id highlight (added / size-changed) applied right
   // after a same-root refresh completes; fades after DIFF_HIGHLIGHT_MS.
   const [diffHighlight, setDiffHighlight] = useState<Map<number, "added" | "changed"> | null>(null);
@@ -479,6 +508,13 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scanPath, threads, includeHidden, followLinks, collectOwners, exclude, startScan, startRefresh, tree]);
 
+  // LAZY: when the backend reports the cached scan we're paging against changed
+  // (409 during ensureChildren), force a fresh rescan of the current root.
+  onStaleRef.current = () => {
+    const p = lastCompletedPathRef.current || scanPath;
+    if (p && p.trim()) doScan(p, undefined, true);
+  };
+
   // Toggling owner collection only changes data on the next walk, so re-scan the
   // current root (forced fresh) when it flips — but never on the initial mount /
   // settings hydration before any scan has completed.
@@ -535,6 +571,12 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         isFirstChunkRef.current = false;
       }
     }
+    // Phase 0: re-arm the very-large-scan banner for each freshly-arrived result.
+    if (data) setLargeScanDismissed(false);
+    // LAZY: the streamed result holds only the root (children empty). The root is
+    // auto-expanded, so eagerly pull its children once so the first level renders
+    // without requiring a manual collapse/expand of the root.
+    if (data?.lazy) tree.ensureChildren(0);
     onStateChange();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
@@ -896,31 +938,52 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     const t = treeRef.current;
     const selIds = selectedIdsRef.current;
     const targetIds = selIds.has(id) && selIds.size > 1 ? [...selIds] : [id];
+    const scan = dataRef.current;
+    const lazy = !!scan?.lazy;
+    const rootPath = scan?.rootPath ?? "";
 
     const filePaths: string[] = [];
     const seen = new Set<string>();
-    const pushFile = (node: NodeRecord) => {
-      if (node.dir || node.id < 0 || !node.path || seen.has(node.path)) return;
-      seen.add(node.path);
-      filePaths.push(node.path);
+    const pushFilePath = (p: string) => {
+      if (!p || seen.has(p)) return;
+      seen.add(p);
+      filePaths.push(p);
     };
-    for (const tid of targetIds) {
-      const node = t.nodeById.get(tid);
-      if (!node) continue;
-      if (!node.dir) {
-        pushFile(node);
-        continue;
+    const pushFile = (node: NodeRecord) => {
+      if (node.dir || node.id < 0 || !node.path) return;
+      pushFilePath(node.path);
+    };
+
+    const run = async () => {
+      for (const tid of targetIds) {
+        const node = t.nodeById.get(tid);
+        if (!node) continue;
+        if (!node.dir) {
+          pushFile(node);
+          continue;
+        }
+        if (lazy) {
+          // LAZY: descendant files come from the backend, not the partial tree.
+          try {
+            const files = await fetchSubtreeFiles(rootPath, node.id);
+            for (const f of files) pushFilePath(f);
+          } catch (err) {
+            console.warn("subtree-files fetch failed for", node.path, err);
+          }
+          continue;
+        }
+        // Full mode: walk descendants, collecting every file underneath it.
+        const queue = [node.id];
+        for (let qi = 0; qi < queue.length; qi++) {
+          const cur = t.nodeById.get(queue[qi]);
+          if (!cur) continue;
+          if (!cur.dir) { pushFile(cur); continue; }
+          for (const childId of cur.children) queue.push(childId);
+        }
       }
-      // Folder: walk descendants, collecting every file underneath it.
-      const queue = [node.id];
-      for (let qi = 0; qi < queue.length; qi++) {
-        const cur = t.nodeById.get(queue[qi]);
-        if (!cur) continue;
-        if (!cur.dir) { pushFile(cur); continue; }
-        for (const childId of cur.children) queue.push(childId);
-      }
-    }
-    if (filePaths.length > 0) onCompress(filePaths);
+      if (filePaths.length > 0) onCompress(filePaths);
+    };
+    void run();
   }, [onCompress]);
 
   // Latest value of the configurable double-click action, read inside the stable
@@ -1970,10 +2033,42 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // Flat, sorted name/path matches across the whole scan. Rendered in the main
   // table (replacing the tree rows) when the Search view is active with a >= 2
   // char query; re-sorts automatically because it reads the active sortKey/dir.
-  const searchResults = useMemo(
+  const localSearchResults = useMemo(
     () => searchNodesAdvanced(tree.nodeById, searchQuery, searchFilters, tree.sortKey, tree.sortDir, 2000),
     [tree.nodeById, searchQuery, searchFilters, tree.sortKey, tree.sortDir],
   );
+
+  // LAZY mode: the renderer holds only loaded dirs, so name/path search runs on
+  // the backend over the cached scan (GET /api/search). Results are fetched
+  // (debounced + abortable) into state, then re-sorted client-side by the active
+  // table sort. Full mode keeps the synchronous in-memory search above.
+  const [lazySearch, setLazySearch] = useState<{ matches: NodeRecord[]; capped: boolean }>({ matches: [], capped: false });
+  const lazyMode = !!data?.lazy;
+  useEffect(() => {
+    if (!lazyMode || activeView !== "search") { setLazySearch({ matches: [], capped: false }); return; }
+    const q = searchQuery.trim();
+    const hasFilters = filtersActive(searchFilters);
+    if (q.length < 2 && !hasFilters) { setLazySearch({ matches: [], capped: false }); return; }
+    const controller = new AbortController();
+    const t = setTimeout(() => {
+      const params = toServerSearchParams(searchFilters);
+      void fetchServerSearch({
+        rootPath: data!.rootPath,
+        query: searchQuery,
+        limit: 2000,
+        signal: controller.signal,
+        ...params,
+      })
+        .then((res) => setLazySearch({ matches: res.matches, capped: res.capped }))
+        .catch((err: unknown) => { if (!(err instanceof DOMException && err.name === "AbortError")) console.warn("server search failed", err); });
+    }, 200);
+    return () => { controller.abort(); clearTimeout(t); };
+  }, [lazyMode, activeView, searchQuery, searchFilters, data]);
+
+  const searchResults = useMemo(() => {
+    if (!lazyMode) return localSearchResults;
+    return [...lazySearch.matches].sort((a, b) => compareNodes(a, b, tree.sortKey, tree.sortDir));
+  }, [lazyMode, localSearchResults, lazySearch, tree.sortKey, tree.sortDir]);
   searchResultsRef.current = searchResults;
   // Show flat results when searching (>=2 char query) OR a pure size/type/date
   // filter is active (lets filters alone list results with an empty query).
@@ -2061,6 +2156,25 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             </button>
           </div>
         )}
+        {data && data.nodeCount > VERY_LARGE_SCAN_NODES && !largeScanDismissed && status !== "scanning" && (
+          <div className="stale-bar" role="status">
+            <Icon name="warning" size={12} />
+            <span>
+              Very large scan ({data.nodeCount.toLocaleString()} items)
+              {data.lazy
+                ? " — loading folders on demand to stay responsive."
+                : " — performance may degrade while everything loads."}
+            </span>
+            <span className="spacer" />
+            <button
+              className="stale-bar-dismiss"
+              title="Dismiss"
+              onClick={() => setLargeScanDismissed(true)}
+            >
+              <Icon name="x" size={12} />
+            </button>
+          </div>
+        )}
         {tagFiltering && (
           <div className="tag-filter-bar" role="status">
             <Icon name="funnel-fill" size={12} />
@@ -2098,6 +2212,15 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                 </select>
               </label>
             </div>
+            )}
+            {data?.lazy && (
+              <div className="stale-bar" role="status">
+                <Icon name="warning" size={12} />
+                <span>
+                  This scan is very large and loads folders on demand — the treemap only
+                  reflects folders you've expanded. Narrow to a subfolder for a complete map.
+                </span>
+              </div>
             )}
             <div className="editor-stack">
               <div className="editor-main">
@@ -2155,7 +2278,13 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                 <input type="checkbox" checked={collectOwners} onChange={(e) => onCollectOwnersChange(e.target.checked)} />
                 Owners
               </label>
-              <button onClick={() => tree.expandToLevel(Infinity)}>Expand all</button>
+              <button
+                onClick={() => tree.expandToLevel(Infinity)}
+                disabled={!!data?.lazy}
+                title={data?.lazy
+                  ? "Expand all is disabled for very large (lazily loaded) scans — folders load on demand as you expand them."
+                  : undefined}
+              >Expand all</button>
               <button onClick={() => tree.expandToLevel(0)}>Collapse all</button>
               <span className="sep" />
               <input
@@ -2235,6 +2364,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                 <TreeTable
                   rows={showRows}
                   flat={showFlat}
+                  lazy={!!data?.lazy}
                   nodeById={tree.nodeById}
                   expanded={tree.expanded}
                   selectedId={tree.selectedId}

@@ -604,6 +604,72 @@ function baseName(p: string): string {
   return parts.length ? parts[parts.length - 1] : p;
 }
 
+// Apply one per-file NDJSON event to a progress-Map draft in place. Used by the
+// batched flush so all buffered events fold into a single Map clone + re-render.
+// Mirrors the per-event semantics of the original `setProgress` switch exactly;
+// only handles the batchable per-file events (job-level `done`/`job_start` are
+// handled directly in `handleEvent`).
+function applyProgressEvent(next: Map<number, FileProg>, ev: CompressEvent): void {
+  switch (ev.type) {
+    case "file_start": {
+      const cur = next.get(ev.index);
+      next.set(ev.index, {
+        index: ev.index,
+        path: ev.path,
+        name: cur?.name ?? baseName(ev.path),
+        kind: ev.kind,
+        origBytes: ev.origBytes,
+        status: "running",
+        pct: 0,
+        newBytes: 0,
+        savedBytes: 0,
+      });
+      break;
+    }
+    case "progress": {
+      const cur = next.get(ev.index);
+      if (!cur) break;
+      next.set(ev.index, { ...cur, status: "running", pct: Math.max(0, Math.min(100, ev.pct)) });
+      break;
+    }
+    case "file_done": {
+      const cur = next.get(ev.index);
+      next.set(ev.index, {
+        index: ev.index,
+        path: cur?.path ?? "",
+        name: cur?.name ?? baseName(cur?.path ?? ""),
+        kind: cur?.kind ?? "other",
+        origBytes: ev.origBytes,
+        status: ev.status === "skipped" || ev.status === "skipped_no_gain" ? "skipped" : "done",
+        pct: 100,
+        newBytes: ev.newBytes,
+        savedBytes: ev.savedBytes,
+        recycled: ev.recycled,
+        disposition: ev.disposition,
+        reason: ev.reason ?? cur?.reason,
+      });
+      break;
+    }
+    case "error": {
+      const cur = next.get(ev.index);
+      next.set(ev.index, {
+        index: ev.index,
+        path: cur?.path ?? ev.path,
+        name: cur?.name ?? baseName(ev.path),
+        kind: cur?.kind ?? "other",
+        origBytes: cur?.origBytes ?? 0,
+        status: "error",
+        pct: 100,
+        newBytes: 0,
+        savedBytes: 0,
+        error: ev.error,
+        reason: ev.reason,
+      });
+      break;
+    }
+  }
+}
+
 /** Case-insensitive, separator- and trailing-slash-normalized path key, so the
  *  selection passed from the table matches the scan tree's reconstructed paths
  *  regardless of slash direction or drive-letter casing on Windows. */
@@ -787,6 +853,15 @@ export function CompressView({
   const abortRef = useRef<AbortController | null>(null);
   const finalizedRef = useRef(false);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Coalesce the per-file progress storm: large jobs (>160 files, 2-8 parallel
+  // encoders) emit NDJSON `progress` lines faster than React can re-render. We
+  // buffer non-terminal per-file events here and flush them all in a single Map
+  // clone + re-render on the next animation frame, instead of cloning the whole
+  // Map per event. Terminal job events (`done`/cancel/finalize) flush this
+  // buffer synchronously first so the final per-file state and the single
+  // completion toast are always correct.
+  const pendingEventsRef = useRef<CompressEvent[]>([]);
+  const flushRafRef = useRef<number | null>(null);
 
   // GPU test / auto-tune (definitive HW-encode probes on a tiny clip).
   const [gpuTest, setGpuTest] = useState<GpuTestResult | null>(null);
@@ -1099,18 +1174,31 @@ export function CompressView({
     if (!anyGpuAvailable(tools)) setPerf((p) => ({ ...p, useGpu: false }));
   }, [tools]);
 
-  // Abort the stream + stop polling on unmount.
+  // Abort the stream + stop polling + cancel any pending progress flush on
+  // unmount.
   useEffect(() => () => {
     abortRef.current?.abort();
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    if (flushRafRef.current !== null) cancelAnimationFrame(flushRafRef.current);
   }, []);
+
+  const inRun = runStatus !== "idle";
 
   // ── Source files (derived from the scan tree) ───────────────────────────────
   // In scoped mode only the launched selection's files are visible; otherwise
   // every compressible file in the scan is listed. Everything downstream
   // (counts, groups, select-all, totals) keys off this list, so scoping here is
   // enough to make the whole view reflect just the selection.
+  //
+  // Gated on `inRun`: while a job is running the view renders from `progArr`,
+  // not from these scan-derived lists, and `nodeById` can change underneath us
+  // (lazy tree loading). Re-scanning the whole selection on every progress
+  // flush is exactly the main-thread saturation that blanks large jobs, so we
+  // freeze the last idle value (held in a ref) for the duration of the run and
+  // recompute fresh once it returns to idle.
+  const idleFilesRef = useRef<CompressFile[]>([]);
   const files = useMemo(() => {
+    if (inRun) return idleFilesRef.current;
     const out: CompressFile[] = [];
     const seen = new Set<string>();
     for (const node of nodeById.values()) {
@@ -1135,7 +1223,8 @@ export function CompressView({
       out.push(ef);
     }
     return out;
-  }, [nodeById, scopePaths, extraFiles]);
+  }, [nodeById, scopePaths, extraFiles, inRun]);
+  idleFilesRef.current = files;
 
   // Normalized paths of dragged-in external files, used to exempt them from the
   // start-time stale-tree guard (which only knows about `nodeById`).
@@ -1206,21 +1295,24 @@ export function CompressView({
     [tools],
   );
 
-  const filteredFiles = useMemo(
-    () => (typeFilter === "all" ? files : files.filter((f) => f.kind === typeFilter)),
-    [files, typeFilter],
-  );
+  // Both derived from `files` and only consumed by the idle selection view, so
+  // they inherit the same `inRun` freeze (skip recompute while a run is active).
+  const idleFilteredRef = useRef<CompressFile[]>([]);
+  const filteredFiles = useMemo(() => {
+    if (inRun) return idleFilteredRef.current;
+    return typeFilter === "all" ? files : files.filter((f) => f.kind === typeFilter);
+  }, [files, typeFilter, inRun]);
+  idleFilteredRef.current = filteredFiles;
 
-  const groups = useMemo(
-    () =>
-      KIND_ORDER.map((kind) => ({
-        kind,
-        items: filteredFiles.filter((f) => f.kind === kind),
-      })).filter((g) => g.items.length > 0),
-    [filteredFiles],
-  );
-
-  const inRun = runStatus !== "idle";
+  const idleGroupsRef = useRef<{ kind: CompressKind; items: CompressFile[] }[]>([]);
+  const groups = useMemo(() => {
+    if (inRun) return idleGroupsRef.current;
+    return KIND_ORDER.map((kind) => ({
+      kind,
+      items: filteredFiles.filter((f) => f.kind === kind),
+    })).filter((g) => g.items.length > 0);
+  }, [filteredFiles, inRun]);
+  idleGroupsRef.current = groups;
 
   const progArr = useMemo(
     () => [...progress.values()].sort((a, b) => a.index - b.index),
@@ -1519,9 +1611,49 @@ export function CompressView({
   );
 
   // ── Job event handling ──────────────────────────────────────────────────────
+  // Apply every buffered per-file event in a single Map clone + re-render. Safe
+  // to call synchronously (terminal events do, so the final state is correct).
+  const flushPending = useCallback(() => {
+    if (flushRafRef.current !== null) {
+      cancelAnimationFrame(flushRafRef.current);
+      flushRafRef.current = null;
+    }
+    const buf = pendingEventsRef.current;
+    if (buf.length === 0) return;
+    pendingEventsRef.current = [];
+    setProgress((prev) => {
+      const next = new Map(prev);
+      for (const ev of buf) applyProgressEvent(next, ev);
+      return next;
+    });
+  }, []);
+
+  // Schedule a flush on the next animation frame (coalesces a burst of events
+  // into one re-render). No-op if a frame is already pending.
+  const scheduleFlush = useCallback(() => {
+    if (flushRafRef.current !== null) return;
+    flushRafRef.current = requestAnimationFrame(() => {
+      flushRafRef.current = null;
+      flushPending();
+    });
+  }, [flushPending]);
+
+  // Drop any buffered events without applying them (used when the progress state
+  // is being reset to a fresh job, so stale events never land on the new state).
+  const cancelPendingFlush = useCallback(() => {
+    if (flushRafRef.current !== null) {
+      cancelAnimationFrame(flushRafRef.current);
+      flushRafRef.current = null;
+    }
+    pendingEventsRef.current = [];
+  }, []);
+
   const finalize = useCallback(
     (status: RunStatus, savedBytes: number, done: number) => {
       if (finalizedRef.current) return;
+      // Apply any buffered per-file events synchronously before reconciling, so
+      // the final per-file state and completion summary reflect every event.
+      flushPending();
       finalizedRef.current = true;
       setRunStatus(status);
       if (done > 0) {
@@ -1576,7 +1708,7 @@ export function CompressView({
         });
       }
     },
-    [onRescan],
+    [onRescan, flushPending],
   );
 
   const handleEvent = useCallback(
@@ -1585,80 +1717,22 @@ export function CompressView({
         case "job_start":
           setRunStatus("running");
           break;
+        // Per-file events arrive in a storm on large jobs; buffer them and flush
+        // on the next animation frame so a burst folds into one re-render.
         case "file_start":
-          setProgress((prev) => {
-            const next = new Map(prev);
-            const cur = next.get(ev.index);
-            next.set(ev.index, {
-              index: ev.index,
-              path: ev.path,
-              name: cur?.name ?? baseName(ev.path),
-              kind: ev.kind,
-              origBytes: ev.origBytes,
-              status: "running",
-              pct: 0,
-              newBytes: 0,
-              savedBytes: 0,
-            });
-            return next;
-          });
-          break;
         case "progress":
-          setProgress((prev) => {
-            const cur = prev.get(ev.index);
-            if (!cur) return prev;
-            const next = new Map(prev);
-            next.set(ev.index, { ...cur, status: "running", pct: Math.max(0, Math.min(100, ev.pct)) });
-            return next;
-          });
-          break;
         case "file_done":
-          setProgress((prev) => {
-            const cur = prev.get(ev.index);
-            const next = new Map(prev);
-            next.set(ev.index, {
-              index: ev.index,
-              path: cur?.path ?? "",
-              name: cur?.name ?? baseName(cur?.path ?? ""),
-              kind: cur?.kind ?? "other",
-              origBytes: ev.origBytes,
-              status: ev.status === "skipped" || ev.status === "skipped_no_gain" ? "skipped" : "done",
-              pct: 100,
-              newBytes: ev.newBytes,
-              savedBytes: ev.savedBytes,
-              recycled: ev.recycled,
-              disposition: ev.disposition,
-              reason: ev.reason ?? cur?.reason,
-            });
-            return next;
-          });
-          break;
         case "error":
-          setProgress((prev) => {
-            const cur = prev.get(ev.index);
-            const next = new Map(prev);
-            next.set(ev.index, {
-              index: ev.index,
-              path: cur?.path ?? ev.path,
-              name: cur?.name ?? baseName(ev.path),
-              kind: cur?.kind ?? "other",
-              origBytes: cur?.origBytes ?? 0,
-              status: "error",
-              pct: 100,
-              newBytes: 0,
-              savedBytes: 0,
-              error: ev.error,
-              reason: ev.reason,
-            });
-            return next;
-          });
+          pendingEventsRef.current.push(ev);
+          scheduleFlush();
           break;
         case "done":
+          // Terminal: finalize() flushes the pending buffer synchronously first.
           finalize("done", ev.savedBytes, ev.done);
           break;
       }
     },
-    [finalize],
+    [finalize, scheduleFlush],
   );
 
   // Map a polled snapshot onto the per-file progress state (stream fallback).
@@ -1845,6 +1919,7 @@ export function CompressView({
 
       abortRef.current?.abort();
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+      cancelPendingFlush();
       finalizedRef.current = false;
       setRunError("");
 
@@ -1879,7 +1954,7 @@ export function CompressView({
         return false;
       }
     },
-    [nodeById, attachStream, onRescan],
+    [nodeById, attachStream, onRescan, cancelPendingFlush],
   );
 
   const handleStart = useCallback(async () => {
@@ -1976,6 +2051,8 @@ export function CompressView({
   const handleStop = useCallback(async () => {
     abortRef.current?.abort();
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    // Apply whatever progress had buffered so the stopped run shows accurately.
+    flushPending();
     finalizedRef.current = true;
     setRunStatus("cancelled");
     if (jobId) {
@@ -1987,12 +2064,14 @@ export function CompressView({
       invalidateAllScanCache();
       onRescan();
     }
-  }, [jobId, progArr, onRescan]);
+  }, [jobId, progArr, onRescan, flushPending]);
 
   const handleRetry = useCallback(async () => {
     if (!jobId) return;
     abortRef.current?.abort();
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    // Drop buffered events from the prior attempt before resetting state.
+    cancelPendingFlush();
     finalizedRef.current = false;
     setRunError("");
     // Reset everything not already done back to pending; the backend resumes
@@ -2017,17 +2096,18 @@ export function CompressView({
       setRunError(e instanceof Error ? e.message : String(e));
       toast.error(`Could not restart: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [jobId, attachStream]);
+  }, [jobId, attachStream, cancelPendingFlush]);
 
   const resetRun = useCallback(() => {
     abortRef.current?.abort();
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    cancelPendingFlush();
     finalizedRef.current = false;
     setRunStatus("idle");
     setProgress(new Map());
     setJobId(null);
     setRunError("");
-  }, []);
+  }, [cancelPendingFlush]);
 
   // ── Tool install ────────────────────────────────────────────────────────────
   const handleInstall = useCallback(async (tool: "handbrake" | "image") => {

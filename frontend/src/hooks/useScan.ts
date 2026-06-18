@@ -45,6 +45,16 @@ export function reconstructChildren<T extends ScanResult>(result: T): T {
   return result;
 }
 
+// Node-count ceiling above which a scan is ingested in LAZY mode: the renderer
+// keeps only the root and fetches each directory's children on demand from the
+// backend's cached scan (GET /api/children), instead of materializing the whole
+// tree (the >10M-node black-screen OOM). Tuned to sit below the renderer's heap
+// headroom (electron raises --max-old-space-size to 8 GB) with margin: a full
+// scan of this many nodes still loads comfortably, beyond it we go lazy. Normal
+// scans (the overwhelming majority) stay well under this and keep today's exact
+// full-materialization fast path.
+export const LAZY_THRESHOLD = 1_500_000;
+
 export type ScanStatus = "idle" | "scanning" | "done" | "error" | "cancelled";
 
 export interface ScanProgress {
@@ -124,11 +134,23 @@ type StreamLine = MetaLine | NodeLine | DoneLine | ScanningLine | ErrorLine;
 export async function readNdjsonStream(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   onProgress: (nodeCount: number, elapsed: number) => void,
+  // forceFull: ignore LAZY_THRESHOLD and always materialize every node. Used by
+  // consumers that MUST iterate the whole tree once (e.g. duplicate-candidate
+  // aggregation), independent of how the persistent tree view ingests the scan.
+  opts?: { forceFull?: boolean },
 ): Promise<ScanResult> {
   const decoder = new TextDecoder();
   let buf = "";
   let meta: MetaLine | null = null;
   const nodes: NodeRecord[] = [];
+  // LAZY mode: when the meta line (which always precedes the node lines) reports
+  // a node count above LAZY_THRESHOLD, we STOP accumulating node lines and keep
+  // only the root. The renderer then loads directories on demand via
+  // /api/children (see useTreeState.ensureChildren), so a >10M-node scan never
+  // materializes its whole tree in JS and can't OOM the renderer. We still drain
+  // the stream to completion (the server streams all nodes regardless) but drop
+  // every non-root line.
+  let lazy = false;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -149,9 +171,13 @@ export async function readNdjsonStream(
       }
       if (raw.type === "meta") {
         meta = raw;
+        lazy = !opts?.forceFull && raw.nodeCount > LAZY_THRESHOLD;
         continue;
       }
       if (raw.type === "node") {
+        // In lazy mode keep ONLY the root node (parent === null); every other
+        // node is dropped and fetched later on expand.
+        if (lazy && raw.parent !== null && raw.parent !== undefined) continue;
         const { type: _t, ...node } = raw;
         nodes.push(node as NodeRecord);
         continue;
@@ -163,7 +189,9 @@ export async function readNdjsonStream(
   if (!meta) throw new Error("Stream ended without meta line");
 
   const { type: _t, ...metaFields } = meta;
-  const result: ScanResult = { ...metaFields, nodes };
+  const result: ScanResult = { ...metaFields, nodes, lazy };
+  // reconstructChildren wires children[]/path. In lazy mode `nodes` is just the
+  // root, so it simply sets root.path = rootPath and root.children = [].
   return reconstructChildren(result);
 }
 

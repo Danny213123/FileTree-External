@@ -4,6 +4,15 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.13.15] - 2026-06-18
+
+Stability release fixing two crashes on very large workloads: a renderer black-screen on >10M-node scans, and the whole-UI blanking when starting a large compression job.
+
+### Fixed
+
+- **Very large scans (>10 million files/nodes) no longer crash the renderer to a black screen**: added threshold-gated lazy per-directory tree loading. Above ~1.5M nodes the renderer keeps only the root in memory and fetches each directory's children on demand from the backend's cached scan via new endpoints (`GET /api/children`, `GET /api/subtree-files`, `GET /api/search`). The Electron renderer's V8 heap limit was raised, and a non-blocking "very large scan" advisory banner appears above ~2M nodes. In lazy mode, search runs server-side, compress folder-expansion uses `/api/subtree-files`, and Reports/Gallery show a "scan a smaller subfolder" notice while the Treemap shows a "reflects only expanded folders" banner. Normal-sized scans are unchanged.
+- **Starting a compression job with many files (>160) no longer blanks/freezes the entire UI**: added an app-root React error boundary with a recoverable "Something went wrong" + Reload fallback, so a render throw can no longer white-screen the whole window. The compress progress-update storm is now coalesced by batching NDJSON progress events into a single per-frame state update (terminal events still flush immediately so completion state and the single toast stay correct), and the full-scan memos no longer recompute during an active run.
+
 ## [1.13.14] - 2026-06-15
 
 A large quality-of-life release implementing the full QoL backlog across selection/table UX, the Compress page, scanning, duplicates & cleanup, search, snapshots/reports, file operations, and app-wide polish. Frontend-led with safe, gated backend additions.

@@ -15,6 +15,7 @@ import {
   fetchAppVersion,
   notify,
   saveSnapshot,
+  fetchSubtreeFiles,
 } from "./api/client";
 import type { AppSettings } from "./api/client";
 import type { DriveEntry, SpecialFolder, SortKey, Unit, ScanResult, TagEntry, SmartFolder, NodeRecord } from "./api/types";
@@ -1076,7 +1077,14 @@ export default function App() {
     // active pane's nodeById children), mirroring WorkspaceTab.handleCompress.
     // Unknown paths are kept verbatim so CompressView can surface a "not found"
     // notice rather than silently dropping them.
-    const nodeById = getActiveRef()?.getNodeById();
+    const active = getActiveRef();
+    const nodeById = active?.getNodeById();
+    const scan = active?.getData();
+    // LAZY mode: the renderer doesn't hold whole subtrees, so a folder's
+    // descendant files must come from the backend (GET /api/subtree-files)
+    // instead of walking the partial in-memory children.
+    const lazy = !!scan?.lazy;
+    const rootPath = scan?.rootPath ?? "";
     const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
     const pathToNode = new Map<string, NodeRecord>();
     if (nodeById) {
@@ -1087,32 +1095,50 @@ export default function App() {
 
     const result: string[] = [];
     const seen = new Set<string>();
-    const pushFile = (node: NodeRecord) => {
-      if (node.dir || node.id < 0 || !node.path || seen.has(node.path)) return;
-      seen.add(node.path);
-      result.push(node.path);
+    const pushFilePath = (p: string) => {
+      if (!p || seen.has(p)) return;
+      seen.add(p);
+      result.push(p);
     };
-    for (const p of paths) {
-      const node = pathToNode.get(norm(p));
-      if (!node) {
-        // Path not in the current scan — keep it raw for CompressView's notice.
-        if (!seen.has(p)) { seen.add(p); result.push(p); }
-        continue;
+    const pushFile = (node: NodeRecord) => {
+      if (node.dir || node.id < 0 || !node.path) return;
+      pushFilePath(node.path);
+    };
+
+    const run = async () => {
+      for (const p of paths) {
+        const node = pathToNode.get(norm(p));
+        if (!node) {
+          // Path not in the current scan — keep it raw for CompressView's notice.
+          pushFilePath(p);
+          continue;
+        }
+        if (!node.dir) {
+          pushFile(node);
+          continue;
+        }
+        if (lazy) {
+          // Folder in lazy mode: ask the backend for every descendant file path.
+          try {
+            const files = await fetchSubtreeFiles(rootPath, node.id);
+            for (const f of files) pushFilePath(f);
+          } catch (err) {
+            console.warn("subtree-files fetch failed for", node.path, err);
+          }
+          continue;
+        }
+        // Full mode: walk descendants, collecting every file underneath it.
+        const queue = [node.id];
+        for (let qi = 0; qi < queue.length; qi++) {
+          const cur = nodeById?.get(queue[qi]);
+          if (!cur) continue;
+          if (!cur.dir) { pushFile(cur); continue; }
+          for (const childId of cur.children) queue.push(childId);
+        }
       }
-      if (!node.dir) {
-        pushFile(node);
-        continue;
-      }
-      // Folder: walk descendants, collecting every file underneath it.
-      const queue = [node.id];
-      for (let qi = 0; qi < queue.length; qi++) {
-        const cur = nodeById?.get(queue[qi]);
-        if (!cur) continue;
-        if (!cur.dir) { pushFile(cur); continue; }
-        for (const childId of cur.children) queue.push(childId);
-      }
-    }
-    openCompressWith(result);
+      openCompressWith(result);
+    };
+    void run();
   }, [getActiveRef, openCompressWith]);
 
   // Quick "Compress" button (TreeTable row action): WorkspaceTab has already
@@ -2277,8 +2303,30 @@ function WorkbenchInspector({
   );
 }
 
+// Shown in place of full-tree views (Reports, Gallery) when the active scan is
+// in LAZY mode: the renderer holds only the folders expanded so far, so a
+// whole-tree aggregation would be incomplete. Steers the user to a smaller scope.
+function LazyViewNotice({ feature }: { feature: string }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", padding: 32, textAlign: "center", color: "var(--text-muted, #888)" }}>
+      <div style={{ maxWidth: 460 }}>
+        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8, color: "var(--text)" }}>{feature} is unavailable for very large scans</div>
+        <div style={{ fontSize: 13, lineHeight: 1.5 }}>
+          This folder has too many items to load entirely, so it's browsed on demand and
+          {" "}{feature.toLowerCase()} can't aggregate the whole tree. Scan a smaller
+          subfolder to use {feature.toLowerCase()}.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function WorkbenchReports({ store, onAfterNavigate }: { store: WorkbenchStore; onAfterNavigate: () => void }) {
   const { sidebar: m } = useWorkbench(store);
+  // LAZY mode: reports aggregate the WHOLE tree, but the renderer only holds the
+  // folders expanded so far — the numbers would be wrong/incomplete. Gate with a
+  // notice steering the user to scan a smaller subfolder for full reports.
+  if (m.data?.lazy) return <LazyViewNotice feature="Reports" />;
   return (
     <ReportsView
       data={m.data}
@@ -2312,6 +2360,9 @@ function WorkbenchSnapshots({ store, onAfterNavigate }: { store: WorkbenchStore;
 // Selecting a cell reveals it in the tree but keeps the gallery open.
 function WorkbenchGallery({ store }: { store: WorkbenchStore }) {
   const { sidebar: m } = useWorkbench(store);
+  // LAZY mode: the gallery scans the whole tree for media; only expanded folders
+  // are loaded here, so gate with a notice (scan a subfolder for the full grid).
+  if (m.data?.lazy) return <LazyViewNotice feature="Gallery" />;
   return <GalleryView nodeById={m.nodeById} onNavigate={m.onNavigate} />;
 }
 

@@ -26,6 +26,15 @@ import { randomBytes } from "crypto";
 // read or forge it.
 const AUTH_TOKEN = randomBytes(32).toString("hex");
 
+// Raise the renderer's V8 old-space ceiling well above Chromium's ~2-4 GB
+// default. A very large scan (millions of nodes) materializes a big JS heap in
+// the renderer while the tree loads; without this the renderer can hit the
+// default limit and die to a black screen. Must be appended before the app is
+// ready (i.e. at module load), so it is in effect for the renderer process.
+// Lazy mode (threshold-gated) keeps the steady-state heap small for huge scans;
+// this headroom covers the transition and large-but-sub-threshold scans.
+app.commandLine.appendSwitch("js-flags", "--max-old-space-size=8192");
+
 // ── Native drag-out addon ─────────────────────────────────────────────────────
 // Runs the Windows shell drag itself (SHDoDragDrop, synchronously on this UI
 // thread) so we learn the real OS drop effect. It classifies the drop:
