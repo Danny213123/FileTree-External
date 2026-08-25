@@ -203,10 +203,11 @@ pub(crate) fn acquire_scan_threads(requested: usize) -> ScanThreadPermit {
 // jobs there is no other coordination, so without a global cap N simultaneous
 // jobs would each spawn their own pool and oversubscribe the CPU/GPU. This gate
 // is a process-wide admission budget split into workload LANES so a queue of
-// heavy videos can't starve quick image/zip work, and so GPU sessions (which
-// consumer NVENC/AMF cap to 2-3) get a dedicated, smaller lane distinct from
-// the CPU lane. Each lane is a counting semaphore; a permit is acquired up
-// front for one file's encode and released (RAII) when that file finishes.
+// heavy videos can't starve quick image/zip work. NVENC gets two slots so GPUs
+// with dual encoder engines can use both, while other hardware encoders retain
+// a conservative single-session lane. Each lane is a counting semaphore; a
+// permit is acquired up front for one file's encode and released (RAII) when
+// that file finishes.
 // ──────────────────────────────────────────────────────────────────
 
 /// Workload lane a compression file runs in. The caps differ because the
@@ -217,8 +218,10 @@ pub(crate) fn acquire_scan_threads(requested: usize) -> ScanThreadPermit {
 pub(crate) enum CompressLane {
     /// CPU video encode (x264 / x265 software).
     VideoCpu,
-    /// Hardware video encode (NVENC / QSV / AMF) — driver session limited.
-    Gpu,
+    /// NVIDIA NVENC. Modern NVIDIA GPUs may expose two encoder engines.
+    Nvenc,
+    /// Intel QSV / AMD AMF. Kept to one session for driver stability.
+    GpuOther,
     /// Image re-encode (ffmpeg / ImageMagick).
     Image,
     /// Built-in zip / archive (I/O bound).
@@ -233,7 +236,8 @@ struct CompressGate {
 #[derive(Debug)]
 struct GateInner {
     video_cpu: usize,
-    gpu: usize,
+    nvenc: usize,
+    gpu_other: usize,
     image: usize,
     zip: usize,
 }
@@ -246,11 +250,17 @@ fn compress_lane_caps() -> GateInner {
         .map(|c| c.get())
         .unwrap_or(4);
     GateInner {
-        // x264/x265 already use many threads per encode, so allow a few parallel
-        // CPU encodes but never the full core count (would oversubscribe).
-        video_cpu: (cores / 2).clamp(1, 8),
-        // Consumer NVENC/AMF cap concurrent sessions to ~2-3; QSV a bit more.
-        gpu: 3,
+        // A HandBrake software encode already fans out across several threads.
+        // Keep one in flight so a GPU failure cannot create a burst of parallel
+        // CPU fallbacks that starves the desktop or exhausts memory.
+        video_cpu: 1,
+        // A dual-engine NVIDIA GPU needs two independent encode sessions to use
+        // both engines; Task Manager otherwise plateaus around 50% Video Encode.
+        // The process-wide gate still prevents unbounded HandBrake fan-out.
+        nvenc: 2,
+        // Retain the conservative limit for QSV/AMF, where the available engine
+        // count and driver behavior vary more widely across supported hardware.
+        gpu_other: 1,
         // Image encodes are short; allow one per core.
         image: cores.clamp(2, 32),
         // Zip is I/O bound; a handful keeps the disk busy without thrashing.
@@ -278,7 +288,8 @@ impl Drop for CompressPermit {
         let mut s = gate.state.lock_recover();
         match self.lane {
             CompressLane::VideoCpu => s.video_cpu += 1,
-            CompressLane::Gpu => s.gpu += 1,
+            CompressLane::Nvenc => s.nvenc += 1,
+            CompressLane::GpuOther => s.gpu_other += 1,
             CompressLane::Image => s.image += 1,
             CompressLane::Zip => s.zip += 1,
         }
@@ -289,7 +300,8 @@ impl Drop for CompressPermit {
 fn lane_slot(s: &mut GateInner, lane: CompressLane) -> &mut usize {
     match lane {
         CompressLane::VideoCpu => &mut s.video_cpu,
-        CompressLane::Gpu => &mut s.gpu,
+        CompressLane::Nvenc => &mut s.nvenc,
+        CompressLane::GpuOther => &mut s.gpu_other,
         CompressLane::Image => &mut s.image,
         CompressLane::Zip => &mut s.zip,
     }
@@ -545,6 +557,14 @@ mod tests {
     #[test]
     fn epoch_formats_unix_start() {
         assert_eq!(epoch_ms_to_utc(1_000), "1970-01-01 00:00:01 UTC");
+    }
+
+    #[test]
+    fn compression_video_lanes_use_both_nvenc_engines_safely() {
+        let caps = compress_lane_caps();
+        assert_eq!(caps.video_cpu, 1);
+        assert_eq!(caps.nvenc, 2);
+        assert_eq!(caps.gpu_other, 1);
     }
 
     #[cfg(windows)]

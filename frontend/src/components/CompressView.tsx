@@ -44,6 +44,7 @@ import { formatBytes } from "../utils/formatBytes";
 import { toast } from "../lib/toast";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
+import { CompressionMonitor } from "./CompressionMonitor";
 
 // Compression page (media re-encode + zip, with live jobs).
 //
@@ -843,8 +844,12 @@ export function CompressView({
   const selectedFilesRef = useRef<CompressFile[]>([]);
   // Epoch ms the active run started, for the "notify only if it ran a while" gate.
   const runStartRef = useRef<number>(0);
+  // Synchronous promise guard: React state does not commit quickly enough to
+  // stop a double-click (or two mounted panes) from issuing duplicate creates.
+  const startAttemptRef = useRef<Promise<boolean> | null>(null);
 
   const [runStatus, setRunStatus] = useState<RunStatus>("idle");
+  const [starting, setStarting] = useState(false);
   const [progress, setProgress] = useState<Map<number, FileProg>>(new Map());
   const [jobId, setJobId] = useState<string | null>(null);
   const [runError, setRunError] = useState("");
@@ -1321,9 +1326,13 @@ export function CompressView({
 
   // Overall progress: files finished / total + an aggregate percentage.
   const total = progArr.length;
-  const doneCount = progArr.filter(
+  const processedCount = progArr.filter(
     (f) => f.status === "done" || f.status === "skipped" || f.status === "error",
   ).length;
+  const savedCount = progArr.filter((f) => f.status === "done").length;
+  const skippedCount = progArr.filter((f) => f.status === "skipped").length;
+  const failedCount = progArr.filter((f) => f.status === "error").length;
+  const activeCount = progArr.filter((f) => f.status === "running").length;
   const aggregatePct = total
     ? Math.round(
         progArr.reduce(
@@ -1760,9 +1769,9 @@ export function CompressView({
         }
         return next;
       });
-      if (snap.status !== "running") {
+      if (["done", "cancelled", "error"].includes(snap.status)) {
         const done = snap.files.filter((f) => f.status === "done" || f.status === "skipped").length;
-        finalize(snap.status, snap.savedBytes, done);
+        finalize(snap.status as RunStatus, snap.savedBytes, done);
       }
     },
     [finalize],
@@ -1853,6 +1862,8 @@ export function CompressView({
       requestBase: Omit<CompressJobRequest, "paths">,
       exemptExternal: Set<string>,
     ): Promise<boolean> => {
+      if (startAttemptRef.current) return startAttemptRef.current;
+      const attempt = (async (): Promise<boolean> => {
       if (candidate.length === 0) return false;
 
       // Stale-path guard: drop selections that no longer exist in the scan tree
@@ -1944,6 +1955,7 @@ export function CompressView({
       try {
         const id = await startCompressJob({ ...requestBase, paths: liveRunnable.map((f) => f.path) });
         setJobId(id);
+        setTab("progress");
         void attachStream(id);
         return true;
       } catch (e) {
@@ -1953,6 +1965,15 @@ export function CompressView({
         toast.error(`Could not start compression: ${e instanceof Error ? e.message : String(e)}`);
         return false;
       }
+      })();
+      startAttemptRef.current = attempt;
+      setStarting(true);
+      const clearAttempt = () => {
+        if (startAttemptRef.current === attempt) startAttemptRef.current = null;
+        setStarting(false);
+      };
+      void attempt.then(clearAttempt, clearAttempt);
+      return attempt;
     },
     [nodeById, attachStream, onRescan, cancelPendingFlush],
   );
@@ -1971,23 +1992,23 @@ export function CompressView({
   // Enqueue the current selection as a frozen batch to auto-start when the
   // active run finishes. Each batch snapshots its files + request so later
   // control changes don't alter it.
-  const handleEnqueue = useCallback(() => {
+  const handleEnqueue = useCallback(async () => {
     const encoderRunnable = selectedFiles.filter((f) => kindAvailable(f.kind));
     if (encoderRunnable.length === 0) return;
-    const batch: QueuedBatch = {
-      id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      files: encoderRunnable,
-      request: buildRequestBase(),
-      externalPaths: new Set(externalPathSet),
-    };
-    setQueue((prev) => [...prev, batch]);
-    setSelected(new Set());
-    toast.info(`Queued ${encoderRunnable.length} file${encoderRunnable.length === 1 ? "" : "s"} — starts when the current job finishes.`);
+    try {
+      const id = await startCompressJob({
+        ...buildRequestBase(),
+        paths: encoderRunnable.map((file) => file.path),
+        queued: true,
+      });
+      setJobId(id);
+      setSelected(new Set());
+      setTab("progress");
+      toast.info(`Queued ${encoderRunnable.length} file${encoderRunnable.length === 1 ? "" : "s"}. The batch is persisted and will survive a restart.`);
+    } catch (error) {
+      toast.error(`Could not queue compression: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }, [selectedFiles, kindAvailable, buildRequestBase, externalPathSet]);
-
-  const removeFromQueue = useCallback((id: string) => {
-    setQueue((prev) => prev.filter((b) => b.id !== id));
-  }, []);
 
   // Kick off the queue manually when idle (the auto-runner only fires after a
   // terminal state; this starts the first batch so the rest then chain).
@@ -2036,7 +2057,9 @@ export function CompressView({
       // as the scan root so the backend's containment check passes.
       const parent = path.replace(/[\\/]+[^\\/]+$/, "");
       try {
-        await startCompressJob({ ...req, paths: [path], scanRoot: parent || req.scanRoot });
+        const id = await startCompressJob({ ...req, paths: [path], scanRoot: parent || req.scanRoot });
+        setJobId(id);
+        setTab("progress");
         const presetName = presetOverride
           ? (PRESETS.find((p) => p.id === presetOverride)?.label ?? "Custom")
           : selectedPresetName;
@@ -2142,14 +2165,14 @@ export function CompressView({
 
   return (
     <div className="compress-view">
-      <div className="compress-tabs" role="tablist" aria-label="Compress / In Progress / History">
+      <div className="compress-tabs" role="tablist" aria-label="Setup / Monitor / History">
         <button
           role="tab"
           aria-selected={tab === "compress"}
           className={`compress-tab${tab === "compress" ? " active" : ""}`}
           onClick={() => setTab("compress")}
         >
-          Compress
+          Setup
         </button>
         <button
           role="tab"
@@ -2157,7 +2180,7 @@ export function CompressView({
           className={`compress-tab${tab === "progress" ? " active" : ""}`}
           onClick={() => setTab("progress")}
         >
-          In Progress
+          Monitor
         </button>
         <button
           role="tab"
@@ -2170,7 +2193,7 @@ export function CompressView({
       </div>
 
       {tab === "progress" ? (
-        <CompressInProgress queue={queue} onRemoveQueued={removeFromQueue} />
+        <CompressionMonitor focusJobId={jobId} />
       ) : tab === "history" ? (
         <CompressHistory onCompressAgain={compressAgain} />
       ) : !scanPath ? (
@@ -2428,15 +2451,16 @@ export function CompressView({
               <button
                 className="compress-btn primary"
                 onClick={startQueue}
+                disabled={starting}
                 title={`Start the ${queue.length} queued batch${queue.length === 1 ? "" : "es"}`}
               >
-                <Icon name="file-zip" size={13} /> Start queue ({queue.length})
+                <Icon name="file-zip" size={13} /> {starting ? "Starting…" : `Start queue (${queue.length})`}
               </button>
             ) : (
               <button
                 className="compress-btn primary"
                 onClick={() => void handleStart()}
-                disabled={runnableSelected.length === 0 || (outputMode === "folder" && !outputDir.trim())}
+                disabled={starting || runnableSelected.length === 0 || (outputMode === "folder" && !outputDir.trim())}
                 title={
                   runnableSelected.length === 0
                     ? "Select at least one file whose encoder is available"
@@ -2445,7 +2469,7 @@ export function CompressView({
                       : `Compress ${runnableSelected.length} file(s)`
                 }
               >
-                <Icon name="file-zip" size={13} /> Compress {runnableSelected.length > 0 ? `(${runnableSelected.length})` : ""}
+                <Icon name="file-zip" size={13} /> {starting ? "Starting…" : `Compress ${runnableSelected.length > 0 ? `(${runnableSelected.length})` : ""}`}
               </button>
             )}
           </>
@@ -2760,13 +2784,15 @@ export function CompressView({
       {inRun && (
         <div className="compress-overall">
           <span className="compress-overall-text">
-            <b>{doneCount.toLocaleString()}</b> / {total.toLocaleString()} files
+            <b>{processedCount.toLocaleString()}</b> / {total.toLocaleString()} processed
           </span>
           <div className="compress-bar" title={`${aggregatePct}%`}>
             <div className="compress-bar-fill" style={{ width: `${aggregatePct}%` }} />
           </div>
           <span className="compress-overall-text">
-            {aggregatePct}% · saved <span className="compress-saved">{formatBytes(savedTotal)}</span>
+            {aggregatePct}% · {activeCount.toLocaleString()} active · {savedCount.toLocaleString()} saved ·{" "}
+            {skippedCount.toLocaleString()} skipped · {failedCount.toLocaleString()} failed ·{" "}
+            <span className="compress-saved">{formatBytes(savedTotal)}</span>
           </span>
         </div>
       )}
@@ -3268,7 +3294,7 @@ function JobFileTable({ files, loading }: { files: CompressJobFile[] | undefined
 // lazy-loaded, virtualized per-file outcome table; active rows refresh live and
 // loaded detail is cached across collapse. Jobs can be resumed, cancelled, or
 // have their output revealed.
-function CompressInProgress({
+export function CompressInProgress({
   queue,
   onRemoveQueued,
 }: {
@@ -3503,6 +3529,7 @@ function CompressInProgress({
               {jobs.map((j) => {
                 const badge = jobBadge(j);
                 const completed = j.done + j.errors + j.skipped;
+                const failed = Math.max(0, j.errors - (j.verifyFailed ?? 0));
                 const pct = j.total > 0 ? Math.round((completed / j.total) * 100) : 0;
                 const isBusy = busy === j.id;
                 const isOpen = expanded.has(j.id);
@@ -3534,11 +3561,11 @@ function CompressInProgress({
                           </div>
                           <span
                             className="compress-run-counts"
-                            title={`${j.done} done · ${j.skipped} skipped · ${(j.verifyFailed ?? 0)} verify-failed · ${Math.max(0, j.errors - (j.verifyFailed ?? 0))} error / ${j.total} files`}
+                            title={`${completed} processed · ${j.done} saved · ${j.skipped} skipped · ${(j.verifyFailed ?? 0)} verify-failed · ${failed} failed / ${j.total} files`}
                           >
-                            {completed.toLocaleString()} / {j.total.toLocaleString()}
+                            {completed.toLocaleString()} processed · {j.done.toLocaleString()} saved · {j.skipped.toLocaleString()} skipped
                             {(j.verifyFailed ?? 0) > 0 ? ` · ${(j.verifyFailed ?? 0).toLocaleString()} verify-fail` : ""}
-                            {j.errors - (j.verifyFailed ?? 0) > 0 ? ` · ${(j.errors - (j.verifyFailed ?? 0)).toLocaleString()} err` : ""}
+                            {failed > 0 ? ` · ${failed.toLocaleString()} failed` : ""}
                           </span>
                         </div>
                       </td>
@@ -3608,6 +3635,13 @@ function CompressHistory({
   const [loading, setLoading] = useState(true);
   const [csvPath, setCsvPath] = useState("");
   const [debugPath, setDebugPath] = useState("");
+  const [historySearch, setHistorySearch] = useState("");
+  const [historyStatus, setHistoryStatus] = useState("");
+  const [historyKind, setHistoryKind] = useState("");
+  const [historyEncoder, setHistoryEncoder] = useState("");
+  const [historyDate, setHistoryDate] = useState("all");
+  const [historySort, setHistorySort] = useState<"name" | "kind" | "preset" | "size" | "saved" | "tool" | "duration" | "status" | "when">("when");
+  const [historyDirection, setHistoryDirection] = useState<"asc" | "desc">("desc");
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -3629,9 +3663,49 @@ function CompressHistory({
     return () => ac.abort();
   }, [load]);
 
+  const display = useMemo(() => {
+    const needle = historySearch.trim().toLowerCase();
+    const cutoff = historyDate === "today" ? Date.now() - 86_400_000
+      : historyDate === "7d" ? Date.now() - 7 * 86_400_000
+      : historyDate === "30d" ? Date.now() - 30 * 86_400_000 : 0;
+    const next = rows.filter((row) => {
+      const skipped = row.status === "skipped_no_gain" || row.reason.startsWith("skipped_");
+      const statusMatch = !historyStatus
+        || (historyStatus === "skipped" ? skipped : row.status === historyStatus);
+      return statusMatch
+        && (!historyKind || row.kind === historyKind)
+        && (!historyEncoder || `${row.tool} ${row.codecParams}`.toLowerCase().includes(historyEncoder.toLowerCase()))
+        && (!cutoff || new Date(row.ts).getTime() >= cutoff)
+        && (!needle || `${row.name} ${row.path} ${row.outPath} ${row.reason} ${row.error}`.toLowerCase().includes(needle));
+    });
+    next.sort((a, b) => {
+      const av: string | number = historySort === "name" ? (a.name || a.path).toLowerCase()
+        : historySort === "kind" ? a.kind
+        : historySort === "preset" ? a.preset
+        : historySort === "size" ? a.origBytes
+        : historySort === "saved" ? a.savedBytes
+        : historySort === "tool" ? `${a.tool} ${a.codecParams}`
+        : historySort === "duration" ? a.durationMs
+        : historySort === "status" ? a.reason || a.status
+        : new Date(a.ts).getTime();
+      const bv: string | number = historySort === "name" ? (b.name || b.path).toLowerCase()
+        : historySort === "kind" ? b.kind
+        : historySort === "preset" ? b.preset
+        : historySort === "size" ? b.origBytes
+        : historySort === "saved" ? b.savedBytes
+        : historySort === "tool" ? `${b.tool} ${b.codecParams}`
+        : historySort === "duration" ? b.durationMs
+        : historySort === "status" ? b.reason || b.status
+        : new Date(b.ts).getTime();
+      const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+      return historyDirection === "asc" ? cmp : -cmp;
+    });
+    return next;
+  }, [rows, historySearch, historyStatus, historyKind, historyEncoder, historyDate, historySort, historyDirection]);
+
   const totals = useMemo(() => {
     let orig = 0, neu = 0, saved = 0, success = 0;
-    for (const r of rows) {
+    for (const r of display) {
       orig += r.origBytes;
       neu += r.newBytes;
       saved += r.savedBytes;
@@ -3639,10 +3713,15 @@ function CompressHistory({
     }
     const pct = orig > 0 ? (saved / orig) * 100 : 0;
     return { orig, neu, saved, success, pct, count: rows.length };
-  }, [rows]);
+  }, [display]);
 
-  // Newest first for display (the backend returns oldest→newest).
-  const display = useMemo(() => [...rows].reverse(), [rows]);
+  const sortHistory = (key: typeof historySort) => {
+    if (historySort === key) setHistoryDirection((direction) => direction === "asc" ? "desc" : "asc");
+    else {
+      setHistorySort(key);
+      setHistoryDirection(key === "when" ? "desc" : "asc");
+    }
+  };
 
   // Virtualize the row body so a full 1000-row log stays responsive.
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
@@ -3736,6 +3815,24 @@ function CompressHistory({
         </a>
       </div>
 
+      <div className="compress-history-filters">
+        <div className="cm-search">
+          <Icon name="search" size={13} />
+          <input aria-label="Search compression history" placeholder="Search files, paths, outcomes..." value={historySearch} onChange={(event) => setHistorySearch(event.target.value)} />
+        </div>
+        <select aria-label="History date" value={historyDate} onChange={(event) => setHistoryDate(event.target.value)}>
+          <option value="all">All dates</option><option value="today">Last 24 hours</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>
+        </select>
+        <select aria-label="History status" value={historyStatus} onChange={(event) => setHistoryStatus(event.target.value)}>
+          <option value="">All statuses</option><option value="success">Successful</option><option value="skipped">Skipped</option><option value="error">Failed</option>
+        </select>
+        <select aria-label="History type" value={historyKind} onChange={(event) => setHistoryKind(event.target.value)}>
+          <option value="">All types</option><option value="video">Video</option><option value="image">Images</option><option value="other">Other</option>
+        </select>
+        <input className="compress-history-encoder" aria-label="Filter encoder" placeholder="Encoder / tool" value={historyEncoder} onChange={(event) => setHistoryEncoder(event.target.value)} />
+        <span>{display.length.toLocaleString()} matching</span>
+      </div>
+
       <div className="compress-body">
         {loading && rows.length === 0 ? (
           <EmptyState icon="clock-history" title="Loading history…" hint="Reading the compression log." />
@@ -3748,15 +3845,15 @@ function CompressHistory({
         ) : (
           <div className="compress-log-vtable">
             <div className="compress-log-vhead">
-              <span className="clog-name">File</span>
-              <span>Kind</span>
-              <span>Preset</span>
-              <span>Original → New</span>
-              <span className="num">Saved</span>
-              <span>Tool</span>
-              <span className="num">Duration</span>
-              <span>Status</span>
-              <span className="clog-ts">When</span>
+              <button className="clog-name" onClick={() => sortHistory("name")}>File</button>
+              <button onClick={() => sortHistory("kind")}>Kind</button>
+              <button onClick={() => sortHistory("preset")}>Preset</button>
+              <button onClick={() => sortHistory("size")}>Original → New</button>
+              <button className="num" onClick={() => sortHistory("saved")}>Saved</button>
+              <button onClick={() => sortHistory("tool")}>Tool</button>
+              <button className="num" onClick={() => sortHistory("duration")}>Duration</button>
+              <button onClick={() => sortHistory("status")}>Status</button>
+              <button className="clog-ts" onClick={() => sortHistory("when")}>When {historySort === "when" ? (historyDirection === "desc" ? "v" : "^") : ""}</button>
               <span className="clog-act">Action</span>
             </div>
             <div className="compress-log-vbody" ref={setScrollEl}>

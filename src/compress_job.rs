@@ -7,16 +7,20 @@
 //! returns immediately. Per-file progress and lifecycle events are appended to
 //! an in-memory ring ([`CompressJob::events`]) that the stream endpoint replays
 //! from the start and then tails live (so a stream opened slightly late still
-//! sees the whole history). After every file the job rewrites its manifest under
+//! sees the whole history). Job state is checkpointed under
 //! `%APPDATA%\FileTree\jobs\<id>.json`, which `retry` reloads to skip files
-//! already `done`.
+//! already `done`; huge batches coalesce fast outcomes to avoid rewriting a
+//! tens-of-megabytes manifest for every small file.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::compress_tools::{self, HandbrakeCaps, ImageKind};
@@ -105,6 +109,23 @@ pub(crate) struct FileState {
     /// preset=quality`), so the In Progress tab shows GPU vs CPU at a glance even
     /// for a live run. Empty until terminal.
     pub(crate) encoder: Mutex<String>,
+    /// Fine-grained UI stage: queued, encoding, verifying, finalizing, terminal.
+    /// Older manifests do not carry this field and default from `status`.
+    pub(crate) stage: Mutex<String>,
+    /// Most recent encoder frame rate, stored as f64 bits (0 means unavailable).
+    pub(crate) fps_bits: AtomicU64,
+    /// Epoch-ms lifecycle timestamps. Zero means the transition has not happened.
+    pub(crate) started_at: AtomicU64,
+    pub(crate) updated_at: AtomicU64,
+    pub(crate) finished_at: AtomicU64,
+    /// Number of times this entry has been attempted, including the current run.
+    pub(crate) attempt: AtomicUsize,
+    /// Diagnostics retained for the inspector. They are populated as soon as a
+    /// command is launched and finalized with the terminal result.
+    pub(crate) tool: Mutex<String>,
+    pub(crate) tool_version: Mutex<String>,
+    pub(crate) command: Mutex<String>,
+    pub(crate) stderr_excerpt: Mutex<String>,
 }
 
 impl FileState {
@@ -124,8 +145,24 @@ impl FileState {
             reason: Mutex::new(String::new()),
             duration_ms: AtomicU64::new(0),
             encoder: Mutex::new(String::new()),
+            stage: Mutex::new(if status == "done" { "terminal" } else { "queued" }.to_string()),
+            fps_bits: AtomicU64::new(0),
+            started_at: AtomicU64::new(0),
+            updated_at: AtomicU64::new(crate::io::now_ms()),
+            finished_at: AtomicU64::new(0),
+            attempt: AtomicUsize::new(0),
+            tool: Mutex::new(String::new()),
+            tool_version: Mutex::new(String::new()),
+            command: Mutex::new(String::new()),
+            stderr_excerpt: Mutex::new(String::new()),
         }
     }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct JobQueue {
+    pending: VecDeque<usize>,
+    active: usize,
 }
 
 /// What to do with the ORIGINAL file after its compressed replacement has been
@@ -171,14 +208,23 @@ pub(crate) struct CompressJob {
     pub(crate) preset: String,
     pub(crate) original_action: OriginalAction,
     pub(crate) tag_filename: bool,
-    /// Max files this job encodes at once (its worker-pool size). Clamped to a
-    /// hardware-derived default when not specified by the request.
+    /// Initial worker limit retained for manifest compatibility.
     pub(crate) concurrency: usize,
+    /// Live worker limit. The fixed pool waits on `queue_cv`, so increasing this
+    /// immediately wakes workers while reductions take effect between files.
+    pub(crate) desired_concurrency: AtomicUsize,
     /// Encoder selection: `auto` | `x264` | `nvenc` | `qsv` | `vce`. `auto`
     /// picks the best available HW encoder for the codec, else CPU x264/x265.
     pub(crate) encoder: String,
     /// Whether hardware acceleration is permitted at all (gates Auto/HW picks).
     pub(crate) use_gpu: bool,
+    /// Set after a confirmed hardware/driver failure or repeated ambiguous GPU
+    /// failures. Remaining videos use software encoding so a sick driver is not
+    /// hammered repeatedly.
+    pub(crate) gpu_unstable: AtomicBool,
+    /// Consecutive ambiguous GPU failures. A source/mux-specific failure must
+    /// not disable hardware encoding for the rest of a multi-day batch.
+    pub(crate) gpu_failure_streak: AtomicUsize,
     /// Target video codec: `h264` | `h265`.
     pub(crate) codec: String,
     /// Deflate level for the zip pipeline (0-9; 0 = store).
@@ -201,22 +247,39 @@ pub(crate) struct CompressJob {
     /// workers writing into a shared `output_dir` never collide on a name. Only
     /// consulted when `output_dir` is set.
     pub(crate) out_reserve: Mutex<HashSet<String>>,
-    /// "running" | "done" | "cancelled" | "error"
+    /// queued | running | pausing | paused | done | cancelled | error
     pub(crate) status: Mutex<String>,
     pub(crate) total: usize,
     pub(crate) files: Vec<FileState>,
+    /// Compact, case-insensitive normalized path identities used to prevent two
+    /// active jobs from processing the same source file concurrently.
+    pub(crate) path_fingerprints: HashSet<u64>,
     pub(crate) saved_bytes: AtomicU64,
     pub(crate) cancel: Arc<AtomicBool>,
+    /// Mutable pending order plus active claim count. All scheduler mutations
+    /// (prioritize, user skip, pause, concurrency) coordinate through this lock.
+    pub(crate) queue: Mutex<JobQueue>,
+    pub(crate) queue_cv: Condvar,
+    /// Accumulated active wall time, excluding time spent queued or paused.
+    pub(crate) active_elapsed_ms: AtomicU64,
+    pub(crate) active_started_at: AtomicU64,
+    /// Stable persisted ordering key for backend queued jobs.
+    pub(crate) queue_rank: AtomicU64,
     /// Handles of the encoder children currently running, keyed by file index,
     /// so `cancel` can `kill()` ALL of them (multiple files encode at once).
     /// Empty between files / for the inline zip pipeline.
     pub(crate) children: Mutex<HashMap<usize, Child>>,
     /// Serializes manifest rewrites so concurrent workers never tear the file.
     pub(crate) manifest_lock: Mutex<()>,
+    /// Terminal outcomes accumulated since the last persisted checkpoint.
+    pub(crate) manifest_dirty: AtomicUsize,
+    /// Epoch-ms timestamp of the last successful/attempted manifest checkpoint.
+    pub(crate) manifest_last_write_ms: AtomicU64,
     /// Live NDJSON event lines. The stream endpoint replays from index 0 then
     /// tails new lines; `finished` + the condvar wake any tailing reader.
     pub(crate) events: Mutex<Vec<String>>,
     pub(crate) events_cv: Condvar,
+    pub(crate) runner_started: AtomicBool,
     pub(crate) finished: AtomicBool,
     pub(crate) manifest_path: PathBuf,
 }
@@ -265,6 +328,51 @@ pub(crate) fn is_safe_job_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+fn path_fingerprint(path: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for ch in path.chars() {
+        let normalized = if ch == '/' { '\\' } else { ch };
+        for lower in normalized.to_lowercase() {
+            lower.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+pub(crate) fn path_fingerprints(paths: &[String]) -> HashSet<u64> {
+    paths.iter().map(|path| path_fingerprint(path)).collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActivePathConflict {
+    pub(crate) job_id: String,
+    pub(crate) identical: bool,
+}
+
+/// Find a live job that owns at least one requested source path. Exact duplicate
+/// batches are idempotent (the caller can attach to `job_id`); partial overlaps
+/// must be rejected because two encoders writing/replacing the same source is
+/// unsafe and wastes the entire second encode.
+pub(crate) fn active_path_conflict(
+    jobs: &HashMap<String, Arc<CompressJob>>,
+    requested: &HashSet<u64>,
+) -> Option<ActivePathConflict> {
+    if requested.is_empty() {
+        return None;
+    }
+    jobs.values().find_map(|job| {
+        if job.finished.load(Ordering::SeqCst)
+            || job.path_fingerprints.is_disjoint(requested)
+        {
+            return None;
+        }
+        Some(ActivePathConflict {
+            job_id: job.id.clone(),
+            identical: job.path_fingerprints == *requested,
+        })
+    })
 }
 
 /// Performance + encoder options threaded from the POST body into the job and
@@ -358,6 +466,7 @@ pub(crate) fn create_job(
     opts: &CompressOptions,
 ) -> Arc<CompressJob> {
     let id = new_job_id();
+    let path_fingerprints = path_fingerprints(paths);
     let files: Vec<FileState> = paths
         .iter()
         .enumerate()
@@ -378,14 +487,25 @@ pub(crate) fn create_job(
     } else {
         OriginalAction::Keep
     };
+    let mut pending_order = (0..total).collect::<Vec<_>>();
+    pending_order.sort_by(|&a, &b| {
+        files[b]
+            .orig_bytes
+            .load(Ordering::Relaxed)
+            .cmp(&files[a].orig_bytes.load(Ordering::Relaxed))
+    });
+    let pending = pending_order.into_iter().collect::<VecDeque<_>>();
     Arc::new(CompressJob {
         id: id.clone(),
         preset: normalize_preset(preset),
         original_action,
         tag_filename: opts.tag_filename,
         concurrency: opts.resolved_concurrency(),
+        desired_concurrency: AtomicUsize::new(opts.resolved_concurrency()),
         encoder: CompressOptions::norm_encoder(&opts.encoder),
         use_gpu: opts.use_gpu,
+        gpu_unstable: AtomicBool::new(false),
+        gpu_failure_streak: AtomicUsize::new(0),
         codec: CompressOptions::norm_codec(&opts.codec),
         zip_level: opts.resolved_zip_level(),
         min_size_bytes: opts.min_size_bytes,
@@ -396,12 +516,21 @@ pub(crate) fn create_job(
         status: Mutex::new("running".to_string()),
         total,
         files,
+        path_fingerprints,
         saved_bytes: AtomicU64::new(0),
         cancel: Arc::new(AtomicBool::new(false)),
+        queue: Mutex::new(JobQueue { pending, active: 0 }),
+        queue_cv: Condvar::new(),
+        active_elapsed_ms: AtomicU64::new(0),
+        active_started_at: AtomicU64::new(crate::io::now_ms()),
+        queue_rank: AtomicU64::new(created_at_from_id(&id)),
         children: Mutex::new(HashMap::new()),
         manifest_lock: Mutex::new(()),
+        manifest_dirty: AtomicUsize::new(0),
+        manifest_last_write_ms: AtomicU64::new(crate::io::now_ms()),
         events: Mutex::new(Vec::new()),
         events_cv: Condvar::new(),
+        runner_started: AtomicBool::new(false),
         finished: AtomicBool::new(false),
         manifest_path: jobs_dir().join(format!("{id}.json")),
     })
@@ -520,6 +649,10 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         // all re-run.
         let resume_done = prev_status == "done";
         let state = FileState::new(i, path, kind, orig, if resume_done { "done" } else { "pending" });
+        state.attempt.store(
+            f.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            Ordering::Relaxed,
+        );
         if resume_done {
             let newb = f.get("newBytes").and_then(|v| v.as_u64()).unwrap_or(0);
             state.new_bytes.store(newb, Ordering::Relaxed);
@@ -539,6 +672,36 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
             if let Some(e) = f.get("encoder").and_then(|v| v.as_str()) {
                 *state.encoder.lock_recover() = e.to_string();
             }
+            *state.stage.lock_recover() = "terminal".to_string();
+            state.fps_bits.store(
+                f.get("fps")
+                    .and_then(|v| v.as_f64())
+                    .map(f64::to_bits)
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            state.started_at.store(
+                f.get("startedAt").and_then(|v| v.as_u64()).unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            state.updated_at.store(
+                f.get("updatedAt").and_then(|v| v.as_u64()).unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            state.finished_at.store(
+                f.get("finishedAt").and_then(|v| v.as_u64()).unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            for (key, target) in [
+                ("tool", &state.tool),
+                ("toolVersion", &state.tool_version),
+                ("command", &state.command),
+                ("stderr", &state.stderr_excerpt),
+            ] {
+                if let Some(value) = f.get(key).and_then(|v| v.as_str()) {
+                    *target.lock_recover() = value.to_string();
+                }
+            }
             state
                 .duration_ms
                 .store(f.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0), Ordering::Relaxed);
@@ -547,6 +710,43 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         files.push(state);
     }
     let total = files.len();
+    let path_fingerprints = files
+        .iter()
+        .map(|file| path_fingerprint(&file.path))
+        .collect();
+
+    let mut pending_order = files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, file)| {
+            (file.status.lock_recover().as_str() != "done").then_some(i)
+        })
+        .collect::<Vec<_>>();
+    let persisted_order = root
+        .get("queueOrder")
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .filter(|&i| i < files.len() && files[i].status.lock_recover().as_str() == "pending")
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if persisted_order.is_empty() {
+        pending_order.sort_by(|&a, &b| {
+            files[b]
+                .orig_bytes
+                .load(Ordering::Relaxed)
+                .cmp(&files[a].orig_bytes.load(Ordering::Relaxed))
+        });
+    } else {
+        let seen = persisted_order.iter().copied().collect::<HashSet<_>>();
+        let mut restored = persisted_order;
+        restored.extend(pending_order.into_iter().filter(|i| !seen.contains(i)));
+        pending_order = restored;
+    }
+    let pending = pending_order.into_iter().collect::<VecDeque<_>>();
 
     Some(Arc::new(CompressJob {
         id: id.to_string(),
@@ -554,8 +754,11 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         original_action,
         tag_filename,
         concurrency: opts.resolved_concurrency(),
+        desired_concurrency: AtomicUsize::new(opts.resolved_concurrency()),
         encoder: CompressOptions::norm_encoder(&opts.encoder),
         use_gpu: opts.use_gpu,
+        gpu_unstable: AtomicBool::new(false),
+        gpu_failure_streak: AtomicUsize::new(0),
         codec: CompressOptions::norm_codec(&opts.codec),
         zip_level: opts.resolved_zip_level(),
         min_size_bytes: opts.min_size_bytes,
@@ -566,12 +769,27 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         status: Mutex::new("running".to_string()),
         total,
         files,
+        path_fingerprints,
         saved_bytes: AtomicU64::new(carried_saved),
         cancel: Arc::new(AtomicBool::new(false)),
+        queue: Mutex::new(JobQueue { pending, active: 0 }),
+        queue_cv: Condvar::new(),
+        active_elapsed_ms: AtomicU64::new(
+            root.get("activeElapsedMs").and_then(|v| v.as_u64()).unwrap_or(0),
+        ),
+        active_started_at: AtomicU64::new(crate::io::now_ms()),
+        queue_rank: AtomicU64::new(
+            root.get("queueRank")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| created_at_from_id(id)),
+        ),
         children: Mutex::new(HashMap::new()),
         manifest_lock: Mutex::new(()),
+        manifest_dirty: AtomicUsize::new(0),
+        manifest_last_write_ms: AtomicU64::new(crate::io::now_ms()),
         events: Mutex::new(Vec::new()),
         events_cv: Condvar::new(),
+        runner_started: AtomicBool::new(false),
         finished: AtomicBool::new(false),
         manifest_path,
     }))
@@ -622,7 +840,15 @@ pub(crate) fn select_video_encoder(
         lane: CompressLane::VideoCpu,
         is_gpu: false,
     };
-    let gpu = |hb: &str| VideoEncoder { hb: hb.to_string(), lane: CompressLane::Gpu, is_gpu: true };
+    let gpu = |hb: &str| VideoEncoder {
+        hb: hb.to_string(),
+        lane: if hb.starts_with("nvenc") {
+            CompressLane::Nvenc
+        } else {
+            CompressLane::GpuOther
+        },
+        is_gpu: true,
+    };
     let suffix = if av1 { "av1" } else if h265 { "h265" } else { "h264" };
     let tok = |vendor: &str| -> String { format!("{vendor}_{suffix}") };
 
@@ -841,6 +1067,13 @@ fn ratio(orig: u64, new_bytes: u64) -> f64 {
 /// to a terminal internal error and the job is closed out, so no panic anywhere
 /// in the runner can ever strand the batch.
 pub(crate) fn spawn_job(state: Arc<AppState>, job: Arc<CompressJob>) {
+    if job
+        .runner_started
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
     std::thread::spawn(move || {
         let guard_job = Arc::clone(&job);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -854,6 +1087,286 @@ pub(crate) fn spawn_job(state: Arc<AppState>, job: Arc<CompressJob>) {
             ));
             force_finalize_job(&guard_job);
         }
+    });
+}
+
+/// Create a persisted job that has not started yet. It can be reordered or
+/// removed safely and survives an application restart because its manifest is
+/// written before the request returns.
+pub(crate) fn create_queued_job(
+    paths: &[String],
+    preset: &str,
+    opts: &CompressOptions,
+) -> Arc<CompressJob> {
+    let job = create_job(paths, preset, opts);
+    *job.status.lock_recover() = "queued".to_string();
+    job.active_started_at.store(0, Ordering::Relaxed);
+    write_manifest(&job);
+    job
+}
+
+fn finish_active_interval(job: &CompressJob) {
+    let started = job.active_started_at.swap(0, Ordering::SeqCst);
+    if started > 0 {
+        job.active_elapsed_ms
+            .fetch_add(crate::io::now_ms().saturating_sub(started), Ordering::Relaxed);
+    }
+}
+
+fn begin_active_interval(job: &CompressJob) {
+    if job.active_started_at.load(Ordering::Relaxed) == 0 {
+        job.active_started_at.store(crate::io::now_ms(), Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn pause_job(job: &Arc<CompressJob>) -> Result<String, String> {
+    let queue = job.queue.lock_recover();
+    let mut status = job.status.lock_recover();
+    match status.as_str() {
+        "running" => {
+            if queue.active == 0 {
+                *status = "paused".to_string();
+                finish_active_interval(job);
+            } else {
+                *status = "pausing".to_string();
+            }
+        }
+        "pausing" | "paused" => {}
+        other => return Err(format!("A {other} job cannot be paused")),
+    }
+    let result = status.clone();
+    drop(status);
+    drop(queue);
+    write_manifest(job);
+    job.emit(ev_job_state(&job.id, &result));
+    job.queue_cv.notify_all();
+    Ok(result)
+}
+
+pub(crate) fn resume_job(job: &Arc<CompressJob>) -> Result<bool, String> {
+    let mut status = job.status.lock_recover();
+    match status.as_str() {
+        "paused" | "pausing" | "queued" => {
+            *status = "running".to_string();
+            begin_active_interval(job);
+        }
+        "running" => return Ok(false),
+        other => return Err(format!("A {other} job cannot be resumed")),
+    }
+    drop(status);
+    write_manifest(job);
+    job.emit(ev_job_state(&job.id, "running"));
+    job.queue_cv.notify_all();
+    Ok(!job.runner_started.load(Ordering::SeqCst))
+}
+
+pub(crate) fn set_job_concurrency(job: &Arc<CompressJob>, concurrency: usize) -> usize {
+    let value = concurrency.clamp(1, 16);
+    job.desired_concurrency.store(value, Ordering::SeqCst);
+    write_manifest(job);
+    job.queue_cv.notify_all();
+    value
+}
+
+pub(crate) fn prioritize_pending(job: &Arc<CompressJob>, indices: &[usize]) -> usize {
+    let wanted = indices.iter().copied().collect::<HashSet<_>>();
+    let mut queue = job.queue.lock_recover();
+    let mut promoted = VecDeque::new();
+    let mut rest = VecDeque::new();
+    while let Some(index) = queue.pending.pop_front() {
+        if wanted.contains(&index) {
+            promoted.push_back(index);
+        } else {
+            rest.push_back(index);
+        }
+    }
+    let count = promoted.len();
+    promoted.append(&mut rest);
+    queue.pending = promoted;
+    drop(queue);
+    if count > 0 {
+        write_manifest(job);
+        job.queue_cv.notify_all();
+    }
+    count
+}
+
+pub(crate) fn skip_pending(job: &Arc<CompressJob>, indices: &[usize]) -> usize {
+    let wanted = indices.iter().copied().collect::<HashSet<_>>();
+    let now = crate::io::now_ms();
+    let mut queue = job.queue.lock_recover();
+    let mut skipped = Vec::new();
+    queue.pending.retain(|index| {
+        if wanted.contains(index) {
+            skipped.push(*index);
+            false
+        } else {
+            true
+        }
+    });
+    drop(queue);
+    for index in &skipped {
+        let Some(file) = job.files.get(*index) else { continue };
+        if file.status.lock_recover().as_str() != "pending" {
+            continue;
+        }
+        *file.status.lock_recover() = "skipped".to_string();
+        *file.stage.lock_recover() = "terminal".to_string();
+        *file.reason.lock_recover() = Reason::SkippedUser.as_str().to_string();
+        file.pct.store(100, Ordering::Relaxed);
+        file.updated_at.store(now, Ordering::Relaxed);
+        file.finished_at.store(now, Ordering::Relaxed);
+        job.emit(ev_file_done(
+            *index,
+            "",
+            file.orig_bytes.load(Ordering::Relaxed),
+            0,
+            0,
+            false,
+            "",
+            Reason::SkippedUser.as_str(),
+            "skipped",
+        ));
+    }
+    if !skipped.is_empty() {
+        write_manifest(job);
+        job.queue_cv.notify_all();
+    }
+    skipped.len()
+}
+
+pub(crate) fn reorder_queued_jobs(state: &AppState, ids: &[String]) -> usize {
+    let jobs = state.compress_jobs.lock_recover();
+    let mut changed = 0;
+    for (position, id) in ids.iter().enumerate() {
+        let Some(job) = jobs.get(id) else { continue };
+        if job.status.lock_recover().as_str() != "queued" {
+            continue;
+        }
+        job.queue_rank.store(position as u64, Ordering::Relaxed);
+        write_manifest(job);
+        changed += 1;
+    }
+    changed
+}
+
+pub(crate) fn remove_queued_job(state: &AppState, id: &str) -> Result<(), String> {
+    let mut jobs = state.compress_jobs.lock_recover();
+    let Some(job) = jobs.get(id).map(Arc::clone) else {
+        return Err("Unknown queued job".to_string());
+    };
+    if job.status.lock_recover().as_str() != "queued" {
+        return Err("Only a queued job can be removed".to_string());
+    }
+    jobs.remove(id);
+    drop(jobs);
+    std::fs::remove_file(&job.manifest_path).map_err(|error| error.to_string())
+}
+
+pub(crate) fn selective_retry_from_manifest(
+    id: &str,
+    requested_indices: &[usize],
+) -> Option<Arc<CompressJob>> {
+    if !is_safe_job_id(id) {
+        return None;
+    }
+    let text = std::fs::read_to_string(jobs_dir().join(format!("{id}.json"))).ok()?;
+    let root = crate::json::parse(&text)?;
+    let files = root.get("files").and_then(|v| v.as_array())?;
+    let requested = requested_indices.iter().copied().collect::<HashSet<_>>();
+    let paths = files
+        .iter()
+        .enumerate()
+        .filter(|(index, file)| {
+            if !requested.is_empty() {
+                requested.contains(index)
+            } else {
+                matches!(
+                    file.get("status").and_then(|v| v.as_str()).unwrap_or("pending"),
+                    "error" | "skipped"
+                )
+            }
+        })
+        .filter_map(|(_, file)| file.get("path").and_then(|v| v.as_str()).map(str::to_string))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return None;
+    }
+    let original_action = root
+        .get("originalAction")
+        .and_then(|v| v.as_str())
+        .map(OriginalAction::from_str)
+        .unwrap_or(OriginalAction::Recycle);
+    let opts = CompressOptions {
+        original_action,
+        tag_filename: root.get("tagFilename").and_then(|v| v.as_bool()).unwrap_or(true),
+        concurrency: root.get("concurrency").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        encoder: root.get("encoder").and_then(|v| v.as_str()).unwrap_or("auto").to_string(),
+        use_gpu: root.get("useGpu").and_then(|v| v.as_bool()).unwrap_or(true),
+        codec: root.get("codec").and_then(|v| v.as_str()).unwrap_or("h264").to_string(),
+        zip_level: root.get("zipLevel").and_then(|v| v.as_f64()).unwrap_or(-1.0) as i64,
+        min_size_bytes: root.get("minSizeBytes").and_then(|v| v.as_u64()).unwrap_or(0),
+        custom_max_height: root.get("customMaxHeight").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        custom_quality: root.get("customQuality").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        output_dir: root.get("outputDir").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+    };
+    Some(create_job(
+        &paths,
+        root.get("preset").and_then(|v| v.as_str()).unwrap_or("balanced"),
+        &opts,
+    ))
+}
+
+/// Restore persisted queued jobs and run one queued batch at a time. Encoder
+/// lane gates still coordinate this scheduler with any manually resumed job.
+pub(crate) fn start_queue_scheduler(state: Arc<AppState>) {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(jobs_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            if !is_safe_job_id(id) {
+                continue;
+            }
+            let is_queued = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| crate::json::parse(&text))
+                .and_then(|root| root.get("status").and_then(|v| v.as_str()).map(|s| s == "queued"))
+                .unwrap_or(false);
+            if !is_queued {
+                continue;
+            }
+            if let Some(job) = job_from_manifest(id) {
+                *job.status.lock_recover() = "queued".to_string();
+                job.active_started_at.store(0, Ordering::Relaxed);
+                state.compress_jobs.lock_recover().entry(id.to_string()).or_insert(job);
+            }
+        }
+    }
+    std::thread::spawn(move || loop {
+        let next = {
+            let jobs = state.compress_jobs.lock_recover();
+            let blocked = jobs.values().any(|job| {
+                matches!(job.status.lock_recover().as_str(), "running" | "pausing" | "paused")
+                    && !job.finished.load(Ordering::SeqCst)
+            });
+            if blocked {
+                None
+            } else {
+                jobs.values()
+                    .filter(|job| job.status.lock_recover().as_str() == "queued")
+                    .min_by_key(|job| job.queue_rank.load(Ordering::Relaxed))
+                    .map(Arc::clone)
+            }
+        };
+        if let Some(job) = next {
+            let _ = resume_job(&job);
+            spawn_job(Arc::clone(&state), job);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     });
 }
 
@@ -921,8 +1434,96 @@ struct Counts {
     verify_failed: AtomicUsize,
 }
 
+const MAX_DYNAMIC_WORKERS: usize = 16;
+
+fn claim_next_file(job: &Arc<CompressJob>) -> Option<usize> {
+    let mut queue = job.queue.lock_recover();
+    loop {
+        if job.cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        let status = job.status.lock_recover().clone();
+        if status != "running" {
+            let (next, _) = job
+                .queue_cv
+                .wait_timeout(queue, std::time::Duration::from_millis(500))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue = next;
+            continue;
+        }
+        let desired = job.desired_concurrency.load(Ordering::SeqCst).clamp(1, 16);
+        if queue.active >= desired {
+            let (next, _) = job
+                .queue_cv
+                .wait_timeout(queue, std::time::Duration::from_millis(250))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue = next;
+            continue;
+        }
+        if let Some(index) = queue.pending.pop_front() {
+            // A user skip can race the claim wake-up. Only pending entries are
+            // eligible to enter the active set.
+            if job.files[index].status.lock_recover().as_str() != "pending" {
+                continue;
+            }
+            queue.active += 1;
+            return Some(index);
+        }
+        if queue.active == 0 {
+            return None;
+        }
+        let (next, _) = job
+            .queue_cv
+            .wait_timeout(queue, std::time::Duration::from_millis(250))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue = next;
+    }
+}
+
+fn release_file_claim(job: &Arc<CompressJob>) {
+    let mut became_paused = false;
+    {
+        let mut queue = job.queue.lock_recover();
+        queue.active = queue.active.saturating_sub(1);
+        if queue.active == 0 {
+            let mut status = job.status.lock_recover();
+            if status.as_str() == "pausing" {
+                *status = "paused".to_string();
+                became_paused = true;
+            }
+        }
+    }
+    if became_paused {
+        finish_active_interval(job);
+        write_manifest(job);
+        job.emit(ev_job_state(&job.id, "paused"));
+    }
+    job.queue_cv.notify_all();
+}
+
+fn terminal_tallies(job: &CompressJob) -> (usize, usize, usize, usize) {
+    let (mut done, mut error, mut skipped, mut verify_failed) = (0, 0, 0, 0);
+    for file in &job.files {
+        match file.status.lock_recover().as_str() {
+            "done" => done += 1,
+            "skipped" => skipped += 1,
+            "error" => {
+                error += 1;
+                if file.reason.lock_recover().as_str() == Reason::ErrorVerifyFailed.as_str() {
+                    verify_failed += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    (done, error, skipped, verify_failed)
+}
+
 fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     job.emit(ev_job_start(&job.id, job.total));
+    // Persist the all-pending baseline before the first potentially multi-hour
+    // encode. A crash during file one must still leave a resumable job.
+    write_manifest(&job);
 
     // Test-only fault injection for the ORCHESTRATION path (distinct from the
     // per-file injector in `process_file`): lets a test prove that a panic in
@@ -1000,38 +1601,27 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
         }
     }
 
-    // Per-job schedule: process the largest (longest-processing) files first for
-    // better tail latency, skipping anything a prior run already completed.
+    // Per-job schedule is held in the job itself so authenticated controls can
+    // reprioritize or skip pending entries without racing a static cursor.
     let already_done = job
         .files
         .iter()
         .filter(|f| f.status.lock_recover().as_str() == "done")
         .count();
-    let mut schedule: Vec<usize> = (0..job.files.len())
-        .filter(|&i| job.files[i].status.lock_recover().as_str() != "done")
-        .collect();
-    schedule.sort_by(|&a, &b| {
-        job.files[b]
-            .orig_bytes
-            .load(Ordering::Relaxed)
-            .cmp(&job.files[a].orig_bytes.load(Ordering::Relaxed))
-    });
 
     let counts = Arc::new(Counts::default());
     counts.done.store(already_done, Ordering::Relaxed);
-    let schedule = Arc::new(schedule);
-    let cursor = Arc::new(AtomicUsize::new(0));
 
-    // Bounded worker pool: `concurrency` threads draw the next scheduled index
-    // from the shared cursor. The global CompressGate further caps total
-    // concurrent encoders across all jobs (acquired per-file inside the pipeline).
-    let nthreads = job.concurrency.clamp(1, schedule.len().max(1));
+    // The pool is fixed at the supported maximum; the condition-variable queue
+    // admits only `desired_concurrency` claims. This makes a live increase wake
+    // immediately and a reduction apply naturally after active files finish.
+    // The global CompressGate remains authoritative for CPU/GPU safety.
+    let pending_count = job.queue.lock_recover().pending.len();
+    let nthreads = MAX_DYNAMIC_WORKERS.min(pending_count.max(1));
     let mut handles = Vec::with_capacity(nthreads);
     for _ in 0..nthreads {
         let state = Arc::clone(&state);
         let job = Arc::clone(&job);
-        let schedule = Arc::clone(&schedule);
-        let cursor = Arc::clone(&cursor);
         let counts = Arc::clone(&counts);
         let hb = hb.clone();
         let img = img.clone();
@@ -1041,11 +1631,7 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
                 if job.cancel.load(Ordering::SeqCst) {
                     break;
                 }
-                let k = cursor.fetch_add(1, Ordering::Relaxed);
-                if k >= schedule.len() {
-                    break;
-                }
-                let i = schedule[k];
+                let Some(i) = claim_next_file(&job) else { break };
                 // Isolate each file: a panic anywhere in the per-file pipeline
                 // (e.g. an unexpected slice/parse bug on pathological encoder
                 // output) is caught here so it can NEVER kill the worker and
@@ -1076,6 +1662,7 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
                         false
                     }
                 };
+                release_file_claim(&job);
                 if stop {
                     break;
                 }
@@ -1108,10 +1695,7 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
         }
     }
 
-    let done_count = counts.done.load(Ordering::Relaxed);
-    let error_count = counts.error.load(Ordering::Relaxed);
-    let skipped_count = counts.skipped.load(Ordering::Relaxed);
-    let verify_failed_count = counts.verify_failed.load(Ordering::Relaxed);
+    let (done_count, error_count, skipped_count, verify_failed_count) = terminal_tallies(&job);
 
     // Post == pre guarantee: every input file must land in exactly one terminal
     // bucket. After the reconcile above (which converts any leftover pending/
@@ -1139,6 +1723,7 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
         "done"
     };
     *job.status.lock_recover() = status.to_string();
+    finish_active_interval(&job);
     write_manifest(&job);
 
     let total_saved = job.saved_bytes.load(Ordering::Relaxed);
@@ -1175,7 +1760,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// Record a per-file internal error (caught worker panic, or a file reconciled
 /// after an aborted worker): set the `FileState` to a terminal `error` with
 /// [`Reason::ErrorInternal`], count it, append the CSV/debug rows, emit the live
-/// error event, and persist the manifest. Uses poison-tolerant locks so this can
+/// error event, and checkpoint the manifest. Uses poison-tolerant locks so this can
 /// safely run after another worker panicked. Idempotent enough for reconcile:
 /// only called for files not already terminal.
 fn record_internal_error(job: &Arc<CompressJob>, i: usize, counts: &Counts, message: &str) {
@@ -1230,7 +1815,7 @@ fn record_internal_error(job: &Arc<CompressJob>, i: usize, counts: &Counts, mess
         Reason::ErrorInternal.as_str(),
     ));
     job.emit(ev_error(i, &f.path, message, Reason::ErrorInternal.as_str()));
-    write_manifest(job);
+    checkpoint_manifest(job);
 }
 
 /// Test-only one-shot trigger for [`record_internal_error`] to panic, exercising
@@ -1262,7 +1847,7 @@ fn record_internal_error_guarded(job: &Arc<CompressJob>, i: usize, counts: &Coun
 }
 
 /// Process one file and record its outcome (FileState, CSV row, debug log, live
-/// event, manifest rewrite). Runs on a pool worker thread. Returns `true` when
+/// event, manifest checkpoint). Runs on a pool worker thread. Returns `true` when
 /// the worker should stop (the job was cancelled mid-file).
 fn process_and_record(
     state: &Arc<AppState>,
@@ -1277,10 +1862,23 @@ fn process_and_record(
 ) -> bool {
     {
         let f = &job.files[i];
+        let now = crate::io::now_ms();
         *f.status.lock_recover() = "running".to_string();
+        *f.stage.lock_recover() = "encoding".to_string();
         f.pct.store(0, Ordering::Relaxed);
+        f.started_at.store(now, Ordering::Relaxed);
+        f.updated_at.store(now, Ordering::Relaxed);
+        f.finished_at.store(0, Ordering::Relaxed);
+        f.attempt.fetch_add(1, Ordering::Relaxed);
         let orig = f.orig_bytes.load(Ordering::Relaxed);
-        job.emit(ev_file_start(i, &f.path, f.kind, orig));
+        job.emit(ev_file_start(
+            i,
+            &f.path,
+            f.kind,
+            orig,
+            now,
+            f.attempt.load(Ordering::Relaxed),
+        ));
     }
 
     let file_start = Instant::now();
@@ -1320,6 +1918,13 @@ fn process_and_record(
             *f.status.lock_recover() = "done".to_string();
             *f.reason.lock_recover() = reason.as_str().to_string();
             *f.encoder.lock_recover() = codec_params.clone();
+            *f.tool.lock_recover() = tool.to_string();
+            *f.tool_version.lock_recover() = tool_version.to_string();
+            *f.command.lock_recover() = diag.command.clone();
+            *f.stderr_excerpt.lock_recover() = diag.stderr_tail.clone();
+            if let Some(fps) = meta.fps {
+                f.fps_bits.store(fps.to_bits(), Ordering::Relaxed);
+            }
             if !fallback_detail.is_empty() {
                 *f.error.lock_recover() = Some(fallback_detail.clone());
             }
@@ -1368,6 +1973,13 @@ fn process_and_record(
             *f.status.lock_recover() = "skipped".to_string();
             *f.reason.lock_recover() = reason.as_str().to_string();
             *f.encoder.lock_recover() = codec_params.clone();
+            *f.tool.lock_recover() = tool.to_string();
+            *f.tool_version.lock_recover() = tool_version.to_string();
+            *f.command.lock_recover() = diag.command.clone();
+            *f.stderr_excerpt.lock_recover() = diag.stderr_tail.clone();
+            if let Some(fps) = meta.fps {
+                f.fps_bits.store(fps.to_bits(), Ordering::Relaxed);
+            }
             f.pct.store(100, Ordering::Relaxed);
             counts.skipped.fetch_add(1, Ordering::Relaxed);
             crate::compress_log::append_row(&crate::compress_log::Row {
@@ -1409,6 +2021,13 @@ fn process_and_record(
             *f.status.lock_recover() = "error".to_string();
             *f.reason.lock_recover() = reason.as_str().to_string();
             *f.encoder.lock_recover() = codec_params.clone();
+            *f.tool.lock_recover() = tool.to_string();
+            *f.tool_version.lock_recover() = tool_version.to_string();
+            *f.command.lock_recover() = diag.command.clone();
+            *f.stderr_excerpt.lock_recover() = diag.stderr_tail.clone();
+            if let Some(fps) = meta.fps {
+                f.fps_bits.store(fps.to_bits(), Ordering::Relaxed);
+            }
             counts.error.fetch_add(1, Ordering::Relaxed);
             if reason == Reason::ErrorVerifyFailed {
                 counts.verify_failed.fetch_add(1, Ordering::Relaxed);
@@ -1462,12 +2081,20 @@ fn process_and_record(
         }
         FileOutcome::Cancelled => {
             *f.status.lock_recover() = "pending".to_string();
+            *f.stage.lock_recover() = "queued".to_string();
             f.pct.store(0, Ordering::Relaxed);
             stop = true;
         }
     }
 
-    write_manifest(job);
+    if !stop {
+        let now = crate::io::now_ms();
+        *f.stage.lock_recover() = "terminal".to_string();
+        f.updated_at.store(now, Ordering::Relaxed);
+        f.finished_at.store(now, Ordering::Relaxed);
+    }
+
+    checkpoint_manifest(job);
     stop
 }
 
@@ -1566,6 +2193,9 @@ pub(crate) enum Reason {
     /// The original was below the user's minimum-size threshold, so no encode was
     /// attempted (too small to meaningfully compress; e.g. a very short video).
     SkippedTooSmall,
+    /// Explicitly skipped by the user while still pending. The source is never
+    /// opened, changed, moved, or deleted.
+    SkippedUser,
     /// The required external encoder (HandBrake / ffmpeg / ImageMagick) is missing.
     ErrorToolMissing,
     /// The file kind has no supported pipeline. Reserved in the taxonomy; the
@@ -1611,6 +2241,7 @@ impl Reason {
             Reason::Success => "success",
             Reason::SkippedNoGain => "skipped_no_gain",
             Reason::SkippedTooSmall => "skipped_too_small",
+            Reason::SkippedUser => "skipped_user",
             Reason::ErrorToolMissing => "error_tool_missing",
             Reason::ErrorUnsupported => "error_unsupported",
             Reason::ErrorEncoder => "error_encoder",
@@ -1893,11 +2524,17 @@ fn process_file(
             (Some(p), Some(ImageKind::Ffmpeg)) => {
                 meta.tool = "ffmpeg".to_string();
                 meta.tool_version = img.version.clone().unwrap_or_default();
+                *job.files[index].tool.lock_recover() = meta.tool.clone();
+                *job.files[index].tool_version.lock_recover() = meta.tool_version.clone();
+                *job.files[index].encoder.lock_recover() = "ffmpeg image".to_string();
                 run_ffmpeg_image(job, index, p, &input, &out, &job.preset)
             }
             (Some(p), Some(ImageKind::ImageMagick)) => {
                 meta.tool = "imagemagick".to_string();
                 meta.tool_version = img.version.clone().unwrap_or_default();
+                *job.files[index].tool.lock_recover() = meta.tool.clone();
+                *job.files[index].tool_version.lock_recover() = meta.tool_version.clone();
+                *job.files[index].encoder.lock_recover() = "ImageMagick".to_string();
                 run_magick_image(job, index, p, &input, &out, &job.preset)
             }
             _ => return FileOutcome::Error {
@@ -1912,6 +2549,9 @@ fn process_file(
             meta.tool = "zip".to_string();
             meta.tool_version = "built-in".to_string();
             meta.codec_params = format!("deflate level={}", job.zip_level);
+            *job.files[index].tool.lock_recover() = meta.tool.clone();
+            *job.files[index].tool_version.lock_recover() = meta.tool_version.clone();
+            *job.files[index].encoder.lock_recover() = meta.codec_params.clone();
             run_zip(job, index, &input, &out, job.zip_level)
         }
     };
@@ -1984,6 +2624,11 @@ fn process_file(
     // file, or a corrupt zip can all slip past the size check. If verification
     // fails we delete the bad output, leave the original untouched, and report a
     // resumable error so a good original is NEVER removed behind a broken copy.
+    *job.files[index].stage.lock_recover() = "verifying".to_string();
+    job.files[index]
+        .updated_at
+        .store(crate::io::now_ms(), Ordering::Relaxed);
+    job.emit(ev_stage(index, "verifying"));
     match verify_output(job, index, &out, kind, &input, hb, ff, img, img_kind) {
         Verify::Ok => {}
         Verify::Cancelled => {
@@ -2001,6 +2646,11 @@ fn process_file(
         }
     }
 
+    *job.files[index].stage.lock_recover() = "finalizing".to_string();
+    job.files[index]
+        .updated_at
+        .store(crate::io::now_ms(), Ordering::Relaxed);
+    job.emit(ev_stage(index, "finalizing"));
     let out_str = out.to_string_lossy().into_owned();
 
     // [COMPRESSED] sidecar metadata tag keyed to the new path (the filename
@@ -2637,6 +3287,25 @@ enum EncodeResult {
     Spawn { error: String, command: String },
 }
 
+const AMBIGUOUS_GPU_FAILURE_LIMIT: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuFailureClass {
+    Hardware,
+    SourceOrMux,
+    Ambiguous,
+}
+
+impl GpuFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hardware => "hardware",
+            Self::SourceOrMux => "source_or_mux",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
 /// Video pipeline entry: resolve the encoder (HW vs CPU), acquire the right
 /// global-budget lane, run HandBrake, and — on a GPU encode failure — fall back
 /// to CPU x264 on the same file (logged). Fills `meta` with the genuine encoder
@@ -2655,7 +3324,16 @@ fn run_video(
     meta.tool_version = hb_info.version.clone().unwrap_or_default();
 
     let hw = compress_tools::probe_gpu_hardware();
-    let mut enc = select_video_encoder(&job.encoder, &job.codec, job.use_gpu, caps, hw);
+    let gpu_disabled = job.gpu_unstable.load(Ordering::SeqCst);
+    let mut enc = if gpu_disabled {
+        crate::compress_debug::log(&format!(
+            "[gpu_circuit_breaker] job={} #{index} prior GPU failure; using CPU for the rest of this job",
+            job.id
+        ));
+        cpu_fallback_encoder(&job.codec, caps)
+    } else {
+        select_video_encoder(&job.encoder, &job.codec, job.use_gpu, caps, hw)
+    };
     // Up-front token validation for CPU/software encoders (x265, svt_av1): if the
     // installed build doesn't expose the chosen token, downgrade to x264 now
     // rather than spawning a doomed encode. GPU tokens are deliberately left
@@ -2675,27 +3353,63 @@ fn run_video(
     let result = run_handbrake(job, index, hb, input, out, &job.preset, &enc, meta);
 
     // GPU encode failed → retry once on CPU, capturing WHY the GPU failed so it
-    // becomes a visible `gpu_fallback` outcome (real HandBrake stderr) instead of
-    // a silent CPU run. A spawn failure of the GPU attempt is also a fallback.
+    // becomes a visible `gpu_fallback` outcome. Only confirmed hardware failures
+    // (or two consecutive ambiguous failures) disable GPU for the whole job; a
+    // source/mux failure after a completed encode must not poison 270k later files.
     if enc.is_gpu {
-        let gpu_failure: Option<String> = match &result {
+        if matches!(&result, EncodeResult::Done { success: true, .. }) {
+            job.gpu_failure_streak.store(0, Ordering::SeqCst);
+        }
+        let output_bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+        let gpu_failure: Option<(String, GpuFailureClass)> = match &result {
             EncodeResult::Done { success: false, diag, .. } => {
-                Some(format!(
-                    "GPU encoder {} failed ({}); fell back to CPU{}",
-                    enc.hb,
-                    match diag.exit_code {
-                        Some(c) => format!("exit {c}"),
-                        None => "no exit code".to_string(),
-                    },
-                    fallback_stderr_suffix(&diag.stderr_tail),
+                Some((
+                    format!(
+                        "GPU encoder {} failed ({}); fell back to CPU{}",
+                        enc.hb,
+                        match diag.exit_code {
+                            Some(c) => format!("exit {c}"),
+                            None => "no exit code".to_string(),
+                        },
+                        fallback_stderr_suffix(&diag.stderr_tail),
+                    ),
+                    classify_gpu_failure(diag, output_bytes),
                 ))
             }
             EncodeResult::Spawn { error, .. } => {
-                Some(format!("GPU encoder {} could not start ({error}); fell back to CPU", enc.hb))
+                Some((
+                    format!("GPU encoder {} could not start ({error}); fell back to CPU", enc.hb),
+                    GpuFailureClass::Hardware,
+                ))
             }
             _ => None,
         };
-        if let Some(detail) = gpu_failure {
+        if let Some((detail, class)) = gpu_failure {
+            let (disable_gpu, streak) = match class {
+                GpuFailureClass::Hardware => (true, 0),
+                GpuFailureClass::SourceOrMux => {
+                    job.gpu_failure_streak.store(0, Ordering::SeqCst);
+                    (false, 0)
+                }
+                GpuFailureClass::Ambiguous => {
+                    let n = job.gpu_failure_streak.fetch_add(1, Ordering::SeqCst) + 1;
+                    (gpu_failure_disables_job(class, n), n)
+                }
+            };
+            if disable_gpu {
+                job.gpu_unstable.store(true, Ordering::SeqCst);
+                crate::compress_debug::log(&format!(
+                    "[gpu_circuit_breaker_trip] job={} #{index} class={} streak={streak}; using CPU for later videos",
+                    job.id,
+                    class.as_str(),
+                ));
+            } else {
+                crate::compress_debug::log(&format!(
+                    "[gpu_retry_next] job={} #{index} class={} streak={streak}; GPU remains enabled for the next video",
+                    job.id,
+                    class.as_str(),
+                ));
+            }
             crate::compress_debug::log(&format!(
                 "[gpu_fallback] job={} #{index} {detail}",
                 job.id
@@ -2749,6 +3463,54 @@ fn fallback_stderr_suffix(tail: &str) -> String {
     }
     let snippet = safe_tail(t, 300);
     format!(" — {}", snippet.replace(['\r', '\n'], " ").trim())
+}
+
+/// Separate adapter/driver failures from bad-input or final-mux failures. The
+/// latter still retry on CPU for the current file, but must not disable the GPU
+/// for every later file in a huge job.
+fn classify_gpu_failure(diag: &EncodeDiag, output_bytes: u64) -> GpuFailureClass {
+    let stderr = diag.stderr_tail.to_ascii_lowercase();
+    const HARDWARE_SIGNATURES: &[&str] = &[
+        "cannot load nvencodeapi",
+        "no nvenc capable devices",
+        "no capable devices found",
+        "nvenc api error",
+        "nvenc error",
+        "cuda error",
+        "cuda device",
+        "driver does not support",
+        "minimum required nvidia driver",
+        "failed to initialize nvenc",
+        "failed to initialise nvenc",
+        "device setup failed",
+        "hardware acceleration failed",
+        "out of memory",
+    ];
+    if diag.exit_code.is_none() || HARDWARE_SIGNATURES.iter().any(|s| stderr.contains(s)) {
+        return GpuFailureClass::Hardware;
+    }
+
+    // HandBrake can return non-zero for a damaged source or a final work/mux
+    // condition even after NVENC produced a complete multi-gigabyte stream. That
+    // says nothing about whether the next source can use the adapter.
+    const SUBSTANTIAL_OUTPUT_BYTES: u64 = 1024 * 1024;
+    if is_unreadable_input_stderr(&stderr)
+        || (output_bytes >= SUBSTANTIAL_OUTPUT_BYTES
+            && stderr.contains("mux: track")
+            && stderr.contains("finished work"))
+    {
+        return GpuFailureClass::SourceOrMux;
+    }
+
+    GpuFailureClass::Ambiguous
+}
+
+fn gpu_failure_disables_job(class: GpuFailureClass, ambiguous_streak: usize) -> bool {
+    match class {
+        GpuFailureClass::Hardware => true,
+        GpuFailureClass::SourceOrMux => false,
+        GpuFailureClass::Ambiguous => ambiguous_streak >= AMBIGUOUS_GPU_FAILURE_LIMIT,
+    }
 }
 
 /// True when `out`'s extension is in the MP4 family (mp4/m4v/mov), the only
@@ -2872,8 +3634,16 @@ fn build_handbrake_args(
 /// only when it ran to completion but exited non-zero AND the job wasn't
 /// cancelled. A spawn failure (missing binary) or a cancel is never retried.
 /// Pure so the retry trigger is unit-testable without spawning HandBrake.
-fn should_retry_minimal(result: &EncodeResult, cancelled: bool) -> bool {
-    matches!(result, EncodeResult::Done { success: false, .. }) && !cancelled
+fn should_retry_minimal(result: &EncodeResult, cancelled: bool, is_gpu: bool) -> bool {
+    !is_gpu && matches!(result, EncodeResult::Done { success: false, .. }) && !cancelled
+}
+
+fn safe_cpu_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(4)
+        .div_ceil(2)
+        .clamp(1, 8)
 }
 
 /// HandBrake video pipeline for a resolved encoder. Presets map to a quality
@@ -2902,6 +3672,9 @@ fn run_handbrake(
         params.push_str(&format!(" maxHeight={h}"));
     }
     meta.codec_params = params;
+    *job.files[index].tool.lock_recover() = "handbrake".to_string();
+    *job.files[index].tool_version.lock_recover() = meta.tool_version.clone();
+    *job.files[index].encoder.lock_recover() = meta.codec_params.clone();
 
     // Acquire the lane permit (CPU video vs GPU session). Cancelled while queued
     // ⇒ no work done.
@@ -2913,7 +3686,7 @@ fn run_handbrake(
     let cpu_threads = if enc.is_gpu {
         None
     } else {
-        Some(std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4))
+        Some(safe_cpu_thread_count())
     };
     let args = build_handbrake_args(
         input, out, &enc.hb, &quality, enc_preset, max_height, enc.is_gpu, cpu_threads, false,
@@ -2926,7 +3699,7 @@ fn run_handbrake(
     // (and we weren't cancelled). This strips exactly the audio/optimize/encopts
     // families most likely to be rejected by an arg-compat mismatch, so a build
     // that chokes on them still produces a plain encode instead of failing.
-    if should_retry_minimal(&result, job.cancel.load(Ordering::Relaxed)) {
+    if should_retry_minimal(&result, job.cancel.load(Ordering::Relaxed), enc.is_gpu) {
         crate::compress_debug::log(&format!(
             "[hb_retry] job={} #{index} first attempt exited non-zero; retrying with minimal args (encoder={})",
             job.id, enc.hb
@@ -3017,12 +3790,12 @@ fn run_zip(job: &Arc<CompressJob>, index: usize, input: &Path, out: &Path, level
     };
     let f = &job.files[index];
     f.pct.store(10, Ordering::Relaxed);
-    job.emit(ev_progress(index, 10));
+    job.emit(ev_progress(job, index, 10));
     let command = format!("zip (deflate level={level}, built-in) {} -> {}", input.display(), out.display());
     match crate::archive::compress_with_level(&[input.to_string_lossy().into_owned()], out, level) {
         Ok(()) => {
             f.pct.store(100, Ordering::Relaxed);
-            job.emit(ev_progress(index, 100));
+            job.emit(ev_progress(job, index, 100));
             EncodeResult::Done {
                 success: true,
                 diag: EncodeDiag { command, exit_code: Some(0), stderr_tail: String::new() },
@@ -3089,6 +3862,10 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     // Capture the full command line before spawning so it is available for the
     // logs whether the child runs, fails, or can't even be spawned.
     let command = command_to_string(&cmd);
+    *job.files[index].command.lock_recover() = command.clone();
+    job.files[index]
+        .updated_at
+        .store(crate::io::now_ms(), Ordering::Relaxed);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
@@ -3284,11 +4061,15 @@ fn read_progress<R: std::io::Read>(
                     if pi != last_pct {
                         last_pct = pi;
                         job.files[index].pct.store(pi as u64, Ordering::Relaxed);
-                        job.emit(ev_progress(index, pi as u64));
+                        job.files[index]
+                            .updated_at
+                            .store(crate::io::now_ms(), Ordering::Relaxed);
+                        job.emit(ev_progress(job, index, pi as u64));
                     }
                 }
                 if let Some(f) = parse_fps(&line) {
                     last_fps = Some(f);
+                    job.files[index].fps_bits.store(f.to_bits(), Ordering::Relaxed);
                 }
                 commit(&line, &mut tail, &mut tail_bytes);
                 line.clear();
@@ -3434,6 +4215,36 @@ fn paths_eq(a: &str, b: &str) -> bool {
 
 // ── Manifest + JSON serialization ────────────────────────────────────────────
 
+const LARGE_MANIFEST_JOB_FILES: usize = 10_000;
+const LARGE_MANIFEST_CHECKPOINT_FILES: usize = 256;
+const LARGE_MANIFEST_CHECKPOINT_MS: u64 = 30_000;
+
+fn manifest_checkpoint_due(total: usize, dirty: usize, elapsed_ms: u64) -> bool {
+    total <= LARGE_MANIFEST_JOB_FILES
+        || dirty >= LARGE_MANIFEST_CHECKPOINT_FILES
+        || elapsed_ms >= LARGE_MANIFEST_CHECKPOINT_MS
+}
+
+/// Persist every outcome for normal jobs. For very large jobs, batch fast
+/// outcomes so a 70+ MB manifest is not rewritten once per small/skipped file;
+/// checkpoint at least every 256 outcomes or 30 seconds instead.
+fn checkpoint_manifest(job: &CompressJob) {
+    let dirty = job.manifest_dirty.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = crate::io::now_ms();
+    let last = job.manifest_last_write_ms.load(Ordering::Relaxed);
+    if !manifest_checkpoint_due(job.total, dirty, now.saturating_sub(last)) {
+        return;
+    }
+    if job
+        .manifest_dirty
+        .compare_exchange(dirty, 0, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    write_manifest(job);
+}
+
 fn write_manifest(job: &CompressJob) {
     // Serialize concurrent rewrites (multiple files finish in parallel) so the
     // manifest can never be torn; recover a poisoned lock — it guards only I/O.
@@ -3455,7 +4266,11 @@ fn write_manifest(job: &CompressJob) {
     s.push_str(",\"tagFilename\":");
     s.push_str(if job.tag_filename { "true" } else { "false" });
     s.push_str(",\"concurrency\":");
-    s.push_str(&job.concurrency.to_string());
+    s.push_str(&job.desired_concurrency.load(Ordering::Relaxed).to_string());
+    s.push_str(",\"activeElapsedMs\":");
+    s.push_str(&job_active_elapsed_ms(job).to_string());
+    s.push_str(",\"queueRank\":");
+    s.push_str(&job.queue_rank.load(Ordering::Relaxed).to_string());
     s.push_str(",\"encoder\":");
     push_json_string(&mut s, &job.encoder);
     s.push_str(",\"useGpu\":");
@@ -3476,6 +4291,14 @@ fn write_manifest(job: &CompressJob) {
     s.push_str(&job.total.to_string());
     s.push_str(",\"savedBytes\":");
     s.push_str(&job.saved_bytes.load(Ordering::Relaxed).to_string());
+    s.push_str(",\"queueOrder\":[");
+    for (i, index) in job.queue.lock_recover().pending.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&index.to_string());
+    }
+    s.push(']');
     s.push_str(",\"files\":[");
     for (i, f) in job.files.iter().enumerate() {
         if i > 0 {
@@ -3484,7 +4307,18 @@ fn write_manifest(job: &CompressJob) {
         push_file_json(&mut s, f);
     }
     s.push_str("]}");
-    let _ = std::fs::write(&job.manifest_path, s);
+    match std::fs::write(&job.manifest_path, s) {
+        Ok(()) => job
+            .manifest_last_write_ms
+            .store(crate::io::now_ms(), Ordering::Relaxed),
+        Err(error) => {
+            job.manifest_dirty.fetch_add(1, Ordering::Relaxed);
+            crate::compress_debug::log_force(&format!(
+                "[manifest_error] job={} path={:?} error={error}",
+                job.id, job.manifest_path
+            ));
+        }
+    }
 }
 
 fn push_file_json(s: &mut String, f: &FileState) {
@@ -3522,6 +4356,48 @@ fn push_file_json(s: &mut String, f: &FileState) {
     push_json_string(s, &f.reason.lock_recover());
     s.push_str(",\"encoder\":");
     push_json_string(s, &f.encoder.lock_recover());
+    s.push_str(",\"stage\":");
+    push_json_string(s, &f.stage.lock_recover());
+    s.push_str(",\"fps\":");
+    let fps_bits = f.fps_bits.load(Ordering::Relaxed);
+    if fps_bits == 0 {
+        s.push_str("null");
+    } else {
+        s.push_str(&format!("{:.2}", f64::from_bits(fps_bits)));
+    }
+    s.push_str(",\"processingRate\":");
+    let started = f.started_at.load(Ordering::Relaxed);
+    let elapsed = if f.finished_at.load(Ordering::Relaxed) > started && started > 0 {
+        f.finished_at.load(Ordering::Relaxed).saturating_sub(started)
+    } else if started > 0 {
+        crate::io::now_ms().saturating_sub(started)
+    } else {
+        0
+    };
+    if elapsed == 0 {
+        s.push_str("null");
+    } else {
+        let completed = orig.saturating_mul(f.pct.load(Ordering::Relaxed)).saturating_div(100);
+        s.push_str(&format!("{:.2}", completed as f64 * 1000.0 / elapsed as f64));
+    }
+    s.push_str(",\"outputBytes\":");
+    s.push_str(&newb.to_string());
+    s.push_str(",\"startedAt\":");
+    s.push_str(&started.to_string());
+    s.push_str(",\"updatedAt\":");
+    s.push_str(&f.updated_at.load(Ordering::Relaxed).to_string());
+    s.push_str(",\"finishedAt\":");
+    s.push_str(&f.finished_at.load(Ordering::Relaxed).to_string());
+    s.push_str(",\"attempt\":");
+    s.push_str(&f.attempt.load(Ordering::Relaxed).to_string());
+    s.push_str(",\"tool\":");
+    push_json_string(s, &f.tool.lock_recover());
+    s.push_str(",\"toolVersion\":");
+    push_json_string(s, &f.tool_version.lock_recover());
+    s.push_str(",\"command\":");
+    push_json_string(s, &f.command.lock_recover());
+    s.push_str(",\"stderr\":");
+    push_json_string(s, &f.stderr_excerpt.lock_recover());
     s.push_str(",\"savedBytes\":");
     s.push_str(&saved.to_string());
     s.push_str(",\"pctSaved\":");
@@ -3531,8 +4407,19 @@ fn push_file_json(s: &mut String, f: &FileState) {
     s.push('}');
 }
 
+fn job_active_elapsed_ms(job: &CompressJob) -> u64 {
+    let accumulated = job.active_elapsed_ms.load(Ordering::Relaxed);
+    let started = job.active_started_at.load(Ordering::Relaxed);
+    if started == 0 {
+        accumulated
+    } else {
+        accumulated.saturating_add(crate::io::now_ms().saturating_sub(started))
+    }
+}
+
 /// Full job JSON for the poll endpoint (`GET /api/compress-jobs/<id>`).
 pub(crate) fn job_full_json(job: &CompressJob) -> String {
+    let summary = summary_from_live(job);
     let mut s = String::with_capacity(256 + job.files.len() * 96);
     s.push_str("{\"id\":");
     push_json_string(&mut s, &job.id);
@@ -3542,6 +4429,46 @@ pub(crate) fn job_full_json(job: &CompressJob) -> String {
     s.push_str(&job.total.to_string());
     s.push_str(",\"savedBytes\":");
     s.push_str(&job.saved_bytes.load(Ordering::Relaxed).to_string());
+    s.push_str(",\"preset\":");
+    push_json_string(&mut s, &job.preset);
+    s.push_str(",\"totalBytes\":");
+    s.push_str(&summary.total_bytes.to_string());
+    s.push_str(",\"workCompletedBytes\":");
+    s.push_str(&summary.work_completed_bytes.to_string());
+    s.push_str(",\"activeCount\":");
+    s.push_str(&summary.active_count.to_string());
+    s.push_str(",\"activeElapsedMs\":");
+    s.push_str(&summary.active_elapsed_ms.to_string());
+    s.push_str(",\"concurrency\":");
+    s.push_str(&summary.concurrency.to_string());
+    s.push_str(",\"encoder\":");
+    push_json_string(&mut s, &job.encoder);
+    s.push_str(",\"codec\":");
+    push_json_string(&mut s, &job.codec);
+    s.push_str(",\"useGpu\":");
+    s.push_str(if job.use_gpu { "true" } else { "false" });
+    s.push_str(",\"originalAction\":");
+    push_json_string(&mut s, job.original_action.as_str());
+    s.push_str(",\"outputDir\":");
+    push_json_string(&mut s, &job.output_dir);
+    s.push_str(",\"stageCounts\":{");
+    for (i, stage) in ["queued", "encoding", "verifying", "finalizing", "terminal"]
+        .iter()
+        .enumerate()
+    {
+        if i > 0 {
+            s.push(',');
+        }
+        push_json_string(&mut s, stage);
+        s.push(':');
+        let count = job
+            .files
+            .iter()
+            .filter(|file| file.stage.lock_recover().as_str() == *stage)
+            .count();
+        s.push_str(&count.to_string());
+    }
+    s.push('}');
     s.push_str(",\"files\":[");
     for (i, f) in job.files.iter().enumerate() {
         if i > 0 {
@@ -3642,8 +4569,357 @@ pub(crate) fn job_full_json_from_manifest(id: &str) -> Option<String> {
     Some(s)
 }
 
+#[derive(Default)]
+pub(crate) struct JobFilesQuery {
+    pub(crate) offset: usize,
+    pub(crate) limit: usize,
+    pub(crate) search: String,
+    pub(crate) status: String,
+    pub(crate) kind: String,
+    pub(crate) encoder: String,
+    pub(crate) outcome: String,
+    pub(crate) disposition: String,
+    pub(crate) path: String,
+    pub(crate) attention: bool,
+    pub(crate) sort: String,
+    pub(crate) direction: String,
+}
+
+#[derive(Clone)]
+struct FilePageItem {
+    index: usize,
+    path: String,
+    kind: String,
+    status: String,
+    stage: String,
+    pct: u64,
+    orig_bytes: u64,
+    new_bytes: u64,
+    reason: String,
+    encoder: String,
+    disposition: String,
+    out_path: String,
+    error: Option<String>,
+    duration_ms: u64,
+    fps: Option<f64>,
+    started_at: u64,
+    updated_at: u64,
+    finished_at: u64,
+    attempt: usize,
+    tool: String,
+    tool_version: String,
+    command: String,
+    stderr: String,
+    queue_position: Option<usize>,
+}
+
+impl FilePageItem {
+    fn from_live(file: &FileState, queue_position: Option<usize>) -> Self {
+        let fps_bits = file.fps_bits.load(Ordering::Relaxed);
+        FilePageItem {
+            index: file.index,
+            path: file.path.clone(),
+            kind: file.kind.as_str().to_string(),
+            status: file.status.lock_recover().clone(),
+            stage: file.stage.lock_recover().clone(),
+            pct: file.pct.load(Ordering::Relaxed),
+            orig_bytes: file.orig_bytes.load(Ordering::Relaxed),
+            new_bytes: file.new_bytes.load(Ordering::Relaxed),
+            reason: file.reason.lock_recover().clone(),
+            encoder: file.encoder.lock_recover().clone(),
+            disposition: file.disposition.lock_recover().clone(),
+            out_path: file.out_path.lock_recover().clone(),
+            error: file.error.lock_recover().clone(),
+            duration_ms: file.duration_ms.load(Ordering::Relaxed),
+            fps: (fps_bits != 0).then(|| f64::from_bits(fps_bits)),
+            started_at: file.started_at.load(Ordering::Relaxed),
+            updated_at: file.updated_at.load(Ordering::Relaxed),
+            finished_at: file.finished_at.load(Ordering::Relaxed),
+            attempt: file.attempt.load(Ordering::Relaxed),
+            tool: file.tool.lock_recover().clone(),
+            tool_version: file.tool_version.lock_recover().clone(),
+            command: file.command.lock_recover().clone(),
+            stderr: file.stderr_excerpt.lock_recover().clone(),
+            queue_position,
+        }
+    }
+
+    fn from_manifest(value: &crate::json::JsonValue, fallback_index: usize) -> Self {
+        let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+        FilePageItem {
+            index: value.get("index").and_then(|v| v.as_u64()).unwrap_or(fallback_index as u64) as usize,
+            path: value.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            kind: value.get("kind").and_then(|v| v.as_str()).unwrap_or("other").to_string(),
+            status: status.to_string(),
+            stage: value
+                .get("stage")
+                .and_then(|v| v.as_str())
+                .unwrap_or(if matches!(status, "done" | "error" | "skipped") { "terminal" } else { "queued" })
+                .to_string(),
+            pct: value.get("pct").and_then(|v| v.as_u64()).unwrap_or(if status == "done" { 100 } else { 0 }),
+            orig_bytes: value.get("origBytes").and_then(|v| v.as_u64()).unwrap_or(0),
+            new_bytes: value.get("newBytes").and_then(|v| v.as_u64()).unwrap_or(0),
+            reason: value.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            encoder: value.get("encoder").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            disposition: value.get("disposition").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            out_path: value.get("outPath").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            error: value.get("error").and_then(|v| v.as_str()).map(str::to_string),
+            duration_ms: value.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0),
+            fps: value.get("fps").and_then(|v| v.as_f64()),
+            started_at: value.get("startedAt").and_then(|v| v.as_u64()).unwrap_or(0),
+            updated_at: value.get("updatedAt").and_then(|v| v.as_u64()).unwrap_or(0),
+            finished_at: value.get("finishedAt").and_then(|v| v.as_u64()).unwrap_or(0),
+            attempt: value.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            tool: value.get("tool").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            tool_version: value.get("toolVersion").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            command: value.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            stderr: value.get("stderr").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            queue_position: None,
+        }
+    }
+
+    fn elapsed_ms(&self, now: u64) -> u64 {
+        if self.duration_ms > 0 {
+            self.duration_ms
+        } else if self.started_at > 0 {
+            now.saturating_sub(self.started_at)
+        } else {
+            0
+        }
+    }
+
+    fn processing_rate(&self, now: u64) -> Option<f64> {
+        let elapsed = self.elapsed_ms(now);
+        (elapsed > 0).then(|| {
+            let completed = self.orig_bytes.saturating_mul(self.pct).saturating_div(100);
+            completed as f64 * 1000.0 / elapsed as f64
+        })
+    }
+}
+
+fn csv_filter(value: &str, filter: &str) -> bool {
+    filter.is_empty()
+        || filter
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case(value))
+}
+
+fn page_item_matches(file: &FilePageItem, query: &JobFilesQuery, now: u64) -> bool {
+    let search = query.search.trim().to_ascii_lowercase();
+    let path_filter = query.path.trim().to_ascii_lowercase();
+    let encoder_filter = query.encoder.trim().to_ascii_lowercase();
+    let attention = file.status == "error"
+        || (file.status == "running" && now.saturating_sub(file.updated_at) > 120_000);
+    (search.is_empty()
+        || file.path.to_ascii_lowercase().contains(&search)
+        || file.reason.to_ascii_lowercase().contains(&search)
+        || file.error.as_deref().unwrap_or("").to_ascii_lowercase().contains(&search))
+        && csv_filter(&file.status, &query.status)
+        && csv_filter(&file.kind, &query.kind)
+        && (encoder_filter.is_empty() || file.encoder.to_ascii_lowercase().contains(&encoder_filter))
+        && csv_filter(&file.reason, &query.outcome)
+        && csv_filter(&file.disposition, &query.disposition)
+        && (path_filter.is_empty() || file.path.to_ascii_lowercase().contains(&path_filter))
+        && (!query.attention || attention)
+}
+
+fn activity_rank(file: &FilePageItem, now: u64) -> u8 {
+    if file.status == "running" {
+        0
+    } else if file.finished_at > 0 && now.saturating_sub(file.finished_at) <= 15_000 {
+        1
+    } else {
+        2
+    }
+}
+
+fn compare_page_items(a: &FilePageItem, b: &FilePageItem, query: &JobFilesQuery, now: u64) -> std::cmp::Ordering {
+    use std::cmp::Ordering as Cmp;
+    let rank = activity_rank(a, now).cmp(&activity_rank(b, now));
+    if rank != Cmp::Equal {
+        return rank;
+    }
+    let cmp = match query.sort.as_str() {
+        "queue" => a.queue_position.unwrap_or(usize::MAX).cmp(&b.queue_position.unwrap_or(usize::MAX)),
+        "name" => file_name_of(&a.path).to_ascii_lowercase().cmp(&file_name_of(&b.path).to_ascii_lowercase()),
+        "size" => a.orig_bytes.cmp(&b.orig_bytes),
+        "progress" => a.pct.cmp(&b.pct),
+        "elapsed" => a.elapsed_ms(now).cmp(&b.elapsed_ms(now)),
+        "eta" => {
+            let ae = a.elapsed_ms(now);
+            let be = b.elapsed_ms(now);
+            let av = if a.pct > 0 { ae.saturating_mul(100 - a.pct) / a.pct } else { u64::MAX };
+            let bv = if b.pct > 0 { be.saturating_mul(100 - b.pct) / b.pct } else { u64::MAX };
+            av.cmp(&bv)
+        }
+        "speed" => a.processing_rate(now).unwrap_or(0.0).total_cmp(&b.processing_rate(now).unwrap_or(0.0)),
+        "savings" => a.orig_bytes.saturating_sub(a.new_bytes).cmp(&b.orig_bytes.saturating_sub(b.new_bytes)),
+        "result" => a.reason.cmp(&b.reason),
+        "start" => a.started_at.cmp(&b.started_at),
+        "finish" => a.finished_at.cmp(&b.finished_at),
+        _ => {
+            if a.status == "running" {
+                a.started_at.cmp(&b.started_at)
+            } else if activity_rank(a, now) == 1 {
+                b.finished_at.cmp(&a.finished_at)
+            } else {
+                a.queue_position.unwrap_or(a.index).cmp(&b.queue_position.unwrap_or(b.index))
+            }
+        }
+    };
+    if query.direction.eq_ignore_ascii_case("desc") { cmp.reverse() } else { cmp }
+}
+
+fn push_page_item_json(out: &mut String, file: &FilePageItem, now: u64) {
+    out.push_str("{\"index\":");
+    out.push_str(&file.index.to_string());
+    for (key, value) in [
+        ("path", file.path.as_str()),
+        ("kind", file.kind.as_str()),
+        ("status", file.status.as_str()),
+        ("stage", file.stage.as_str()),
+        ("reason", file.reason.as_str()),
+        ("encoder", file.encoder.as_str()),
+        ("disposition", file.disposition.as_str()),
+        ("outPath", file.out_path.as_str()),
+        ("tool", file.tool.as_str()),
+        ("toolVersion", file.tool_version.as_str()),
+        ("command", file.command.as_str()),
+        ("stderr", file.stderr.as_str()),
+    ] {
+        out.push_str(",\"");
+        out.push_str(key);
+        out.push_str("\":");
+        push_json_string(out, value);
+    }
+    out.push_str(",\"error\":");
+    match &file.error {
+        Some(error) => push_json_string(out, error),
+        None => out.push_str("null"),
+    }
+    for (key, value) in [
+        ("pct", file.pct),
+        ("origBytes", file.orig_bytes),
+        ("newBytes", file.new_bytes),
+        ("savedBytes", file.orig_bytes.saturating_sub(file.new_bytes)),
+        ("durationMs", file.duration_ms),
+        ("elapsedMs", file.elapsed_ms(now)),
+        ("startedAt", file.started_at),
+        ("updatedAt", file.updated_at),
+        ("finishedAt", file.finished_at),
+        ("attempt", file.attempt as u64),
+    ] {
+        out.push_str(",\"");
+        out.push_str(key);
+        out.push_str("\":");
+        out.push_str(&value.to_string());
+    }
+    out.push_str(",\"queuePosition\":");
+    match file.queue_position {
+        Some(position) => out.push_str(&position.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"fps\":");
+    match file.fps {
+        Some(fps) => out.push_str(&format!("{fps:.2}")),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"processingRate\":");
+    match file.processing_rate(now) {
+        Some(rate) => out.push_str(&format!("{rate:.2}")),
+        None => out.push_str("null"),
+    }
+    out.push('}');
+}
+
+pub(crate) fn job_files_page_json(
+    live: Option<&CompressJob>,
+    id: &str,
+    query: &JobFilesQuery,
+) -> Option<String> {
+    let mut items = if let Some(job) = live {
+        let positions = job
+            .queue
+            .lock_recover()
+            .pending
+            .iter()
+            .enumerate()
+            .map(|(position, index)| (*index, position))
+            .collect::<HashMap<_, _>>();
+        job.files
+            .iter()
+            .map(|file| FilePageItem::from_live(file, positions.get(&file.index).copied()))
+            .collect::<Vec<_>>()
+    } else {
+        if !is_safe_job_id(id) {
+            return None;
+        }
+        let text = std::fs::read_to_string(jobs_dir().join(format!("{id}.json"))).ok()?;
+        let root = crate::json::parse(&text)?;
+        root.get("files")
+            .and_then(|v| v.as_array())?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| FilePageItem::from_manifest(value, index))
+            .collect::<Vec<_>>()
+    };
+    let total = items.len();
+    let now = crate::io::now_ms();
+    items.retain(|file| page_item_matches(file, query, now));
+    let total_matches = items.len();
+    items.sort_by(|a, b| compare_page_items(a, b, query, now));
+    let limit = query.limit.clamp(1, 250);
+    let start = query.offset.min(items.len());
+    let end = start.saturating_add(limit).min(items.len());
+    let mut out = format!(
+        "{{\"id\":\"{}\",\"offset\":{start},\"limit\":{limit},\"total\":{total},\"totalMatches\":{total_matches},\"items\":[",
+        id
+    );
+    for (position, file) in items[start..end].iter().enumerate() {
+        if position > 0 {
+            out.push(',');
+        }
+        push_page_item_json(&mut out, file, now);
+    }
+    out.push_str("],\"facets\":{");
+    for (facet_index, (name, values)) in [
+        ("status", items.iter().map(|f| f.status.as_str()).collect::<Vec<_>>()),
+        ("type", items.iter().map(|f| f.kind.as_str()).collect::<Vec<_>>()),
+        ("encoder", items.iter().map(|f| f.encoder.as_str()).filter(|v| !v.is_empty()).collect::<Vec<_>>()),
+        ("outcome", items.iter().map(|f| f.reason.as_str()).filter(|v| !v.is_empty()).collect::<Vec<_>>()),
+        ("disposition", items.iter().map(|f| f.disposition.as_str()).filter(|v| !v.is_empty()).collect::<Vec<_>>()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if facet_index > 0 {
+            out.push(',');
+        }
+        push_json_string(&mut out, name);
+        out.push_str(":{");
+        let mut counts = HashMap::<&str, usize>::new();
+        for value in values {
+            *counts.entry(value).or_default() += 1;
+        }
+        let mut counts = counts.into_iter().collect::<Vec<_>>();
+        counts.sort_by(|a, b| a.0.cmp(b.0));
+        for (i, (value, count)) in counts.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            push_json_string(&mut out, value);
+            out.push(':');
+            out.push_str(&count.to_string());
+        }
+        out.push('}');
+    }
+    out.push_str("}}");
+    Some(out)
+}
+
 /// One row for the list endpoint (`GET /api/compress-jobs`), derived from either
 /// a live registry job or a persisted manifest.
+#[derive(Clone)]
 struct JobSummary {
     id: String,
     status: String,
@@ -3658,6 +4934,21 @@ struct JobSummary {
     verify_failed: usize,
     pending: usize,
     saved_bytes: u64,
+    total_bytes: u64,
+    work_completed_bytes: u64,
+    successful_bytes: u64,
+    skipped_bytes: u64,
+    failed_bytes: u64,
+    active_work_bytes: u64,
+    active_count: usize,
+    active_elapsed_ms: u64,
+    concurrency: usize,
+    encoder: String,
+    codec: String,
+    use_gpu: bool,
+    original_action: String,
+    output_dir: String,
+    queue_rank: u64,
     created_at: u64,
     updated_at: u64,
     /// Currently tracked + not finished in THIS process (i.e. encoding now).
@@ -3683,24 +4974,147 @@ fn manifest_mtime_ms(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+fn manifest_signature(path: &Path) -> (u64, u64) {
+    let Ok(metadata) = std::fs::metadata(path) else { return (0, 0) };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    (modified, metadata.len())
+}
+
+fn summary_sidecar_path(manifest: &Path) -> PathBuf {
+    manifest.with_extension("summary")
+}
+
+fn normalize_persisted_status(status: &str) -> String {
+    if matches!(status, "running" | "pausing") {
+        "paused".to_string()
+    } else {
+        status.to_string()
+    }
+}
+
+fn summary_from_cached_value(id: &str, value: &crate::json::JsonValue) -> JobSummary {
+    let number = |key: &str| value.get(key).and_then(|item| item.as_u64()).unwrap_or(0);
+    let string = |key: &str, fallback: &str| {
+        value.get(key).and_then(|item| item.as_str()).unwrap_or(fallback).to_string()
+    };
+    let total = number("total") as usize;
+    let done = number("done") as usize;
+    let errors = number("errors") as usize;
+    let skipped = number("skipped") as usize;
+    let status = normalize_persisted_status(&string("status", "error"));
+    JobSummary {
+        id: id.to_string(),
+        status,
+        preset: string("preset", "balanced"),
+        total,
+        done,
+        errors,
+        skipped,
+        verify_failed: number("verifyFailed") as usize,
+        pending: value
+            .get("pending")
+            .and_then(|item| item.as_u64())
+            .map(|count| count as usize)
+            .unwrap_or_else(|| total.saturating_sub(done + errors + skipped)),
+        saved_bytes: number("savedBytes"),
+        total_bytes: number("totalBytes"),
+        work_completed_bytes: number("workCompletedBytes"),
+        successful_bytes: number("successfulBytes"),
+        skipped_bytes: number("skippedBytes"),
+        failed_bytes: number("failedBytes"),
+        active_work_bytes: 0,
+        active_count: 0,
+        active_elapsed_ms: number("activeElapsedMs"),
+        concurrency: number("concurrency").clamp(1, 16) as usize,
+        encoder: string("encoder", "auto"),
+        codec: string("codec", "h264"),
+        use_gpu: value.get("useGpu").and_then(|item| item.as_bool()).unwrap_or(true),
+        original_action: string("originalAction", "recycle"),
+        output_dir: string("outputDir", ""),
+        queue_rank: value
+            .get("queueRank")
+            .and_then(|item| item.as_u64())
+            .unwrap_or_else(|| created_at_from_id(id)),
+        created_at: value
+            .get("createdAt")
+            .and_then(|item| item.as_u64())
+            .unwrap_or_else(|| created_at_from_id(id)),
+        updated_at: number("updatedAt"),
+        active: false,
+        resumable: value
+            .get("resumable")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(done < total),
+    }
+}
+
+fn load_summary_sidecar(id: &str, manifest: &Path, signature: (u64, u64)) -> Option<JobSummary> {
+    let text = std::fs::read_to_string(summary_sidecar_path(manifest)).ok()?;
+    let root = crate::json::parse(&text)?;
+    if root.get("sourceModifiedMs").and_then(|value| value.as_u64()) != Some(signature.0)
+        || root.get("sourceLength").and_then(|value| value.as_u64()) != Some(signature.1)
+    {
+        return None;
+    }
+    let summary = root.get("summary")?;
+    Some(summary_from_cached_value(id, summary))
+}
+
+fn write_summary_sidecar(manifest: &Path, signature: (u64, u64), summary: &JobSummary) {
+    let mut json = format!(
+        "{{\"sourceModifiedMs\":{},\"sourceLength\":{},\"summary\":",
+        signature.0, signature.1
+    );
+    push_summary_json(&mut json, summary);
+    json.push('}');
+    let _ = std::fs::write(summary_sidecar_path(manifest), json);
+}
+
 fn summary_from_live(job: &CompressJob) -> JobSummary {
     let (mut done, mut errors, mut skipped, mut verify_failed) = (0usize, 0usize, 0usize, 0usize);
+    let (mut total_bytes, mut work_completed_bytes, mut active_count) = (0u64, 0u64, 0usize);
+    let (mut successful_bytes, mut skipped_bytes, mut failed_bytes, mut active_work_bytes) =
+        (0u64, 0u64, 0u64, 0u64);
     for f in &job.files {
+        let orig = f.orig_bytes.load(Ordering::Relaxed);
+        total_bytes = total_bytes.saturating_add(orig);
         match f.status.lock_recover().as_str() {
-            "done" => done += 1,
+            "done" => {
+                done += 1;
+                work_completed_bytes = work_completed_bytes.saturating_add(orig);
+                successful_bytes = successful_bytes.saturating_add(orig);
+            }
             "error" => {
                 errors += 1;
+                work_completed_bytes = work_completed_bytes.saturating_add(orig);
+                failed_bytes = failed_bytes.saturating_add(orig);
                 if f.reason.lock_recover().as_str() == Reason::ErrorVerifyFailed.as_str() {
                     verify_failed += 1;
                 }
             }
-            "skipped" => skipped += 1,
+            "skipped" => {
+                skipped += 1;
+                work_completed_bytes = work_completed_bytes.saturating_add(orig);
+                skipped_bytes = skipped_bytes.saturating_add(orig);
+            }
+            "running" => {
+                active_count += 1;
+                let active_work = orig.saturating_mul(f.pct.load(Ordering::Relaxed)).saturating_div(100);
+                active_work_bytes = active_work_bytes.saturating_add(active_work);
+                work_completed_bytes = work_completed_bytes.saturating_add(active_work);
+            }
             _ => {}
         }
     }
     let total = job.total;
     let pending = total.saturating_sub(done + errors + skipped);
-    let active = !job.finished.load(Ordering::SeqCst);
+    let status = job.status.lock_recover().clone();
+    let active = matches!(status.as_str(), "running" | "pausing");
     // On resume the worker re-runs everything that isn't `done` (skipped/error/
     // pending all re-run), so remaining work = total - done.
     let remaining = total.saturating_sub(done);
@@ -3708,7 +5122,7 @@ fn summary_from_live(job: &CompressJob) -> JobSummary {
     let mtime = manifest_mtime_ms(&job.manifest_path);
     JobSummary {
         id: job.id.clone(),
-        status: job.status.lock_recover().clone(),
+        status,
         preset: job.preset.clone(),
         total,
         done,
@@ -3717,6 +5131,21 @@ fn summary_from_live(job: &CompressJob) -> JobSummary {
         verify_failed,
         pending,
         saved_bytes: job.saved_bytes.load(Ordering::Relaxed),
+        total_bytes,
+        work_completed_bytes,
+        successful_bytes,
+        skipped_bytes,
+        failed_bytes,
+        active_work_bytes,
+        active_count,
+        active_elapsed_ms: job_active_elapsed_ms(job),
+        concurrency: job.desired_concurrency.load(Ordering::Relaxed),
+        encoder: job.encoder.clone(),
+        codec: job.codec.clone(),
+        use_gpu: job.use_gpu,
+        original_action: job.original_action.as_str().to_string(),
+        output_dir: job.output_dir.clone(),
+        queue_rank: job.queue_rank.load(Ordering::Relaxed),
         created_at: created,
         updated_at: if mtime > 0 { mtime } else { created },
         active,
@@ -3725,9 +5154,24 @@ fn summary_from_live(job: &CompressJob) -> JobSummary {
 }
 
 fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (u64, u64, JobSummary)>>> = OnceLock::new();
+    let signature = manifest_signature(path);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((modified, length, summary)) = cache.lock_recover().get(path) {
+        if (*modified, *length) == signature {
+            return Some(summary.clone());
+        }
+    }
+    if let Some(summary) = load_summary_sidecar(id, path, signature) {
+        cache
+            .lock_recover()
+            .insert(path.to_path_buf(), (signature.0, signature.1, summary.clone()));
+        return Some(summary);
+    }
+
     let text = std::fs::read_to_string(path).ok()?;
     let root = crate::json::parse(&text)?;
-    let status = root.get("status").and_then(|v| v.as_str()).unwrap_or("error").to_string();
+    let status = normalize_persisted_status(root.get("status").and_then(|v| v.as_str()).unwrap_or("error"));
     let preset = root.get("preset").and_then(|v| v.as_str()).unwrap_or("balanced").to_string();
     let saved_bytes = root.get("savedBytes").and_then(|v| v.as_u64()).unwrap_or(0);
     let files = root.get("files").and_then(|v| v.as_array());
@@ -3737,24 +5181,46 @@ fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
         .map(|n| n as usize)
         .unwrap_or_else(|| files.map(|a| a.len()).unwrap_or(0));
     let (mut done, mut errors, mut skipped, mut verify_failed) = (0usize, 0usize, 0usize, 0usize);
+    let (mut total_bytes, mut work_completed_bytes, mut active_count) = (0u64, 0u64, 0usize);
+    let (mut successful_bytes, mut skipped_bytes, mut failed_bytes, mut active_work_bytes) =
+        (0u64, 0u64, 0u64, 0u64);
     if let Some(files) = files {
         for f in files {
+            let orig = f.get("origBytes").and_then(|v| v.as_u64()).unwrap_or(0);
+            total_bytes = total_bytes.saturating_add(orig);
             match f.get("status").and_then(|v| v.as_str()).unwrap_or("pending") {
-                "done" => done += 1,
+                "done" => {
+                    done += 1;
+                    work_completed_bytes = work_completed_bytes.saturating_add(orig);
+                    successful_bytes = successful_bytes.saturating_add(orig);
+                }
                 "error" => {
                     errors += 1;
+                    work_completed_bytes = work_completed_bytes.saturating_add(orig);
+                    failed_bytes = failed_bytes.saturating_add(orig);
                     if f.get("reason").and_then(|v| v.as_str()) == Some(Reason::ErrorVerifyFailed.as_str()) {
                         verify_failed += 1;
                     }
                 }
-                "skipped" => skipped += 1,
+                "skipped" => {
+                    skipped += 1;
+                    work_completed_bytes = work_completed_bytes.saturating_add(orig);
+                    skipped_bytes = skipped_bytes.saturating_add(orig);
+                }
+                "running" => {
+                    active_count += 1;
+                    let pct = f.get("pct").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let active_work = orig.saturating_mul(pct).saturating_div(100);
+                    active_work_bytes = active_work_bytes.saturating_add(active_work);
+                    work_completed_bytes = work_completed_bytes.saturating_add(active_work);
+                }
                 _ => {}
             }
         }
     }
     let pending = total.saturating_sub(done + errors + skipped);
     let remaining = total.saturating_sub(done);
-    Some(JobSummary {
+    let summary = JobSummary {
         id: id.to_string(),
         status,
         preset,
@@ -3765,13 +5231,46 @@ fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
         verify_failed,
         pending,
         saved_bytes,
+        total_bytes,
+        work_completed_bytes,
+        successful_bytes,
+        skipped_bytes,
+        failed_bytes,
+        active_work_bytes,
+        active_count,
+        active_elapsed_ms: root
+            .get("activeElapsedMs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        concurrency: root
+            .get("concurrency")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize,
+        encoder: root.get("encoder").and_then(|v| v.as_str()).unwrap_or("auto").to_string(),
+        codec: root.get("codec").and_then(|v| v.as_str()).unwrap_or("h264").to_string(),
+        use_gpu: root.get("useGpu").and_then(|v| v.as_bool()).unwrap_or(true),
+        original_action: root
+            .get("originalAction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("recycle")
+            .to_string(),
+        output_dir: root.get("outputDir").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        queue_rank: root
+            .get("queueRank")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| created_at_from_id(id)),
         created_at: created_at_from_id(id),
-        updated_at: manifest_mtime_ms(path),
+        updated_at: signature.0,
         // Not in this process's registry ⇒ never actively encoding here; it is
         // resumable whenever any file still needs work.
         active: false,
         resumable: remaining > 0,
-    })
+    };
+    write_summary_sidecar(path, signature, &summary);
+    cache
+        .lock_recover()
+        .insert(path.to_path_buf(), (signature.0, signature.1, summary.clone()));
+    Some(summary)
 }
 
 fn push_summary_json(s: &mut String, j: &JobSummary) {
@@ -3795,6 +5294,36 @@ fn push_summary_json(s: &mut String, j: &JobSummary) {
     s.push_str(&j.pending.to_string());
     s.push_str(",\"savedBytes\":");
     s.push_str(&j.saved_bytes.to_string());
+    s.push_str(",\"totalBytes\":");
+    s.push_str(&j.total_bytes.to_string());
+    s.push_str(",\"workCompletedBytes\":");
+    s.push_str(&j.work_completed_bytes.to_string());
+    s.push_str(",\"successfulBytes\":");
+    s.push_str(&j.successful_bytes.to_string());
+    s.push_str(",\"skippedBytes\":");
+    s.push_str(&j.skipped_bytes.to_string());
+    s.push_str(",\"failedBytes\":");
+    s.push_str(&j.failed_bytes.to_string());
+    s.push_str(",\"activeWorkBytes\":");
+    s.push_str(&j.active_work_bytes.to_string());
+    s.push_str(",\"activeCount\":");
+    s.push_str(&j.active_count.to_string());
+    s.push_str(",\"activeElapsedMs\":");
+    s.push_str(&j.active_elapsed_ms.to_string());
+    s.push_str(",\"concurrency\":");
+    s.push_str(&j.concurrency.to_string());
+    s.push_str(",\"encoder\":");
+    push_json_string(s, &j.encoder);
+    s.push_str(",\"codec\":");
+    push_json_string(s, &j.codec);
+    s.push_str(",\"useGpu\":");
+    s.push_str(if j.use_gpu { "true" } else { "false" });
+    s.push_str(",\"originalAction\":");
+    push_json_string(s, &j.original_action);
+    s.push_str(",\"outputDir\":");
+    push_json_string(s, &j.output_dir);
+    s.push_str(",\"queueRank\":");
+    s.push_str(&j.queue_rank.to_string());
     s.push_str(",\"createdAt\":");
     s.push_str(&j.created_at.to_string());
     s.push_str(",\"updatedAt\":");
@@ -3836,9 +5365,13 @@ pub(crate) fn list_jobs_json(state: &AppState) -> String {
         }
     }
     summaries.sort_by(|a, b| {
-        b.created_at
-            .cmp(&a.created_at)
-            .then(b.updated_at.cmp(&a.updated_at))
+        if a.status == "queued" && b.status == "queued" {
+            a.queue_rank.cmp(&b.queue_rank)
+        } else {
+            b.created_at
+                .cmp(&a.created_at)
+                .then(b.updated_at.cmp(&a.updated_at))
+        }
     });
     let mut body = String::from("{\"jobs\":[");
     for (i, j) in summaries.iter().enumerate() {
@@ -3849,6 +5382,148 @@ pub(crate) fn list_jobs_json(state: &AppState) -> String {
     }
     body.push_str("]}");
     body
+}
+
+pub(crate) fn compress_telemetry_json(state: &AppState, selected_id: &str) -> String {
+    static CACHE: Mutex<Option<(u64, String, String)>> = Mutex::new(None);
+    let now = crate::io::now_ms();
+    if let Some((sampled, id, json)) = CACHE.lock_recover().as_ref() {
+        if *id == selected_id && now.saturating_sub(*sampled) < 1_000 {
+            return json.clone();
+        }
+    }
+
+    let selected = state.compress_jobs.lock_recover().get(selected_id).map(Arc::clone);
+    let (fallback_sessions, live_fps, destination_drive) = selected
+        .as_ref()
+        .map(|job| {
+            let sessions = job.children.lock_recover().len();
+            let fps_values = job
+                .files
+                .iter()
+                .filter(|file| file.status.lock_recover().as_str() == "running")
+                .filter_map(|file| {
+                    let bits = file.fps_bits.load(Ordering::Relaxed);
+                    (bits != 0).then(|| f64::from_bits(bits))
+                })
+                .collect::<Vec<_>>();
+            let fps = (!fps_values.is_empty()).then(|| fps_values.iter().sum::<f64>());
+            let source = if job.output_dir.is_empty() {
+                job.files.first().map(|f| f.path.as_str()).unwrap_or("")
+            } else {
+                job.output_dir.as_str()
+            };
+            let drive = source
+                .as_bytes()
+                .first()
+                .copied()
+                .filter(|c| c.is_ascii_alphabetic())
+                .map(|c| (c as char).to_ascii_uppercase().to_string())
+                .unwrap_or_default();
+            (sessions, fps, drive)
+        })
+        .unwrap_or((0, None, String::new()));
+
+    let mut gpu_encode = None;
+    let mut nvidia_sessions = None;
+    let mut nvidia_fps = None;
+    let mut gpu_memory_used = None;
+    let mut gpu_memory_total = None;
+    let mut smi = Command::new("nvidia-smi");
+    smi.args([
+        "--query-gpu=utilization.encoder,encoder.stats.sessionCount,encoder.stats.averageFps,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ]);
+    compress_tools::no_window(&mut smi);
+    if let Ok(output) = smi.output() {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let values = line.split(',').map(str::trim).collect::<Vec<_>>();
+                let parse = |index: usize| values.get(index).and_then(|v| v.parse::<f64>().ok());
+                if let Some(value) = parse(0) {
+                    gpu_encode = Some(gpu_encode.unwrap_or(0.0_f64).max(value));
+                }
+                if let Some(value) = parse(1) {
+                    nvidia_sessions = Some(nvidia_sessions.unwrap_or(0.0_f64).max(value));
+                }
+                if let Some(value) = parse(2) {
+                    nvidia_fps = Some(nvidia_fps.unwrap_or(0.0_f64) + value);
+                }
+                if let Some(value) = parse(3) {
+                    gpu_memory_used = Some(gpu_memory_used.unwrap_or(0.0_f64) + value * 1024.0 * 1024.0);
+                }
+                if let Some(value) = parse(4) {
+                    gpu_memory_total = Some(gpu_memory_total.unwrap_or(0.0_f64) + value * 1024.0 * 1024.0);
+                }
+            }
+        }
+    }
+
+    let mut encoder_cpu = None;
+    let mut ram_bytes = None;
+    let mut read_bps = None;
+    let mut write_bps = None;
+    let mut destination_free = None;
+    #[cfg(windows)]
+    {
+        let drive_script = if destination_drive.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ";$d=Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='{}:'\" -ErrorAction SilentlyContinue;if($d){{Write-Output ('DISK|'+$d.FreeSpace)}}",
+                destination_drive
+            )
+        };
+        let script = format!(
+            "$p=Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -ErrorAction SilentlyContinue | Where-Object {{$_.Name -match 'HandBrakeCLI|ffmpeg|magick'}};$cpu=0;$ram=0;$r=0;$w=0;foreach($x in $p){{$cpu+=[double]$x.PercentProcessorTime;$ram+=[double]$x.WorkingSet;$r+=[double]$x.IOReadBytesPersec;$w+=[double]$x.IOWriteBytesPersec}};if($p){{Write-Output ('PROC|'+$cpu+'|'+$ram+'|'+$r+'|'+$w)}}{drive_script}"
+        );
+        let mut powershell = Command::new("powershell.exe");
+        powershell.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        compress_tools::no_window(&mut powershell);
+        if let Ok(output) = powershell.output() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let values = line.trim().split('|').collect::<Vec<_>>();
+                match values.first().copied() {
+                    Some("PROC") => {
+                        encoder_cpu = values.get(1).and_then(|v| v.parse().ok());
+                        ram_bytes = values.get(2).and_then(|v| v.parse().ok());
+                        read_bps = values.get(3).and_then(|v| v.parse().ok());
+                        write_bps = values.get(4).and_then(|v| v.parse().ok());
+                    }
+                    Some("DISK") => destination_free = values.get(1).and_then(|v| v.parse().ok()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn push_opt(out: &mut String, key: &str, value: Option<f64>) {
+        out.push_str(",\"");
+        out.push_str(key);
+        out.push_str("\":");
+        match value {
+            Some(value) if value.is_finite() => out.push_str(&format!("{value:.2}")),
+            _ => out.push_str("null"),
+        }
+    }
+    let mut json = format!("{{\"sampledAt\":{now}");
+    push_opt(&mut json, "gpuVideoEncodePct", gpu_encode);
+    push_opt(
+        &mut json,
+        "encoderSessions",
+        nvidia_sessions.or_else(|| (fallback_sessions > 0).then_some(fallback_sessions as f64)),
+    );
+    push_opt(&mut json, "aggregateFps", live_fps.or(nvidia_fps));
+    push_opt(&mut json, "encoderCpuPct", encoder_cpu);
+    push_opt(&mut json, "ramBytes", ram_bytes);
+    push_opt(&mut json, "readBytesPerSec", read_bps);
+    push_opt(&mut json, "writeBytesPerSec", write_bps);
+    push_opt(&mut json, "destinationFreeBytes", destination_free);
+    push_opt(&mut json, "gpuMemoryUsedBytes", gpu_memory_used);
+    push_opt(&mut json, "gpuMemoryTotalBytes", gpu_memory_total);
+    json.push('}');
+    *CACHE.lock_recover() = Some((now, selected_id.to_string(), json.clone()));
+    json
 }
 
 // ── NDJSON event builders (one JSON object per line) ──────────────────────────
@@ -3862,7 +5537,14 @@ fn ev_job_start(id: &str, total: usize) -> String {
     s
 }
 
-fn ev_file_start(index: usize, path: &str, kind: FileKind, orig: u64) -> String {
+fn ev_file_start(
+    index: usize,
+    path: &str,
+    kind: FileKind,
+    orig: u64,
+    started_at: u64,
+    attempt: usize,
+) -> String {
     let mut s = String::from("{\"type\":\"file_start\",\"index\":");
     s.push_str(&index.to_string());
     s.push_str(",\"path\":");
@@ -3871,12 +5553,49 @@ fn ev_file_start(index: usize, path: &str, kind: FileKind, orig: u64) -> String 
     push_json_string(&mut s, kind.as_str());
     s.push_str(",\"origBytes\":");
     s.push_str(&orig.to_string());
+    s.push_str(",\"stage\":\"encoding\",\"startedAt\":");
+    s.push_str(&started_at.to_string());
+    s.push_str(",\"updatedAt\":");
+    s.push_str(&started_at.to_string());
+    s.push_str(",\"attempt\":");
+    s.push_str(&attempt.to_string());
     s.push_str("}\n");
     s
 }
 
-fn ev_progress(index: usize, pct: u64) -> String {
-    format!("{{\"type\":\"progress\",\"index\":{index},\"pct\":{pct}}}\n")
+fn ev_progress(job: &CompressJob, index: usize, pct: u64) -> String {
+    let file = &job.files[index];
+    let fps = file.fps_bits.load(Ordering::Relaxed);
+    let mut s = format!(
+        "{{\"type\":\"progress\",\"index\":{index},\"pct\":{pct},\"stage\":\"encoding\",\"updatedAt\":{}",
+        crate::io::now_ms()
+    );
+    s.push_str(",\"fps\":");
+    if fps == 0 {
+        s.push_str("null");
+    } else {
+        s.push_str(&format!("{:.2}", f64::from_bits(fps)));
+    }
+    s.push_str("}\n");
+    s
+}
+
+fn ev_stage(index: usize, stage: &str) -> String {
+    let mut s = format!("{{\"type\":\"stage\",\"index\":{index},\"stage\":");
+    push_json_string(&mut s, stage);
+    s.push_str(",\"updatedAt\":");
+    s.push_str(&crate::io::now_ms().to_string());
+    s.push_str("}\n");
+    s
+}
+
+fn ev_job_state(id: &str, status: &str) -> String {
+    let mut s = String::from("{\"type\":\"job_state\",\"jobId\":");
+    push_json_string(&mut s, id);
+    s.push_str(",\"status\":");
+    push_json_string(&mut s, status);
+    s.push_str("}\n");
+    s
 }
 
 fn ev_file_done(
@@ -3908,6 +5627,8 @@ fn ev_file_done(
     push_json_string(&mut s, reason);
     s.push_str(",\"status\":");
     push_json_string(&mut s, status);
+    s.push_str(",\"stage\":\"terminal\",\"finishedAt\":");
+    s.push_str(&crate::io::now_ms().to_string());
     s.push_str("}\n");
     s
 }
@@ -3921,6 +5642,8 @@ fn ev_error(index: usize, path: &str, error: &str, reason: &str) -> String {
     push_json_string(&mut s, error);
     s.push_str(",\"reason\":");
     push_json_string(&mut s, reason);
+    s.push_str(",\"stage\":\"terminal\",\"finishedAt\":");
+    s.push_str(&crate::io::now_ms().to_string());
     s.push_str("}\n");
     s
 }
@@ -3997,6 +5720,18 @@ mod encoder_tests {
         let enc = select_video_encoder("auto", "h264", true, &caps, &hw);
         assert_eq!(enc.hb, "nvenc_h264");
         assert!(enc.is_gpu);
+    }
+
+    #[test]
+    fn nvenc_uses_dual_session_lane_while_other_gpus_stay_single_session() {
+        let caps = HandbrakeCaps::default();
+        let nvenc = select_video_encoder("nvenc", "h264", true, &caps, &no_gpu());
+        assert_eq!(nvenc.lane, CompressLane::Nvenc);
+
+        let qsv = select_video_encoder("qsv", "h264", true, &caps, &no_gpu());
+        let vce = select_video_encoder("vce", "h264", true, &caps, &no_gpu());
+        assert_eq!(qsv.lane, CompressLane::GpuOther);
+        assert_eq!(vce.lane, CompressLane::GpuOther);
     }
 
     #[test]
@@ -4186,17 +5921,56 @@ mod encoder_tests {
     }
 
     #[test]
-    fn minimal_retry_triggers_only_on_noncancelled_nonzero_exit() {
+    fn minimal_retry_is_cpu_only_and_requires_noncancelled_nonzero_exit() {
         let fail = EncodeResult::Done { success: false, diag: EncodeDiag::default(), fps: None };
         let ok = EncodeResult::Done { success: true, diag: EncodeDiag::default(), fps: None };
         let spawn = EncodeResult::Spawn { error: "x".into(), command: "y".into() };
-        // Non-zero exit, not cancelled → retry.
-        assert!(should_retry_minimal(&fail, false));
-        // Cancelled, or success, or spawn failure → never retry.
-        assert!(!should_retry_minimal(&fail, true));
-        assert!(!should_retry_minimal(&ok, false));
-        assert!(!should_retry_minimal(&spawn, false));
-        assert!(!should_retry_minimal(&EncodeResult::Cancelled, false));
+        // A CPU non-zero exit may be an argument compatibility issue, so retry.
+        assert!(should_retry_minimal(&fail, false, false));
+        // Repeating a failed hardware encode can destabilize the driver.
+        assert!(!should_retry_minimal(&fail, false, true));
+        // Cancelled, successful, spawn-failed, or cancelled results never retry.
+        assert!(!should_retry_minimal(&fail, true, false));
+        assert!(!should_retry_minimal(&ok, false, false));
+        assert!(!should_retry_minimal(&spawn, false, false));
+        assert!(!should_retry_minimal(&EncodeResult::Cancelled, false, false));
+    }
+
+    #[test]
+    fn gpu_circuit_breaker_ignores_completed_mux_and_requires_repeated_unknowns() {
+        let completed_mux = EncodeDiag {
+            exit_code: Some(4),
+            stderr_tail: "mux: track 0, 222856 frames\nFinished work\nlibhb: work result = 4"
+                .to_string(),
+            ..EncodeDiag::default()
+        };
+        let class = classify_gpu_failure(&completed_mux, 1_700_000_000);
+        assert_eq!(class, GpuFailureClass::SourceOrMux);
+        assert!(!gpu_failure_disables_job(class, 99));
+
+        let ambiguous = classify_gpu_failure(
+            &EncodeDiag { exit_code: Some(4), stderr_tail: "Encode failed".to_string(), ..EncodeDiag::default() },
+            0,
+        );
+        assert_eq!(ambiguous, GpuFailureClass::Ambiguous);
+        assert!(!gpu_failure_disables_job(ambiguous, 1));
+        assert!(gpu_failure_disables_job(ambiguous, 2));
+
+        let hardware = classify_gpu_failure(
+            &EncodeDiag { exit_code: Some(1), stderr_tail: "CUDA error: device setup failed".to_string(), ..EncodeDiag::default() },
+            0,
+        );
+        assert_eq!(hardware, GpuFailureClass::Hardware);
+        assert!(gpu_failure_disables_job(hardware, 1));
+    }
+
+    #[test]
+    fn cpu_fallback_leaves_headroom_for_the_desktop() {
+        let threads = safe_cpu_thread_count();
+        assert!((1..=8).contains(&threads));
+        if let Ok(available) = std::thread::available_parallelism() {
+            assert!(threads <= available.get());
+        }
     }
 
     #[test]
@@ -4214,6 +5988,46 @@ mod encoder_tests {
         assert!(media_pre_skip(FileKind::Video, Path::new("a.mp4"), 50 * 1024 * 1024).is_none());
         // Zero size is unknown → never pre-skip.
         assert!(media_pre_skip(FileKind::Image, Path::new("a.webp"), 0).is_none());
+    }
+
+    #[test]
+    fn active_jobs_deduplicate_identical_and_reject_overlapping_paths() {
+        let opts = CompressOptions {
+            original_action: OriginalAction::Keep,
+            tag_filename: false,
+            concurrency: 1,
+            encoder: "auto".to_string(),
+            use_gpu: true,
+            codec: "h264".to_string(),
+            zip_level: 6,
+            min_size_bytes: 0,
+            custom_max_height: 0,
+            custom_quality: 0,
+            output_dir: String::new(),
+        };
+        let paths = vec!["C:\\batch\\a.mp4".to_string(), "C:\\batch\\b.mp4".to_string()];
+        let job = create_job(&paths, "balanced", &opts);
+        let mut jobs = HashMap::new();
+        jobs.insert(job.id.clone(), Arc::clone(&job));
+
+        let same = active_path_conflict(&jobs, &path_fingerprints(&paths)).expect("duplicate");
+        assert!(same.identical);
+        assert_eq!(same.job_id, job.id);
+
+        let overlap = vec!["c:/BATCH/b.mp4".to_string(), "C:\\batch\\c.mp4".to_string()];
+        let conflict = active_path_conflict(&jobs, &path_fingerprints(&overlap)).expect("overlap");
+        assert!(!conflict.identical);
+
+        job.finished.store(true, Ordering::SeqCst);
+        assert!(active_path_conflict(&jobs, &path_fingerprints(&paths)).is_none());
+    }
+
+    #[test]
+    fn huge_manifests_checkpoint_by_count_or_time() {
+        assert!(manifest_checkpoint_due(100, 1, 0));
+        assert!(!manifest_checkpoint_due(199_533, 255, 29_999));
+        assert!(manifest_checkpoint_due(199_533, 256, 0));
+        assert!(manifest_checkpoint_due(199_533, 1, 30_000));
     }
 }
 
@@ -5049,5 +6863,200 @@ mod manifest_tests {
         assert!(ev.contains("\"verifyFailed\":1"));
         assert!(ev.contains("\"total\":6"));
     }
-}
 
+    #[test]
+    fn pause_resume_concurrency_and_pending_skip_preserve_sources() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+        let dir = std::env::temp_dir().join(format!("ft-controls-{}", new_job_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small.bin");
+        let large = dir.join("large.bin");
+        std::fs::write(&small, b"source-bytes").unwrap();
+        std::fs::write(&large, vec![7u8; 4096]).unwrap();
+        let job = create_job(
+            &[small.to_string_lossy().into_owned(), large.to_string_lossy().into_owned()],
+            "balanced",
+            &CompressOptions::default(),
+        );
+
+        assert_eq!(pause_job(&job).unwrap(), "paused");
+        assert_eq!(job.active_started_at.load(Ordering::Relaxed), 0);
+        assert!(resume_job(&job).unwrap(), "a never-started paused job needs a runner");
+        assert_eq!(job.status.lock_recover().as_str(), "running");
+        assert_eq!(set_job_concurrency(&job, 99), 16);
+        assert_eq!(set_job_concurrency(&job, 0), 1);
+
+        // Largest-first is the default; prioritizing index 0 moves the small file
+        // to the front without touching either source.
+        assert_eq!(job.queue.lock_recover().pending.front().copied(), Some(1));
+        assert_eq!(prioritize_pending(&job, &[0]), 1);
+        assert_eq!(job.queue.lock_recover().pending.front().copied(), Some(0));
+        let before = std::fs::read(&small).unwrap();
+        assert_eq!(skip_pending(&job, &[0]), 1);
+        assert_eq!(job.files[0].status.lock_recover().as_str(), "skipped");
+        assert_eq!(job.files[0].reason.lock_recover().as_str(), "skipped_user");
+        assert_eq!(std::fs::read(&small).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn graceful_pause_waits_for_active_claims() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+        let job = create_job(&["a.bin".to_string()], "balanced", &CompressOptions::default());
+        job.queue.lock_recover().active = 1;
+        assert_eq!(pause_job(&job).unwrap(), "pausing");
+        assert_eq!(job.status.lock_recover().as_str(), "pausing");
+        release_file_claim(&job);
+        assert_eq!(job.status.lock_recover().as_str(), "paused");
+        assert_eq!(job.active_started_at.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn selective_retry_keeps_original_settings_and_only_selected_files() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+        let opts = CompressOptions {
+            original_action: OriginalAction::Keep,
+            concurrency: 7,
+            encoder: "nvenc".to_string(),
+            codec: "h265".to_string(),
+            ..CompressOptions::default()
+        };
+        let job = create_job(&["failed.mp4".to_string(), "skipped.jpg".to_string()], "high", &opts);
+        *job.files[0].status.lock_recover() = "error".to_string();
+        *job.files[0].reason.lock_recover() = Reason::ErrorEncoder.as_str().to_string();
+        *job.files[1].status.lock_recover() = "skipped".to_string();
+        *job.files[1].reason.lock_recover() = Reason::SkippedNoGain.as_str().to_string();
+        write_manifest(&job);
+
+        let retry = selective_retry_from_manifest(&job.id, &[1]).expect("selective retry");
+        assert_eq!(retry.total, 1);
+        assert_eq!(retry.files[0].path, "skipped.jpg");
+        assert_eq!(retry.preset, "high");
+        assert_eq!(retry.encoder, "nvenc");
+        assert_eq!(retry.codec, "h265");
+        assert_eq!(retry.original_action, OriginalAction::Keep);
+        assert_eq!(retry.desired_concurrency.load(Ordering::Relaxed), 7);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn paged_files_pin_active_then_recently_finished() {
+        let job = create_job(
+            &["queued.bin".to_string(), "active.bin".to_string(), "recent.bin".to_string()],
+            "balanced",
+            &CompressOptions::default(),
+        );
+        let now = crate::io::now_ms();
+        *job.files[1].status.lock_recover() = "running".to_string();
+        *job.files[1].stage.lock_recover() = "encoding".to_string();
+        job.files[1].started_at.store(now - 5_000, Ordering::Relaxed);
+        *job.files[2].status.lock_recover() = "done".to_string();
+        *job.files[2].stage.lock_recover() = "terminal".to_string();
+        job.files[2].finished_at.store(now - 1_000, Ordering::Relaxed);
+        let json = job_files_page_json(
+            Some(&job),
+            &job.id,
+            &JobFilesQuery { limit: 250, sort: "name".to_string(), ..JobFilesQuery::default() },
+        )
+        .unwrap();
+        let active = json.find("active.bin").unwrap();
+        let recent = json.find("recent.bin").unwrap();
+        let queued = json.find("queued.bin").unwrap();
+        assert!(active < recent && recent < queued);
+    }
+
+    #[test]
+    fn persisted_summary_sidecar_invalidates_when_manifest_changes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let (home, _restore) = redirect_home();
+        let id = new_job_id();
+        let manifest_path = jobs_dir().join(format!("{id}.json"));
+        std::fs::create_dir_all(jobs_dir()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "{{\"id\":\"{id}\",\"status\":\"running\",\"preset\":\"balanced\",\"total\":1,\"files\":[{{\"path\":\"a.mp4\",\"kind\":\"video\",\"status\":\"pending\",\"origBytes\":100}}]}}"
+            ),
+        )
+        .unwrap();
+
+        let first = summary_from_manifest(&id, &manifest_path).expect("first summary");
+        assert_eq!(first.status, "paused", "orphaned running jobs are resumable, not live");
+        assert!(summary_sidecar_path(&manifest_path).exists());
+
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "{{\"id\":\"{id}\",\"status\":\"cancelled\",\"preset\":\"balanced\",\"total\":2,\"files\":[{{\"path\":\"a.mp4\",\"kind\":\"video\",\"status\":\"done\",\"origBytes\":100}},{{\"path\":\"b.mp4\",\"kind\":\"video\",\"status\":\"pending\",\"origBytes\":200}}]}}"
+            ),
+        )
+        .unwrap();
+        let changed = summary_from_manifest(&id, &manifest_path).expect("changed summary");
+        assert_eq!(changed.status, "cancelled");
+        assert_eq!(changed.total, 2);
+        assert_eq!(changed.done, 1);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn synthetic_200k_file_page_keeps_active_rows_pinned() {
+        let now = crate::io::now_ms();
+        let started = std::time::Instant::now();
+        let mut files = (0..200_000usize)
+            .map(|index| {
+                let active = index % 40_000 == 0;
+                let recent = index % 40_000 == 1;
+                FilePageItem {
+                    index,
+                    path: format!("D:\\synthetic\\video-{index:06}.mp4"),
+                    kind: "video".to_string(),
+                    status: if active { "running" } else if recent { "done" } else { "pending" }.to_string(),
+                    stage: if active { "encoding" } else if recent { "terminal" } else { "queued" }.to_string(),
+                    pct: if active { 45 } else if recent { 100 } else { 0 },
+                    orig_bytes: 64 * 1024 * 1024,
+                    new_bytes: if recent { 40 * 1024 * 1024 } else { 0 },
+                    reason: if recent { "success" } else { "" }.to_string(),
+                    encoder: "nvenc_h265".to_string(),
+                    disposition: if recent { "kept" } else { "pending" }.to_string(),
+                    out_path: String::new(),
+                    error: None,
+                    duration_ms: 0,
+                    fps: active.then_some(180.0),
+                    started_at: if active { now.saturating_sub(5_000 + index as u64) } else { 0 },
+                    updated_at: if active { now } else { 0 },
+                    finished_at: if recent { now.saturating_sub(1_000 + index as u64 / 40_000) } else { 0 },
+                    attempt: 1,
+                    tool: "HandBrakeCLI".to_string(),
+                    tool_version: "synthetic".to_string(),
+                    command: String::new(),
+                    stderr: String::new(),
+                    queue_position: (!active && !recent).then_some(index),
+                }
+            })
+            .collect::<Vec<_>>();
+        let query = JobFilesQuery {
+            limit: 250,
+            sort: "name".to_string(),
+            ..JobFilesQuery::default()
+        };
+        files.retain(|file| page_item_matches(file, &query, now));
+        files.sort_by(|a, b| compare_page_items(a, b, &query, now));
+
+        assert_eq!(files.len(), 200_000);
+        assert!(files[..5].iter().all(|file| file.status == "running"));
+        assert!(files[5..10].iter().all(|file| file.status == "done"));
+        let mut first_page = String::new();
+        for file in files.iter().take(query.limit) {
+            push_page_item_json(&mut first_page, file, now);
+        }
+        assert!(first_page.contains("video-000000.mp4"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "200k-file ordering took {:?}", started.elapsed());
+    }
+}

@@ -114,6 +114,9 @@ catch (e) {
 }
 let serverProcess = null;
 let mainWindow = null;
+let compressionPowerBlocker = null;
+let compressionKeepAwakeEnabled = true;
+let compressionWatchTimer = null;
 // Port the Rust server is listening on (127.0.0.1). Set once at startup and
 // used by the `mutate` IPC proxy so the renderer never needs to know it to
 // reach the local API.
@@ -644,6 +647,78 @@ if ($action) { [Console]::Out.WriteLine("FILETREE_ACTION:" + $action) }
 electron_1.ipcMain.on("diag", (_event, message) => {
     console.log("[renderer]", message);
 });
+electron_1.ipcMain.on("compression-state", (event, state) => {
+    compressionKeepAwakeEnabled = state?.enabled !== false;
+    const active = compressionKeepAwakeEnabled && state?.active === true;
+    const status = typeof state?.status === "string" ? state.status : "idle";
+    const progress = Math.max(0, Math.min(1, Number(state?.progress) || 0));
+    if (active) {
+        if (compressionPowerBlocker == null || !electron_1.powerSaveBlocker.isStarted(compressionPowerBlocker)) {
+            compressionPowerBlocker = electron_1.powerSaveBlocker.start("prevent-display-sleep");
+        }
+    }
+    else if (compressionPowerBlocker != null) {
+        if (electron_1.powerSaveBlocker.isStarted(compressionPowerBlocker))
+            electron_1.powerSaveBlocker.stop(compressionPowerBlocker);
+        compressionPowerBlocker = null;
+    }
+    const win = electron_1.BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+    if (!win || win.isDestroyed())
+        return;
+    if (status === "paused")
+        win.setProgressBar(progress, { mode: "paused" });
+    else if (status === "error" || status === "cancelled")
+        win.setProgressBar(progress, { mode: "error" });
+    else if (status === "running" || status === "pausing")
+        win.setProgressBar(Math.max(0.001, progress), { mode: "normal" });
+    else
+        win.setProgressBar(-1, { mode: "none" });
+});
+function startCompressionDesktopWatch() {
+    if (compressionWatchTimer)
+        return;
+    compressionWatchTimer = setInterval(async () => {
+        if (!serverPort)
+            return;
+        try {
+            const response = await fetch(`http://127.0.0.1:${serverPort}/api/compress-jobs`);
+            if (!response.ok)
+                return;
+            const jobs = (await response.json()).jobs ?? [];
+            const running = jobs.filter((job) => job.status === "running" || job.status === "pausing");
+            const paused = jobs.find((job) => job.status === "paused");
+            const failed = jobs.find((job) => job.status === "error");
+            const totalBytes = running.reduce((sum, job) => sum + (Number(job.totalBytes) || 0), 0);
+            const completedBytes = running.reduce((sum, job) => sum + (Number(job.workCompletedBytes) || 0), 0);
+            const progress = totalBytes > 0 ? Math.max(0, Math.min(1, completedBytes / totalBytes)) : 0;
+            if (compressionKeepAwakeEnabled && running.length > 0) {
+                if (compressionPowerBlocker == null || !electron_1.powerSaveBlocker.isStarted(compressionPowerBlocker)) {
+                    compressionPowerBlocker = electron_1.powerSaveBlocker.start("prevent-display-sleep");
+                }
+            }
+            else if (compressionPowerBlocker != null) {
+                if (electron_1.powerSaveBlocker.isStarted(compressionPowerBlocker))
+                    electron_1.powerSaveBlocker.stop(compressionPowerBlocker);
+                compressionPowerBlocker = null;
+            }
+            if (!mainWindow || mainWindow.isDestroyed())
+                return;
+            if (running.length > 0)
+                mainWindow.setProgressBar(Math.max(0.001, progress), { mode: "normal" });
+            else if (paused) {
+                const value = Number(paused.totalBytes) > 0 ? Number(paused.workCompletedBytes) / Number(paused.totalBytes) : 0;
+                mainWindow.setProgressBar(Math.max(0, Math.min(1, value)), { mode: "paused" });
+            }
+            else if (failed)
+                mainWindow.setProgressBar(1, { mode: "error" });
+            else
+                mainWindow.setProgressBar(-1, { mode: "none" });
+        }
+        catch {
+            // The server may be shutting down; cleanup in before-quit remains authoritative.
+        }
+    }, 2000);
+}
 // ── Native desktop notifications (F9 low-space alerts) ────────────────────────
 // The renderer asks MAIN to raise a real OS notification (Windows Action Center
 // toast) so a low-space warning is seen even when the window is unfocused. The
@@ -1847,6 +1922,7 @@ electron_1.app.whenReady().then(async () => {
         serverPort = port;
         await startRustServer(port);
         createWindow(port);
+        startCompressionDesktopWatch();
     }
     catch (err) {
         console.error("[electron] Fatal startup error:", err);
@@ -1858,6 +1934,15 @@ electron_1.app.on("window-all-closed", () => {
 });
 electron_1.app.on("before-quit", () => {
     killAllPtys();
+    if (compressionWatchTimer) {
+        clearInterval(compressionWatchTimer);
+        compressionWatchTimer = null;
+    }
+    if (compressionPowerBlocker != null) {
+        if (electron_1.powerSaveBlocker.isStarted(compressionPowerBlocker))
+            electron_1.powerSaveBlocker.stop(compressionPowerBlocker);
+        compressionPowerBlocker = null;
+    }
     if (serverProcess) {
         serverProcess.kill();
         serverProcess = null;

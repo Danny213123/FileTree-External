@@ -2,7 +2,7 @@
 
 A standalone Windows disk-usage explorer: point at a folder, see what's taking space, and clean it up. Single `.exe`, no installer.
 
-**Current version:** `1.9.0`
+**Current version:** `1.14.0`
 
 ## Features
 
@@ -62,6 +62,18 @@ A standalone Windows disk-usage explorer: point at a folder, see what's taking s
 - Integrated Windows terminal opened at the selected folder or scan root.
 - Copy and paste support with Ctrl+C/Ctrl+Shift+C/Ctrl+V/Ctrl+Shift+V behavior that matches terminal expectations.
 - Right-click terminal context menu with Copy and Paste.
+
+### Compression Workspace
+
+- Compact Setup, Monitor, and History workspaces for mixed video, image, and archive batches.
+- HandBrake video encoding with automatic NVENC, Quick Sync, or AMD selection, safe CPU fallback, codec/quality presets, and live 1-16 worker control.
+- Size-weighted overall progress plus per-file stages, progress, elapsed time, ETA, speed, encoder, sizes, savings, disposition, and result.
+- Master-detail monitoring with a run rail, cached hardware/process telemetry, virtualized 200,000-file-scale tables, active/recent pinning, search, filters, sorting, persisted columns, and a diagnostics inspector.
+- Graceful pause/resume, immediate resumable stop, pending-file prioritize/skip, selective retry, and persisted queued batches that survive restarts.
+- Deep output verification before any original is recycled or deleted, partial-output cleanup on stop, low-space/stall warnings, and source-preserving failure behavior.
+- In-place or separate-folder output, recoverable Recycle Bin handling by default, optional permanent delete or keep-original modes, and `[COMPRESSED]` tagging.
+- Searchable/filterable compression history with CSV export, detailed command/stderr diagnostics, and per-file compress-again controls.
+- Windows keep-awake and taskbar progress integration while compression is active, with automatic release while paused or idle.
 
 ### Export, CLI, And Packaging
 

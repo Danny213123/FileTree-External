@@ -573,13 +573,17 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     }
     // Phase 0: re-arm the very-large-scan banner for each freshly-arrived result.
     if (data) setLargeScanDismissed(false);
-    // LAZY: the streamed result holds only the root (children empty). The root is
-    // auto-expanded, so eagerly pull its children once so the first level renders
-    // without requiring a manual collapse/expand of the root.
-    if (data?.lazy) tree.ensureChildren(0);
     onStateChange();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
+
+  // LAZY: wait until setNodes has actually committed the streamed root before
+  // requesting its children. Calling ensureChildren in the data effect above
+  // could race React's state commit and leave an expanded but empty root.
+  useEffect(() => {
+    if (!data?.lazy || !tree.nodeById.has(0)) return;
+    tree.ensureChildren(0);
+  }, [data?.lazy, data?.rootPath, data?.scannedAt, tree.nodeById, tree.ensureChildren]);
 
   // Status transitions (idle→scanning→done/…) are rare and meaningful, so they
   // notify App. Progress ticks deliberately do NOT live here anymore: they flow

@@ -151,7 +151,7 @@ Copy-Item -LiteralPath $serverExe -Destination $packagedServerExe -Force
 Copy-Item -LiteralPath $serverExe -Destination $legacyServerExe -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "assets") -Destination $resourcesDir -Recurse -Force
 
-foreach ($fileName in @("README.md", "NOTICE", "VERSION")) {
+foreach ($fileName in @("README.md", "LICENSE", "NOTICE", "VERSION")) {
   $source = Join-Path $repoRoot $fileName
   if (Test-Path $source) {
     Copy-Item -LiteralPath $source -Destination $portableDir -Force

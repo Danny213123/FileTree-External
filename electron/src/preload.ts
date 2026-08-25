@@ -9,6 +9,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
   mutate: (route: string, body?: unknown): Promise<{ ok: boolean; status: number; data: any }> =>
     ipcRenderer.invoke("mutate", route, body),
 
+  setCompressionState: (state: { active: boolean; enabled: boolean; status: string; progress: number }): void =>
+    ipcRenderer.send("compression-state", state),
+
   // Encrypted secret storage (AI API keys) backed by the OS keystore via
   // Electron safeStorage in MAIN. Values never touch localStorage.
   secrets: {

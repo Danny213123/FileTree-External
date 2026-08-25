@@ -398,6 +398,8 @@ function collectVisibleRows(
 
 export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
   const [nodes, setNodesState] = useState<NodeRecord[]>([]);
+  const nodesRef = useRef<NodeRecord[]>(nodes);
+  nodesRef.current = nodes;
   // ── Lazy-load bookkeeping ──────────────────────────────────────────────────
   // `loadedDirs` (state) drives UI; `loadedDirsRef`/`loadingDirsRef` are the
   // synchronous guards so concurrent expand bursts don't double-fetch a dir.
@@ -515,10 +517,20 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
   const ensureChildren = useCallback((dirId: number) => {
     const lz = lazyRef.current;
     if (!lz?.enabled || dirId < 0) return;
+    // The scan-result effect sets the root and requests its children in separate
+    // renders. Do not start a request until the target directory is committed;
+    // the root preload effect will retry as soon as it appears.
+    if (!nodesRef.current.some((node) => node.id === dirId && node.dir)) return;
     if (loadedDirsRef.current.has(dirId) || loadingDirsRef.current.has(dirId)) return;
     loadingDirsRef.current.add(dirId);
+    const requestRoot = lz.rootPath;
+    const requestScannedAt = lz.scannedAt;
     void fetchChildren({ rootPath: lz.rootPath, dirId, scannedAt: lz.scannedAt })
       .then((fetched) => {
+        const current = lazyRef.current;
+        if (!current?.enabled
+          || current.rootPath !== requestRoot
+          || current.scannedAt !== requestScannedAt) return;
         setNodesState((prev) => {
           const byId = new Map<number, NodeRecord>();
           for (const n of prev) byId.set(n.id, n);
@@ -537,6 +549,12 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
           next.push(...added);
           return next;
         });
+        setLoadedDirs((prev) => {
+          if (prev.has(dirId)) return prev;
+          const next = new Set(prev);
+          next.add(dirId);
+          return next;
+        });
       })
       .catch((err: unknown) => {
         if (err instanceof ScanStaleError) {
@@ -547,12 +565,6 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       })
       .finally(() => {
         loadingDirsRef.current.delete(dirId);
-        setLoadedDirs((prev) => {
-          if (prev.has(dirId)) return prev;
-          const next = new Set(prev);
-          next.add(dirId);
-          return next;
-        });
       });
   }, []);
 

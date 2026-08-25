@@ -85,6 +85,49 @@ pub(crate) fn node_abs_path(nodes: &[NodeRecord], id: usize) -> String {
     }
 }
 
+/// Return one directory's direct child ids after scan finalization has released
+/// the per-directory `children` allocations. A directory's entries receive one
+/// contiguous id block when that directory is scanned, so the first mismatch
+/// after a match ends the lookup without walking the rest of a large tree.
+pub(crate) fn node_child_ids(nodes: &[NodeRecord], parent_id: usize) -> Vec<usize> {
+    let Some(parent) = nodes.get(parent_id) else {
+        return Vec::new();
+    };
+    if !parent.children.is_empty() {
+        return parent.children.clone();
+    }
+
+    let mut children = Vec::new();
+    let mut found_block = false;
+    for (id, node) in nodes.iter().enumerate() {
+        if node.parent == Some(parent_id) {
+            found_block = true;
+            children.push(id);
+        } else if found_block {
+            break;
+        }
+    }
+    children
+}
+
+/// Whether `node_id` is below `ancestor_id`, using parent pointers only. This
+/// remains valid after the memory-saving finalization step clears child lists.
+pub(crate) fn node_is_descendant(
+    nodes: &[NodeRecord],
+    node_id: usize,
+    ancestor_id: usize,
+) -> bool {
+    let mut current = Some(node_id);
+    for _ in 0..=nodes.len() {
+        let Some(id) = current else { return false };
+        if id == ancestor_id {
+            return true;
+        }
+        current = nodes.get(id).and_then(|node| node.parent);
+    }
+    false
+}
+
 /// Join a parent directory path and a child name. Mirrors `scan::join_path`'s
 /// separator handling so a reconstructed path is byte-identical to what the scan
 /// originally stored.
@@ -241,6 +284,14 @@ impl ScanCache {
         }
     }
 
+    #[cfg(test)]
+    fn with_cap(cap_bytes: usize) -> Self {
+        Self {
+            cap_bytes,
+            ..Self::new()
+        }
+    }
+
     fn bump(&self) -> u64 {
         self.tick.fetch_add(1, AtomicOrdering::Relaxed).wrapping_add(1)
     }
@@ -267,7 +318,8 @@ impl ScanCache {
 
     /// Insert (or replace) `key`, then evict least-recently-used roots until the
     /// running byte total fits under the cap. The just-inserted entry is never
-    /// the eviction victim.
+    /// the eviction victim. A single oversized lazy tree may remain above the
+    /// cap alongside the newest normal entry so its children stay pageable.
     pub(crate) fn insert(&mut self, key: String, result: Arc<ScanResult>) {
         let bytes = estimate_scan_bytes(&result);
         let tick = self.bump();
@@ -284,15 +336,27 @@ impl ScanCache {
                 bytes,
             },
         );
-        self.evict_to_cap(&key);
+        self.evict_to_cap(&key, bytes);
     }
 
-    fn evict_to_cap(&mut self, keep: &str) {
+    fn evict_to_cap(&mut self, keep: &str, incoming_bytes: usize) {
         while self.total_bytes > self.cap_bytes && self.entries.len() > 1 {
             let victim = self
                 .entries
                 .iter()
-                .filter(|(k, _)| k.as_str() != keep)
+                .filter(|(k, e)| {
+                    if k.as_str() == keep {
+                        return false;
+                    }
+                    // A scan larger than the nominal cache cap is the one that
+                    // needs server-side lazy paging. When a normal small scan
+                    // finishes in another tab, keep the oversized tree and evict
+                    // older small entries instead. The incoming small result is
+                    // also retained (it is the current last_scan Arc anyway).
+                    // A newly-arriving oversized scan may evict the previous one,
+                    // preventing multiple giant trees from accumulating.
+                    !(incoming_bytes <= self.cap_bytes && e.bytes > self.cap_bytes)
+                })
                 .min_by_key(|(_, e)| e.last_used.load(AtomicOrdering::Relaxed))
                 .map(|(k, _)| k.clone());
             let Some(victim) = victim else { break };
@@ -436,4 +500,149 @@ pub(crate) struct DuplicateCandidate {
     pub(crate) size: u64,
     pub(crate) waste: u64,
     pub(crate) ids: Vec<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan_with_payload(root: &str, payload_bytes: usize) -> Arc<ScanResult> {
+        Arc::new(ScanResult {
+            root_path: root.to_string(),
+            scanned_at_ms: 1,
+            elapsed_ms: 0,
+            thread_count: 1,
+            nodes: vec![NodeRecord {
+                id: 0,
+                parent: None,
+                name: "x".repeat(payload_bytes),
+                path: root.to_string(),
+                is_dir: true,
+                is_link: false,
+                hidden: false,
+                readonly: false,
+                size: 0,
+                allocated: 0,
+                files: 0,
+                folders: 0,
+                modified_ms: 0,
+                created_ms: 0,
+                accessed_ms: 0,
+                depth: 0,
+                errors: 0,
+                children: Vec::new(),
+                extension: String::new(),
+                owner: String::new(),
+                attributes: 0,
+            }],
+            errors: Vec::new(),
+            summary: ScanSummary::default(),
+        })
+    }
+
+    #[test]
+    fn normal_scan_does_not_evict_oversized_lazy_tree() {
+        let mut cache = ScanCache::with_cap(1024);
+
+        cache.insert("large".to_string(), scan_with_payload("large", 2048));
+        cache.insert("small".to_string(), scan_with_payload("small", 16));
+
+        assert!(cache.get_any("large").is_some());
+        assert!(cache.get_any("small").is_some());
+    }
+
+    #[test]
+    fn newer_oversized_tree_replaces_previous_oversized_tree() {
+        let mut cache = ScanCache::with_cap(1024);
+
+        cache.insert("large-old".to_string(), scan_with_payload("large-old", 2048));
+        cache.insert("small".to_string(), scan_with_payload("small", 16));
+        cache.insert("large-new".to_string(), scan_with_payload("large-new", 2048));
+
+        assert!(cache.get_any("large-new").is_some());
+        assert!(cache.get_any("large-old").is_none());
+        assert!(cache.get_any("small").is_none());
+    }
+
+    #[test]
+    fn child_ids_are_recovered_from_contiguous_parent_block() {
+        let mut result = Arc::unwrap_or_clone(scan_with_payload("root", 0));
+        result.nodes.extend([
+            NodeRecord {
+                id: 1,
+                parent: Some(0),
+                name: "first".to_string(),
+                path: "root\\first".to_string(),
+                is_dir: true,
+                is_link: false,
+                hidden: false,
+                readonly: false,
+                size: 0,
+                allocated: 0,
+                files: 1,
+                folders: 0,
+                modified_ms: 0,
+                created_ms: 0,
+                accessed_ms: 0,
+                depth: 1,
+                errors: 0,
+                children: Vec::new(),
+                extension: String::new(),
+                owner: String::new(),
+                attributes: 0,
+            },
+            NodeRecord {
+                id: 2,
+                parent: Some(0),
+                name: "second".to_string(),
+                path: "root\\second".to_string(),
+                is_dir: true,
+                is_link: false,
+                hidden: false,
+                readonly: false,
+                size: 0,
+                allocated: 0,
+                files: 0,
+                folders: 0,
+                modified_ms: 0,
+                created_ms: 0,
+                accessed_ms: 0,
+                depth: 1,
+                errors: 0,
+                children: Vec::new(),
+                extension: String::new(),
+                owner: String::new(),
+                attributes: 0,
+            },
+            NodeRecord {
+                id: 3,
+                parent: Some(1),
+                name: "leaf.bin".to_string(),
+                path: String::new(),
+                is_dir: false,
+                is_link: false,
+                hidden: false,
+                readonly: false,
+                size: 1,
+                allocated: 1,
+                files: 1,
+                folders: 0,
+                modified_ms: 0,
+                created_ms: 0,
+                accessed_ms: 0,
+                depth: 2,
+                errors: 0,
+                children: Vec::new(),
+                extension: "bin".to_string(),
+                owner: String::new(),
+                attributes: 0,
+            },
+        ]);
+
+        assert_eq!(node_child_ids(&result.nodes, 0), vec![1, 2]);
+        assert_eq!(node_child_ids(&result.nodes, 1), vec![3]);
+        assert!(node_is_descendant(&result.nodes, 3, 0));
+        assert!(node_is_descendant(&result.nodes, 3, 1));
+        assert!(!node_is_descendant(&result.nodes, 2, 1));
+    }
 }

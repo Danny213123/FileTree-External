@@ -24,8 +24,11 @@ use crate::export::{
     scan_progress_ndjson_line, scan_result_to_html, scan_result_to_xlsx, special_folders_json,
     write_scan_result_csv, write_scan_result_json, write_scan_result_ndjson, write_scan_result_xml,
 };
-use crate::io::{default_thread_count, open_path, parse_bool, reveal_path, split_patterns};
-use crate::model::{node_abs_path, AppState, DupesProgress, HttpRequest, ScanOptions};
+use crate::io::{default_thread_count, open_path, parse_bool, reveal_path, split_patterns, LockRecover};
+use crate::model::{
+    node_abs_path, node_child_ids, node_is_descendant, AppState, DupesProgress, HttpRequest,
+    ScanOptions,
+};
 use crate::scan::{scan_path, scan_path_with_progress};
 
 /// The built renderer (`frontend/dist`) is compiled into the binary so the
@@ -204,6 +207,7 @@ pub(crate) fn run_server(initial_path: PathBuf, port: u16) -> sio::Result<()> {
     // Seed the allowed-read roots with the launch directory so previews of files
     // under it work before the first explicit scan; scans add more roots.
     register_scan_root(&state, &state.initial_path);
+    crate::compress_job::start_queue_scheduler(Arc::clone(&state));
 
     println!("{} is running at http://127.0.0.1:{port}", APP_NAME);
     println!("Press Ctrl+C to stop.");
@@ -623,6 +627,29 @@ fn compress_preflight_json(paths: &[String]) -> String {
     }
     s.push_str("]}");
     s
+}
+
+fn respond_compress_job_conflict(
+    stream: &mut TcpStream,
+    conflict: &crate::compress_job::ActivePathConflict,
+) -> sio::Result<()> {
+    let mut body = String::new();
+    if conflict.identical {
+        body.push_str("{\"jobId\":");
+        push_json_string(&mut body, &conflict.job_id);
+        body.push_str(",\"reused\":true}");
+        respond_json(stream, 200, "OK", &body)
+    } else {
+        body.push_str("{\"error\":");
+        push_json_string(
+            &mut body,
+            "One or more selected files are already being compressed by another active job.",
+        );
+        body.push_str(",\"existingJobId\":");
+        push_json_string(&mut body, &conflict.job_id);
+        body.push('}');
+        respond_json(stream, 409, "Conflict", &body)
+    }
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
@@ -1652,6 +1679,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
         // because its GET sibling must stay readable for the job list.)
         "/api/compress-jobs/cancel",
         "/api/compress-jobs/retry",
+        "/api/compress-jobs/pause",
+        "/api/compress-jobs/resume",
+        "/api/compress-jobs/concurrency",
+        "/api/compress-jobs/prioritize",
+        "/api/compress-jobs/skip",
+        "/api/compress-jobs/retry-files",
+        "/api/compress-jobs/queue-reorder",
+        "/api/compress-jobs/queue-remove",
         "/api/compress-tools/install",
         "/api/compress-tools/test-gpu",
         "/api/compress-tools/autotune",
@@ -3306,9 +3341,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 }
             }
             let dir_id = query.get("id").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
-            let Some(dir) = result.nodes.get(dir_id) else {
+            if result.nodes.get(dir_id).is_none() {
                 return respond_json(&mut stream, 404, "Not Found", "{\"error\":\"Unknown node id\"}");
-            };
+            }
             let sort_key = query.get("sort").map(String::as_str).unwrap_or("size");
             let sort_dir = match query.get("dir").map(String::as_str) {
                 Some("asc") => 1,
@@ -3321,8 +3356,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     _ => -1,
                 },
             };
-            // Sort a copy of the child id list (the cached scan is shared+immutable).
-            let mut child_ids: Vec<usize> = dir.children.clone();
+            // Finalization clears per-directory child Vecs to keep multi-million
+            // node scans within memory limits. Recover this directory's one
+            // contiguous id block from parent pointers for lazy paging.
+            let mut child_ids = node_child_ids(&result.nodes, dir_id);
             child_ids.sort_by(|&a, &b| {
                 match (result.nodes.get(a), result.nodes.get(b)) {
                     (Some(na), Some(nb)) => compare_child_nodes(na, nb, sort_key, sort_dir),
@@ -3402,28 +3439,25 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             buf.extend_from_slice(b"{\"paths\":[");
             let mut emitted = 0usize;
             let mut truncated = false;
-            let mut bfs: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-            bfs.push_back(dir_id);
-            'walk: while let Some(cur) = bfs.pop_front() {
-                let Some(node) = result.nodes.get(cur) else { continue };
-                if node.is_dir {
-                    for &c in &node.children {
-                        bfs.push_back(c);
-                    }
-                } else if cur != dir_id {
-                    if emitted >= cap {
-                        truncated = true;
-                        break 'walk;
-                    }
-                    if emitted > 0 {
-                        buf.push(b',');
-                    }
-                    crate::export::push_json_string_vec(&mut buf, &node_abs_path(&result.nodes, cur));
-                    emitted += 1;
-                    if buf.len() >= 32 * 1024 {
-                        cw.write_all(&buf)?;
-                        buf.clear();
-                    }
+            for (cur, node) in result.nodes.iter().enumerate() {
+                if node.is_dir
+                    || cur == dir_id
+                    || (dir_id != 0 && !node_is_descendant(&result.nodes, cur, dir_id))
+                {
+                    continue;
+                }
+                if emitted >= cap {
+                    truncated = true;
+                    break;
+                }
+                if emitted > 0 {
+                    buf.push(b',');
+                }
+                crate::export::push_json_string_vec(&mut buf, &node_abs_path(&result.nodes, cur));
+                emitted += 1;
+                if buf.len() >= 32 * 1024 {
+                    cw.write_all(&buf)?;
+                    buf.clear();
                 }
             }
             write!(buf, "],\"truncated\":{},\"count\":{emitted}}}", if truncated { "true" } else { "false" })?;
@@ -3943,6 +3977,11 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     .and_then(|v| v.get("useGpu"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
+                let queued = root
+                    .as_ref()
+                    .and_then(|v| v.get("queued"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let codec = extract_json_str(&body_str, "codec").unwrap_or_else(|| "h264".to_string());
                 let zip_level = root
                     .as_ref()
@@ -3980,6 +4019,18 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     .unwrap_or(0);
                 if paths.is_empty() {
                     return respond_text(&mut stream, 400, "Bad request", "Missing paths");
+                }
+                let requested_fingerprints = crate::compress_job::path_fingerprints(&paths);
+                {
+                    let jobs = state
+                        .compress_jobs
+                        .lock()
+                        .expect("compress_jobs lock");
+                    if let Some(conflict) =
+                        crate::compress_job::active_path_conflict(&jobs, &requested_fingerprints)
+                    {
+                        return respond_compress_job_conflict(&mut stream, &conflict);
+                    }
                 }
                 // Re-register the scan root the renderer says these files came
                 // from into the COMPRESS allowlist. `register_compress_root`
@@ -4084,16 +4135,35 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     custom_quality,
                     output_dir,
                 };
-                let job = crate::compress_job::create_job(&paths, &preset, &opts);
+                let job = if queued {
+                    crate::compress_job::create_queued_job(&paths, &preset, &opts)
+                } else {
+                    crate::compress_job::create_job(&paths, &preset, &opts)
+                };
                 let id = job.id.clone();
-                state
-                    .compress_jobs
-                    .lock()
-                    .expect("compress_jobs lock")
-                    .insert(id.clone(), Arc::clone(&job));
-                crate::compress_job::spawn_job(Arc::clone(&state), job);
+                {
+                    // Double-check while holding the insertion lock. Two create
+                    // requests can pass the optimistic check above together;
+                    // only one is allowed to publish a job for these paths.
+                    let mut jobs = state
+                        .compress_jobs
+                        .lock()
+                        .expect("compress_jobs lock");
+                    if let Some(conflict) =
+                        crate::compress_job::active_path_conflict(&jobs, &requested_fingerprints)
+                    {
+                        drop(jobs);
+                        return respond_compress_job_conflict(&mut stream, &conflict);
+                    }
+                    jobs.insert(id.clone(), Arc::clone(&job));
+                }
+                if !queued {
+                    crate::compress_job::spawn_job(Arc::clone(&state), job);
+                }
                 let mut body = String::from("{\"jobId\":");
                 push_json_string(&mut body, &id);
+                body.push_str(",\"status\":");
+                push_json_string(&mut body, if queued { "queued" } else { "running" });
                 body.push('}');
                 respond_json(&mut stream, 200, "OK", &body)
             } else {
@@ -4163,8 +4233,139 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                     let _ = child.kill();
                 }
                 job.events_cv.notify_all();
+                job.queue_cv.notify_all();
             }
             respond_json(&mut stream, 200, "OK", "{\"ok\":true}")
+        }
+        "/api/compress-jobs/pause" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let id = extract_json_str(&body_str, "id").unwrap_or_default();
+            let job = state.compress_jobs.lock_recover().get(&id).map(Arc::clone);
+            match job.and_then(|job| crate::compress_job::pause_job(&job).ok()) {
+                Some(status) => respond_json(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &format!("{{\"ok\":true,\"status\":\"{status}\"}}"),
+                ),
+                None => respond_json(&mut stream, 409, "Conflict", "{\"error\":\"Job cannot be paused\"}"),
+            }
+        }
+        "/api/compress-jobs/resume" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let id = extract_json_str(&body_str, "id").unwrap_or_default();
+            let live = state.compress_jobs.lock_recover().get(&id).map(Arc::clone);
+            if let Some(job) = live {
+                match crate::compress_job::resume_job(&job) {
+                    Ok(start_runner) => {
+                        if start_runner {
+                            crate::compress_job::spawn_job(Arc::clone(&state), job);
+                        }
+                        respond_json(&mut stream, 200, "OK", "{\"ok\":true,\"status\":\"running\"}")
+                    }
+                    Err(error) => {
+                        let mut body = String::from("{\"error\":");
+                        push_json_string(&mut body, &error);
+                        body.push('}');
+                        respond_json(&mut stream, 409, "Conflict", &body)
+                    }
+                }
+            } else if let Some(job) = crate::compress_job::job_from_manifest(&id) {
+                if let Some(error) = crate::compress_job::revalidate_job_tools(&job) {
+                    let mut body = String::from("{\"error\":");
+                    push_json_string(&mut body, &error);
+                    body.push('}');
+                    return respond_json(&mut stream, 409, "Conflict", &body);
+                }
+                state.compress_jobs.lock_recover().insert(id.clone(), Arc::clone(&job));
+                crate::compress_job::spawn_job(Arc::clone(&state), job);
+                respond_json(&mut stream, 200, "OK", "{\"ok\":true,\"status\":\"running\"}")
+            } else {
+                respond_json(&mut stream, 404, "Not found", "{\"error\":\"Unknown job\"}")
+            }
+        }
+        "/api/compress-jobs/concurrency" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let root = crate::json::parse(&body_str);
+            let id = extract_json_str(&body_str, "id").unwrap_or_default();
+            let requested = root
+                .as_ref()
+                .and_then(|v| v.get("concurrency"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as usize;
+            let job = state.compress_jobs.lock_recover().get(&id).map(Arc::clone);
+            match job {
+                Some(job) => {
+                    let value = crate::compress_job::set_job_concurrency(&job, requested);
+                    respond_json(&mut stream, 200, "OK", &format!("{{\"ok\":true,\"concurrency\":{value}}}"))
+                }
+                None => respond_json(&mut stream, 404, "Not found", "{\"error\":\"Unknown job\"}"),
+            }
+        }
+        "/api/compress-jobs/prioritize" | "/api/compress-jobs/skip" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let root = crate::json::parse(&body_str);
+            let id = extract_json_str(&body_str, "id").unwrap_or_default();
+            let indices = root
+                .as_ref()
+                .and_then(|v| v.get("indices"))
+                .and_then(|v| v.as_array())
+                .map(|values| values.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let job = state.compress_jobs.lock_recover().get(&id).map(Arc::clone);
+            match job {
+                Some(job) => {
+                    let changed = if route == "/api/compress-jobs/prioritize" {
+                        crate::compress_job::prioritize_pending(&job, &indices)
+                    } else {
+                        crate::compress_job::skip_pending(&job, &indices)
+                    };
+                    respond_json(&mut stream, 200, "OK", &format!("{{\"ok\":true,\"changed\":{changed}}}"))
+                }
+                None => respond_json(&mut stream, 404, "Not found", "{\"error\":\"Unknown job\"}"),
+            }
+        }
+        "/api/compress-jobs/retry-files" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let root = crate::json::parse(&body_str);
+            let id = extract_json_str(&body_str, "id").unwrap_or_default();
+            let indices = root
+                .as_ref()
+                .and_then(|v| v.get("indices"))
+                .and_then(|v| v.as_array())
+                .map(|values| values.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect::<Vec<_>>())
+                .unwrap_or_default();
+            match crate::compress_job::selective_retry_from_manifest(&id, &indices) {
+                Some(job) => {
+                    let job_id = job.id.clone();
+                    state.compress_jobs.lock_recover().insert(job_id.clone(), Arc::clone(&job));
+                    crate::compress_job::spawn_job(Arc::clone(&state), job);
+                    let mut body = String::from("{\"jobId\":");
+                    push_json_string(&mut body, &job_id);
+                    body.push('}');
+                    respond_json(&mut stream, 200, "OK", &body)
+                }
+                None => respond_json(&mut stream, 400, "Bad request", "{\"error\":\"No failed or skipped files selected\"}"),
+            }
+        }
+        "/api/compress-jobs/queue-reorder" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let ids = extract_json_str_array(&body_str, "ids");
+            let changed = crate::compress_job::reorder_queued_jobs(&state, &ids);
+            respond_json(&mut stream, 200, "OK", &format!("{{\"ok\":true,\"changed\":{changed}}}"))
+        }
+        "/api/compress-jobs/queue-remove" => {
+            let body_str = String::from_utf8_lossy(&request.body);
+            let id = extract_json_str(&body_str, "id").unwrap_or_default();
+            match crate::compress_job::remove_queued_job(&state, &id) {
+                Ok(()) => respond_json(&mut stream, 200, "OK", "{\"ok\":true}"),
+                Err(error) => {
+                    let mut body = String::from("{\"error\":");
+                    push_json_string(&mut body, &error);
+                    body.push('}');
+                    respond_json(&mut stream, 409, "Conflict", &body)
+                }
+            }
         }
         // Resume a job from its persisted manifest, skipping files already done.
         "/api/compress-jobs/retry" => {
@@ -4182,11 +4383,20 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                         return respond_json(&mut stream, 409, "Conflict", &body);
                     }
                     let jid = job.id.clone();
-                    state
-                        .compress_jobs
-                        .lock()
-                        .expect("compress_jobs lock")
-                        .insert(jid.clone(), Arc::clone(&job));
+                    {
+                        let mut jobs = state
+                            .compress_jobs
+                            .lock()
+                            .expect("compress_jobs lock");
+                        if let Some(conflict) = crate::compress_job::active_path_conflict(
+                            &jobs,
+                            &job.path_fingerprints,
+                        ) {
+                            drop(jobs);
+                            return respond_compress_job_conflict(&mut stream, &conflict);
+                        }
+                        jobs.insert(jid.clone(), Arc::clone(&job));
+                    }
                     crate::compress_job::spawn_job(Arc::clone(&state), job);
                     let mut body = String::from("{\"jobId\":");
                     push_json_string(&mut body, &jid);
@@ -4234,6 +4444,33 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let body_str = String::from_utf8_lossy(&request.body);
             let paths = extract_json_str_array(&body_str, "paths");
             respond_json(&mut stream, 200, "OK", &compress_preflight_json(&paths))
+        }
+        "/api/compress-jobs/files" => {
+            let id = query.get("id").cloned().unwrap_or_default();
+            let live = state.compress_jobs.lock_recover().get(&id).map(Arc::clone);
+            let page_query = crate::compress_job::JobFilesQuery {
+                offset: query.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0),
+                limit: query.get("limit").and_then(|v| v.parse().ok()).unwrap_or(250),
+                search: query.get("search").cloned().unwrap_or_default(),
+                status: query.get("status").cloned().unwrap_or_default(),
+                kind: query.get("type").cloned().unwrap_or_default(),
+                encoder: query.get("encoder").cloned().unwrap_or_default(),
+                outcome: query.get("outcome").cloned().unwrap_or_default(),
+                disposition: query.get("disposition").cloned().unwrap_or_default(),
+                path: query.get("path").cloned().unwrap_or_default(),
+                attention: query.get("attention").map(|v| v == "true" || v == "1").unwrap_or(false),
+                sort: query.get("sort").cloned().unwrap_or_else(|| "activity".to_string()),
+                direction: query.get("direction").cloned().unwrap_or_else(|| "asc".to_string()),
+            };
+            match crate::compress_job::job_files_page_json(live.as_deref(), &id, &page_query) {
+                Some(body) => respond_json(&mut stream, 200, "OK", &body),
+                None => respond_json(&mut stream, 404, "Not found", "{\"error\":\"Unknown job\"}"),
+            }
+        }
+        "/api/compress-jobs/telemetry" => {
+            let id = query.get("id").cloned().unwrap_or_default();
+            let body = crate::compress_job::compress_telemetry_json(&state, &id);
+            respond_json(&mut stream, 200, "OK", &body)
         }
         // Poll fallback: full job JSON for `GET /api/compress-jobs/<id>`. Placed
         // after the exact compress-jobs sub-routes so they match first.

@@ -549,10 +549,27 @@ export interface CompressJobFile {
   /** What actually happened to the original after a verified compress:
    *  `recycled`, `deleted`, or `kept`. Empty until terminal / for non-success. */
   disposition?: string;
+  stage?: "queued" | "encoding" | "verifying" | "finalizing" | "terminal";
+  fps?: number | null;
+  processingRate?: number | null;
+  outputBytes?: number;
+  startedAt?: number;
+  updatedAt?: number;
+  finishedAt?: number;
+  attempt?: number;
+  tool?: string;
+  toolVersion?: string;
+  command?: string;
+  stderr?: string;
+  outPath?: string;
+  elapsedMs?: number;
+  queuePosition?: number | null;
 }
 
 /** Overall job status from the poll-fallback endpoint. */
-export type CompressJobStatus = "running" | "done" | "cancelled" | "error";
+export type CompressJobStatus =
+  | "queued" | "running" | "pausing" | "paused"
+  | "done" | "cancelled" | "error";
 
 /** GET /api/compress-jobs/<id> — full job snapshot (poll fallback). */
 export interface CompressJob {
@@ -560,6 +577,23 @@ export interface CompressJob {
   status: CompressJobStatus;
   total: number;
   savedBytes: number;
+  preset?: CompressPreset;
+  totalBytes?: number;
+  workCompletedBytes?: number;
+  successfulBytes?: number;
+  skippedBytes?: number;
+  failedBytes?: number;
+  activeWorkBytes?: number;
+  activeCount?: number;
+  activeElapsedMs?: number;
+  concurrency?: number;
+  encoder?: string;
+  codec?: string;
+  useGpu?: boolean;
+  originalAction?: OriginalAction;
+  outputDir?: string;
+  queueRank?: number;
+  stageCounts?: Record<string, number>;
   files: CompressJobFile[];
 }
 
@@ -579,6 +613,21 @@ export interface CompressJobSummary {
   verifyFailed?: number;
   pending: number;
   savedBytes: number;
+  totalBytes?: number;
+  workCompletedBytes?: number;
+  successfulBytes?: number;
+  skippedBytes?: number;
+  failedBytes?: number;
+  activeWorkBytes?: number;
+  activeCount?: number;
+  activeElapsedMs?: number;
+  concurrency?: number;
+  encoder?: string;
+  codec?: string;
+  useGpu?: boolean;
+  originalAction?: OriginalAction;
+  outputDir?: string;
+  queueRank?: number;
   /** Epoch ms the job was created (parsed from its id). */
   createdAt: number;
   /** Epoch ms of the last manifest write (last progress). */
@@ -587,6 +636,45 @@ export interface CompressJobSummary {
   active: boolean;
   /** Has remaining (non-done) work and isn't actively running. */
   resumable: boolean;
+}
+
+export interface CompressJobFilesPage {
+  id: string;
+  offset: number;
+  limit: number;
+  total: number;
+  totalMatches: number;
+  items: CompressJobFile[];
+  facets: Record<string, Record<string, number>>;
+}
+
+export interface CompressFilesQuery {
+  offset?: number;
+  limit?: number;
+  search?: string;
+  status?: string;
+  type?: string;
+  encoder?: string;
+  outcome?: string;
+  disposition?: string;
+  path?: string;
+  attention?: boolean;
+  sort?: string;
+  direction?: "asc" | "desc";
+}
+
+export interface CompressTelemetry {
+  sampledAt: number;
+  gpuVideoEncodePct: number | null;
+  encoderSessions: number | null;
+  aggregateFps: number | null;
+  encoderCpuPct: number | null;
+  ramBytes: number | null;
+  readBytesPerSec: number | null;
+  writeBytesPerSec: number | null;
+  destinationFreeBytes: number | null;
+  gpuMemoryUsedBytes: number | null;
+  gpuMemoryTotalBytes: number | null;
 }
 
 /** Video encoder selection. `auto` lets the server pick the best available
@@ -643,6 +731,8 @@ export interface CompressJobRequest {
    *  underneath a registered root, so this never widens access beyond what the
    *  user actually scanned. */
   scanRoot?: string;
+  /** Persist without starting; the backend queue survives restarts. */
+  queued?: boolean;
 }
 
 // NDJSON stream events from GET /api/compress-jobs/stream?id=<jobId>, one JSON
@@ -664,6 +754,20 @@ export interface CompressProgressEvent {
   index: number;
   /** 0..100. */
   pct: number;
+  stage?: string;
+  fps?: number | null;
+  updatedAt?: number;
+}
+export interface CompressStageEvent {
+  type: "stage";
+  index: number;
+  stage: string;
+  updatedAt: number;
+}
+export interface CompressJobStateEvent {
+  type: "job_state";
+  jobId: string;
+  status: CompressJobStatus;
 }
 export interface CompressFileDoneEvent {
   type: "file_done";
@@ -709,6 +813,8 @@ export type CompressEvent =
   | CompressJobStartEvent
   | CompressFileStartEvent
   | CompressProgressEvent
+  | CompressStageEvent
+  | CompressJobStateEvent
   | CompressFileDoneEvent
   | CompressErrorEvent
   | CompressDoneEvent;

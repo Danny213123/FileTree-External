@@ -4,6 +4,17 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.14.0] - 2026-08-24
+
+### Compression workspace overhaul
+
+- Rebuilt Compression as compact Setup, Monitor, and History workspaces. Monitor now has a run rail, sticky job controls, size-weighted segmented progress, per-file progress/stages, elapsed time, ETA, rate, encoder details, and a responsive diagnostics inspector.
+- Added a paged, virtualized file table for very large jobs with persisted columns, resizable widths, search, filters, quick views, sortable fields, keyboard selection, active-file pinning, and a 15-second recently-finished group.
+- Added graceful pause/resume, live 1-16 worker concurrency, pending-file prioritize/skip, selective retry, persisted queued jobs, queue reordering/removal, and additive authenticated API routes.
+- Added cached NVIDIA and Windows encoder telemetry for GPU Video Encode, sessions, aggregate fps, encoder CPU/RAM/I/O, and destination free space. Unavailable counters are reported as unavailable instead of zero.
+- Compression now keeps Windows awake while work is running or pausing and mirrors aggregate running, paused, and error progress in the taskbar. Stop remains immediate, removes partial outputs, preserves sources, and leaves the job resumable.
+- Upgraded History with search, date/status/type/encoder filters, sorting, export and diagnostic actions, and per-file compress-again controls.
+
 ## [1.13.15] - 2026-06-18
 
 Stability release fixing two crashes on very large workloads: a renderer black-screen on >10M-node scans, and the whole-UI blanking when starting a large compression job.

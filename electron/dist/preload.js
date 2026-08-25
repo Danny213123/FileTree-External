@@ -8,6 +8,7 @@ electron_1.contextBridge.exposeInMainWorld("electronAPI", {
     // destructive routes without ever holding the secret. `route` is a server path
     // like "/api/delete?path=…"; `body`, when present, is JSON-encoded.
     mutate: (route, body) => electron_1.ipcRenderer.invoke("mutate", route, body),
+    setCompressionState: (state) => electron_1.ipcRenderer.send("compression-state", state),
     // Encrypted secret storage (AI API keys) backed by the OS keystore via
     // Electron safeStorage in MAIN. Values never touch localStorage.
     secrets: {

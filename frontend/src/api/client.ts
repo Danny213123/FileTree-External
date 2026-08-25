@@ -24,6 +24,9 @@ import type {
   CompressJob,
   CompressJobRequest,
   CompressJobSummary,
+  CompressJobFilesPage,
+  CompressFilesQuery,
+  CompressTelemetry,
   CompressEvent,
   CompressLogRow,
 } from "./types";
@@ -252,7 +255,11 @@ export async function fetchChildren(opts: {
     if (opts.dir) params.set("dir", opts.dir);
     if (opts.scannedAt) params.set("scannedAt", String(opts.scannedAt));
     const res = await fetch(`/api/children?${params}`, { signal: opts.signal });
-    if (res.status === 409) throw new ScanStaleError();
+    // A lazy result can outlive the server-side tree when another very large
+    // tab wins cache eviction. Treat a missing scan/node exactly like a changed
+    // scan so the workspace performs a fresh walk instead of showing a dead,
+    // permanently-empty expanded folder.
+    if (res.status === 404 || res.status === 409) throw new ScanStaleError();
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const text = await res.text();
     let hasMore = false;
@@ -1681,6 +1688,49 @@ export async function cancelCompressJob(id: string): Promise<{ ok: boolean; erro
   return { ok: false, error: mutateErrorText(r) };
 }
 
+async function compressJobMutation(
+  path: string,
+  body: Record<string, unknown>,
+): Promise<Record<string, any>> {
+  const r = await postMutation(path, body);
+  if (!r.ok) throw new Error(mutateErrorText(r));
+  return (r.data ?? {}) as Record<string, any>;
+}
+
+export async function pauseCompressJob(id: string): Promise<void> {
+  await compressJobMutation("/api/compress-jobs/pause", { id });
+}
+
+export async function resumeCompressJob(id: string): Promise<void> {
+  await compressJobMutation("/api/compress-jobs/resume", { id });
+}
+
+export async function setCompressConcurrency(id: string, concurrency: number): Promise<void> {
+  await compressJobMutation("/api/compress-jobs/concurrency", { id, concurrency });
+}
+
+export async function prioritizeCompressFiles(id: string, indices: number[]): Promise<void> {
+  await compressJobMutation("/api/compress-jobs/prioritize", { id, indices });
+}
+
+export async function skipCompressFiles(id: string, indices: number[]): Promise<void> {
+  await compressJobMutation("/api/compress-jobs/skip", { id, indices });
+}
+
+export async function retryCompressFiles(id: string, indices: number[]): Promise<string> {
+  const data = await compressJobMutation("/api/compress-jobs/retry-files", { id, indices });
+  if (!data.jobId) throw new Error("Server did not return a retry job id");
+  return data.jobId as string;
+}
+
+export async function reorderQueuedCompressJobs(ids: string[]): Promise<void> {
+  await compressJobMutation("/api/compress-jobs/queue-reorder", { ids });
+}
+
+export async function removeQueuedCompressJob(id: string): Promise<void> {
+  await compressJobMutation("/api/compress-jobs/queue-remove", { id });
+}
+
 /** Resume a job from its manifest (skips files already `done`). Returns the
  *  (possibly new) job id to re-attach the stream to. */
 export async function retryCompressJob(id: string): Promise<string> {
@@ -1714,6 +1764,37 @@ export async function fetchCompressJob(
     const res = await fetch(`/api/compress-jobs/${encodeURIComponent(id)}`, { signal });
     if (!res.ok) return null;
     return (await res.json()) as CompressJob;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchCompressJobFiles(
+  id: string,
+  query: CompressFilesQuery,
+  signal?: AbortSignal,
+): Promise<CompressJobFilesPage | null> {
+  try {
+    const params = new URLSearchParams({ id });
+    Object.entries(query).forEach(([key, value]) => {
+      if (value !== undefined && value !== "" && value !== false) params.set(key, String(value));
+    });
+    const res = await fetch(`/api/compress-jobs/files?${params}`, { signal });
+    if (!res.ok) return null;
+    return (await res.json()) as CompressJobFilesPage;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchCompressTelemetry(
+  id: string,
+  signal?: AbortSignal,
+): Promise<CompressTelemetry | null> {
+  try {
+    const res = await fetch(`/api/compress-jobs/telemetry?id=${encodeURIComponent(id)}`, { signal });
+    if (!res.ok) return null;
+    return (await res.json()) as CompressTelemetry;
   } catch {
     return null;
   }
