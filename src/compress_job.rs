@@ -5,9 +5,9 @@
 //! A job never runs on an HTTP connection thread (encodes take minutes); the
 //! create endpoint spawns a dedicated [`std::thread`] via [`spawn_job`] and
 //! returns immediately. Per-file progress and lifecycle events are appended to
-//! an in-memory ring ([`CompressJob::events`]) that the stream endpoint replays
-//! from the start and then tails live (so a stream opened slightly late still
-//! sees the whole history). Job state is checkpointed under
+//! a bounded in-memory ring ([`CompressJob::events`]) that the stream endpoint
+//! replays from its oldest retained item and then tails live. Job state is
+//! checkpointed under
 //! `%APPDATA%\FileTree\jobs\<id>.json`, which `retry` reloads to skip files
 //! already `done`; huge batches coalesce fast outcomes to avoid rewriting a
 //! tens-of-megabytes manifest for every small file.
@@ -32,6 +32,22 @@ use crate::model::AppState;
 /// occupied without spreading disk, memory, and verification bandwidth across
 /// a large waiting/active pool that lowers aggregate throughput.
 const MAX_COMPRESSION_WORKERS: usize = 2;
+const LIVE_EVENT_CAPACITY: usize = 4_096;
+
+#[derive(Debug)]
+pub(crate) struct JobEvents {
+    pub(crate) base: u64,
+    pub(crate) lines: VecDeque<String>,
+}
+
+impl JobEvents {
+    fn new() -> Self {
+        Self {
+            base: 0,
+            lines: VecDeque::new(),
+        }
+    }
+}
 
 /// Coarse file classification that selects a pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,9 +291,10 @@ pub(crate) struct CompressJob {
     pub(crate) manifest_dirty: AtomicUsize,
     /// Epoch-ms timestamp of the last successful/attempted manifest checkpoint.
     pub(crate) manifest_last_write_ms: AtomicU64,
-    /// Live NDJSON event lines. The stream endpoint replays from index 0 then
-    /// tails new lines; `finished` + the condvar wake any tailing reader.
-    pub(crate) events: Mutex<Vec<String>>,
+    /// Bounded live NDJSON event ring. Slow/reconnecting readers resume at the
+    /// oldest retained event; authoritative state remains available through the
+    /// paginated files endpoint and compact job summaries.
+    pub(crate) events: Mutex<JobEvents>,
     pub(crate) events_cv: Condvar,
     pub(crate) runner_started: AtomicBool,
     pub(crate) finished: AtomicBool,
@@ -288,7 +305,11 @@ impl CompressJob {
     /// Append one NDJSON event line and wake any stream reader tailing the buffer.
     fn emit(&self, line: String) {
         let mut events = self.events.lock_recover();
-        events.push(line);
+        if events.lines.len() >= LIVE_EVENT_CAPACITY {
+            events.lines.pop_front();
+            events.base = events.base.saturating_add(1);
+        }
+        events.lines.push_back(line);
         self.events_cv.notify_all();
     }
 }
@@ -531,7 +552,7 @@ pub(crate) fn create_job(
         manifest_lock: Mutex::new(()),
         manifest_dirty: AtomicUsize::new(0),
         manifest_last_write_ms: AtomicU64::new(crate::io::now_ms()),
-        events: Mutex::new(Vec::new()),
+        events: Mutex::new(JobEvents::new()),
         events_cv: Condvar::new(),
         runner_started: AtomicBool::new(false),
         finished: AtomicBool::new(false),
@@ -788,7 +809,7 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         manifest_lock: Mutex::new(()),
         manifest_dirty: AtomicUsize::new(0),
         manifest_last_write_ms: AtomicU64::new(crate::io::now_ms()),
-        events: Mutex::new(Vec::new()),
+        events: Mutex::new(JobEvents::new()),
         events_cv: Condvar::new(),
         runner_started: AtomicBool::new(false),
         finished: AtomicBool::new(false),
@@ -5893,6 +5914,18 @@ mod encoder_tests {
         assert!(ev_progress(&job, 0, 0).contains("\"stage\":\"waiting_gpu\""));
         *job.files[0].stage.lock_recover() = "finalizing".to_string();
         assert!(ev_progress(&job, 0, 100).contains("\"stage\":\"finalizing\""));
+    }
+
+    #[test]
+    fn live_event_replay_buffer_stays_bounded() {
+        let job = create_job(&[], "balanced", &CompressOptions::default());
+        for index in 0..(LIVE_EVENT_CAPACITY + 100) {
+            job.emit(format!("{{\"type\":\"test\",\"index\":{index}}}\n"));
+        }
+        let events = job.events.lock_recover();
+        assert_eq!(events.lines.len(), LIVE_EVENT_CAPACITY);
+        assert_eq!(events.base, 100);
+        assert!(events.lines.front().is_some_and(|line| line.contains("\"index\":100")));
     }
 
     #[test]

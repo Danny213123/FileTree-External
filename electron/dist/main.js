@@ -56,6 +56,11 @@ const AUTH_TOKEN = (0, crypto_1.randomBytes)(32).toString("hex");
 // Lazy mode (threshold-gated) keeps the steady-state heap small for huge scans;
 // this headroom covers the transition and large-but-sub-threshold scans.
 electron_1.app.commandLine.appendSwitch("js-flags", "--max-old-space-size=8192");
+// Compression owns the GPU's video engines and can trigger driver/compositor
+// resets under sustained NVENC/NVDEC load. Keep Chromium's UI compositor in
+// software so a hardware encode cannot turn the FileTree window black. This
+// does not affect HandBrake, which is a separate process and still uses NVENC.
+electron_1.app.disableHardwareAcceleration();
 let nativeDragFiles = null;
 let nativeMoveItems = null;
 // Real CF_HDROP clipboard + a guarded shell COPY (mirrors nativeMoveItems) for
@@ -270,6 +275,18 @@ function createWindow(port) {
     });
     const appOrigin = `http://127.0.0.1:${port}`;
     mainWindow.loadURL(`${appOrigin}/`);
+    // A renderer OOM or driver reset should not strand the user on a blank window.
+    // Reloading is safe because compression lives in the Rust server and the
+    // Monitor reconstructs itself from paginated job APIs after navigation.
+    mainWindow.webContents.on("render-process-gone", (_event, details) => {
+        console.error(`[electron] renderer exited: ${details.reason} (${details.exitCode})`);
+        if (details.reason === "clean-exit")
+            return;
+        setTimeout(() => {
+            if (mainWindow && !mainWindow.isDestroyed())
+                void mainWindow.loadURL(`${appOrigin}/`);
+        }, 500);
+    });
     // Keep the renderer pinned to its own origin. A file:// "navigation" is how
     // Chromium reports a file/folder dropped onto the window from Explorer — we
     // intercept it and forward the path instead. Same-origin navigations are

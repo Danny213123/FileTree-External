@@ -4,6 +4,14 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.14.5] - 2026-08-24
+
+### Fixed
+
+- Starting a very large compression run no longer duplicates the entire scan into a normalized-path set, a per-file React progress map, and a legacy sorted row array. The Monitor remains page-backed in batches of 250, preventing renderer exhaustion and a black FileTree window.
+- Compression stream replay is bounded to the latest 4,096 events instead of retaining an unbounded in-memory history; authoritative file state remains available through the paginated endpoint.
+- Electron now uses software UI compositing while HandBrake owns the GPU video engines. A renderer terminated by the OS or driver is automatically reloaded and reconstructs the Monitor from the running backend job.
+
 ## [1.14.4] - 2026-08-24
 
 ### Fixed

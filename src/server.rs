@@ -4171,9 +4171,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 respond_json(&mut stream, 200, "OK", &body)
             }
         }
-        // Live NDJSON progress stream for one job. Replays the job's full event
-        // history then tails new events, so a stream opened slightly after the
-        // job started still sees everything.
+        // Live NDJSON progress stream for one job. Replays the bounded retained
+        // event window, then tails new events. Full state lives in paginated APIs.
         "/api/compress-jobs/stream" => {
             let id = query.get("id").cloned().unwrap_or_default();
             let job = state
@@ -4189,23 +4188,28 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
             )?;
-            let mut idx = 0usize;
+            let mut cursor = 0u64;
             loop {
                 let batch: Vec<String>;
                 {
                     let mut guard = job.events.lock().expect("events lock");
-                    while idx >= guard.len() && !job.finished.load(Ordering::SeqCst) {
+                    while cursor >= guard.base.saturating_add(guard.lines.len() as u64)
+                        && !job.finished.load(Ordering::SeqCst)
+                    {
                         let (g, _timeout) = job
                             .events_cv
                             .wait_timeout(guard, Duration::from_millis(1000))
                             .expect("events cv");
                         guard = g;
                     }
-                    if idx >= guard.len() && job.finished.load(Ordering::SeqCst) {
+                    let end = guard.base.saturating_add(guard.lines.len() as u64);
+                    if cursor >= end && job.finished.load(Ordering::SeqCst) {
                         break;
                     }
-                    batch = guard[idx..].to_vec();
-                    idx = guard.len();
+                    cursor = cursor.max(guard.base);
+                    let start = cursor.saturating_sub(guard.base) as usize;
+                    batch = guard.lines.iter().skip(start).cloned().collect();
+                    cursor = end;
                 }
                 for line in &batch {
                     if write_chunk(&mut stream, line.as_bytes()).is_err() {

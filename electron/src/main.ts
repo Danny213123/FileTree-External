@@ -36,6 +36,12 @@ const AUTH_TOKEN = randomBytes(32).toString("hex");
 // this headroom covers the transition and large-but-sub-threshold scans.
 app.commandLine.appendSwitch("js-flags", "--max-old-space-size=8192");
 
+// Compression owns the GPU's video engines and can trigger driver/compositor
+// resets under sustained NVENC/NVDEC load. Keep Chromium's UI compositor in
+// software so a hardware encode cannot turn the FileTree window black. This
+// does not affect HandBrake, which is a separate process and still uses NVENC.
+app.disableHardwareAcceleration();
+
 // ── Native drag-out addon ─────────────────────────────────────────────────────
 // Runs the Windows shell drag itself (SHDoDragDrop, synchronously on this UI
 // thread) so we learn the real OS drop effect. It classifies the drop:
@@ -297,6 +303,17 @@ function createWindow(port: number): void {
 
   const appOrigin = `http://127.0.0.1:${port}`;
   mainWindow.loadURL(`${appOrigin}/`);
+
+  // A renderer OOM or driver reset should not strand the user on a blank window.
+  // Reloading is safe because compression lives in the Rust server and the
+  // Monitor reconstructs itself from paginated job APIs after navigation.
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    console.error(`[electron] renderer exited: ${details.reason} (${details.exitCode})`);
+    if (details.reason === "clean-exit") return;
+    setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) void mainWindow.loadURL(`${appOrigin}/`);
+    }, 500);
+  });
 
   // Keep the renderer pinned to its own origin. A file:// "navigation" is how
   // Chromium reports a file/folder dropped onto the window from Explorer — we
