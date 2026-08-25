@@ -34,6 +34,7 @@
 //! Logging is best-effort: any failure (missing APPDATA, I/O error, …) is
 //! swallowed and never blocks or fails the real compression.
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -107,6 +108,132 @@ pub(crate) fn log_path() -> PathBuf {
             .join("filetree")
             .join("compress-log.csv")
     }
+}
+
+/// Durable fingerprint of an unchanged source that completed a real encode but
+/// produced no savings. This is intentionally separate from the display log:
+/// History is compacted to 5,000 rows, while skip decisions must survive large
+/// multi-day batches without dropping older entries.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct NoGainKey {
+    path: String,
+    source_bytes: u64,
+    source_modified_ms: u64,
+    profile: String,
+}
+
+static NO_GAIN_INDEX: Mutex<Option<(PathBuf, HashSet<NoGainKey>)>> = Mutex::new(None);
+const NO_GAIN_HEADER: &str = "path,source_bytes,source_modified_ms,profile\n";
+
+fn no_gain_path() -> PathBuf {
+    log_path().with_file_name("compress-no-gain-v1.csv")
+}
+
+fn normalized_source_path(path: &str) -> String {
+    let normalized = path.replace('/', "\\");
+    #[cfg(windows)]
+    {
+        normalized.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
+}
+
+fn no_gain_key(path: &str, source_bytes: u64, source_modified_ms: u64, profile: &str) -> Option<NoGainKey> {
+    if source_bytes == 0 || source_modified_ms == 0 || profile.trim().is_empty() {
+        return None;
+    }
+    Some(NoGainKey {
+        path: normalized_source_path(path),
+        source_bytes,
+        source_modified_ms,
+        profile: profile.to_string(),
+    })
+}
+
+fn load_no_gain_index(path: &Path) -> HashSet<NoGainKey> {
+    let Ok(text) = fs::read_to_string(path) else { return HashSet::new() };
+    parse_csv(&text)
+        .into_iter()
+        .filter_map(|record| {
+            if col(&record, 0) == "path" {
+                return None;
+            }
+            no_gain_key(
+                col(&record, 0),
+                col(&record, 1).parse().ok()?,
+                col(&record, 2).parse().ok()?,
+                col(&record, 3),
+            )
+        })
+        .collect()
+}
+
+fn ensure_no_gain_index<'a>(
+    slot: &'a mut Option<(PathBuf, HashSet<NoGainKey>)>,
+    path: &Path,
+) -> &'a mut HashSet<NoGainKey> {
+    if slot.as_ref().map(|(loaded_path, _)| loaded_path != path).unwrap_or(true) {
+        *slot = Some((path.to_path_buf(), load_no_gain_index(path)));
+    }
+    &mut slot.as_mut().expect("no-gain cache initialized").1
+}
+
+/// True only when a prior real encode with the exact same source fingerprint
+/// and compression profile produced no savings.
+pub(crate) fn was_unchanged_no_gain(
+    path: &str,
+    source_bytes: u64,
+    source_modified_ms: u64,
+    profile: &str,
+) -> bool {
+    let Some(key) = no_gain_key(path, source_bytes, source_modified_ms, profile) else {
+        return false;
+    };
+    let cache_path = no_gain_path();
+    let mut slot = NO_GAIN_INDEX.lock().unwrap_or_else(|error| error.into_inner());
+    ensure_no_gain_index(&mut slot, &cache_path).contains(&key)
+}
+
+/// Remember a verified no-gain result. Duplicate fingerprints stay in memory
+/// and are not appended again, keeping the durable index compact across retries.
+pub(crate) fn remember_unchanged_no_gain(
+    path: &str,
+    source_bytes: u64,
+    source_modified_ms: u64,
+    profile: &str,
+) {
+    let Some(key) = no_gain_key(path, source_bytes, source_modified_ms, profile) else {
+        return;
+    };
+    let cache_path = no_gain_path();
+    let mut slot = NO_GAIN_INDEX.lock().unwrap_or_else(|error| error.into_inner());
+    if !ensure_no_gain_index(&mut slot, &cache_path).insert(key.clone()) {
+        return;
+    }
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let needs_header = fs::metadata(&cache_path).map(|metadata| metadata.len() == 0).unwrap_or(true);
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&cache_path) else { return };
+    if needs_header && file.write_all(NO_GAIN_HEADER.as_bytes()).is_err() {
+        return;
+    }
+    let line = format!(
+        "{},{},{},{}\n",
+        csv_escape(&key.path),
+        key.source_bytes,
+        key.source_modified_ms,
+        csv_escape(&key.profile),
+    );
+    let _ = file.write_all(line.as_bytes());
+}
+
+#[cfg(test)]
+pub(crate) fn reset_no_gain_index_for_tests() {
+    *NO_GAIN_INDEX.lock().unwrap_or_else(|error| error.into_inner()) = None;
 }
 
 /// Append one CSV row. Best-effort: any error is silently ignored so the real

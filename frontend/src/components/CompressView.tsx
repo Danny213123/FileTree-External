@@ -2969,6 +2969,7 @@ export function CompressView({
 const STATUS_LABEL: Record<string, string> = {
   success: "Saved",
   skipped_no_gain: "No gain",
+  skipped_prior_no_gain: "Previously no gain",
   skipped_too_small: "Too small",
   error: "Error",
 };
@@ -2979,6 +2980,7 @@ const STATUS_LABEL: Record<string, string> = {
 const REASON_LABEL: Record<string, string> = {
   success: "Saved",
   skipped_no_gain: "Skipped — not smaller",
+  skipped_prior_no_gain: "Skipped — unchanged since prior no-gain result",
   skipped_too_small: "Skipped — too small",
   error_tool_missing: "Error — tool missing",
   error_unsupported: "Error — unsupported",
@@ -2996,6 +2998,7 @@ const REASON_LABEL: Record<string, string> = {
 const REASON_TOOLTIP: Record<string, string> = {
   success: "Output was smaller; original replaced.",
   skipped_no_gain: "The re-encoded output wasn't smaller than the original, so it was discarded and the original kept.",
+  skipped_prior_no_gain: "The source and compression profile are unchanged since a prior encode produced no savings, so no encoder was started.",
   skipped_too_small: "The original was below the minimum-size threshold, so it was left untouched without attempting to compress (too small to meaningfully shrink — e.g. a video with too few frames).",
   error_tool_missing: "The required encoder (HandBrake for video, ffmpeg/ImageMagick for images) isn't installed.",
   error_unsupported: "This file type has no supported compression pipeline.",
@@ -3014,7 +3017,7 @@ const REASON_TOOLTIP: Record<string, string> = {
  *  back to the coarse status). */
 function reasonClass(reason: string, status: string): string {
   if (reason === "success" || reason === "gpu_fallback" || status === "success") return "done";
-  if (reason === "skipped_no_gain" || reason === "skipped_too_small" || status === "skipped" || status === "skipped_no_gain")
+  if (reason.startsWith("skipped_") || status === "skipped" || status === "skipped_no_gain")
     return "skipped";
   return "error";
 }
@@ -3029,6 +3032,9 @@ function progBadge(rf: FileProg): { label: string; title: string } {
     case "skipped":
       if (rf.reason === "skipped_too_small") {
         return { label: "Too small", title: REASON_TOOLTIP.skipped_too_small };
+      }
+      if (rf.reason === "skipped_prior_no_gain") {
+        return { label: "Previously no gain", title: REASON_TOOLTIP.skipped_prior_no_gain };
       }
       return { label: "No gain", title: REASON_TOOLTIP.skipped_no_gain };
     case "error":

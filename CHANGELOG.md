@@ -4,6 +4,14 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.14.1] - 2026-08-24
+
+### Fixed
+
+- Compression now remembers a source that completed a real encode without producing a smaller output. A later run with the same path, size, modified timestamp, compression settings, resolved encoder, encoder tool/version, and GPU adapter/capability profile skips the file before starting an encoder instead of repeating wasted work.
+- The no-gain decision is invalidated automatically when the source, preset, codec, encoder, tool, or relevant hardware capability changes. Sources are refreshed when workers claim them, so long-queued jobs cannot use stale metadata.
+- Monitor and History identify these early exits as **Previously no gain**, distinct from a no-gain result discovered by a new encode.
+
 ## [1.14.0] - 2026-08-24
 
 ### Compression workspace overhaul

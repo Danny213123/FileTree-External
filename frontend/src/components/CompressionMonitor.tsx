@@ -430,7 +430,7 @@ export function CompressionMonitor({ focusJobId }: Props) {
       case "encoder": return <span title={file.encoder}>{file.encoder || "--"}</span>;
       case "sizes": return `${formatBytes(file.origBytes)} / ${file.newBytes ? formatBytes(file.newBytes) : "--"}`;
       case "savings": return file.savedBytes ? formatBytes(file.savedBytes) : "--";
-      case "result": return <span className={`cm-result ${file.status}`} title={file.error}>{file.reason || file.status}</span>;
+      case "result": return <span className={`cm-result ${file.status}`} title={file.error}>{file.reason === "skipped_prior_no_gain" ? "Previously no gain" : file.reason || file.status}</span>;
       default: return null;
     }
   };

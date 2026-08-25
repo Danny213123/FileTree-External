@@ -2,7 +2,7 @@
 
 A standalone Windows disk-usage explorer: point at a folder, see what's taking space, and clean it up. Single `.exe`, no installer.
 
-**Current version:** `1.14.0`
+**Current version:** `1.14.1`
 
 ## Features
 
@@ -71,6 +71,7 @@ A standalone Windows disk-usage explorer: point at a folder, see what's taking s
 - Master-detail monitoring with a run rail, cached hardware/process telemetry, virtualized 200,000-file-scale tables, active/recent pinning, search, filters, sorting, persisted columns, and a diagnostics inspector.
 - Graceful pause/resume, immediate resumable stop, pending-file prioritize/skip, selective retry, and persisted queued batches that survive restarts.
 - Deep output verification before any original is recycled or deleted, partial-output cleanup on stop, low-space/stall warnings, and source-preserving failure behavior.
+- Durable no-gain fingerprints skip unchanged files before an encoder starts; changed sources, presets, codecs, encoders, tools, or capabilities automatically trigger a fresh attempt.
 - In-place or separate-folder output, recoverable Recycle Bin handling by default, optional permanent delete or keep-original modes, and `[COMPRESSED]` tagging.
 - Searchable/filterable compression history with CSV export, detailed command/stderr diagnostics, and per-file compress-again controls.
 - Windows keep-awake and taskbar progress integration while compression is active, with automatic release while paused or idle.
