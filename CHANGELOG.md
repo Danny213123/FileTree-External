@@ -4,6 +4,13 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.14.2] - 2026-08-24
+
+### Fixed
+
+- Compression now checks the source filename for FileTree's `[COMPRESSED]` marker before profiling settings, reserving an output, or starting HandBrake, ffmpeg, ImageMagick, or zip. The check is case-insensitive and enforced by the backend for interactive, external, queued, resumed, and API-submitted files.
+- Tagged sources are preserved unchanged and recorded as **Already compressed** instead of being encoded into a second `[COMPRESSED] [COMPRESSED]` output. A parent folder containing the marker does not cause ordinary files inside it to be skipped.
+
 ## [1.14.1] - 2026-08-24
 
 ### Fixed

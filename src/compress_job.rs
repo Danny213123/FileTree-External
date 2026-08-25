@@ -2193,6 +2193,9 @@ pub(crate) enum Reason {
     /// A previous real encode with the same source fingerprint and compression
     /// profile produced no savings, so no encoder was started this time.
     SkippedPriorNoGain,
+    /// The source filename already contains FileTree's `[COMPRESSED]` marker,
+    /// so it must never be sent through an encoder again.
+    SkippedAlreadyCompressed,
     /// The original was below the user's minimum-size threshold, so no encode was
     /// attempted (too small to meaningfully compress; e.g. a very short video).
     SkippedTooSmall,
@@ -2244,6 +2247,7 @@ impl Reason {
             Reason::Success => "success",
             Reason::SkippedNoGain => "skipped_no_gain",
             Reason::SkippedPriorNoGain => "skipped_prior_no_gain",
+            Reason::SkippedAlreadyCompressed => "skipped_already_compressed",
             Reason::SkippedTooSmall => "skipped_too_small",
             Reason::SkippedUser => "skipped_user",
             Reason::ErrorToolMissing => "error_tool_missing",
@@ -2321,6 +2325,15 @@ fn is_already_compressed_ext(path: &Path) -> bool {
             | "mp4" | "mkv" | "mov" | "m4v" | "webm" | "m4a" | "aac" | "mp3" | "ogg" | "flac"
             | "docx" | "xlsx" | "pptx"
     )
+}
+
+/// FileTree's output marker is authoritative regardless of extension or case.
+/// Inspect only the final filename: a parent directory named `[COMPRESSED]`
+/// does not imply that every source inside it has already been processed.
+fn has_compressed_filename_tag(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase().contains("[compressed]"))
+        .unwrap_or(false)
 }
 
 /// Whether `path` is a cloud-only placeholder whose contents aren't present
@@ -2504,6 +2517,29 @@ fn process_file(
                 .to_string(),
             diag: EncodeDiag::default(),
             meta: EncodeMeta::default(),
+        };
+    }
+    // This filename is already one of FileTree's outputs. Check before probing
+    // tools, profiling settings, reserving an output path, or spawning an
+    // encoder so a second `[COMPRESSED]` generation never wastes resources.
+    if has_compressed_filename_tag(&input) {
+        let orig = std::fs::metadata(&input)
+            .map(|metadata| metadata.len())
+            .unwrap_or_else(|_| job.files[index].orig_bytes.load(Ordering::Relaxed));
+        job.files[index].orig_bytes.store(orig, Ordering::Relaxed);
+        let mut meta = EncodeMeta::default();
+        meta.tool = "filename preflight".to_string();
+        meta.tool_version = "v1".to_string();
+        meta.codec_params = "pre-skip: filename contains [COMPRESSED]".to_string();
+        return FileOutcome::Skipped {
+            reason: Reason::SkippedAlreadyCompressed,
+            new_bytes: orig,
+            diag: EncodeDiag {
+                command: "pre-skip (already contains [COMPRESSED])".to_string(),
+                exit_code: Some(0),
+                stderr_tail: String::new(),
+            },
+            meta,
         };
     }
     // Cloud-only placeholder (OneDrive et al.): the file exists as a stub but its
@@ -6121,6 +6157,16 @@ mod encoder_tests {
     }
 
     #[test]
+    fn compressed_filename_tag_is_case_insensitive_and_filename_scoped() {
+        use std::path::Path;
+        assert!(has_compressed_filename_tag(Path::new("movie [COMPRESSED].mp4")));
+        assert!(has_compressed_filename_tag(Path::new("movie [compressed] (1).MKV")));
+        let tagged_parent = Path::new("[COMPRESSED]").join("movie.mp4");
+        assert!(!has_compressed_filename_tag(&tagged_parent));
+        assert!(!has_compressed_filename_tag(Path::new("movie compressed.mp4")));
+    }
+
+    #[test]
     fn active_jobs_deduplicate_identical_and_reject_overlapping_paths() {
         let opts = CompressOptions {
             original_action: OriginalAction::Keep,
@@ -6977,6 +7023,54 @@ mod manifest_tests {
         // The threshold round-trips through the manifest.
         let back = job_from_manifest(&id).expect("job reload");
         assert_eq!(back.min_size_bytes, 1_000_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A tagged source is rejected before tool resolution and never produces a
+    /// doubled `[COMPRESSED] [COMPRESSED]` output.
+    #[test]
+    fn tagged_file_skips_before_encoder_and_preserves_source() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let dir = std::env::temp_dir().join(format!(
+            "ft-tagged-preflight-{}-{}",
+            std::process::id(),
+            new_job_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let source = dir.join("movie [compressed].mp4");
+        let before = vec![5u8; 2 * 1024 * 1024];
+        std::fs::write(&source, &before).expect("write tagged source");
+        let source_path = source.to_string_lossy().into_owned();
+        let job = create_job(std::slice::from_ref(&source_path), "balanced", &CompressOptions::default());
+        let state = test_state();
+        let no_tool = compress_tools::ToolInfo::default();
+
+        let outcome = process_file(
+            &state,
+            &job,
+            0,
+            &no_tool,
+            &no_tool,
+            &no_tool,
+            None,
+            &HandbrakeCaps::default(),
+        );
+        match outcome {
+            FileOutcome::Skipped { reason, diag, .. } => {
+                assert_eq!(reason.as_str(), "skipped_already_compressed");
+                assert!(diag.command.starts_with("pre-skip"));
+            }
+            _ => panic!("a tagged source must skip before encoder resolution"),
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), before, "source bytes changed");
+        assert!(
+            !output_path(&source, FileKind::Video).exists(),
+            "a tagged pre-skip must not create a doubled-tag output"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
