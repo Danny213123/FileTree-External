@@ -495,8 +495,8 @@ export function CompressionMonitor({ focusJobId }: Props) {
             <div className="cm-job-controls">
               <label className="cm-concurrency" title="Live worker limit; reductions apply after active files finish">
                 Workers
-                <input type="number" min={1} max={16} value={selectedJob.concurrency ?? 1} onChange={(event) => {
-                  const value = Number(event.target.value);
+                <input type="number" min={1} max={2} value={selectedJob.concurrency ?? 2} onChange={(event) => {
+                  const value = Math.max(1, Math.min(2, Math.floor(Number(event.target.value) || 1)));
                   void mutate("workers", () => setCompressConcurrency(selectedJob.id, value));
                 }} />
               </label>

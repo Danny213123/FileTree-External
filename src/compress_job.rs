@@ -28,6 +28,11 @@ use crate::export::push_json_string;
 use crate::io::{acquire_compress, CompressLane, LockRecover};
 use crate::model::AppState;
 
+/// Hard per-job worker ceiling. Two concurrent files keep both NVENC engines
+/// occupied without spreading disk, memory, and verification bandwidth across
+/// a large waiting/active pool that lowers aggregate throughput.
+const MAX_COMPRESSION_WORKERS: usize = 2;
+
 /// Coarse file classification that selects a pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FileKind {
@@ -436,21 +441,17 @@ impl CompressOptions {
             _ => "h264".to_string(),
         }
     }
-    /// Default worker count: roughly half the logical cores (each video encode is
-    /// itself multi-threaded), clamped to a sane range. The global CompressGate
-    /// still caps total concurrent encoders across jobs.
+    /// Two parallel files are the throughput-oriented default. Individual
+    /// encoders remain internally multi-threaded, and the global CompressGate
+    /// still applies the stricter per-encoder safety limits.
     fn default_concurrency() -> usize {
-        std::thread::available_parallelism()
-            .map(|c| c.get())
-            .unwrap_or(4)
-            .div_ceil(2)
-            .clamp(2, 8)
+        MAX_COMPRESSION_WORKERS
     }
     fn resolved_concurrency(&self) -> usize {
         if self.concurrency == 0 {
             Self::default_concurrency()
         } else {
-            self.concurrency.clamp(1, 16)
+            self.concurrency.clamp(1, MAX_COMPRESSION_WORKERS)
         }
     }
     fn resolved_zip_level(&self) -> i64 {
@@ -1161,7 +1162,7 @@ pub(crate) fn resume_job(job: &Arc<CompressJob>) -> Result<bool, String> {
 }
 
 pub(crate) fn set_job_concurrency(job: &Arc<CompressJob>, concurrency: usize) -> usize {
-    let value = concurrency.clamp(1, 16);
+    let value = concurrency.clamp(1, MAX_COMPRESSION_WORKERS);
     job.desired_concurrency.store(value, Ordering::SeqCst);
     write_manifest(job);
     job.queue_cv.notify_all();
@@ -1434,8 +1435,6 @@ struct Counts {
     verify_failed: AtomicUsize,
 }
 
-const MAX_DYNAMIC_WORKERS: usize = 16;
-
 fn claim_next_file(job: &Arc<CompressJob>) -> Option<usize> {
     let mut queue = job.queue.lock_recover();
     loop {
@@ -1451,7 +1450,10 @@ fn claim_next_file(job: &Arc<CompressJob>) -> Option<usize> {
             queue = next;
             continue;
         }
-        let desired = job.desired_concurrency.load(Ordering::SeqCst).clamp(1, 16);
+        let desired = job
+            .desired_concurrency
+            .load(Ordering::SeqCst)
+            .clamp(1, MAX_COMPRESSION_WORKERS);
         if queue.active >= desired {
             let (next, _) = job
                 .queue_cv
@@ -1617,7 +1619,7 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     // immediately and a reduction apply naturally after active files finish.
     // The global CompressGate remains authoritative for CPU/GPU safety.
     let pending_count = job.queue.lock_recover().pending.len();
-    let nthreads = MAX_DYNAMIC_WORKERS.min(pending_count.max(1));
+    let nthreads = MAX_COMPRESSION_WORKERS.min(pending_count.max(1));
     let mut handles = Vec::with_capacity(nthreads);
     for _ in 0..nthreads {
         let state = Arc::clone(&state);
@@ -5196,7 +5198,7 @@ fn summary_from_cached_value(id: &str, value: &crate::json::JsonValue) -> JobSum
         active_work_bytes: 0,
         active_count: 0,
         active_elapsed_ms: number("activeElapsedMs"),
-        concurrency: number("concurrency").clamp(1, 16) as usize,
+        concurrency: number("concurrency").clamp(1, MAX_COMPRESSION_WORKERS as u64) as usize,
         encoder: string("encoder", "auto"),
         codec: string("codec", "h264"),
         use_gpu: value.get("useGpu").and_then(|item| item.as_bool()).unwrap_or(true),
@@ -5408,10 +5410,11 @@ fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
             .get("activeElapsedMs")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
-        concurrency: root
+        concurrency: (root
             .get("concurrency")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1) as usize,
+            .unwrap_or(MAX_COMPRESSION_WORKERS as u64) as usize)
+            .clamp(1, MAX_COMPRESSION_WORKERS),
         encoder: root.get("encoder").and_then(|v| v.as_str()).unwrap_or("auto").to_string(),
         codec: root.get("codec").and_then(|v| v.as_str()).unwrap_or("h264").to_string(),
         use_gpu: root.get("useGpu").and_then(|v| v.as_bool()).unwrap_or(true),
@@ -6140,6 +6143,15 @@ mod encoder_tests {
     }
 
     #[test]
+    fn compression_concurrency_defaults_to_two_and_never_exceeds_it() {
+        let defaults = CompressOptions::default();
+        assert_eq!(defaults.resolved_concurrency(), 2);
+        assert_eq!(CompressOptions { concurrency: 1, ..defaults.clone() }.resolved_concurrency(), 1);
+        assert_eq!(CompressOptions { concurrency: 99, ..defaults }.resolved_concurrency(), 2);
+        assert_eq!(MAX_COMPRESSION_WORKERS, 2);
+    }
+
+    #[test]
     fn media_pre_skip_rules() {
         use std::path::Path;
         // Efficient codec under the cap → skipped; large stays.
@@ -6260,7 +6272,7 @@ mod manifest_tests {
         let opts = CompressOptions {
             original_action: OriginalAction::Delete,
             tag_filename: true,
-            concurrency: 4,
+            concurrency: 2,
             encoder: "qsv".to_string(),
             use_gpu: false,
             codec: "h265".to_string(),
@@ -6282,7 +6294,7 @@ mod manifest_tests {
         assert_eq!(back.original_action, OriginalAction::Delete);
         assert_eq!(back.min_size_bytes, 2_000_000);
         assert!(back.tag_filename);
-        assert_eq!(back.concurrency, 4);
+        assert_eq!(back.concurrency, 2);
         assert_eq!(back.encoder, "qsv");
         assert!(!back.use_gpu);
         assert_eq!(back.codec, "h265");
@@ -6639,7 +6651,7 @@ mod manifest_tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Concurrency-exhaustion regression: with a worker pool (concurrency=4) and
+    /// Concurrency-exhaustion regression: with a worker pool (concurrency=2) and
     /// MORE panicking files than workers, a "one dead worker per bad file" bug
     /// would stall the batch once every worker had exited. Every file must reach a
     /// terminal state and the job must finish.
@@ -6654,7 +6666,7 @@ mod manifest_tests {
 
         let payload = vec![b'A'; 8 * 1024];
         let mut paths: Vec<String> = Vec::new();
-        // 12 panicking files (> the 4 workers) scheduled first, then 6 good files.
+        // 12 panicking files (> the 2 workers) scheduled first, then 6 good files.
         for n in 0..12 {
             let boom = dir.join(format!("__FORCE_PANIC__{n}.bin"));
             std::fs::write(&boom, &payload).expect("write boom");
@@ -6669,7 +6681,7 @@ mod manifest_tests {
 
         let opts = CompressOptions {
             original_action: OriginalAction::Keep,
-            concurrency: 4,
+            concurrency: 2,
             ..CompressOptions::default()
         };
         let job = create_job(&paths, "balanced", &opts);
@@ -7202,7 +7214,7 @@ mod manifest_tests {
         assert_eq!(job.active_started_at.load(Ordering::Relaxed), 0);
         assert!(resume_job(&job).unwrap(), "a never-started paused job needs a runner");
         assert_eq!(job.status.lock_recover().as_str(), "running");
-        assert_eq!(set_job_concurrency(&job, 99), 16);
+        assert_eq!(set_job_concurrency(&job, 99), 2);
         assert_eq!(set_job_concurrency(&job, 0), 1);
 
         // Largest-first is the default; prioritizing index 0 moves the small file
@@ -7259,7 +7271,7 @@ mod manifest_tests {
         assert_eq!(retry.encoder, "nvenc");
         assert_eq!(retry.codec, "h265");
         assert_eq!(retry.original_action, OriginalAction::Keep);
-        assert_eq!(retry.desired_concurrency.load(Ordering::Relaxed), 7);
+        assert_eq!(retry.desired_concurrency.load(Ordering::Relaxed), 2);
         let _ = std::fs::remove_dir_all(&home);
     }
 

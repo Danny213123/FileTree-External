@@ -4,6 +4,13 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.14.3] - 2026-08-24
+
+### Changed
+
+- Compression now defaults to and enforces a maximum of two parallel file workers. This aligns the job scheduler with the two NVENC session lanes and avoids spreading disk, memory, decode, verification, and encoder bandwidth across larger worker pools that can reduce aggregate throughput.
+- Setup and Monitor concurrency controls now allow 1-2 workers. New jobs, live updates, resumed manifests, selective retries, and persisted summaries all normalize older or out-of-range values to the two-worker ceiling, and each job creates at most two worker threads.
+
 ## [1.14.2] - 2026-08-24
 
 ### Fixed

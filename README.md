@@ -2,7 +2,7 @@
 
 A standalone Windows disk-usage explorer: point at a folder, see what's taking space, and clean it up. Single `.exe`, no installer.
 
-**Current version:** `1.14.2`
+**Current version:** `1.14.3`
 
 ## Features
 
@@ -66,7 +66,7 @@ A standalone Windows disk-usage explorer: point at a folder, see what's taking s
 ### Compression Workspace
 
 - Compact Setup, Monitor, and History workspaces for mixed video, image, and archive batches.
-- HandBrake video encoding with automatic NVENC, Quick Sync, or AMD selection, safe CPU fallback, codec/quality presets, and live 1-16 worker control.
+- HandBrake video encoding with automatic NVENC, Quick Sync, or AMD selection, safe CPU fallback, codec/quality presets, and a throughput-oriented maximum of two parallel workers.
 - Size-weighted overall progress plus per-file stages, progress, elapsed time, ETA, speed, encoder, sizes, savings, disposition, and result.
 - Master-detail monitoring with a run rail, cached hardware/process telemetry, virtualized 200,000-file-scale tables, active/recent pinning, search, filters, sorting, persisted columns, and a diagnostics inspector.
 - Graceful pause/resume, immediate resumable stop, pending-file prioritize/skip, selective retry, and persisted queued batches that survive restarts.

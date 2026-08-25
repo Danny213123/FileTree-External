@@ -124,7 +124,7 @@ const DISPOSITION_LABEL: Record<string, { label: string; title: string }> = {
 const PERF_KEY = "filetree.compress.perf";
 
 interface CompressPerfSettings {
-  /** 0 ⇒ let the server pick a hardware default (logical cores, lane-capped). */
+  /** Parallel file workers. The backend enforces a hard maximum of two. */
   concurrency: number;
   encoder: CompressEncoder;
   useGpu: boolean;
@@ -161,7 +161,7 @@ interface CompressPerfSettings {
 }
 
 const DEFAULT_PERF: CompressPerfSettings = {
-  concurrency: 0,
+  concurrency: 2,
   encoder: "auto",
   useGpu: true,
   codec: "h264",
@@ -218,7 +218,9 @@ function loadPerf(): CompressPerfSettings {
     if (!raw) return { ...DEFAULT_PERF };
     const p = JSON.parse(raw) as Partial<CompressPerfSettings>;
     return {
-      concurrency: typeof p.concurrency === "number" && p.concurrency >= 0 ? Math.min(64, Math.floor(p.concurrency)) : 0,
+      concurrency: typeof p.concurrency === "number" && p.concurrency > 0
+        ? Math.min(2, Math.floor(p.concurrency))
+        : 2,
       encoder: (["auto", "x264", "nvenc", "qsv", "vce"] as const).includes(p.encoder as CompressEncoder)
         ? (p.encoder as CompressEncoder)
         : "auto",
@@ -858,7 +860,7 @@ export function CompressView({
   const abortRef = useRef<AbortController | null>(null);
   const finalizedRef = useRef(false);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Coalesce the per-file progress storm: large jobs (>160 files, 2-8 parallel
+  // Coalesce the per-file progress storm: large jobs (>160 files, up to 2 parallel
   // encoders) emit NDJSON `progress` lines faster than React can re-render. We
   // buffer non-terminal per-file events here and flush them all in a single Map
   // clone + re-render on the next animation frame, instead of cloning the whole
@@ -2629,12 +2631,12 @@ export function CompressView({
             <input
               id="cv-concurrency"
               type="number"
-              min={0}
-              max={64}
+              min={1}
+              max={2}
               value={perf.concurrency}
-              onChange={(e) => updatePerf({ concurrency: Math.max(0, Math.min(64, Math.floor(Number(e.target.value) || 0))) })}
+              onChange={(e) => updatePerf({ concurrency: Math.max(1, Math.min(2, Math.floor(Number(e.target.value) || 1))) })}
             />
-            <span className="compress-perf-hint">0 = auto</span>
+            <span className="compress-perf-hint">Maximum 2 workers</span>
           </div>
           <div className="compress-perf-field">
             <label htmlFor="cv-zip">Zip level</label>

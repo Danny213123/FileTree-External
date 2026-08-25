@@ -699,7 +699,7 @@ export interface CompressJobRequest {
    *  Sent so an older server still honors the recoverable-vs-destroy intent. */
   recycleOriginals: boolean;
   tagFilename: boolean;
-  /** Worker concurrency (parallel files). 0 / omitted ⇒ server hardware-default. */
+  /** Worker concurrency (parallel files), clamped to 1-2. 0 / omitted ⇒ 2. */
   concurrency?: number;
   /** Video encoder selection (default `auto`). */
   encoder?: CompressEncoder;
