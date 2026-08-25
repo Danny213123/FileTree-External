@@ -2723,6 +2723,7 @@ const STATUS_LABEL: Record<string, string> = {
   skipped_prior_no_gain: "Previously no gain",
   skipped_already_compressed: "Already compressed",
   skipped_too_small: "Too small",
+  skipped_incomplete: "Incomplete download",
   error: "Error",
 };
 
@@ -2735,6 +2736,7 @@ const REASON_LABEL: Record<string, string> = {
   skipped_prior_no_gain: "Skipped — unchanged since prior no-gain result",
   skipped_already_compressed: "Skipped — already compressed",
   skipped_too_small: "Skipped — too small",
+  skipped_incomplete: "Skipped — incomplete download",
   error_tool_missing: "Error — tool missing",
   error_unsupported: "Error — unsupported",
   error_encoder: "Error — encoder failed",
@@ -2754,6 +2756,7 @@ const REASON_TOOLTIP: Record<string, string> = {
   skipped_prior_no_gain: "The source and compression profile are unchanged since a prior encode produced no savings, so no encoder was started.",
   skipped_already_compressed: "The filename already contains FileTree's [COMPRESSED] marker, so no encoder was started.",
   skipped_too_small: "The original was below the minimum-size threshold, so it was left untouched without attempting to compress (too small to meaningfully shrink — e.g. a video with too few frames).",
+  skipped_incomplete: "The filename has a temporary download suffix, so FileTree left it untouched without reading or compressing it. Let the download finish before retrying.",
   error_tool_missing: "The required encoder (HandBrake for video, ffmpeg/ImageMagick for images) isn't installed.",
   error_unsupported: "This file type has no supported compression pipeline.",
   error_encoder: "The encoder ran but exited with an error. See the debug log / stderr excerpt for details.",
@@ -2784,6 +2787,9 @@ function progBadge(rf: FileProg): { label: string; title: string } {
     case "running":
       return { label: `${Math.round(rf.pct)}%`, title: "Encoding…" };
     case "skipped":
+      if (rf.reason === "skipped_incomplete") {
+        return { label: "Incomplete download", title: REASON_TOOLTIP.skipped_incomplete };
+      }
       if (rf.reason === "skipped_too_small") {
         return { label: "Too small", title: REASON_TOOLTIP.skipped_too_small };
       }

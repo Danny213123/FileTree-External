@@ -2193,6 +2193,9 @@ pub(crate) enum Reason {
     /// Explicitly skipped by the user while still pending. The source is never
     /// opened, changed, moved, or deleted.
     SkippedUser,
+    /// A temporary/incomplete download suffix was detected. These files are
+    /// never read or transformed because their contents may still be changing.
+    SkippedIncomplete,
     /// The required external encoder (HandBrake / ffmpeg / ImageMagick) is missing.
     ErrorToolMissing,
     /// The file kind has no supported pipeline. Reserved in the taxonomy; the
@@ -2241,6 +2244,7 @@ impl Reason {
             Reason::SkippedAlreadyCompressed => "skipped_already_compressed",
             Reason::SkippedTooSmall => "skipped_too_small",
             Reason::SkippedUser => "skipped_user",
+            Reason::SkippedIncomplete => "skipped_incomplete",
             Reason::ErrorToolMissing => "error_tool_missing",
             Reason::ErrorUnsupported => "error_unsupported",
             Reason::ErrorEncoder => "error_encoder",
@@ -2325,6 +2329,20 @@ fn has_compressed_filename_tag(path: &Path) -> bool {
     path.file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase().contains("[compressed]"))
         .unwrap_or(false)
+}
+
+/// Download-client temporary suffixes. A compound name such as `movie.mp4.part`
+/// is not a generic compressible file; it is an unfinished download and must be
+/// left untouched until the downloader renames it to its final extension.
+fn is_incomplete_download(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "part" | "partial" | "crdownload" | "download" | "opdownload" | "aria2"
+    )
 }
 
 /// Whether `path` is a cloud-only placeholder whose contents aren't present
@@ -2555,6 +2573,27 @@ fn process_file(
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
+
+    // Temporary download fragments are neither valid finished media nor useful
+    // ZIP candidates. Skip before no-gain lookup, output reservation, or any
+    // encoder/archive work so a multi-gigabyte `.mp4.part` cannot waste minutes
+    // and then fail at an archive boundary.
+    if is_incomplete_download(&input) {
+        let mut meta = EncodeMeta::default();
+        meta.tool = "filename preflight".to_string();
+        meta.tool_version = "v1".to_string();
+        meta.codec_params = "pre-skip: incomplete download suffix".to_string();
+        return FileOutcome::Skipped {
+            reason: Reason::SkippedIncomplete,
+            new_bytes: orig,
+            diag: EncodeDiag {
+                command: "pre-skip (incomplete download)".to_string(),
+                exit_code: Some(0),
+                stderr_tail: String::new(),
+            },
+            meta,
+        };
+    }
 
     // Minimum-size threshold: a file below the user's minimum is too small to
     // meaningfully compress (especially a video with too few frames), so skip it
@@ -3770,8 +3809,9 @@ fn encode_inactivity_limit_ms() -> u64 {
         .unwrap_or(10 * 60 * 1000)
 }
 
-/// Spawn `cmd` as the job's active child, drain stdout silently, parse `%`
-/// progress from stderr, and poll until exit or cancellation. The child handle
+/// Spawn `cmd` as the job's active child, parse `%` progress from both stdout
+/// and stderr, and poll until exit or cancellation. HandBrake versions differ
+/// in which stream carries their live carriage-return progress line. The child handle
 /// is stored on the job so `cancel` can `kill()` it. A per-file inactivity
 /// watchdog kills a child that produces NO output for
 /// [`encode_inactivity_limit_ms`] (a hung/corrupt input), so a single bad file
@@ -3809,19 +3849,13 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     // longer than the inactivity limit (a hung/corrupt input).
     let last_activity = Arc::new(AtomicU64::new(now_ms()));
 
-    // Drain stdout so the pipe can never fill and block the child.
-    let out_handle = stdout.map(|mut pipe| {
+    // HandBrake 1.11 emits live encode progress on stdout on some Windows
+    // systems. Parse it instead of silently draining it; the returned bounded
+    // text tail is discarded because only stderr is diagnostic.
+    let out_handle = stdout.map(|pipe| {
+        let job = Arc::clone(job);
         let last_activity = Arc::clone(&last_activity);
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = [0u8; 8192];
-            loop {
-                match pipe.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => last_activity.store(now_ms(), Ordering::Relaxed),
-                }
-            }
-        })
+        std::thread::spawn(move || read_progress(pipe, &job, index, &last_activity))
     });
 
     // Parse percentage + fps from stderr (HandBrake/ffmpeg both report there) and
@@ -3880,12 +3914,15 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     if let Some(mut c) = job.children.lock_recover().remove(&index) {
         let _ = c.wait();
     }
-    if let Some(h) = out_handle {
-        let _ = h.join();
-    }
-    let (mut stderr_tail, fps) = err_handle
+    let (_, stdout_fps) = out_handle
         .map(|h| h.join().unwrap_or_default())
         .unwrap_or_default();
+    let (mut stderr_tail, stderr_fps) = err_handle
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    // Prefer stdout because it carries HandBrake's genuine live encode rate in
+    // affected builds; stderr may only contain a static source-frame-rate line.
+    let fps = stdout_fps.or(stderr_fps);
 
     if cancelled {
         return EncodeResult::Cancelled;
@@ -3978,7 +4015,8 @@ fn read_progress<R: std::io::Read>(
             if b == b'\n' || b == b'\r' {
                 if let Some(p) = parse_percent(&line) {
                     let pi = p.round().clamp(0.0, 100.0) as i64;
-                    if pi != last_pct {
+                    let current = job.files[index].pct.load(Ordering::Relaxed) as i64;
+                    if pi != last_pct && pi > current {
                         last_pct = pi;
                         job.files[index].pct.store(pi as u64, Ordering::Relaxed);
                         if pi >= 100 {
@@ -4046,6 +4084,14 @@ fn parse_fps(line: &str) -> Option<f64> {
 
 /// Extract a percentage from a line like `Encoding: task 1 of 1, 42.53 %`.
 fn parse_percent(line: &str) -> Option<f64> {
+    // HandBrake reports a separate `Scanning title ... 100.00 %` phase before
+    // encoding begins. Treating that as encode progress makes a live file jump
+    // to 100%/Finalizing while NVENC is still working. Only task-encoding lines
+    // represent the progress shown in the monitor.
+    let lower = line.trim_start().to_ascii_lowercase();
+    if !lower.starts_with("encoding:") || !lower.contains("task") {
+        return None;
+    }
     let bytes = line.as_bytes();
     let pct_pos = line.rfind('%')?;
     let mut end = pct_pos;
@@ -5917,6 +5963,39 @@ mod encoder_tests {
     }
 
     #[test]
+    fn handbrake_scan_percentage_never_marks_encode_complete() {
+        assert_eq!(
+            parse_percent("Encoding: task 1 of 1, 42.53 % (60.00 fps, avg 59.90 fps)"),
+            Some(42.53)
+        );
+        assert_eq!(parse_percent("Scanning title 1 of 1, 100.00 %"), None);
+        assert_eq!(parse_percent("libhb: scan thread found 1 valid title(s)"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_stdout_drives_live_handbrake_progress() {
+        let job = create_job(&["stdout-progress.mp4".to_string()], "balanced", &CompressOptions::default());
+        let mut cmd = Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::Out.WriteLine('Encoding: task 1 of 1, 42.53 % (146.74 fps, avg 142.37 fps)')",
+        ]);
+
+        let result = run_child(&job, 0, cmd);
+        match result {
+            EncodeResult::Done { success, fps, .. } => {
+                assert!(success);
+                assert_eq!(fps, Some(146.74));
+            }
+            _ => panic!("stdout progress child did not complete"),
+        }
+        assert_eq!(job.files[0].pct.load(Ordering::Relaxed), 43);
+    }
+
+    #[test]
     fn live_event_replay_buffer_stays_bounded() {
         let job = create_job(&[], "balanced", &CompressOptions::default());
         for index in 0..(LIVE_EVENT_CAPACITY + 100) {
@@ -6815,6 +6894,69 @@ mod manifest_tests {
         // The threshold round-trips through the manifest.
         let back = job_from_manifest(&id).expect("job reload");
         assert_eq!(back.min_size_bytes, 1_000_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Temporary download fragments are skipped before ZIP/video work. This is
+    /// the regression for a 6.8 GiB `.mp4.part` wasting minutes in Deflate and
+    /// then failing at the ZIP32 limit.
+    #[test]
+    fn incomplete_download_skips_before_pipeline_and_preserves_source() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+
+        let dir = std::env::temp_dir().join(format!(
+            "ft-incomplete-preflight-{}-{}",
+            std::process::id(),
+            new_job_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let source = dir.join("movie.mp4.part");
+        let before = vec![9u8; 2 * 1024 * 1024];
+        std::fs::write(&source, &before).expect("write partial source");
+        let source_path = source.to_string_lossy().into_owned();
+        let job = create_job(
+            std::slice::from_ref(&source_path),
+            "balanced",
+            &CompressOptions::default(),
+        );
+        let state = test_state();
+        let no_tool = compress_tools::ToolInfo::default();
+
+        let outcome = process_file(
+            &state,
+            &job,
+            0,
+            &no_tool,
+            &no_tool,
+            &no_tool,
+            None,
+            &HandbrakeCaps::default(),
+        );
+        match outcome {
+            FileOutcome::Skipped { reason, diag, .. } => {
+                assert_eq!(reason.as_str(), "skipped_incomplete");
+                assert_eq!(diag.command, "pre-skip (incomplete download)");
+            }
+            _ => panic!("an incomplete download must skip before its pipeline"),
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), before, "source bytes changed");
+        assert!(
+            !output_path(&source, FileKind::Other).exists(),
+            "an incomplete pre-skip must not create an output"
+        );
+        for name in [
+            "x.partial",
+            "x.crdownload",
+            "x.download",
+            "x.opdownload",
+            "x.aria2",
+        ] {
+            assert!(is_incomplete_download(Path::new(name)), "did not skip {name}");
+        }
+        assert!(!is_incomplete_download(Path::new("archive.part1.rar")));
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);

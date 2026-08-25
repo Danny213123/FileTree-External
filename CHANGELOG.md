@@ -4,6 +4,14 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.14.6] - 2026-08-24
+
+### Fixed
+
+- Temporary download fragments (`.part`, `.partial`, `.crdownload`, `.download`, `.opdownload`, and `.aria2`) are skipped before any archive or encoder work, preserving the source and avoiding wasted multi-gigabyte attempts.
+- The built-in ZIP pipeline enables ZIP64 for legitimate files at or above the ZIP32 4 GiB entry limit instead of failing after writing gigabytes with `Large file option has not been set`.
+- HandBrake live progress is parsed from both stdout and stderr, while its pre-encode `Scanning ... 100%` line is ignored; file percentage and ETA now advance from real NVENC work instead of sticking at zero or jumping to Finalizing early.
+
 ## [1.14.5] - 2026-08-24
 
 ### Fixed

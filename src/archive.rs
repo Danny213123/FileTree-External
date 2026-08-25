@@ -23,6 +23,13 @@ use zip::CompressionMethod;
 /// I/O chunk for streaming file bodies (into the zip, out of the zip, through a
 /// hasher). 64 KiB keeps syscalls amortized without holding a whole file.
 const CHUNK: usize = 64 * 1024;
+/// ZIP32 cannot represent an entry at or above 4 GiB. Enable ZIP64 before
+/// writing those files so the writer does not fail after streaming gigabytes.
+const ZIP32_ENTRY_LIMIT: u64 = u32::MAX as u64;
+
+fn needs_zip64(size: u64) -> bool {
+    size >= ZIP32_ENTRY_LIMIT
+}
 
 /// Create `dest` (a `.zip`) containing every path in `paths` at the default
 /// Deflate level. Kept for the F5 zip endpoint; delegates to
@@ -51,7 +58,12 @@ fn is_precompressed(path: &Path) -> bool {
 /// Deflate at `level` (0..=9). Storing such files is both faster and avoids the
 /// pathological slight *growth* Deflate can add to incompressible data.
 fn entry_options(path: &Path, level: i64) -> SimpleFileOptions {
-    let base = SimpleFileOptions::default().unix_permissions(0o644);
+    let large_file = fs::metadata(path)
+        .map(|metadata| needs_zip64(metadata.len()))
+        .unwrap_or(false);
+    let base = SimpleFileOptions::default()
+        .unix_permissions(0o644)
+        .large_file(large_file);
     if level <= 0 || is_precompressed(path) {
         base.compression_method(CompressionMethod::Stored)
     } else {
@@ -239,4 +251,16 @@ fn to_hex(bytes: impl AsRef<[u8]>) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zip64_is_selected_before_the_zip32_entry_limit() {
+        assert!(!needs_zip64((u32::MAX as u64) - 1));
+        assert!(needs_zip64(u32::MAX as u64));
+        assert!(needs_zip64(7_303_577_911));
+    }
 }
