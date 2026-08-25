@@ -154,13 +154,12 @@ fn capture_version(path: &Path, args: &[&str]) -> Option<String> {
 
 /// Hardware video encoders HandBrake reports as available on this machine,
 /// parsed from its encoder list. Drives the Auto encoder selection, the
-/// capability-gated UI picker, and per-file CPU fallback. `x265` (software HEVC)
-/// is tracked too so the H.265 codec can be offered without any GPU.
+/// capability-gated UI picker, and hardware-only encoder selection. Software
+/// tokens remain parsed for diagnostics and compatibility with older manifests.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HandbrakeCaps {
     pub(crate) x265: bool,
-    /// CPU SVT-AV1 software encoder (the AV1 fallback). Tracked so an AV1 job on a
-    /// build without SVT-AV1 can be downgraded to x264 up front instead of failing.
+    /// CPU SVT-AV1 token, retained only as capability evidence for old clients.
     pub(crate) svt_av1: bool,
     pub(crate) nvenc_h264: bool,
     pub(crate) nvenc_h265: bool,
@@ -302,7 +301,8 @@ pub(crate) fn probe_gpu_hardware() -> &'static GpuHardware {
 /// encoders this build + machine actually expose. HandBrake only lists an
 /// encoder when the underlying driver/hardware is usable, so presence in the
 /// help text is an accurate capability signal. Best-effort: a failure to run or
-/// parse yields empty caps (so the pipeline simply stays on CPU x264).
+/// parse yields empty caps; the pipeline still attempts hardware and fails the
+/// file safely if the requested encoder is genuinely unavailable.
 pub(crate) fn detect_handbrake_caps(path: &Path) -> HandbrakeCaps {
     detect_handbrake_caps_ex(path).0
 }
@@ -767,7 +767,7 @@ pub(crate) fn install_json(tool: &str) -> String {
     s
 }
 
-// ── GPU encode probe (definitive HW-encode test + CPU/GPU auto-tune) ─────────
+// ── GPU encode probe (definitive hardware-only validation) ──────────────────
 
 /// Write a tiny, valid YUV4MPEG2 (`.y4m`) clip to a temp file for a real encode
 /// test. Generated in pure Rust — no bundled binary asset, no external tool —
@@ -914,10 +914,10 @@ pub(crate) fn test_gpu_json(encoder: &str, codec: &str) -> String {
     s
 }
 
-/// Handle `POST /api/compress-tools/autotune`: sample-encode the CPU software
-/// encoder and the best available GPU encoder on the tiny clip, then recommend
-/// the faster of the two that actually succeeded. `{ok:true, cpu:{…}, gpu:{…}?,
-/// recommendedEncoder, recommendedUseGpu}`.
+/// Backward-compatible `POST /api/compress-tools/autotune` response. The old
+/// endpoint compared CPU and GPU encoders; hardware-only mode now probes only
+/// the best GPU encoder and always recommends hardware. `cpu:null` keeps older
+/// clients able to parse the additive response without ever launching x264.
 pub(crate) fn autotune_json(codec: &str) -> String {
     let hb = detect_handbrake();
     let Some(hb_path) = hb.path.as_ref() else {
@@ -929,53 +929,27 @@ pub(crate) fn autotune_json(codec: &str) -> String {
         return "{\"ok\":false,\"error\":\"Could not create a test clip\"}".to_string();
     };
 
-    // CPU baseline: force the software encoder (use_gpu=false → x264/x265/svt_av1).
-    let cpu_enc = crate::compress_job::select_video_encoder("x264", codec, false, &caps, hw);
-    let cpu = run_encode_probe(hb_path, &clip, &cpu_enc.hb, false);
-
-    // Best GPU encoder for the codec (auto preference order), if any resolves.
+    // Best GPU encoder for the codec (NVENC > QSV > VCE). Selection itself has
+    // no software return path, even when capability probing is inconclusive.
     let gpu_enc = crate::compress_job::select_video_encoder("auto", codec, true, &caps, hw);
-    let gpu = if gpu_enc.is_gpu {
-        Some(run_encode_probe(hb_path, &clip, &gpu_enc.hb, true))
+    let gpu = run_encode_probe(hb_path, &clip, &gpu_enc.hb, true);
+    let rec_encoder = if gpu.encoder.starts_with("nvenc") {
+        "nvenc"
+    } else if gpu.encoder.starts_with("qsv") {
+        "qsv"
+    } else if gpu.encoder.starts_with("vce") {
+        "vce"
     } else {
-        None
+        "auto"
     };
     let _ = std::fs::remove_file(&clip);
 
-    // Recommend the faster encoder that succeeded; prefer GPU on a tie since it
-    // offloads the CPU. Fall back to CPU when GPU is unavailable or failed.
-    let (rec_encoder, rec_use_gpu): (String, bool) = match &gpu {
-        Some(g) if g.success && (!cpu.success || g.ms <= cpu.ms) => {
-            // Map the resolved HW token back to a UI encoder id.
-            let id = if g.encoder.starts_with("nvenc") {
-                "nvenc"
-            } else if g.encoder.starts_with("qsv") {
-                "qsv"
-            } else if g.encoder.starts_with("vce") {
-                "vce"
-            } else {
-                "auto"
-            };
-            (id.to_string(), true)
-        }
-        _ => ("x264".to_string(), false),
-    };
-
-    let mut s = String::from("{\"ok\":true,\"cpu\":{");
-    push_probe_fields(&mut s, &cpu);
+    let mut s = String::from("{\"ok\":true,\"cpu\":null,\"gpu\":{");
+    push_probe_fields(&mut s, &gpu);
     s.push('}');
-    s.push_str(",\"gpu\":");
-    match &gpu {
-        Some(g) => {
-            s.push('{');
-            push_probe_fields(&mut s, g);
-            s.push('}');
-        }
-        None => s.push_str("null"),
-    }
     s.push_str(",\"recommendedEncoder\":");
-    push_json_string(&mut s, &rec_encoder);
-    s.push_str(&format!(",\"recommendedUseGpu\":{rec_use_gpu}"));
+    push_json_string(&mut s, rec_encoder);
+    s.push_str(",\"recommendedUseGpu\":true");
     s.push('}');
     s
 }

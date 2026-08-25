@@ -535,8 +535,8 @@ export interface CompressJobFile {
    *  `error_encoder`, `error_unreadable_input`, `error_tool_missing`,
    *  `gpu_fallback`). Empty until terminal. */
   reason?: string;
-  /** The genuine encoder + codec params actually used (e.g. `nvenc_h265 q=26
-   *  preset=quality` or `x264 q=24 …`). Empty until the file terminates. */
+  /** The genuine hardware encoder + codec params used (e.g. `nvenc_h265 q=26
+   *  preset=quality`). Empty until the file terminates. */
   encoder?: string;
   /** origBytes - newBytes (never negative). */
   savedBytes?: number;
@@ -549,7 +549,7 @@ export interface CompressJobFile {
   /** What actually happened to the original after a verified compress:
    *  `recycled`, `deleted`, or `kept`. Empty until terminal / for non-success. */
   disposition?: string;
-  stage?: "queued" | "encoding" | "verifying" | "finalizing" | "terminal";
+  stage?: "queued" | "waiting_gpu" | "encoding" | "verifying" | "finalizing" | "terminal";
   fps?: number | null;
   processingRate?: number | null;
   outputBytes?: number;
@@ -677,8 +677,8 @@ export interface CompressTelemetry {
   gpuMemoryTotalBytes: number | null;
 }
 
-/** Video encoder selection. `auto` lets the server pick the best available
- *  hardware encoder (falling back to x264 per-file when none works). */
+/** Video encoder selection. `x264` remains accepted only for old saved data and
+ *  is normalized to hardware-only `auto` by current clients and servers. */
 export type CompressEncoder = "auto" | "x264" | "nvenc" | "qsv" | "vce";
 
 /** Target video codec. */
@@ -701,9 +701,9 @@ export interface CompressJobRequest {
   tagFilename: boolean;
   /** Worker concurrency (parallel files), clamped to 1-2. 0 / omitted ⇒ 2. */
   concurrency?: number;
-  /** Video encoder selection (default `auto`). */
+  /** Hardware video encoder selection (default `auto`; no software fallback). */
   encoder?: CompressEncoder;
-  /** Allow hardware (GPU) encoding when available (default true). */
+  /** Compatibility field. Current servers force this true. */
   useGpu?: boolean;
   /** Minimum original size in bytes to attempt compression; smaller files are
    *  skipped untouched (`skipped_too_small`). 0 / omitted ⇒ no minimum. */

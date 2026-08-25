@@ -111,10 +111,11 @@ pub(crate) struct FileState {
     /// Wall-clock encode time for this file in ms (0 until done/skipped/error).
     pub(crate) duration_ms: AtomicU64,
     /// The genuine encoder/codec-params actually used (e.g. `nvenc_h265 q=26
-    /// preset=quality`), so the In Progress tab shows GPU vs CPU at a glance even
-    /// for a live run. Empty until terminal.
+    /// preset=quality hwdecode=nvdec`), so the monitor shows the exact hardware
+    /// path used for a live run. Empty until the encoder is resolved.
     pub(crate) encoder: Mutex<String>,
-    /// Fine-grained UI stage: queued, encoding, verifying, finalizing, terminal.
+    /// Fine-grained UI stage: queued, waiting_gpu, encoding, verifying,
+    /// finalizing, terminal.
     /// Older manifests do not carry this field and default from `status`.
     pub(crate) stage: Mutex<String>,
     /// Most recent encoder frame rate, stored as f64 bits (0 means unavailable).
@@ -218,18 +219,12 @@ pub(crate) struct CompressJob {
     /// Live worker limit. The fixed pool waits on `queue_cv`, so increasing this
     /// immediately wakes workers while reductions take effect between files.
     pub(crate) desired_concurrency: AtomicUsize,
-    /// Encoder selection: `auto` | `x264` | `nvenc` | `qsv` | `vce`. `auto`
-    /// picks the best available HW encoder for the codec, else CPU x264/x265.
+    /// Hardware encoder selection: `auto` | `nvenc` | `qsv` | `vce`. Legacy
+    /// `x264` values are normalized to `auto`; video never uses software encode.
     pub(crate) encoder: String,
-    /// Whether hardware acceleration is permitted at all (gates Auto/HW picks).
+    /// Retained in manifests/API responses for compatibility; always true for
+    /// newly loaded jobs because the video pipeline is hardware-only.
     pub(crate) use_gpu: bool,
-    /// Set after a confirmed hardware/driver failure or repeated ambiguous GPU
-    /// failures. Remaining videos use software encoding so a sick driver is not
-    /// hammered repeatedly.
-    pub(crate) gpu_unstable: AtomicBool,
-    /// Consecutive ambiguous GPU failures. A source/mux-specific failure must
-    /// not disable hardware encoding for the rest of a multi-day batch.
-    pub(crate) gpu_failure_streak: AtomicUsize,
     /// Target video codec: `h264` | `h265`.
     pub(crate) codec: String,
     /// Deflate level for the zip pipeline (0-9; 0 = store).
@@ -431,7 +426,10 @@ impl Default for CompressOptions {
 impl CompressOptions {
     fn norm_encoder(e: &str) -> String {
         match e {
-            "auto" | "x264" | "nvenc" | "qsv" | "vce" => e.to_string(),
+            "auto" | "nvenc" | "qsv" | "vce" => e.to_string(),
+            // Older clients/manifests may still request software x264. Preserve
+            // API compatibility while enforcing the hardware-only policy.
+            "x264" => "auto".to_string(),
             _ => "auto".to_string(),
         }
     }
@@ -453,6 +451,12 @@ impl CompressOptions {
         } else {
             self.concurrency.clamp(1, MAX_COMPRESSION_WORKERS)
         }
+    }
+    fn resolved_use_gpu(&self) -> bool {
+        // Read the legacy field so old request/manifest shapes remain accepted,
+        // but hardware-only video ignores attempts to disable acceleration.
+        let _legacy_setting = self.use_gpu;
+        true
     }
     fn resolved_zip_level(&self) -> i64 {
         if self.zip_level < 0 { 6 } else { self.zip_level.clamp(0, 9) }
@@ -504,9 +508,7 @@ pub(crate) fn create_job(
         concurrency: opts.resolved_concurrency(),
         desired_concurrency: AtomicUsize::new(opts.resolved_concurrency()),
         encoder: CompressOptions::norm_encoder(&opts.encoder),
-        use_gpu: opts.use_gpu,
-        gpu_unstable: AtomicBool::new(false),
-        gpu_failure_streak: AtomicUsize::new(0),
+        use_gpu: opts.resolved_use_gpu(),
         codec: CompressOptions::norm_codec(&opts.codec),
         zip_level: opts.resolved_zip_level(),
         min_size_bytes: opts.min_size_bytes,
@@ -757,9 +759,7 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         concurrency: opts.resolved_concurrency(),
         desired_concurrency: AtomicUsize::new(opts.resolved_concurrency()),
         encoder: CompressOptions::norm_encoder(&opts.encoder),
-        use_gpu: opts.use_gpu,
-        gpu_unstable: AtomicBool::new(false),
-        gpu_failure_streak: AtomicUsize::new(0),
+        use_gpu: opts.resolved_use_gpu(),
         codec: CompressOptions::norm_codec(&opts.codec),
         zip_level: opts.resolved_zip_level(),
         min_size_bytes: opts.min_size_bytes,
@@ -807,40 +807,26 @@ fn normalize_preset(p: &str) -> String {
 /// runs in, whether it is hardware-accelerated, and a short label for logs/CSV.
 #[derive(Clone, Debug)]
 pub(crate) struct VideoEncoder {
-    /// HandBrake `-e` value, e.g. `x264`, `x265`, `nvenc_h264`, `qsv_h265`.
+    /// HandBrake `-e` value, e.g. `nvenc_h264`, `qsv_h265`, `vce_h264`.
     pub(crate) hb: String,
     pub(crate) lane: CompressLane,
     pub(crate) is_gpu: bool,
 }
 
-/// Map the job's encoder choice + codec + detected capabilities to the concrete
-/// HandBrake encoder to use. `auto` prefers a hardware encoder for the codec
-/// (NVENC > QSV > VCE) when GPU use is allowed and available, otherwise the CPU
-/// software encoder (x265 for HEVC, x264 for H.264). An explicit HW encoder that
-/// isn't available silently falls back to CPU here (a runtime GPU failure is
-/// handled separately by the per-file CPU retry).
+/// Map the job's encoder choice + codec + detected capabilities to a concrete
+/// hardware HandBrake encoder. `auto` prefers NVENC, then QSV, then VCE. Legacy
+/// GPU-off/x264 requests are treated as `auto`; there is deliberately no
+/// software-video return path. When detection is inconclusive we attempt NVENC
+/// so the file fails visibly rather than silently consuming CPU.
 pub(crate) fn select_video_encoder(
     encoder: &str,
     codec: &str,
-    use_gpu: bool,
+    _use_gpu: bool,
     caps: &HandbrakeCaps,
     hw: &compress_tools::GpuHardware,
 ) -> VideoEncoder {
     let av1 = codec == "av1";
     let h265 = codec == "h265";
-    // CPU software encoder per codec: SVT-AV1 for AV1, x265 for HEVC (when the
-    // build exposes it), else x264.
-    let cpu = || VideoEncoder {
-        hb: if av1 {
-            "svt_av1".to_string()
-        } else if h265 && caps.x265 {
-            "x265".to_string()
-        } else {
-            "x264".to_string()
-        },
-        lane: CompressLane::VideoCpu,
-        is_gpu: false,
-    };
     let gpu = |hb: &str| VideoEncoder {
         hb: hb.to_string(),
         lane: if hb.starts_with("nvenc") {
@@ -850,25 +836,26 @@ pub(crate) fn select_video_encoder(
         },
         is_gpu: true,
     };
-    let suffix = if av1 { "av1" } else if h265 { "h265" } else { "h264" };
+    let suffix = if av1 {
+        "av1"
+    } else if h265 {
+        "h265"
+    } else {
+        "h264"
+    };
     let tok = |vendor: &str| -> String { format!("{vendor}_{suffix}") };
-
-    if !use_gpu || encoder == "x264" {
-        return cpu();
-    }
 
     // Whether we should attempt a vendor's HW encoder. We deliberately treat an
     // empty `-h` cap as "unknown" rather than "absent": the build the user runs
     // omits the tokens from redirected help even though NVENC works. So a vendor
     // is attempted when its `-h` token is present OR its physical adapter exists.
-    // A failed attempt now falls back to CPU *loudly* (see run_video), so this
-    // never silently wastes work — and we still avoid attempts when there is no
-    // matching adapter at all (unless the user explicitly picked that vendor).
+    // A failed attempt is terminal for that file and leaves the source untouched.
+    // We still avoid attempts when there is no matching adapter at all unless the
+    // user explicitly picked that vendor.
     //
-    // AV1 is gated more tightly: only fairly recent GPUs encode AV1, so the mere
-    // presence of an adapter does NOT imply AV1 support. We require the `-h` AV1
-    // token; absent that, AV1 stays on the CPU SVT-AV1 encoder (no wasted GPU
-    // attempt that would just fall back).
+    // AV1 is gated more tightly: only fairly recent GPUs encode AV1, so adapter
+    // presence alone does not choose AV1 in Auto. An explicit vendor selection
+    // is still attempted and fails visibly if that GPU lacks AV1 support.
     let (nvenc_ok, qsv_ok, vce_ok) = if av1 {
         (caps.nvenc_av1, caps.qsv_av1, caps.vce_av1)
     } else {
@@ -879,8 +866,8 @@ pub(crate) fn select_video_encoder(
         )
     };
 
-    // Explicit vendor pick: honor it even with no adapter detected (the user
-    // asked for it; the loud fallback explains any failure).
+    // Explicit vendor pick: honor it even with no adapter detected. A failure is
+    // terminal for that file and never invokes a software encoder.
     match encoder {
         "nvenc" => return gpu(&tok("nvenc")),
         "qsv" => return gpu(&tok("qsv")),
@@ -888,70 +875,47 @@ pub(crate) fn select_video_encoder(
         _ => {} // "auto" (and anything else) → preference order below
     }
 
-    // Auto: prefer NVENC, then QSV, then VCE — but only for a vendor whose
-    // adapter/token is actually present, so a GPU-less box stays on CPU.
-    if nvenc_ok { return gpu(&tok("nvenc")); }
-    if qsv_ok { return gpu(&tok("qsv")); }
-    if vce_ok { return gpu(&tok("vce")); }
-    cpu()
+    // Auto: prefer NVENC, then QSV, then VCE when capability evidence exists.
+    if nvenc_ok {
+        return gpu(&tok("nvenc"));
+    }
+    if qsv_ok {
+        return gpu(&tok("qsv"));
+    }
+    if vce_ok {
+        return gpu(&tok("vce"));
+    }
+
+    // Hardware-only final attempt. This keeps old jobs/clients from silently
+    // becoming x264 work when probing fails; HandBrake's exact NVENC error is
+    // surfaced while the source remains untouched.
+    gpu(&tok("nvenc"))
 }
 
-/// Quality value + optional height cap for a video encoder at a preset. The
-/// quality scale differs per encoder family: x264/x265 use RF, NVENC uses CQ and
-/// QSV uses ICQ (all passed via HandBrake's `-q`), so the numbers are tuned per
-/// family to land at comparable visual quality. Also returns the
-/// `--encoder-preset` (speed/efficiency) appropriate to the family.
+/// Hardware quality value + optional height cap for a video preset. HandBrake
+/// passes these values to NVENC/QSV/VCE through `-q`; every hardware family uses
+/// the encoder's quality-focused preset.
 fn video_quality(
-    hb_encoder: &str,
+    _hb_encoder: &str,
     preset: &str,
     custom_q: u32,
     custom_h: u32,
 ) -> (String, Option<String>, &'static str) {
-    let gpu = hb_encoder.starts_with("nvenc")
-        || hb_encoder.starts_with("qsv")
-        || hb_encoder.starts_with("vce");
-    // (quality, maxHeight) by preset; GPU CQ/ICQ runs a touch higher than RF for
-    // a similar size since hardware encoders are less efficient per quality step.
-    let (q, h): (String, Option<String>) = match (preset, gpu) {
-        ("max", false) => ("30".to_string(), Some("480".to_string())),
-        ("max", true) => ("32".to_string(), Some("480".to_string())),
-        // "More savings": between Balanced (1080p/RF24) and Maximum (480p/RF30).
-        ("more", false) => ("27".to_string(), Some("720".to_string())),
-        ("more", true) => ("29".to_string(), Some("720".to_string())),
-        ("high", false) => ("20".to_string(), None),
-        ("high", true) => ("22".to_string(), None),
-        ("custom", _) => {
-            // User-chosen RF base (default 26, clamped); GPU adds +2 like the
-            // other presets. Height 0 ⇒ original (no cap).
+    let (q, h): (String, Option<String>) = match preset {
+        "max" => ("32".to_string(), Some("480".to_string())),
+        "more" => ("29".to_string(), Some("720".to_string())),
+        "high" => ("22".to_string(), None),
+        "custom" => {
+            // Preserve the existing custom scale while keeping the hardware
+            // offset used by every built-in preset. Height 0 keeps the source.
             let base = custom_quality_or_default(custom_q);
-            let q = if gpu { (base + 2).min(40) } else { base };
+            let q = (base + 2).min(40);
             let h = if custom_h == 0 { None } else { Some(custom_h.to_string()) };
             (q.to_string(), h)
         }
-        (_, false) => ("24".to_string(), Some("1080".to_string())),
-        (_, true) => ("26".to_string(), Some("1080".to_string())),
+        _ => ("26".to_string(), Some("1080".to_string())),
     };
-    let enc_preset = if gpu {
-        "quality"
-    } else if hb_encoder.starts_with("svt_av1") {
-        // SVT-AV1 uses a numeric speed preset (0 slowest/best … 13 fastest).
-        // Bias toward "slower but smaller" for the quality-focused presets.
-        match preset {
-            "max" => "9",
-            "more" => "8",
-            "high" => "5",
-            "custom" => "7",
-            _ => "7",
-        }
-    } else {
-        match preset {
-            "max" => "veryfast",
-            "high" => "slow",
-            // "more" and "custom" both use x264 medium.
-            _ => "medium",
-        }
-    };
-    (q, h, enc_preset)
+    (q, h, "quality")
 }
 
 /// Clamp a custom RF base into the supported 16..=40 window, substituting the
@@ -981,12 +945,16 @@ fn pipeline_params(
                 "high" => ("20".to_string(), None),
                 "custom" => {
                     let q = custom_quality_or_default(custom_q).to_string();
-                    let h = if custom_h == 0 { None } else { Some(custom_h.to_string()) };
+                    let h = if custom_h == 0 {
+                        None
+                    } else {
+                        Some(custom_h.to_string())
+                    };
                     (q, h)
                 }
                 _ => ("24".to_string(), Some("1080".to_string())),
             };
-            let mut s = format!("x264 rf={q}");
+            let mut s = format!("gpu-auto q={q}");
             if let Some(h) = h {
                 s.push_str(&format!(" maxHeight={h}"));
             }
@@ -1538,7 +1506,7 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
 
     let hb = compress_tools::detect_handbrake();
     let (img, img_kind) = compress_tools::detect_image();
-    // ffmpeg is the preferred output verifier (full re-decode); detect it once
+    // ffmpeg is the preferred output verifier (full hardware re-decode); detect it once
     // here even when ImageMagick is the chosen image encoder, since the video
     // pipeline runs on HandBrake and wouldn't otherwise locate ffmpeg.
     let ff = compress_tools::detect_ffmpeg();
@@ -1578,8 +1546,8 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
 
         // Evidence dump: the exact encoder tokens THIS HandBrake build reports,
         // plus a clear note about how GPU will be attempted. Empty `-h` caps are
-        // treated as "unknown": if an adapter is present we still try GPU and rely
-        // on the (now loud) per-file fallback to explain any real failure.
+        // treated as "unknown": if an adapter is present we still try GPU and
+        // surface any real hardware failure on the affected file.
         if let Some(p) = hb.path.as_ref() {
             crate::compress_debug::log(&format!(
                 "[job_start] handbrake encoders ({}): {}",
@@ -1589,13 +1557,13 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
             if job.use_gpu && !caps.any_gpu() && eff.any_gpu() {
                 crate::compress_debug::log(
                     "[job_start] NOTE: HandBrake -h reported no hardware encoder, but a GPU \
-                     adapter is present — FileTree will still ATTEMPT the hardware encoder and, \
-                     if it fails, fall back to CPU with the GPU error captured (reason=gpu_fallback).",
+                     adapter is present — FileTree will still ATTEMPT the hardware encoder. \
+                     Failure is terminal for that file; software fallback is disabled.",
                 );
             } else if job.use_gpu && !eff.any_gpu() {
                 crate::compress_debug::log(
                     "[job_start] WARNING: useGpu requested but no hardware encoder token AND no \
-                     GPU adapter were detected. Encoding will use CPU x264/x265. Point \
+                     GPU adapter were detected. Video files will fail without being altered. Point \
                      FILETREE_HANDBRAKE at a hardware-capable HandBrakeCLI, or drop one into the \
                      app tools dir, to enable GPU.",
                 );
@@ -2416,7 +2384,7 @@ fn source_modified_ms(path: &Path) -> u64 {
 }
 
 /// Settings and runtime capabilities that can change whether an encode saves
-/// space. Bump `v1` whenever FileTree changes its encode recipe materially.
+/// space. Bump the profile version whenever FileTree changes its recipe.
 fn no_gain_profile(
     job: &CompressJob,
     kind: FileKind,
@@ -2428,16 +2396,12 @@ fn no_gain_profile(
     let (tool_path, tool_version, image_tool, resolved_encoder, hardware) = match kind {
         FileKind::Video => {
             let hw = compress_tools::probe_gpu_hardware();
-            let mut resolved = if job.gpu_unstable.load(Ordering::Relaxed) {
-                cpu_fallback_encoder(&job.codec, caps)
-            } else {
-                select_video_encoder(&job.encoder, &job.codec, job.use_gpu, caps, hw)
-            };
-            if !resolved.is_gpu {
-                resolved.hb = validate_encoder_token(&resolved.hb, caps).to_string();
-            }
+            let resolved = select_video_encoder(&job.encoder, &job.codec, true, caps, hw);
             (
-                hb.path.as_ref().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default(),
+                hb.path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 hb.version.clone().unwrap_or_default(),
                 "",
                 resolved.hb,
@@ -2460,13 +2424,11 @@ fn no_gain_profile(
         ),
     };
     format!(
-        "v1|kind={}|preset={}|encoder={}|resolved={}|gpu={}|unstable={}|codec={}|zip={}|height={}|quality={}|tool={}|toolVersion={}|imageTool={}|hardware={}|caps={}{}{}{}{}{}{}{}{}{}{}",
+        "v2|kind={}|preset={}|encoder={}|resolved={}|gpu=true|codec={}|zip={}|height={}|quality={}|tool={}|toolVersion={}|imageTool={}|hardware={}|caps={}{}{}{}{}{}{}{}{}{}{}",
         kind.as_str(),
         job.preset,
         job.encoder,
         resolved_encoder,
-        job.use_gpu,
-        job.gpu_unstable.load(Ordering::Relaxed),
         job.codec,
         job.zip_level,
         job.custom_max_height,
@@ -2662,19 +2624,21 @@ fn process_file(
         reserved_output_in_dir(job, &input, kind)
     };
 
-    // Resolve the genuine encoder (so logs/CSV reflect GPU vs CPU) + run it. For
-    // video a GPU encode failure falls back to CPU x264 (logged) on the same file.
+    // Resolve the genuine hardware encoder and run it. Video failures preserve
+    // the source and never retry with a software encoder.
     let mut meta = EncodeMeta::default();
     let encode = match kind {
         FileKind::Video => match hb.path.as_ref() {
             Some(p) => run_video(job, index, p, &input, &out, caps, hb, &mut meta),
-            None => return FileOutcome::Error {
-                reason: Reason::ErrorToolMissing,
-                message: "HandBrake not installed - install HandBrakeCLI to compress video"
-                    .to_string(),
-                diag: EncodeDiag::default(),
-                meta: EncodeMeta::default(),
-            },
+            None => {
+                return FileOutcome::Error {
+                    reason: Reason::ErrorToolMissing,
+                    message: "HandBrake not installed - install HandBrakeCLI to compress video"
+                        .to_string(),
+                    diag: EncodeDiag::default(),
+                    meta: EncodeMeta::default(),
+                };
+            }
         },
         FileKind::Image => match (img.path.as_ref(), img_kind) {
             (Some(p), Some(ImageKind::Ffmpeg)) => {
@@ -3028,7 +2992,7 @@ fn run_verify_capture(job: &Arc<CompressJob>, index: usize, mut cmd: Command) ->
 }
 
 /// Deep-verify a just-produced compressed output BEFORE the original is disposed
-/// of. Re-decodes media (ffmpeg, falling back to a HandBrake `--scan`), decodes
+/// of. Hardware-decodes video (ffmpeg, falling back to a HandBrake `--scan`), decodes
 /// images (ImageMagick `identify -regard-warnings`, falling back to ffmpeg) and
 /// confirms dimensions match the original, and CRC-checks zip archives. Returns
 /// [`Verify::Failed`] with a detail on any integrity problem, [`Verify::Cancelled`]
@@ -3062,9 +3026,22 @@ fn verify_output(
     }
 }
 
-/// Verify a re-encoded video by full re-decode. ffmpeg is preferred
-/// (`-v error -xerror -i <out> -f null -`): any non-zero exit OR any stderr is a
-/// failure. Without ffmpeg, a HandBrake `--scan` must report at least one title.
+fn ffmpeg_hwaccel_for_encoder(encoder: &str) -> Option<(&'static str, &'static str)> {
+    if encoder.starts_with("nvenc") {
+        Some(("cuda", "cuda"))
+    } else if encoder.starts_with("qsv") {
+        Some(("qsv", "qsv"))
+    } else if encoder.starts_with("vce") {
+        Some(("d3d11va", "d3d11"))
+    } else {
+        None
+    }
+}
+
+/// Verify a re-encoded video by full hardware re-decode. ffmpeg is preferred;
+/// any non-zero exit OR any stderr is a failure. The selected encoder determines
+/// the mandatory ffmpeg hardware backend, and there is no software-decode retry.
+/// Without ffmpeg, a hardware-enabled HandBrake `--scan` must report a title.
 /// On success the probed duration is sanity-checked against the original.
 fn verify_media(
     job: &Arc<CompressJob>,
@@ -3074,9 +3051,23 @@ fn verify_media(
     ff: &compress_tools::ToolInfo,
     hb: &compress_tools::ToolInfo,
 ) -> Verify {
-    if let Some(ffmpeg) = ff.path.as_ref() {
+    let encoder = job.files[index].encoder.lock_recover().clone();
+    if let (Some(ffmpeg), Some((hwaccel, output_format))) =
+        (ff.path.as_ref(), ffmpeg_hwaccel_for_encoder(&encoder))
+    {
         let mut cmd = Command::new(ffmpeg);
-        cmd.args(["-v", "error", "-xerror", "-i"]).arg(out).args(["-f", "null", "-"]);
+        cmd.args([
+            "-v",
+            "error",
+            "-xerror",
+            "-hwaccel",
+            hwaccel,
+            "-hwaccel_output_format",
+            output_format,
+            "-i",
+        ])
+        .arg(out)
+        .args(["-f", "null", "-"]);
         let run = run_verify_capture(job, index, cmd);
         if run.cancelled {
             return Verify::Cancelled;
@@ -3084,14 +3075,17 @@ fn verify_media(
         if run.spawned {
             if !run.success {
                 return Verify::Failed(format!(
-                    "ffmpeg re-decode exited {}: {}",
+                    "ffmpeg hardware re-decode exited {}: {}",
                     run.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
                     safe_tail(run.stderr.trim(), 400)
                 ));
             }
             let errtail = run.stderr.trim();
             if !errtail.is_empty() {
-                return Verify::Failed(format!("ffmpeg reported decode errors: {}", safe_tail(errtail, 400)));
+                return Verify::Failed(format!(
+                    "ffmpeg hardware decode reported errors: {}",
+                    safe_tail(errtail, 400)
+                ));
             }
             // Duration sanity check (best-effort: only fails on a clear mismatch).
             if let (Some(od), Some(nd)) = (
@@ -3111,10 +3105,14 @@ fn verify_media(
             return Verify::Ok;
         }
     }
-    // ffmpeg unavailable → HandBrake scan title check.
+    // ffmpeg unavailable -> hardware-enabled HandBrake scan title check.
     if let Some(hbp) = hb.path.as_ref() {
         let mut cmd = Command::new(hbp);
-        cmd.args(["--scan", "-i"]).arg(out).args(["-t", "0"]);
+        cmd.arg("--scan");
+        if let Some(decoder) = hardware_decoder_for_encoder(&encoder) {
+            cmd.args(["--enable-hw-decoding", decoder]);
+        }
+        cmd.arg("-i").arg(out).args(["-t", "0"]);
         let run = run_verify_capture(job, index, cmd);
         if run.cancelled {
             return Verify::Cancelled;
@@ -3448,36 +3446,21 @@ enum EncodeResult {
     /// Child ran to completion; `success` is true when it exited 0. `diag`
     /// carries the command line, exit code and captured stderr tail; `fps` is the
     /// average encode rate parsed from the encoder output (video only).
-    Done { success: bool, diag: EncodeDiag, fps: Option<f64> },
+    Done {
+        success: bool,
+        diag: EncodeDiag,
+        fps: Option<f64>,
+    },
     /// Job was cancelled; the child was killed.
     Cancelled,
     /// The child could not be spawned. `command` is the line we tried to run.
     Spawn { error: String, command: String },
 }
 
-const AMBIGUOUS_GPU_FAILURE_LIMIT: usize = 2;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GpuFailureClass {
-    Hardware,
-    SourceOrMux,
-    Ambiguous,
-}
-
-impl GpuFailureClass {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Hardware => "hardware",
-            Self::SourceOrMux => "source_or_mux",
-            Self::Ambiguous => "ambiguous",
-        }
-    }
-}
-
-/// Video pipeline entry: resolve the encoder (HW vs CPU), acquire the right
-/// global-budget lane, run HandBrake, and — on a GPU encode failure — fall back
-/// to CPU x264 on the same file (logged). Fills `meta` with the genuine encoder
-/// used and its codec-parameter string for the CSV/debug record.
+/// Video pipeline entry: resolve a hardware encoder, acquire its global-budget
+/// lane, and run HandBrake. A hardware failure is terminal for this file; the
+/// partial output is removed and the original remains untouched. Software video
+/// encoding is never attempted.
 fn run_video(
     job: &Arc<CompressJob>,
     index: usize,
@@ -3492,193 +3475,19 @@ fn run_video(
     meta.tool_version = hb_info.version.clone().unwrap_or_default();
 
     let hw = compress_tools::probe_gpu_hardware();
-    let gpu_disabled = job.gpu_unstable.load(Ordering::SeqCst);
-    let mut enc = if gpu_disabled {
-        crate::compress_debug::log(&format!(
-            "[gpu_circuit_breaker] job={} #{index} prior GPU failure; using CPU for the rest of this job",
-            job.id
-        ));
-        cpu_fallback_encoder(&job.codec, caps)
-    } else {
-        select_video_encoder(&job.encoder, &job.codec, job.use_gpu, caps, hw)
-    };
-    // Up-front token validation for CPU/software encoders (x265, svt_av1): if the
-    // installed build doesn't expose the chosen token, downgrade to x264 now
-    // rather than spawning a doomed encode. GPU tokens are deliberately left
-    // alone — they may be "assumed" from a detected adapter even when absent from
-    // the `-h` parse, and a genuine runtime GPU failure is still caught by the
-    // GPU→CPU fallback below. The two layers compose.
-    if !enc.is_gpu {
-        let valid = validate_encoder_token(&enc.hb, caps);
-        if valid != enc.hb {
-            crate::compress_debug::log(&format!(
-                "[encoder_validate] job={} #{index} encoder '{}' not supported by this HandBrake build; using x264",
-                job.id, enc.hb
-            ));
-            enc.hb = valid.to_string();
-        }
-    }
+    let enc = select_video_encoder(&job.encoder, &job.codec, true, caps, hw);
     let result = run_handbrake(job, index, hb, input, out, &job.preset, &enc, meta);
-
-    // GPU encode failed → retry once on CPU, capturing WHY the GPU failed so it
-    // becomes a visible `gpu_fallback` outcome. Only confirmed hardware failures
-    // (or two consecutive ambiguous failures) disable GPU for the whole job; a
-    // source/mux failure after a completed encode must not poison 270k later files.
-    if enc.is_gpu {
-        if matches!(&result, EncodeResult::Done { success: true, .. }) {
-            job.gpu_failure_streak.store(0, Ordering::SeqCst);
-        }
-        let output_bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
-        let gpu_failure: Option<(String, GpuFailureClass)> = match &result {
-            EncodeResult::Done { success: false, diag, .. } => {
-                Some((
-                    format!(
-                        "GPU encoder {} failed ({}); fell back to CPU{}",
-                        enc.hb,
-                        match diag.exit_code {
-                            Some(c) => format!("exit {c}"),
-                            None => "no exit code".to_string(),
-                        },
-                        fallback_stderr_suffix(&diag.stderr_tail),
-                    ),
-                    classify_gpu_failure(diag, output_bytes),
-                ))
-            }
-            EncodeResult::Spawn { error, .. } => {
-                Some((
-                    format!("GPU encoder {} could not start ({error}); fell back to CPU", enc.hb),
-                    GpuFailureClass::Hardware,
-                ))
-            }
-            _ => None,
-        };
-        if let Some((detail, class)) = gpu_failure {
-            let (disable_gpu, streak) = match class {
-                GpuFailureClass::Hardware => (true, 0),
-                GpuFailureClass::SourceOrMux => {
-                    job.gpu_failure_streak.store(0, Ordering::SeqCst);
-                    (false, 0)
-                }
-                GpuFailureClass::Ambiguous => {
-                    let n = job.gpu_failure_streak.fetch_add(1, Ordering::SeqCst) + 1;
-                    (gpu_failure_disables_job(class, n), n)
-                }
-            };
-            if disable_gpu {
-                job.gpu_unstable.store(true, Ordering::SeqCst);
-                crate::compress_debug::log(&format!(
-                    "[gpu_circuit_breaker_trip] job={} #{index} class={} streak={streak}; using CPU for later videos",
-                    job.id,
-                    class.as_str(),
-                ));
-            } else {
-                crate::compress_debug::log(&format!(
-                    "[gpu_retry_next] job={} #{index} class={} streak={streak}; GPU remains enabled for the next video",
-                    job.id,
-                    class.as_str(),
-                ));
-            }
-            crate::compress_debug::log(&format!(
-                "[gpu_fallback] job={} #{index} {detail}",
-                job.id
-            ));
-            meta.gpu_fallback = Some(detail);
-            let _ = std::fs::remove_file(out);
-            // Fall back to the CPU software encoder for the chosen codec, itself
-            // validated against the build (e.g. svt_av1 → x264 when SVT-AV1 isn't
-            // present) so the fallback can't be doomed too.
-            let mut cpu = cpu_fallback_encoder(&job.codec, caps);
-            let valid = validate_encoder_token(&cpu.hb, caps);
-            if valid != cpu.hb {
-                crate::compress_debug::log(&format!(
-                    "[encoder_validate] job={} #{index} CPU fallback '{}' not supported; using x264",
-                    job.id, cpu.hb
-                ));
-                cpu.hb = valid.to_string();
-            }
-            // run_handbrake overwrites meta.codec_params with the CPU encoder, so
-            // `meta` ends up reflecting the genuine encoder actually used.
-            return run_handbrake(job, index, hb, input, out, &job.preset, &cpu, meta);
-        }
+    if matches!(
+        &result,
+        EncodeResult::Done { success: false, .. } | EncodeResult::Spawn { .. }
+    ) {
+        crate::compress_debug::log(&format!(
+            "[gpu_only_failure] job={} #{index} encoder={}; no software fallback; source preserved",
+            job.id, enc.hb
+        ));
+        let _ = std::fs::remove_file(out);
     }
     result
-}
-
-/// The CPU software encoder to retry on after a GPU encode fails, chosen by the
-/// job's target codec: SVT-AV1 for AV1, x265 for H.265 when the build supports
-/// it (else x264), x264 otherwise. Always a CPU lane, never GPU — this is the
-/// guaranteed-available fallback.
-fn cpu_fallback_encoder(codec: &str, caps: &HandbrakeCaps) -> VideoEncoder {
-    VideoEncoder {
-        hb: if codec == "av1" {
-            "svt_av1".to_string()
-        } else if codec == "h265" && caps.x265 {
-            "x265".to_string()
-        } else {
-            "x264".to_string()
-        },
-        lane: CompressLane::VideoCpu,
-        is_gpu: false,
-    }
-}
-
-/// Compact, single-line suffix of a GPU encoder's stderr tail for the
-/// `gpu_fallback` message (the full tail still reaches the CSV/debug log).
-fn fallback_stderr_suffix(tail: &str) -> String {
-    let t = tail.trim();
-    if t.is_empty() {
-        return String::new();
-    }
-    let snippet = safe_tail(t, 300);
-    format!(" — {}", snippet.replace(['\r', '\n'], " ").trim())
-}
-
-/// Separate adapter/driver failures from bad-input or final-mux failures. The
-/// latter still retry on CPU for the current file, but must not disable the GPU
-/// for every later file in a huge job.
-fn classify_gpu_failure(diag: &EncodeDiag, output_bytes: u64) -> GpuFailureClass {
-    let stderr = diag.stderr_tail.to_ascii_lowercase();
-    const HARDWARE_SIGNATURES: &[&str] = &[
-        "cannot load nvencodeapi",
-        "no nvenc capable devices",
-        "no capable devices found",
-        "nvenc api error",
-        "nvenc error",
-        "cuda error",
-        "cuda device",
-        "driver does not support",
-        "minimum required nvidia driver",
-        "failed to initialize nvenc",
-        "failed to initialise nvenc",
-        "device setup failed",
-        "hardware acceleration failed",
-        "out of memory",
-    ];
-    if diag.exit_code.is_none() || HARDWARE_SIGNATURES.iter().any(|s| stderr.contains(s)) {
-        return GpuFailureClass::Hardware;
-    }
-
-    // HandBrake can return non-zero for a damaged source or a final work/mux
-    // condition even after NVENC produced a complete multi-gigabyte stream. That
-    // says nothing about whether the next source can use the adapter.
-    const SUBSTANTIAL_OUTPUT_BYTES: u64 = 1024 * 1024;
-    if is_unreadable_input_stderr(&stderr)
-        || (output_bytes >= SUBSTANTIAL_OUTPUT_BYTES
-            && stderr.contains("mux: track")
-            && stderr.contains("finished work"))
-    {
-        return GpuFailureClass::SourceOrMux;
-    }
-
-    GpuFailureClass::Ambiguous
-}
-
-fn gpu_failure_disables_job(class: GpuFailureClass, ambiguous_streak: usize) -> bool {
-    match class {
-        GpuFailureClass::Hardware => true,
-        GpuFailureClass::SourceOrMux => false,
-        GpuFailureClass::Ambiguous => ambiguous_streak >= AMBIGUOUS_GPU_FAILURE_LIMIT,
-    }
 }
 
 /// True when `out`'s extension is in the MP4 family (mp4/m4v/mov), the only
@@ -3694,51 +3503,24 @@ fn is_mp4_family(out: &Path) -> bool {
     )
 }
 
-/// Whether a HandBrake `-e` token is supported by the installed build, per the
-/// detected caps. `x264` is the always-present software baseline (HandBrake
-/// always ships it), so it is the guaranteed-valid fallback. An unknown token is
-/// treated as unsupported so the caller downgrades rather than spawning a doomed
-/// encode. NOTE: GPU tokens here reflect the `-h` parse only; the caller applies
-/// this check to CPU tokens and leaves GPU attempts to the runtime GPU→CPU
-/// fallback (so an "assumed from adapter" GPU encode is still attempted).
-fn encoder_token_supported(token: &str, caps: &HandbrakeCaps) -> bool {
-    match token {
-        "x264" => true,
-        "x265" => caps.x265,
-        "svt_av1" => caps.svt_av1,
-        "nvenc_h264" => caps.nvenc_h264,
-        "nvenc_h265" => caps.nvenc_h265,
-        "nvenc_av1" => caps.nvenc_av1,
-        "qsv_h264" => caps.qsv_h264,
-        "qsv_h265" => caps.qsv_h265,
-        "qsv_av1" => caps.qsv_av1,
-        "vce_h264" => caps.vce_h264,
-        "vce_h265" => caps.vce_h265,
-        "vce_av1" => caps.vce_av1,
-        _ => false,
+fn hardware_decoder_for_encoder(encoder: &str) -> Option<&'static str> {
+    if encoder.starts_with("nvenc") {
+        Some("nvdec")
+    } else if encoder.starts_with("qsv") {
+        Some("qsv")
+    } else {
+        // HandBrake 1.11 exposes NVDEC and QSV here, but no VCN decoder option.
+        None
     }
-}
-
-/// Resolve a chosen `-e` token to one the build actually supports: returns the
-/// token unchanged when supported, else `x264` (the guaranteed-available CPU
-/// baseline). Pure so it is unit-testable.
-fn validate_encoder_token<'a>(token: &'a str, caps: &HandbrakeCaps) -> &'a str {
-    if encoder_token_supported(token, caps) { token } else { "x264" }
 }
 
 /// Assemble the HandBrake CLI argument vector for one encode. PURE (no spawn) so
 /// the argument logic is unit-testable without HandBrake installed.
 ///
-/// `minimal` produces the guaranteed-valid retry arg set used after a
-/// first-attempt non-zero exit: input/output/encoder/quality/preset plus a
-/// downscale only when one is requested — and crucially NO audio, `--optimize`,
-/// or `--encopts` flags (the arg families most prone to compatibility drift).
-///
-/// In the normal (non-minimal) set the audio block uses passthrough with an AAC
-/// fallback and DOES NOT pass a global `-B` bitrate alongside `-E copy` (that
-/// combination is invalid and HandBrake rejects it at job setup — the v1.13.0
-/// regression that failed every video). `--optimize` is emitted only for
-/// MP4-family outputs.
+/// NVENC explicitly enables NVDEC input decoding; QSV enables QSV decoding.
+/// Audio is copied instead of software-encoded. Unsupported passthrough or GPU
+/// combinations fail the file and preserve its source rather than invoking CPU.
+/// `--optimize` is emitted only for MP4-family outputs.
 fn build_handbrake_args(
     input: &Path,
     out: &Path,
@@ -3746,9 +3528,6 @@ fn build_handbrake_args(
     quality: &str,
     enc_preset: &str,
     max_height: Option<&str>,
-    is_gpu: bool,
-    cpu_threads: Option<usize>,
-    minimal: bool,
 ) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let push = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
@@ -3763,32 +3542,19 @@ fn build_handbrake_args(
     push(&mut a, "--encoder-preset");
     push(&mut a, enc_preset);
 
-    if !minimal {
-        // Audio: re-encode every track to 160 kbps AAC. This is the proven
-        // pre-v1.13.0 behavior — the audio savings are what tip an
-        // already-compressed video net-smaller once NVENC leaves the video stream
-        // roughly size-neutral. v1.13.0 switched to `-E copy` passthrough, which
-        // removed those savings and made files finish as no-gain; we restore the
-        // re-encode here. `-B` IS valid with a real encoder (`av_aac`) — it is
-        // only invalid alongside `-E copy` (the v1.13.4 crash fix). A flat 160k
-        // can marginally grow audio already below 160k, which matches the
-        // long-working pre-regression behavior and is acceptable.
-        push(&mut a, "-E");
-        push(&mut a, "av_aac");
-        push(&mut a, "-B");
-        push(&mut a, "160");
-        // --optimize (mp4 faststart) is MP4/M4V/MOV-only.
-        if is_mp4_family(out) {
-            push(&mut a, "--optimize");
-        }
-        if !is_gpu {
-            if let Some(t) = cpu_threads {
-                // CPU tuning: let x264/x265 use the box's threads (the lane cap
-                // bounds concurrent encodes, so this won't oversubscribe).
-                push(&mut a, "--encopts");
-                a.push(format!("threads={t}"));
-            }
-        }
+    if let Some(decoder) = hardware_decoder_for_encoder(encoder) {
+        push(&mut a, "--enable-hw-decoding");
+        push(&mut a, decoder);
+    }
+    // Passthrough avoids a separate CPU AAC encode. If the source audio cannot
+    // be copied into the selected container, HandBrake fails and FileTree keeps
+    // the original instead of silently switching to software work.
+    push(&mut a, "-E");
+    push(&mut a, "copy");
+    push(&mut a, "--audio-fallback");
+    push(&mut a, "none");
+    if is_mp4_family(out) {
+        push(&mut a, "--optimize");
     }
     if let Some(h) = max_height {
         push(&mut a, "--maxHeight");
@@ -3798,29 +3564,10 @@ fn build_handbrake_args(
     a
 }
 
-/// Whether a first encode attempt should be retried with the minimal arg set:
-/// only when it ran to completion but exited non-zero AND the job wasn't
-/// cancelled. A spawn failure (missing binary) or a cancel is never retried.
-/// Pure so the retry trigger is unit-testable without spawning HandBrake.
-fn should_retry_minimal(result: &EncodeResult, cancelled: bool, is_gpu: bool) -> bool {
-    !is_gpu && matches!(result, EncodeResult::Done { success: false, .. }) && !cancelled
-}
-
-fn safe_cpu_thread_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|c| c.get())
-        .unwrap_or(4)
-        .div_ceil(2)
-        .clamp(1, 8)
-}
-
 /// HandBrake video pipeline for a resolved encoder. Presets map to a quality
 /// (RF/CQ/ICQ) + optional downscale + `--encoder-preset`; progress + fps are
 /// parsed from the encoder output. Acquires the encoder's global-budget lane for
-/// the duration of the encode (released on return). On a non-zero first exit it
-/// retries ONCE with a minimal, guaranteed-valid arg set (no audio/optimize/
-/// encopts flags) so any future arg-compatibility drift degrades to a plain
-/// encode instead of a hard failure.
+/// the duration of the encode (released on return). There is no software retry.
 fn run_handbrake(
     job: &Arc<CompressJob>,
     index: usize,
@@ -3836,6 +3583,10 @@ fn run_handbrake(
     let max_height = max_height.as_deref();
 
     let mut params = format!("{} q={quality} preset={enc_preset}", enc.hb);
+    if let Some(decoder) = hardware_decoder_for_encoder(&enc.hb) {
+        params.push_str(&format!(" hwdecode={decoder}"));
+    }
+    params.push_str(" audio=copy audioFallback=none");
     if let Some(h) = max_height {
         params.push_str(&format!(" maxHeight={h}"));
     }
@@ -3844,43 +3595,23 @@ fn run_handbrake(
     *job.files[index].tool_version.lock_recover() = meta.tool_version.clone();
     *job.files[index].encoder.lock_recover() = meta.codec_params.clone();
 
-    // Acquire the lane permit (CPU video vs GPU session). Cancelled while queued
-    // ⇒ no work done.
+    // A claimed worker can still wait behind another job's global GPU sessions.
+    // Show that honestly instead of presenting a frozen 0% "Encoding" row.
+    *job.files[index].stage.lock_recover() = "waiting_gpu".to_string();
+    job.emit(ev_progress(job, index, job.files[index].pct.load(Ordering::Relaxed)));
+
+    // Acquire the hardware session permit. Cancelled while queued => no work.
     let _permit = match acquire_compress(enc.lane, &job.cancel) {
         Some(p) => p,
         None => return EncodeResult::Cancelled,
     };
+    *job.files[index].stage.lock_recover() = "encoding".to_string();
+    job.emit(ev_progress(job, index, job.files[index].pct.load(Ordering::Relaxed)));
 
-    let cpu_threads = if enc.is_gpu {
-        None
-    } else {
-        Some(safe_cpu_thread_count())
-    };
-    let args = build_handbrake_args(
-        input, out, &enc.hb, &quality, enc_preset, max_height, enc.is_gpu, cpu_threads, false,
-    );
+    let args = build_handbrake_args(input, out, &enc.hb, &quality, enc_preset, max_height);
     let mut cmd = Command::new(hb);
     cmd.args(&args);
-    let result = run_child(job, index, cmd);
-
-    // Retry once with the minimal arg set if the first attempt exited non-zero
-    // (and we weren't cancelled). This strips exactly the audio/optimize/encopts
-    // families most likely to be rejected by an arg-compat mismatch, so a build
-    // that chokes on them still produces a plain encode instead of failing.
-    if should_retry_minimal(&result, job.cancel.load(Ordering::Relaxed), enc.is_gpu) {
-        crate::compress_debug::log(&format!(
-            "[hb_retry] job={} #{index} first attempt exited non-zero; retrying with minimal args (encoder={})",
-            job.id, enc.hb
-        ));
-        let _ = std::fs::remove_file(out);
-        let margs = build_handbrake_args(
-            input, out, &enc.hb, &quality, enc_preset, max_height, enc.is_gpu, None, true,
-        );
-        let mut cmd2 = Command::new(hb);
-        cmd2.args(&margs);
-        return run_child(job, index, cmd2);
-    }
-    result
+    run_child(job, index, cmd)
 }
 
 /// ffmpeg image pipeline. Presets map to a JPEG-style quality (`-q:v`, lower =
@@ -4229,6 +3960,9 @@ fn read_progress<R: std::io::Read>(
                     if pi != last_pct {
                         last_pct = pi;
                         job.files[index].pct.store(pi as u64, Ordering::Relaxed);
+                        if pi >= 100 {
+                            *job.files[index].stage.lock_recover() = "finalizing".to_string();
+                        }
                         job.files[index]
                             .updated_at
                             .store(crate::io::now_ms(), Ordering::Relaxed);
@@ -4620,7 +4354,14 @@ pub(crate) fn job_full_json(job: &CompressJob) -> String {
     s.push_str(",\"outputDir\":");
     push_json_string(&mut s, &job.output_dir);
     s.push_str(",\"stageCounts\":{");
-    for (i, stage) in ["queued", "encoding", "verifying", "finalizing", "terminal"]
+    for (i, stage) in [
+        "queued",
+        "waiting_gpu",
+        "encoding",
+        "verifying",
+        "finalizing",
+        "terminal",
+    ]
         .iter()
         .enumerate()
     {
@@ -5562,11 +5303,22 @@ pub(crate) fn compress_telemetry_json(state: &AppState, selected_id: &str) -> St
         }
     }
 
-    let selected = state.compress_jobs.lock_recover().get(selected_id).map(Arc::clone);
-    let (fallback_sessions, live_fps, destination_drive) = selected
+    let selected = state
+        .compress_jobs
+        .lock_recover()
+        .get(selected_id)
+        .map(Arc::clone);
+    let (fallback_sessions, live_fps, destination_drive, child_pids) = selected
         .as_ref()
         .map(|job| {
-            let sessions = job.children.lock_recover().len();
+            let children = job.children.lock_recover();
+            let sessions = children.len();
+            let child_pids = children
+                .values()
+                .map(|child| child.id().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            drop(children);
             let fps_values = job
                 .files
                 .iter()
@@ -5589,9 +5341,9 @@ pub(crate) fn compress_telemetry_json(state: &AppState, selected_id: &str) -> St
                 .filter(|c| c.is_ascii_alphabetic())
                 .map(|c| (c as char).to_ascii_uppercase().to_string())
                 .unwrap_or_default();
-            (sessions, fps, drive)
+            (sessions, fps, drive, child_pids)
         })
-        .unwrap_or((0, None, String::new()));
+        .unwrap_or((0, None, String::new(), String::new()));
 
     let mut gpu_encode = None;
     let mut nvidia_sessions = None;
@@ -5635,6 +5387,13 @@ pub(crate) fn compress_telemetry_json(state: &AppState, selected_id: &str) -> St
     let mut destination_free = None;
     #[cfg(windows)]
     {
+        let process_script = if child_pids.is_empty() {
+            "$p=@()".to_string()
+        } else {
+            format!(
+                "$ids=@({child_pids});$p=Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -ErrorAction SilentlyContinue | Where-Object {{$ids -contains [int]$_.IDProcess}}"
+            )
+        };
         let drive_script = if destination_drive.is_empty() {
             String::new()
         } else {
@@ -5644,7 +5403,7 @@ pub(crate) fn compress_telemetry_json(state: &AppState, selected_id: &str) -> St
             )
         };
         let script = format!(
-            "$p=Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -ErrorAction SilentlyContinue | Where-Object {{$_.Name -match 'HandBrakeCLI|ffmpeg|magick'}};$cpu=0;$ram=0;$r=0;$w=0;foreach($x in $p){{$cpu+=[double]$x.PercentProcessorTime;$ram+=[double]$x.WorkingSet;$r+=[double]$x.IOReadBytesPersec;$w+=[double]$x.IOWriteBytesPersec}};if($p){{Write-Output ('PROC|'+$cpu+'|'+$ram+'|'+$r+'|'+$w)}}{drive_script}"
+            "{process_script};$cpu=0;$ram=0;$r=0;$w=0;foreach($x in $p){{$cpu+=[double]$x.PercentProcessorTime;$ram+=[double]$x.WorkingSet;$r+=[double]$x.IOReadBytesPersec;$w+=[double]$x.IOWriteBytesPersec}};if($p){{Write-Output ('PROC|'+$cpu+'|'+$ram+'|'+$r+'|'+$w)}}{drive_script}"
         );
         let mut powershell = Command::new("powershell.exe");
         powershell.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
@@ -5654,7 +5413,13 @@ pub(crate) fn compress_telemetry_json(state: &AppState, selected_id: &str) -> St
                 let values = line.trim().split('|').collect::<Vec<_>>();
                 match values.first().copied() {
                     Some("PROC") => {
-                        encoder_cpu = values.get(1).and_then(|v| v.parse().ok());
+                        let cores = std::thread::available_parallelism()
+                            .map(|value| value.get())
+                            .unwrap_or(1) as f64;
+                        encoder_cpu = values
+                            .get(1)
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .map(|value| (value / cores).clamp(0.0, 100.0));
                         ram_bytes = values.get(2).and_then(|v| v.parse().ok());
                         read_bps = values.get(3).and_then(|v| v.parse().ok());
                         write_bps = values.get(4).and_then(|v| v.parse().ok());
@@ -5735,10 +5500,10 @@ fn ev_file_start(
 fn ev_progress(job: &CompressJob, index: usize, pct: u64) -> String {
     let file = &job.files[index];
     let fps = file.fps_bits.load(Ordering::Relaxed);
-    let mut s = format!(
-        "{{\"type\":\"progress\",\"index\":{index},\"pct\":{pct},\"stage\":\"encoding\",\"updatedAt\":{}",
-        crate::io::now_ms()
-    );
+    let stage = file.stage.lock_recover().clone();
+    let mut s = format!("{{\"type\":\"progress\",\"index\":{index},\"pct\":{pct},\"stage\":");
+    push_json_string(&mut s, &stage);
+    s.push_str(&format!(",\"updatedAt\":{}", crate::io::now_ms()));
     s.push_str(",\"fps\":");
     if fps == 0 {
         s.push_str("null");
@@ -5854,38 +5619,46 @@ mod encoder_tests {
     }
 
     #[test]
-    fn av1_falls_back_to_svt_av1_without_hw_token() {
-        // No AV1 -h token and no GPU adapter ⇒ CPU SVT-AV1, regardless of use_gpu.
+    fn av1_without_capability_evidence_still_attempts_hardware() {
+        // Detection can be inconclusive. Hardware-only mode attempts NVENC and
+        // lets HandBrake fail visibly instead of silently launching SVT-AV1.
         let caps = HandbrakeCaps::default();
-        let enc = select_video_encoder("auto", "av1", true, &caps, &no_gpu());
-        assert_eq!(enc.hb, "svt_av1");
-        assert!(!enc.is_gpu);
-    }
-
-    #[test]
-    fn av1_uses_nvenc_av1_when_token_present() {
-        let caps = HandbrakeCaps { nvenc_av1: true, ..Default::default() };
         let enc = select_video_encoder("auto", "av1", true, &caps, &no_gpu());
         assert_eq!(enc.hb, "nvenc_av1");
         assert!(enc.is_gpu);
     }
 
     #[test]
-    fn av1_adapter_without_token_stays_cpu() {
-        // A recent-ish requirement: a mere NVIDIA adapter must NOT imply AV1 HW
-        // support (only newer GPUs encode AV1), so AV1 stays on CPU here.
+    fn av1_uses_nvenc_av1_when_token_present() {
+        let caps = HandbrakeCaps {
+            nvenc_av1: true,
+            ..Default::default()
+        };
+        let enc = select_video_encoder("auto", "av1", true, &caps, &no_gpu());
+        assert_eq!(enc.hb, "nvenc_av1");
+        assert!(enc.is_gpu);
+    }
+
+    #[test]
+    fn av1_adapter_without_token_never_selects_cpu() {
         let caps = HandbrakeCaps::default();
-        let hw = GpuHardware { nvidia: true, ..Default::default() };
+        let hw = GpuHardware {
+            nvidia: true,
+            ..Default::default()
+        };
         let enc = select_video_encoder("auto", "av1", true, &caps, &hw);
-        assert_eq!(enc.hb, "svt_av1");
-        assert!(!enc.is_gpu);
+        assert_eq!(enc.hb, "nvenc_av1");
+        assert!(enc.is_gpu);
     }
 
     #[test]
     fn h264_adapter_inference_still_attempts_gpu() {
         // H.264/H.265 keep the lenient adapter-based inference.
         let caps = HandbrakeCaps::default();
-        let hw = GpuHardware { nvidia: true, ..Default::default() };
+        let hw = GpuHardware {
+            nvidia: true,
+            ..Default::default()
+        };
         let enc = select_video_encoder("auto", "h264", true, &caps, &hw);
         assert_eq!(enc.hb, "nvenc_h264");
         assert!(enc.is_gpu);
@@ -5904,86 +5677,67 @@ mod encoder_tests {
     }
 
     #[test]
-    fn explicit_x264_or_no_gpu_is_cpu() {
-        let caps = HandbrakeCaps { x265: true, ..Default::default() };
-        let hw = GpuHardware { nvidia: true, ..Default::default() };
-        assert_eq!(select_video_encoder("x264", "h264", true, &caps, &hw).hb, "x264");
-        assert_eq!(select_video_encoder("auto", "h265", false, &caps, &hw).hb, "x265");
+    fn legacy_x264_and_gpu_off_requests_are_hardware_only() {
+        let caps = HandbrakeCaps {
+            x265: true,
+            ..Default::default()
+        };
+        let hw = GpuHardware {
+            nvidia: true,
+            ..Default::default()
+        };
+        let legacy_cpu = select_video_encoder("x264", "h264", true, &caps, &hw);
+        let gpu_off = select_video_encoder("auto", "h265", false, &caps, &hw);
+        assert_eq!(legacy_cpu.hb, "nvenc_h264");
+        assert_eq!(gpu_off.hb, "nvenc_h265");
+        assert!(legacy_cpu.is_gpu && gpu_off.is_gpu);
     }
 
     #[test]
-    fn cpu_fallback_encoder_by_codec() {
-        // The GPU→CPU fallback never returns a GPU encoder and maps each codec to
-        // its guaranteed CPU software encoder.
-        let no_x265 = HandbrakeCaps::default();
-        let with_x265 = HandbrakeCaps { x265: true, ..Default::default() };
-
-        let av1 = cpu_fallback_encoder("av1", &no_x265);
-        assert_eq!(av1.hb, "svt_av1");
-        assert!(!av1.is_gpu);
-
-        // H.265 only uses x265 when the build actually supports it; else x264.
-        assert_eq!(cpu_fallback_encoder("h265", &with_x265).hb, "x265");
-        assert_eq!(cpu_fallback_encoder("h265", &no_x265).hb, "x264");
-
-        let h264 = cpu_fallback_encoder("h264", &with_x265);
-        assert_eq!(h264.hb, "x264");
-        assert!(!h264.is_gpu);
-    }
-
-    #[test]
-    fn handbrake_args_audio_reencode_aac_160() {
+    fn handbrake_args_use_nvdec_and_audio_passthrough() {
         use std::path::Path;
-        // Restored pre-v1.13.0 behavior: audio is RE-ENCODED to 160k AAC (the
-        // savings that tip an already-compressed video net-smaller), NOT passed
-        // through. `-B` is valid here because it accompanies a real encoder
-        // (av_aac) — it is only invalid alongside `-E copy`.
         let args = build_handbrake_args(
-            Path::new("in.mkv"), Path::new("out.mkv"), "x264", "24", "medium",
-            None, false, Some(8), false,
+            Path::new("in.mkv"),
+            Path::new("out.mkv"),
+            "nvenc_h264",
+            "26",
+            "quality",
+            None,
         );
-        // `-E av_aac` is immediately followed by `-B 160`.
         let e_pos = args.iter().position(|a| a == "-E").expect("-E present");
-        assert_eq!(args[e_pos + 1], "av_aac", "audio encoder is av_aac (re-encode)");
-        assert_eq!(args[e_pos + 2], "-B");
-        assert_eq!(args[e_pos + 3], "160");
-        // The old passthrough form is gone.
-        assert!(!args.iter().any(|a| a == "copy"), "audio must not be passthrough");
-        assert!(!args.iter().any(|a| a == "--audio-copy-mask"));
-        // --optimize remains mp4-family-only (mkv output ⇒ absent).
-        assert!(!args.iter().any(|a| a == "--optimize"), "mkv output gets no --optimize");
+        assert_eq!(args[e_pos + 1], "copy");
+        let fallback_pos = args
+            .iter()
+            .position(|a| a == "--audio-fallback")
+            .expect("--audio-fallback present");
+        assert_eq!(args[fallback_pos + 1], "none");
+        assert!(!args.iter().any(|a| a == "av_aac" || a == "-B"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--enable-hw-decoding" && w[1] == "nvdec")
+        );
+        assert!(
+            !args.iter().any(|a| a == "--optimize"),
+            "mkv output gets no --optimize"
+        );
     }
 
     #[test]
     fn video_quality_more_and_custom_presets() {
-        // "More savings": CPU RF 27 / GPU CQ 29, both capped at 720p.
-        let (q, h, p) = video_quality("x264", "more", 0, 0);
-        assert_eq!(q, "27");
-        assert_eq!(h.as_deref(), Some("720"));
-        assert_eq!(p, "medium");
+        // "More savings": GPU CQ 29 capped at 720p.
         let (q, h, p) = video_quality("nvenc_h264", "more", 0, 0);
         assert_eq!(q, "29");
         assert_eq!(h.as_deref(), Some("720"));
         assert_eq!(p, "quality");
-        // SVT-AV1 "more" uses speed 8.
-        let (_, _, p) = video_quality("svt_av1", "more", 0, 0);
-        assert_eq!(p, "8");
 
         // Custom honors the supplied quality + height; GPU adds +2.
-        let (q, h, p) = video_quality("x264", "custom", 22, 1440);
-        assert_eq!(q, "22");
-        assert_eq!(h.as_deref(), Some("1440"));
-        assert_eq!(p, "medium");
         let (q, h, _) = video_quality("nvenc_h264", "custom", 22, 1440);
         assert_eq!(q, "24"); // +2 for GPU
         assert_eq!(h.as_deref(), Some("1440"));
         // Custom height 0 ⇒ original (no cap); quality 0 ⇒ default 26.
-        let (q, h, _) = video_quality("x264", "custom", 0, 0);
-        assert_eq!(q, "26");
+        let (q, h, _) = video_quality("nvenc_h264", "custom", 0, 0);
+        assert_eq!(q, "28");
         assert_eq!(h, None);
-        // Custom SVT-AV1 uses speed 7.
-        let (_, _, p) = video_quality("svt_av1", "custom", 0, 0);
-        assert_eq!(p, "7");
     }
 
     #[test]
@@ -6003,7 +5757,12 @@ mod encoder_tests {
         use std::path::Path;
         let has_optimize = |out: &str| {
             build_handbrake_args(
-                Path::new("in.x"), Path::new(out), "x264", "24", "medium", None, false, Some(4), false,
+                Path::new("in.x"),
+                Path::new(out),
+                "nvenc_h264",
+                "26",
+                "quality",
+                None,
             )
             .iter()
             .any(|a| a == "--optimize")
@@ -6019,52 +5778,47 @@ mod encoder_tests {
     }
 
     #[test]
-    fn handbrake_minimal_args_strip_audio_optimize_encopts() {
+    fn handbrake_args_keep_downscale_and_never_add_cpu_encoder_options() {
         use std::path::Path;
-        // The retry arg set is the guaranteed-valid minimum: encoder/quality/preset
-        // and (when downscaling) maxHeight — but no audio, optimize, or encopts.
         let args = build_handbrake_args(
-            Path::new("in.mp4"), Path::new("out.mp4"), "x264", "24", "medium",
-            Some("1080"), false, Some(8), true,
+            Path::new("in.mp4"),
+            Path::new("out.mp4"),
+            "nvenc_h264",
+            "26",
+            "quality",
+            Some("1080"),
         );
-        assert!(!args.iter().any(|a| a == "-E"), "minimal set has no audio flags");
-        assert!(!args.iter().any(|a| a == "--optimize"), "minimal set has no --optimize");
-        assert!(!args.iter().any(|a| a == "--encopts"), "minimal set has no --encopts");
-        assert!(args.windows(2).any(|w| w[0] == "-e" && w[1] == "x264"));
-        assert!(args.windows(2).any(|w| w[0] == "-q" && w[1] == "24"));
-        assert!(args.windows(2).any(|w| w[0] == "--encoder-preset" && w[1] == "medium"));
-        // Downscale is preserved (it's correctness, not a risky flag family).
-        assert!(args.windows(2).any(|w| w[0] == "--maxHeight" && w[1] == "1080"));
+        assert!(
+            !args.iter().any(|a| a == "--encopts"),
+            "minimal set has no --encopts"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "nvenc_h264")
+        );
+        assert!(args.windows(2).any(|w| w[0] == "-q" && w[1] == "26"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--encoder-preset" && w[1] == "quality")
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--maxHeight" && w[1] == "1080")
+        );
         assert!(args.iter().any(|a| a == "--keep-display-aspect"));
     }
 
     #[test]
-    fn handbrake_cpu_threads_only_when_present_and_cpu() {
-        use std::path::Path;
-        // GPU encodes never get --encopts threads; CPU encodes do when a count is given.
-        let gpu = build_handbrake_args(
-            Path::new("i.mp4"), Path::new("o.mp4"), "nvenc_h264", "26", "quality", None, true, None, false,
-        );
-        assert!(!gpu.iter().any(|a| a == "--encopts"));
-        let cpu = build_handbrake_args(
-            Path::new("i.mp4"), Path::new("o.mp4"), "x264", "24", "medium", None, false, Some(6), false,
-        );
-        assert!(cpu.windows(2).any(|w| w[0] == "--encopts" && w[1] == "threads=6"));
-    }
-
-    #[test]
-    fn unsupported_encoder_token_resolves_to_x264() {
-        // x264 is the always-present baseline; svt_av1/x265 depend on the build.
-        let bare = HandbrakeCaps::default();
-        assert_eq!(validate_encoder_token("x264", &bare), "x264");
-        assert_eq!(validate_encoder_token("svt_av1", &bare), "x264", "no SVT-AV1 in build");
-        assert_eq!(validate_encoder_token("x265", &bare), "x264", "no x265 in build");
-        assert_eq!(validate_encoder_token("totally_unknown", &bare), "x264");
-        // Supported tokens pass through unchanged.
-        let rich = HandbrakeCaps { x265: true, svt_av1: true, nvenc_h264: true, ..Default::default() };
-        assert_eq!(validate_encoder_token("x265", &rich), "x265");
-        assert_eq!(validate_encoder_token("svt_av1", &rich), "svt_av1");
-        assert_eq!(validate_encoder_token("nvenc_h264", &rich), "nvenc_h264");
+    fn hardware_decoder_mapping_never_selects_software() {
+        assert_eq!(hardware_decoder_for_encoder("nvenc_h264"), Some("nvdec"));
+        assert_eq!(hardware_decoder_for_encoder("nvenc_av1"), Some("nvdec"));
+        assert_eq!(hardware_decoder_for_encoder("qsv_h265"), Some("qsv"));
+        assert_eq!(hardware_decoder_for_encoder("vce_h264"), None);
+        assert_eq!(hardware_decoder_for_encoder("x264"), None);
+        assert_eq!(ffmpeg_hwaccel_for_encoder("nvenc_h264"), Some(("cuda", "cuda")));
+        assert_eq!(ffmpeg_hwaccel_for_encoder("qsv_h265"), Some(("qsv", "qsv")));
+        assert_eq!(ffmpeg_hwaccel_for_encoder("vce_h264"), Some(("d3d11va", "d3d11")));
+        assert_eq!(ffmpeg_hwaccel_for_encoder("x264"), None);
     }
 
     #[test]
@@ -6077,78 +5831,68 @@ mod encoder_tests {
                       No title found.\n";
         assert!(is_unreadable_input_stderr(sample));
         assert_eq!(
-            if is_unreadable_input_stderr(sample) { Reason::ErrorUnreadableInput } else { Reason::ErrorEncoder }.as_str(),
+            if is_unreadable_input_stderr(sample) {
+                Reason::ErrorUnreadableInput
+            } else {
+                Reason::ErrorEncoder
+            }
+            .as_str(),
             "error_unreadable_input",
         );
         // Case-insensitive + each signature on its own triggers.
         assert!(is_unreadable_input_stderr("MOOV ATOM NOT FOUND"));
         assert!(is_unreadable_input_stderr("scan: 0 valid title(s) found"));
-        assert!(is_unreadable_input_stderr("hb_scan: unrecognized file type"));
+        assert!(is_unreadable_input_stderr(
+            "hb_scan: unrecognized file type"
+        ));
         // A genuine encoder error (e.g. a codec/preset gripe) is NOT misclassified.
-        assert!(!is_unreadable_input_stderr("x264 [error]: invalid preset 'bogus'"));
+        assert!(!is_unreadable_input_stderr(
+            "x264 [error]: invalid preset 'bogus'"
+        ));
         assert!(!is_unreadable_input_stderr(""));
-    }
-
-    #[test]
-    fn minimal_retry_is_cpu_only_and_requires_noncancelled_nonzero_exit() {
-        let fail = EncodeResult::Done { success: false, diag: EncodeDiag::default(), fps: None };
-        let ok = EncodeResult::Done { success: true, diag: EncodeDiag::default(), fps: None };
-        let spawn = EncodeResult::Spawn { error: "x".into(), command: "y".into() };
-        // A CPU non-zero exit may be an argument compatibility issue, so retry.
-        assert!(should_retry_minimal(&fail, false, false));
-        // Repeating a failed hardware encode can destabilize the driver.
-        assert!(!should_retry_minimal(&fail, false, true));
-        // Cancelled, successful, spawn-failed, or cancelled results never retry.
-        assert!(!should_retry_minimal(&fail, true, false));
-        assert!(!should_retry_minimal(&ok, false, false));
-        assert!(!should_retry_minimal(&spawn, false, false));
-        assert!(!should_retry_minimal(&EncodeResult::Cancelled, false, false));
-    }
-
-    #[test]
-    fn gpu_circuit_breaker_ignores_completed_mux_and_requires_repeated_unknowns() {
-        let completed_mux = EncodeDiag {
-            exit_code: Some(4),
-            stderr_tail: "mux: track 0, 222856 frames\nFinished work\nlibhb: work result = 4"
-                .to_string(),
-            ..EncodeDiag::default()
-        };
-        let class = classify_gpu_failure(&completed_mux, 1_700_000_000);
-        assert_eq!(class, GpuFailureClass::SourceOrMux);
-        assert!(!gpu_failure_disables_job(class, 99));
-
-        let ambiguous = classify_gpu_failure(
-            &EncodeDiag { exit_code: Some(4), stderr_tail: "Encode failed".to_string(), ..EncodeDiag::default() },
-            0,
-        );
-        assert_eq!(ambiguous, GpuFailureClass::Ambiguous);
-        assert!(!gpu_failure_disables_job(ambiguous, 1));
-        assert!(gpu_failure_disables_job(ambiguous, 2));
-
-        let hardware = classify_gpu_failure(
-            &EncodeDiag { exit_code: Some(1), stderr_tail: "CUDA error: device setup failed".to_string(), ..EncodeDiag::default() },
-            0,
-        );
-        assert_eq!(hardware, GpuFailureClass::Hardware);
-        assert!(gpu_failure_disables_job(hardware, 1));
-    }
-
-    #[test]
-    fn cpu_fallback_leaves_headroom_for_the_desktop() {
-        let threads = safe_cpu_thread_count();
-        assert!((1..=8).contains(&threads));
-        if let Ok(available) = std::thread::available_parallelism() {
-            assert!(threads <= available.get());
-        }
     }
 
     #[test]
     fn compression_concurrency_defaults_to_two_and_never_exceeds_it() {
         let defaults = CompressOptions::default();
         assert_eq!(defaults.resolved_concurrency(), 2);
-        assert_eq!(CompressOptions { concurrency: 1, ..defaults.clone() }.resolved_concurrency(), 1);
-        assert_eq!(CompressOptions { concurrency: 99, ..defaults }.resolved_concurrency(), 2);
+        assert_eq!(
+            CompressOptions {
+                concurrency: 1,
+                ..defaults.clone()
+            }
+            .resolved_concurrency(),
+            1
+        );
+        assert_eq!(
+            CompressOptions {
+                concurrency: 99,
+                ..defaults
+            }
+            .resolved_concurrency(),
+            2
+        );
         assert_eq!(MAX_COMPRESSION_WORKERS, 2);
+    }
+
+    #[test]
+    fn legacy_video_settings_normalize_to_hardware_only() {
+        let legacy = CompressOptions {
+            encoder: "x264".to_string(),
+            use_gpu: false,
+            ..CompressOptions::default()
+        };
+        assert_eq!(CompressOptions::norm_encoder(&legacy.encoder), "auto");
+        assert!(legacy.resolved_use_gpu());
+    }
+
+    #[test]
+    fn progress_events_report_waiting_and_finalizing_stages() {
+        let job = create_job(&["video.mp4".to_string()], "balanced", &CompressOptions::default());
+        *job.files[0].stage.lock_recover() = "waiting_gpu".to_string();
+        assert!(ev_progress(&job, 0, 0).contains("\"stage\":\"waiting_gpu\""));
+        *job.files[0].stage.lock_recover() = "finalizing".to_string();
+        assert!(ev_progress(&job, 0, 100).contains("\"stage\":\"finalizing\""));
     }
 
     #[test]
@@ -6296,7 +6040,10 @@ mod manifest_tests {
         assert!(back.tag_filename);
         assert_eq!(back.concurrency, 2);
         assert_eq!(back.encoder, "qsv");
-        assert!(!back.use_gpu);
+        assert!(
+            back.use_gpu,
+            "legacy GPU-off manifests normalize to hardware-only mode"
+        );
         assert_eq!(back.codec, "h265");
         assert_eq!(back.zip_level, 3);
         assert_eq!(back.custom_max_height, 720);

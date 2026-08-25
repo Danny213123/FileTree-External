@@ -34,10 +34,8 @@ import {
   compressDebugPath,
   compressDebugLogUrl,
   testGpuEncoder,
-  autotuneCompress,
   notify,
   type GpuTestResult,
-  type AutotuneResult,
 } from "../api/client";
 import { invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import { formatBytes } from "../utils/formatBytes";
@@ -221,10 +219,10 @@ function loadPerf(): CompressPerfSettings {
       concurrency: typeof p.concurrency === "number" && p.concurrency > 0
         ? Math.min(2, Math.floor(p.concurrency))
         : 2,
-      encoder: (["auto", "x264", "nvenc", "qsv", "vce"] as const).includes(p.encoder as CompressEncoder)
+      encoder: (["nvenc", "qsv", "vce"] as const).includes(p.encoder as "nvenc" | "qsv" | "vce")
         ? (p.encoder as CompressEncoder)
         : "auto",
-      useGpu: typeof p.useGpu === "boolean" ? p.useGpu : true,
+      useGpu: true,
       codec: p.codec === "h265" || p.codec === "av1" ? p.codec : "h264",
       zipLevel: typeof p.zipLevel === "number" && p.zipLevel >= -1 && p.zipLevel <= 9 ? Math.floor(p.zipLevel) : -1,
       minSizeBytes: typeof p.minSizeBytes === "number" && p.minSizeBytes >= 0 ? Math.floor(p.minSizeBytes) : 0,
@@ -330,7 +328,7 @@ function loadUserPresets(): SavedPreset[] {
         customMaxHeight: Math.floor(height),
         customQuality: Math.min(CUSTOM_QUALITY_MAX, Math.max(CUSTOM_QUALITY_MIN, Math.floor(quality))),
         codec: codec as CompressCodec,
-        encoder: encoder as CompressEncoder,
+        encoder: encoder === "x264" ? "auto" : encoder as CompressEncoder,
       });
     }
     return out;
@@ -480,8 +478,7 @@ function PresetManagerDialog({
 }
 
 const ENCODER_OPTIONS: { id: CompressEncoder; label: string }[] = [
-  { id: "auto", label: "Auto (best available)" },
-  { id: "x264", label: "x264 (CPU)" },
+  { id: "auto", label: "Auto GPU (best available)" },
   { id: "nvenc", label: "NVENC (NVIDIA)" },
   { id: "qsv", label: "QSV (Intel)" },
   { id: "vce", label: "AMF/VCE (AMD)" },
@@ -492,7 +489,8 @@ const ENCODER_OPTIONS: { id: CompressEncoder; label: string }[] = [
  *  NOT just the `-h` parse — some builds omit the tokens from redirected help
  *  even though the encoder works, so an empty parse must not disable the GPU. */
 function encoderAvailable(id: CompressEncoder, tools: CompressTools | null, _codec: CompressCodec): boolean {
-  if (id === "auto" || id === "x264") return true;
+  if (id === "auto") return true;
+  if (id === "x264") return false;
   const av = tools?.available;
   if (av) {
     switch (id) {
@@ -798,9 +796,6 @@ export function CompressView({
   const [tagFilename, setTagFilename] = useState(true);
   const [perf, setPerf] = useState<CompressPerfSettings>(() => loadPerf());
   const [showPerf, setShowPerf] = useState(false);
-  // Apply hardware-derived defaults once, only when the user hasn't saved any
-  // preferences yet: turn GPU off when no hardware encoder was detected.
-  const perfDefaultedRef = useRef(false);
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [installing, setInstalling] = useState<"handbrake" | "image" | null>(null);
@@ -870,10 +865,9 @@ export function CompressView({
   const pendingEventsRef = useRef<CompressEvent[]>([]);
   const flushRafRef = useRef<number | null>(null);
 
-  // GPU test / auto-tune (definitive HW-encode probes on a tiny clip).
+  // Definitive hardware-encode probe on a tiny clip.
   const [gpuTest, setGpuTest] = useState<GpuTestResult | null>(null);
-  const [autotune, setAutotune] = useState<AutotuneResult | null>(null);
-  const [probing, setProbing] = useState<"" | "test" | "tune">("");
+  const [probing, setProbing] = useState(false);
   const [diagCopied, setDiagCopied] = useState(false);
 
   // ── Tool detection ─────────────────────────────────────────────────────────
@@ -1048,33 +1042,15 @@ export function CompressView({
 
   // Definitive GPU-encoder test: a real HW encode of a tiny generated clip.
   const onTestGpu = useCallback(async () => {
-    setProbing("test");
+    setProbing(true);
     setGpuTest(null);
     try {
       const res = await testGpuEncoder(perf.encoder, perf.codec);
       setGpuTest(res);
     } finally {
-      setProbing("");
+      setProbing(false);
     }
   }, [perf.encoder, perf.codec]);
-
-  // Auto-tune: sample-encode CPU vs GPU and apply the faster recommendation.
-  const onAutotune = useCallback(async () => {
-    setProbing("tune");
-    setAutotune(null);
-    try {
-      const res = await autotuneCompress(perf.codec);
-      setAutotune(res);
-      if (res.ok && res.recommendedEncoder) {
-        updatePerf({
-          encoder: res.recommendedEncoder as CompressEncoder,
-          useGpu: res.recommendedUseGpu ?? perf.useGpu,
-        });
-      }
-    } finally {
-      setProbing("");
-    }
-  }, [perf.codec, perf.useGpu, updatePerf]);
 
   // Copy a plain-text diagnostics bundle (HandBrake path/version, `-h` evidence,
   // GPU adapter info, current encoder/codec settings, and the latest GPU
@@ -1120,7 +1096,7 @@ export function CompressView({
     } else {
       lines.push("Tools: not detected yet");
     }
-    lines.push(`Settings: encoder=${perf.encoder} codec=${perf.codec} useGpu=${perf.useGpu} concurrency=${perf.concurrency} zipLevel=${perf.zipLevel} minSizeBytes=${perf.minSizeBytes} preset=${selectedPresetName} resolution=${perf.customMaxHeight === 0 ? "original" : `${perf.customMaxHeight}p`} quality=${perf.customQuality}`);
+    lines.push(`Settings: encoder=${perf.encoder} codec=${perf.codec} hardwareOnly=true concurrency=${perf.concurrency} zipLevel=${perf.zipLevel} minSizeBytes=${perf.minSizeBytes} preset=${selectedPresetName} resolution=${perf.customMaxHeight === 0 ? "original" : `${perf.customMaxHeight}p`} quality=${perf.customQuality}`);
     if (gpuTest) {
       lines.push(
         `GPU test: ${
@@ -1129,15 +1105,6 @@ export function CompressView({
               ? `OK ${gpuTest.encoder} in ${gpuTest.ms} ms (${gpuTest.outBytes ?? 0} bytes)`
               : `FAILED ${gpuTest.encoder ?? "?"}${gpuTest.exitCode != null ? ` exit ${gpuTest.exitCode}` : ""} ${gpuTest.stderr ?? ""}`
             : `error ${gpuTest.error ?? "unknown"}`
-        }`,
-      );
-    }
-    if (autotune) {
-      lines.push(
-        `Auto-tune: ${
-          autotune.ok
-            ? `CPU ${autotune.cpu?.success ? `${autotune.cpu.ms} ms` : "failed"}, GPU ${autotune.gpu ? (autotune.gpu.success ? `${autotune.gpu.ms} ms` : "failed") : "n/a"} → ${autotune.recommendedEncoder}${autotune.recommendedUseGpu ? " (GPU)" : " (CPU)"}`
-            : `failed ${autotune.error ?? "unknown"}`
         }`,
       );
     }
@@ -1167,19 +1134,7 @@ export function CompressView({
         // give up silently
       }
     }
-  }, [tools, perf, selectedPresetName, gpuTest, autotune]);
-
-  // Hardware-derived default: if no perf prefs were ever saved and NO GPU is
-  // effectively available (no `-h` token AND no physical adapter), default GPU
-  // off so Auto stays on CPU x264. When an adapter is present we leave GPU on
-  // even if `-h` didn't list an encoder — the encode will try GPU and surface a
-  // loud fallback if it can't.
-  useEffect(() => {
-    if (perfDefaultedRef.current || !tools) return;
-    perfDefaultedRef.current = true;
-    if (localStorage.getItem(PERF_KEY)) return; // user has explicit prefs
-    if (!anyGpuAvailable(tools)) setPerf((p) => ({ ...p, useGpu: false }));
-  }, [tools]);
+  }, [tools, perf, selectedPresetName, gpuTest]);
 
   // Abort the stream + stop polling + cancel any pending progress flush on
   // unmount.
@@ -1841,7 +1796,7 @@ export function CompressView({
       tagFilename,
       concurrency: perf.concurrency,
       encoder: perf.encoder,
-      useGpu: perf.useGpu,
+      useGpu: true,
       codec: perf.codec,
       zipLevel: perf.zipLevel,
       minSizeBytes: perf.minSizeBytes,
@@ -2568,14 +2523,11 @@ export function CompressView({
               onChange={(e) => changeCodec(e.target.value as CompressCodec)}
             >
               <option value="h264">H.264 (compatible)</option>
-              <option value="h265" disabled={!!tools && !tools.caps?.x265 && !tools.caps?.nvencH265 && !tools.caps?.qsvH265 && !tools.caps?.vceH265}>
+              <option value="h265" disabled={!!tools && !tools.caps?.nvencH265 && !tools.caps?.qsvH265 && !tools.caps?.vceH265}>
                 H.265 (smaller)
               </option>
-              {/* AV1: hardware AV1 needs a recent GPU (gated on the -h AV1 caps);
-                  CPU SVT-AV1 is always available as a (slow) fallback, so the
-                  option is never disabled, but the label flags HW availability. */}
-              <option value="av1">
-                AV1 (smallest{tools && (tools.caps?.nvencAv1 || tools.caps?.qsvAv1 || tools.caps?.vceAv1) ? ", GPU-capable" : ", CPU only"})
+              <option value="av1" disabled={!!tools && !tools.caps?.nvencAv1 && !tools.caps?.qsvAv1 && !tools.caps?.vceAv1}>
+                AV1 (hardware only)
               </option>
             </select>
           </div>
@@ -2613,19 +2565,9 @@ export function CompressView({
             />
             Hide encoder-missing warning
           </label>
-          <label className="compress-toggle">
-            <input
-              type="checkbox"
-              checked={perf.useGpu}
-              disabled={!anyGpuAvailable(tools)}
-              onChange={(e) => updatePerf({ useGpu: e.target.checked })}
-            />
-            Use GPU when available
-            {tools && !anyGpuAvailable(tools) && <span className="compress-perf-hint"> (no GPU detected)</span>}
-            {tools && anyGpuAvailable(tools) && !tools.caps?.anyGpu && (
-              <span className="compress-perf-hint"> (via adapter — verified on first run)</span>
-            )}
-          </label>
+          <div className="compress-perf-note">
+            GPU-only video: hardware decode and encode are required; software fallback is disabled.
+          </div>
           <div className="compress-perf-field">
             <label htmlFor="cv-concurrency">Parallel files</label>
             <input
@@ -2713,19 +2655,10 @@ export function CompressView({
                   type="button"
                   className="compress-btn"
                   onClick={() => void onTestGpu()}
-                  disabled={probing !== ""}
+                  disabled={probing}
                   title="Run the resolved GPU encoder on a tiny generated clip to confirm it really encodes"
                 >
-                  {probing === "test" ? "Testing…" : "Test GPU encoder"}
-                </button>
-                <button
-                  type="button"
-                  className="compress-btn"
-                  onClick={() => void onAutotune()}
-                  disabled={probing !== ""}
-                  title="Sample-encode CPU vs GPU and pick the faster encoder"
-                >
-                  {probing === "tune" ? "Tuning…" : "Auto-tune CPU vs GPU"}
+                  {probing ? "Testing…" : "Test GPU encoder"}
                 </button>
                 <button
                   type="button"
@@ -2745,35 +2678,27 @@ export function CompressView({
                     : `Could not test: ${gpuTest.error ?? "unknown error"}`}
                 </div>
               )}
-              {autotune && (
-                <div className="compress-perf-note">
-                  {autotune.ok
-                    ? `Auto-tune: CPU ${autotune.cpu?.success ? `${autotune.cpu.ms} ms` : "failed"}` +
-                      `, GPU ${autotune.gpu ? (autotune.gpu.success ? `${autotune.gpu.ms} ms` : "failed") : "n/a"}` +
-                      ` → using ${autotune.recommendedEncoder}${autotune.recommendedUseGpu ? " (GPU)" : " (CPU)"}.`
-                    : `Auto-tune failed: ${autotune.error ?? "unknown error"}`}
-                </div>
-              )}
               {tools.handbrakeEncodersRaw && (
                 <details className="compress-perf-evidence">
                   <summary className="compress-perf-hint">HandBrake encoder list (raw)</summary>
                   <pre className="compress-perf-raw">{tools.handbrakeEncodersRaw}</pre>
                 </details>
               )}
-              {/* Adapter present but `-h` empty: GPU will still be attempted; a
-                  failure surfaces loudly as a gpu_fallback outcome with the error. */}
+              {/* Adapter present but `-h` empty: GPU is still attempted and any
+                  failure preserves the source without software fallback. */}
               {!tools.caps?.anyGpu && anyGpuAvailable(tools) && (
                 <div className="compress-perf-note">
                   A GPU adapter is present but HandBrake&apos;s <code>-h</code> didn&apos;t list a hardware
-                  encoder. FileTree will still try the GPU encoder; if it fails, the file shows a
-                  <b> GPU→CPU fallback</b> with HandBrake&apos;s exact error. NVENC activity appears under
+                  encoder. FileTree will still try the GPU encoder; if it fails, the file is marked failed
+                  and its source is preserved. NVENC activity appears under
                   Task Manager → Performance → GPU → <b>Video Encode</b>.
                 </div>
               )}
-              {/* No GPU adapter at all and no -h encoder: genuinely CPU-only. */}
+              {/* No GPU means video cannot run in hardware-only mode. */}
               {!anyGpuAvailable(tools) && (
                 <div className="compress-perf-warn">
-                  No GPU encoder or adapter detected, so encoding will use the CPU. If you have a
+                  No GPU encoder or adapter was detected. Video compression will fail without altering
+                  the source; FileTree will not use a software encoder. If you have a
                   GPU-capable HandBrakeCLI elsewhere, point <code>FILETREE_HANDBRAKE</code> at it (or drop
                   it into the app&apos;s tools folder) and reopen this panel.
                 </div>

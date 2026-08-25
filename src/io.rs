@@ -210,14 +210,10 @@ pub(crate) fn acquire_scan_threads(requested: usize) -> ScanThreadPermit {
 // that file finishes.
 // ──────────────────────────────────────────────────────────────────
 
-/// Workload lane a compression file runs in. The caps differ because the
-/// resources differ: CPU video encodes are heavy (x264 already multi-threads),
-/// GPU encodes are session-capped by the driver, and image/zip work is light /
-/// I/O bound.
+/// Workload lane a compression file runs in. Hardware video encoders are
+/// session-capped by the driver, while image/zip work is light / I/O bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompressLane {
-    /// CPU video encode (x264 / x265 software).
-    VideoCpu,
     /// NVIDIA NVENC. Modern NVIDIA GPUs may expose two encoder engines.
     Nvenc,
     /// Intel QSV / AMD AMF. Kept to one session for driver stability.
@@ -235,7 +231,6 @@ struct CompressGate {
 
 #[derive(Debug)]
 struct GateInner {
-    video_cpu: usize,
     nvenc: usize,
     gpu_other: usize,
     image: usize,
@@ -250,10 +245,6 @@ fn compress_lane_caps() -> GateInner {
         .map(|c| c.get())
         .unwrap_or(4);
     GateInner {
-        // A HandBrake software encode already fans out across several threads.
-        // Keep one in flight so a GPU failure cannot create a burst of parallel
-        // CPU fallbacks that starves the desktop or exhausts memory.
-        video_cpu: 1,
         // A dual-engine NVIDIA GPU needs two independent encode sessions to use
         // both engines; Task Manager otherwise plateaus around 50% Video Encode.
         // The process-wide gate still prevents unbounded HandBrake fan-out.
@@ -287,7 +278,6 @@ impl Drop for CompressPermit {
         let gate = compress_gate();
         let mut s = gate.state.lock_recover();
         match self.lane {
-            CompressLane::VideoCpu => s.video_cpu += 1,
             CompressLane::Nvenc => s.nvenc += 1,
             CompressLane::GpuOther => s.gpu_other += 1,
             CompressLane::Image => s.image += 1,
@@ -299,7 +289,6 @@ impl Drop for CompressPermit {
 
 fn lane_slot(s: &mut GateInner, lane: CompressLane) -> &mut usize {
     match lane {
-        CompressLane::VideoCpu => &mut s.video_cpu,
         CompressLane::Nvenc => &mut s.nvenc,
         CompressLane::GpuOther => &mut s.gpu_other,
         CompressLane::Image => &mut s.image,
@@ -562,7 +551,6 @@ mod tests {
     #[test]
     fn compression_video_lanes_use_both_nvenc_engines_safely() {
         let caps = compress_lane_caps();
-        assert_eq!(caps.video_cpu, 1);
         assert_eq!(caps.nvenc, 2);
         assert_eq!(caps.gpu_other, 1);
     }

@@ -137,6 +137,7 @@ function fileName(path: string): string {
 }
 
 function stageLabel(file: CompressJobFile): string {
+  if (file.stage === "waiting_gpu") return "Waiting for GPU";
   if (file.stage) return file.stage === "terminal" ? file.status : file.stage;
   return file.status === "pending" ? "queued" : file.status;
 }
@@ -534,7 +535,7 @@ export function CompressionMonitor({ focusJobId }: Props) {
             <Telemetry label="GPU encode" value={telemetryText(telemetry?.gpuVideoEncodePct, "%")} />
             <Telemetry label="Sessions" value={telemetryText(telemetry?.encoderSessions)} />
             <Telemetry label="Aggregate" value={telemetryText(telemetry?.aggregateFps, " fps")} />
-            <Telemetry label="Encoder CPU" value={telemetryText(telemetry?.encoderCpuPct, "%")} />
+            <Telemetry label="Pipeline CPU" value={telemetryText(telemetry?.encoderCpuPct, "%")} />
             <Telemetry label="RAM" value={telemetry?.ramBytes == null ? "Unavailable" : formatBytes(telemetry.ramBytes)} />
             <Telemetry label="Read" value={fmtRate(telemetry?.readBytesPerSec)} />
             <Telemetry label="Write" value={fmtRate(telemetry?.writeBytesPerSec)} />

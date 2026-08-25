@@ -4,6 +4,15 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.14.4] - 2026-08-24
+
+### Fixed
+
+- Video compression is now hardware-only. New jobs, resumed manifests, and legacy GPU-off/x264 settings resolve to NVENC, QSV, or AMF/VCE; GPU failures fail only the affected file, remove partial output, and preserve the source without a software-encode retry.
+- NVENC jobs now enable HandBrake NVDEC input decoding, QSV jobs enable QSV decoding, audio passthrough disables HandBrake's software fallback, and post-encode video verification uses the matching ffmpeg hardware decoder. The generated command and file inspector identify the hardware decoder and audio settings.
+- Removed the CPU encoder option, GPU-off toggle, CPU-vs-GPU autotune work, software video lane, GPU-to-CPU circuit breaker, and all x264/x265/SVT-AV1 runtime fallback paths.
+- Compression CPU telemetry is now scoped to the selected job's active child processes and normalized to a 0-100% machine-wide value instead of summing per-core counters into misleading readings such as 770%.
+
 ## [1.14.3] - 2026-08-24
 
 ### Changed

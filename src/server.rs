@@ -4430,7 +4430,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) -> sio::Result<()>
             let codec = extract_json_str(&body_str, "codec").unwrap_or_else(|| "h264".to_string());
             respond_json(&mut stream, 200, "OK", &crate::compress_tools::test_gpu_json(&encoder, &codec))
         }
-        // Sample-encode CPU vs GPU on the tiny clip and recommend the faster.
+        // Backward-compatible hardware-only probe (never launches a CPU encode).
         "/api/compress-tools/autotune" => {
             let body_str = String::from_utf8_lossy(&request.body);
             let codec = extract_json_str(&body_str, "codec").unwrap_or_else(|| "h264".to_string());

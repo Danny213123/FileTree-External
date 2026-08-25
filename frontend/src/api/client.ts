@@ -1615,7 +1615,7 @@ export interface GpuTestResult extends Partial<EncodeProbe> {
 export interface AutotuneResult {
   ok: boolean;
   error?: string;
-  cpu?: EncodeProbe;
+  cpu?: EncodeProbe | null;
   gpu?: EncodeProbe | null;
   recommendedEncoder?: string;
   recommendedUseGpu?: boolean;
@@ -1632,8 +1632,8 @@ export async function testGpuEncoder(
   return (r.data ?? { ok: false, error: "No response" }) as GpuTestResult;
 }
 
-/** Auto-tune: sample-encode CPU vs GPU on a tiny clip and recommend the faster
- *  (token-authed POST). Never throws. */
+/** Legacy auto-tune route. Current servers perform a GPU-only validation probe
+ *  and never launch a software encoder. Never throws. */
 export async function autotuneCompress(codec: string): Promise<AutotuneResult> {
   const r = await postMutation("/api/compress-tools/autotune", { codec });
   if (!r.ok) return { ok: false, error: mutateErrorText(r) };
