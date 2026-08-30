@@ -2753,7 +2753,7 @@ const REASON_LABEL: Record<string, string> = {
 const REASON_TOOLTIP: Record<string, string> = {
   success: "Output was smaller; original replaced.",
   skipped_no_gain: "The re-encoded output wasn't smaller than the original, so it was discarded and the original kept.",
-  skipped_prior_no_gain: "The source and compression profile are unchanged since a prior encode produced no savings, so no encoder was started.",
+  skipped_prior_no_gain: "The source is unchanged since a prior encode produced no savings, so no encoder was started again.",
   skipped_already_compressed: "The filename already contains FileTree's [COMPRESSED] marker, so no encoder was started.",
   skipped_too_small: "The original was below the minimum-size threshold, so it was left untouched without attempting to compress (too small to meaningfully shrink — e.g. a video with too few frames).",
   skipped_incomplete: "The filename has a temporary download suffix, so FileTree left it untouched without reading or compressing it. Let the download finish before retrying.",

@@ -4,6 +4,13 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [1.14.7] - 2026-08-24
+
+### Fixed
+
+- An unchanged source that has already produced an output at least as large as itself is now pre-skipped across all later presets, codecs, encoders, and tool versions. FileTree reuses the existing path/size/modified-time no-gain record before launching an encoder, preventing multi-hour repeat attempts while preserving the source.
+- Existing `compress-no-gain-v1.csv` records remain compatible; their former profile column is ignored when loading, so previously learned no-gain results immediately gain the stronger behavior. Verified real-encode no-gain outcomes from recent pre-index compression history are also imported when the source still has the logged size and has not been modified since that result.
+
 ## [1.14.6] - 2026-08-24
 
 ### Fixed

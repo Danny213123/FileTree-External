@@ -2181,8 +2181,8 @@ pub(crate) enum Reason {
     Success,
     /// Output produced but not smaller than the original (deleted, original kept).
     SkippedNoGain,
-    /// A previous real encode with the same source fingerprint and compression
-    /// profile produced no savings, so no encoder was started this time.
+    /// A previous real encode with the same source fingerprint produced no
+    /// savings, so no encoder was started again.
     SkippedPriorNoGain,
     /// The source filename already contains FileTree's `[COMPRESSED]` marker,
     /// so it must never be sent through an encoder again.
@@ -2422,74 +2422,6 @@ fn source_modified_ms(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Settings and runtime capabilities that can change whether an encode saves
-/// space. Bump the profile version whenever FileTree changes its recipe.
-fn no_gain_profile(
-    job: &CompressJob,
-    kind: FileKind,
-    hb: &compress_tools::ToolInfo,
-    img: &compress_tools::ToolInfo,
-    img_kind: Option<ImageKind>,
-    caps: &HandbrakeCaps,
-) -> String {
-    let (tool_path, tool_version, image_tool, resolved_encoder, hardware) = match kind {
-        FileKind::Video => {
-            let hw = compress_tools::probe_gpu_hardware();
-            let resolved = select_video_encoder(&job.encoder, &job.codec, true, caps, hw);
-            (
-                hb.path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                hb.version.clone().unwrap_or_default(),
-                "",
-                resolved.hb,
-                format!("{}{}{}", hw.nvidia as u8, hw.intel as u8, hw.amd as u8),
-            )
-        }
-        FileKind::Image => (
-            img.path.as_ref().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default(),
-            img.version.clone().unwrap_or_default(),
-            img_kind.map(ImageKind::as_str).unwrap_or("none"),
-            img_kind.map(ImageKind::as_str).unwrap_or("none").to_string(),
-            "000".to_string(),
-        ),
-        FileKind::Other => (
-            "built-in".to_string(),
-            "v1".to_string(),
-            "",
-            format!("deflate-{}", job.zip_level),
-            "000".to_string(),
-        ),
-    };
-    format!(
-        "v2|kind={}|preset={}|encoder={}|resolved={}|gpu=true|codec={}|zip={}|height={}|quality={}|tool={}|toolVersion={}|imageTool={}|hardware={}|caps={}{}{}{}{}{}{}{}{}{}{}",
-        kind.as_str(),
-        job.preset,
-        job.encoder,
-        resolved_encoder,
-        job.codec,
-        job.zip_level,
-        job.custom_max_height,
-        job.custom_quality,
-        tool_path,
-        tool_version,
-        image_tool,
-        hardware,
-        caps.x265 as u8,
-        caps.svt_av1 as u8,
-        caps.nvenc_h264 as u8,
-        caps.nvenc_h265 as u8,
-        caps.nvenc_av1 as u8,
-        caps.qsv_h264 as u8,
-        caps.qsv_h265 as u8,
-        caps.qsv_av1 as u8,
-        caps.vce_h264 as u8,
-        caps.vce_h265 as u8,
-        caps.vce_av1 as u8,
-    )
-}
-
 fn process_file(
     state: &Arc<AppState>,
     job: &Arc<CompressJob>,
@@ -2622,8 +2554,7 @@ fn process_file(
         };
     }
 
-    let profile = no_gain_profile(job, kind, hb, img, img_kind, caps);
-    if crate::compress_log::was_unchanged_no_gain(&input_str, orig, source_modified, &profile) {
+    if crate::compress_log::was_unchanged_no_gain(&input_str, orig, source_modified) {
         let mut meta = EncodeMeta::default();
         meta.tool = "no-gain cache".to_string();
         meta.tool_version = "v1".to_string();
@@ -2799,12 +2730,10 @@ fn process_file(
             && std::fs::metadata(&input).map(|metadata| metadata.len()).ok() == Some(orig)
             && source_modified_ms(&input) == source_modified
         {
-            let completed_profile = no_gain_profile(job, kind, hb, img, img_kind, caps);
             crate::compress_log::remember_unchanged_no_gain(
                 &input_str,
                 orig,
                 source_modified,
-                &completed_profile,
             );
         }
         return FileOutcome::Skipped { reason: Reason::SkippedNoGain, new_bytes, diag, meta };
@@ -7010,9 +6939,9 @@ mod manifest_tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A prior no-gain result for the exact source bytes and encode profile is
-    /// consulted before an encoder is resolved or spawned. Changing the source
-    /// invalidates the fingerprint and restores the normal encode path.
+    /// A prior no-gain result for the exact source bytes is consulted before an
+    /// encoder is resolved or spawned, even after settings change. Changing the
+    /// source invalidates the fingerprint and restores the normal encode path.
     #[test]
     fn unchanged_prior_no_gain_skips_before_encoder_and_source_change_retries() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -7036,26 +6965,18 @@ mod manifest_tests {
         let modified_ms = source_modified_ms(&source);
         assert!(modified_ms > 0, "test source must have a usable modified time");
 
-        let profile = no_gain_profile(
-            &job,
-            FileKind::Video,
-            &no_tool,
-            &no_tool,
-            None,
-            &caps,
-        );
         crate::compress_log::remember_unchanged_no_gain(
             &source_path,
             source_bytes,
             modified_ms,
-            &profile,
         );
-        assert!(
-            crate::compress_log::log_path()
-                .with_file_name("compress-no-gain-v1.csv")
-                .is_file(),
-            "the no-gain fingerprint must be durable"
-        );
+        let no_gain_path = crate::compress_log::log_path()
+            .with_file_name("compress-no-gain-v1.csv");
+        assert!(no_gain_path.is_file(), "the no-gain fingerprint must be durable");
+        let legacy_index = std::fs::read_to_string(&no_gain_path)
+            .expect("read durable no-gain index")
+            .replace("all-profiles", "v2|preset=balanced|codec=h264|quality=26");
+        std::fs::write(&no_gain_path, legacy_index).expect("write legacy profile record");
         crate::compress_log::reset_no_gain_index_for_tests();
 
         let skipped = process_file(
@@ -7080,6 +7001,62 @@ mod manifest_tests {
             !output_path(&source, FileKind::Video).exists(),
             "a pre-skip must not reserve or write an output"
         );
+
+        std::fs::remove_file(&no_gain_path).expect("remove durable index for history migration");
+        crate::compress_log::append_row(&crate::compress_log::Row {
+            job_id: "historical-job",
+            index: 0,
+            path: &source_path,
+            name: "unchanged.mp4",
+            kind: "video",
+            preset: "balanced",
+            status: "skipped_no_gain",
+            orig_bytes: source_bytes,
+            new_bytes: source_bytes + 1,
+            saved_bytes: 0,
+            pct_saved: 0.0,
+            ratio: 1.0,
+            tool: "handbrake",
+            codec_params: "nvenc_h264 q=26",
+            duration_ms: 1,
+            out_path: "",
+            recycled: false,
+            error: "",
+            reason: "skipped_no_gain",
+            exit_code: Some(0),
+            tool_version: "HandBrake test",
+            command: "HandBrakeCLI -i unchanged.mp4",
+            stderr_excerpt: "",
+        });
+        crate::compress_log::reset_no_gain_index_for_tests();
+
+        let changed_profile = CompressOptions {
+            encoder: "nvenc".to_string(),
+            codec: "av1".to_string(),
+            custom_quality: 34,
+            ..opts.clone()
+        };
+        let changed_profile_job = create_job(
+            std::slice::from_ref(&source_path),
+            "custom",
+            &changed_profile,
+        );
+        let still_skipped = process_file(
+            &state,
+            &changed_profile_job,
+            0,
+            &no_tool,
+            &no_tool,
+            &no_tool,
+            None,
+            &caps,
+        );
+        match still_skipped {
+            FileOutcome::Skipped { reason, .. } => {
+                assert_eq!(reason.as_str(), "skipped_prior_no_gain")
+            }
+            _ => panic!("encoder and preset changes must not retry an unchanged no-gain source"),
+        }
 
         let mut changed = std::fs::read(&source).unwrap();
         changed.push(9);

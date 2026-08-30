@@ -119,10 +119,12 @@ struct NoGainKey {
     path: String,
     source_bytes: u64,
     source_modified_ms: u64,
-    profile: String,
 }
 
 static NO_GAIN_INDEX: Mutex<Option<(PathBuf, HashSet<NoGainKey>)>> = Mutex::new(None);
+// Keep the legacy profile column so existing index files remain readable. New
+// records use `all-profiles`: once an unchanged source has proven unable to
+// shrink, later encoder or preset changes must not spend hours proving it again.
 const NO_GAIN_HEADER: &str = "path,source_bytes,source_modified_ms,profile\n";
 
 fn no_gain_path() -> PathBuf {
@@ -141,21 +143,22 @@ fn normalized_source_path(path: &str) -> String {
     }
 }
 
-fn no_gain_key(path: &str, source_bytes: u64, source_modified_ms: u64, profile: &str) -> Option<NoGainKey> {
-    if source_bytes == 0 || source_modified_ms == 0 || profile.trim().is_empty() {
+fn no_gain_key(path: &str, source_bytes: u64, source_modified_ms: u64) -> Option<NoGainKey> {
+    if source_bytes == 0 || source_modified_ms == 0 {
         return None;
     }
     Some(NoGainKey {
         path: normalized_source_path(path),
         source_bytes,
         source_modified_ms,
-        profile: profile.to_string(),
     })
 }
 
 fn load_no_gain_index(path: &Path) -> HashSet<NoGainKey> {
-    let Ok(text) = fs::read_to_string(path) else { return HashSet::new() };
-    parse_csv(&text)
+    let mut index: HashSet<NoGainKey> = fs::read_to_string(path)
+        .ok()
+        .map(|text| parse_csv(&text))
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|record| {
             if col(&record, 0) == "path" {
@@ -165,10 +168,47 @@ fn load_no_gain_index(path: &Path) -> HashSet<NoGainKey> {
                 col(&record, 0),
                 col(&record, 1).parse().ok()?,
                 col(&record, 2).parse().ok()?,
-                col(&record, 3),
             )
         })
-        .collect()
+        .collect();
+
+    // v1.14.1 introduced the durable index, so older verified no-gain outcomes
+    // may exist only in the compact History CSV. Import only real encoder runs
+    // whose source still has the logged size and was not modified after that
+    // outcome. Pre-skips and stale/replaced sources are deliberately ignored.
+    let history_path = path.with_file_name("compress-log.csv");
+    if let Ok(history) = fs::read_to_string(history_path) {
+        for record in parse_csv(&history) {
+            if col(&record, 0) == "ts"
+                || col(&record, 7) != "skipped_no_gain"
+                || col(&record, 19) != "skipped_no_gain"
+                || col(&record, 22).starts_with("pre-skip")
+            {
+                continue;
+            }
+            let source_path = col(&record, 3);
+            let Ok(source_bytes) = col(&record, 8).parse::<u64>() else { continue };
+            let Ok(metadata) = fs::metadata(source_path) else { continue };
+            if metadata.len() != source_bytes {
+                continue;
+            }
+            let source_modified_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            if source_modified_ms == 0
+                || crate::audit::unix_ms_to_iso8601(source_modified_ms).as_str() > col(&record, 0)
+            {
+                continue;
+            }
+            if let Some(key) = no_gain_key(source_path, source_bytes, source_modified_ms) {
+                index.insert(key);
+            }
+        }
+    }
+    index
 }
 
 fn ensure_no_gain_index<'a>(
@@ -182,14 +222,14 @@ fn ensure_no_gain_index<'a>(
 }
 
 /// True only when a prior real encode with the exact same source fingerprint
-/// and compression profile produced no savings.
+/// produced no savings. Encoder and preset changes deliberately do not retry an
+/// unchanged source: the user can modify/replace the source to invalidate it.
 pub(crate) fn was_unchanged_no_gain(
     path: &str,
     source_bytes: u64,
     source_modified_ms: u64,
-    profile: &str,
 ) -> bool {
-    let Some(key) = no_gain_key(path, source_bytes, source_modified_ms, profile) else {
+    let Some(key) = no_gain_key(path, source_bytes, source_modified_ms) else {
         return false;
     };
     let cache_path = no_gain_path();
@@ -203,9 +243,8 @@ pub(crate) fn remember_unchanged_no_gain(
     path: &str,
     source_bytes: u64,
     source_modified_ms: u64,
-    profile: &str,
 ) {
-    let Some(key) = no_gain_key(path, source_bytes, source_modified_ms, profile) else {
+    let Some(key) = no_gain_key(path, source_bytes, source_modified_ms) else {
         return;
     };
     let cache_path = no_gain_path();
@@ -226,7 +265,7 @@ pub(crate) fn remember_unchanged_no_gain(
         csv_escape(&key.path),
         key.source_bytes,
         key.source_modified_ms,
-        csv_escape(&key.profile),
+        "all-profiles",
     );
     let _ = file.write_all(line.as_bytes());
 }

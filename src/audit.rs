@@ -139,8 +139,15 @@ pub(crate) fn now_iso8601() -> String {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = dur.as_secs();
-    let millis = dur.subsec_millis();
+    unix_ms_to_iso8601(dur.as_millis() as u64)
+}
+
+/// Format an existing Unix timestamp with the same fixed-width UTC layout used
+/// by audit and compression rows. The representation sorts chronologically, so
+/// callers can safely compare it with a logged timestamp.
+pub(crate) fn unix_ms_to_iso8601(unix_ms: u64) -> String {
+    let secs = unix_ms / 1_000;
+    let millis = unix_ms % 1_000;
     let days = (secs / 86_400) as i64;
     let secs_of_day = (secs % 86_400) as u32;
     let (year, month, day) = civil_from_days(days);

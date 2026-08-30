@@ -2,7 +2,7 @@
 
 A standalone Windows disk-usage explorer: point at a folder, see what's taking space, and clean it up. Single `.exe`, no installer.
 
-**Current version:** `1.14.6`
+**Current version:** `1.14.7`
 
 ## Features
 
