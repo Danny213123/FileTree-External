@@ -952,8 +952,10 @@ mod tests {
 
     #[test]
     fn shell_images_are_png_and_use_icon_fallback() {
-        let icon = shell_icon_png("mp4").expect("Windows file type icon");
-        assert_eq!(&icon[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+        for extension in ["mp4", "zip", "rar"] {
+            let icon = shell_icon_png(extension).expect("Windows file type icon");
+            assert_eq!(&icon[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+        }
 
         let executable = std::env::current_exe().expect("current test executable");
         let image = shell_thumbnail_png(

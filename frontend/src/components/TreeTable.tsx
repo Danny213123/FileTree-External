@@ -550,7 +550,7 @@ function TreeTableInner({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ROW_HEIGHT,
-    overscan: 20,
+    overscan: 8,
   });
 
   // ── Type-to-find (#1) ──────────────────────────────────────────────────────
@@ -1098,6 +1098,7 @@ function TreeTableInner({
                     path={node.path}
                     isDir={node.dir}
                     isBundle={isBundle}
+                    preferThumbnail={selectedId === node.id}
                   />
                   {node.id === renamingId ? (
                     <RenameInput

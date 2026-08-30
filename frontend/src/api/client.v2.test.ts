@@ -8,7 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { fetchServerSearch } from "./client";
+import { fetchServerSearch, moveItems } from "./client";
 
 describe("v2 server search", () => {
   beforeEach(() => {
@@ -44,5 +44,29 @@ describe("v2 server search", () => {
       query: expect.objectContaining({ limit: 500, offset: 0, search: "summer video" }),
     }));
     expect(result).toEqual({ matches: [], total: 1_200, capped: true });
+  });
+
+  it("routes file moves through Tauri and preserves the verified result", async () => {
+    vi.mocked(invoke).mockResolvedValue({
+      ok: true,
+      moved: ["D:\\Downloads\\source"],
+      alreadyThere: [],
+      conflicts: [],
+      skipped: [],
+      errors: [],
+    });
+
+    const result = await moveItems(
+      ["D:\\Downloads\\source"],
+      "D:\\Downloads\\destination",
+    );
+
+    expect(invoke).toHaveBeenCalledWith("move_items", {
+      paths: ["D:\\Downloads\\source"],
+      destination: "D:\\Downloads\\destination",
+      conflict: null,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.moved).toEqual(["D:\\Downloads\\source"]);
   });
 });

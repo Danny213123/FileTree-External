@@ -1194,6 +1194,24 @@ export async function moveItems(
   const empty: MoveItemsResult = {
     ok: false, moved: [], alreadyThere: [], conflicts: [], skipped: [], errors: [],
   };
+  if (isTauriV2()) {
+    try {
+      const result = await invoke<MoveItemsResult>("move_items", {
+        paths,
+        destination,
+        conflict: conflict ?? null,
+      });
+      const errors = result.errors ?? [];
+      return {
+        ...empty,
+        ...result,
+        errors,
+        error: result.error ?? (errors.length > 0 ? errors.join("; ") : undefined),
+      };
+    } catch (error) {
+      return { ...empty, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   const r = await postMutation(
     "/api/move-items",
     conflict ? { paths, destination, conflict } : { paths, destination },

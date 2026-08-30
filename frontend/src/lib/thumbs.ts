@@ -14,7 +14,7 @@ export function isVideo(ext: string): boolean { return VIDEO_EXTS.has(ext.toLowe
 // near the root of a huge scan would otherwise walk hundreds of thousands of
 // nodes synchronously and jank the UI; once exceeded we return the best match
 // found so far.
-const MAX_VISITED = 20000;
+const MAX_VISITED = 2000;
 
 /**
  * Pick a representative thumbnail for a folder: the path of the LARGEST

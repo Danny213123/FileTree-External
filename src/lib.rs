@@ -11,6 +11,7 @@ mod desktop_runtime;
 mod diff;
 mod dupes;
 mod export;
+mod file_ops;
 mod fileattr;
 mod io;
 mod json;
@@ -34,6 +35,7 @@ pub mod v2;
 pub use desktop_runtime::{
     CompressionFilesRequest, CompressionStartRequest, CompressionStartResult, DesktopRuntime,
 };
+pub use file_ops::{MoveItemsResult, move_items};
 
 pub fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")

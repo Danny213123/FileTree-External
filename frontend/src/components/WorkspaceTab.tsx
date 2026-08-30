@@ -3,7 +3,7 @@ import { useScan, fetchScanStream } from "../hooks/useScan";
 import { useTreeState, type ChipKey, type LazyOptions } from "../hooks/useTreeState";
 import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import {
-  revealPath, openPath, shellContextMenu, createFolder,
+  revealPath, openPath, createFolder,
   copyPath, renameItem, moveItems, deletePath, copyFiles,
   hasNativeMove, moveItemsNative, fetchDupesV2Bounded, runCommand,
   exportUrl, printReportAsPdf, webFetch, webSearch,
@@ -949,6 +949,34 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     treeRef.current.setSelectedId(ids[ids.length - 1]);
   }, []);
 
+  const [fileContextMenu, setFileContextMenu] = useState<{
+    id: number;
+    path: string;
+    isDir: boolean;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!fileContextMenu) return;
+    const dismiss = () => setFileContextMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") dismiss();
+    };
+    window.addEventListener("pointerdown", dismiss);
+    window.addEventListener("blur", dismiss);
+    window.addEventListener("resize", dismiss);
+    window.addEventListener("scroll", dismiss, true);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("blur", dismiss);
+      window.removeEventListener("resize", dismiss);
+      window.removeEventListener("scroll", dismiss, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [fileContextMenu]);
+
   const handleContextMenu = useCallback((id: number, x: number, y: number) => {
     const t = treeRef.current;
     const selIds = selectedIdsRef.current;
@@ -956,10 +984,13 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     if (!alreadySelected) handleSelectRow(id, "single");
     const node = t.nodeById.get(id);
     if (!node || node.id < 0 || !node.path) return;
-    const targets = alreadySelected && selIds.size > 1
-      ? [...selIds].map((sid) => t.nodeById.get(sid)?.path).filter((p): p is string => !!p)
-      : [node.path];
-    shellContextMenu(targets, x, y).catch(() => {});
+    setFileContextMenu({
+      id,
+      path: node.path,
+      isDir: node.dir,
+      x: Math.max(4, Math.min(x, window.innerWidth - 224)),
+      y: Math.max(4, Math.min(y, window.innerHeight - 220)),
+    });
   }, [handleSelectRow]);
 
   // Quick "Compress" row action. Mirrors handleContextMenu's target rule: when
@@ -1027,14 +1058,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const handleDblClick = useCallback((id: number) => {
     const node = treeRef.current.nodeById.get(id);
     if (!node) return;
-    // Drill into folders in-app by default. When Explorer opening is selected,
-    // fall back to in-app navigation if the Windows shell rejects the request.
     if (node.dir) {
       if (!folderDblClickExplorerRef.current) {
         openLocation(node.path);
         return;
       }
-      void openPath(node.path).catch(() => openLocation(node.path));
+      void openPath(node.path).catch((error: unknown) => {
+        toast.error(error instanceof Error ? error.message : String(error));
+      });
       return;
     }
     void openPath(node.path).catch((error: unknown) => {
@@ -1313,9 +1344,13 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // which presents Windows' OWN Replace/Skip/Keep-both dialog, so this dialog is
   // the dev/browser fallback. (See handleInternalMove.)
   const runMoveWithConflicts = useCallback(
-    async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string }> => {
+    async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string; moved: boolean }> => {
       const detected = await moveItems(sources, destination);
+      if (!detected.ok && detected.error) {
+        return { ok: false, error: detected.error, moved: false };
+      }
       const allErrors = [...detected.errors];
+      let moved = detected.moved.length > 0;
       const conflicts = detected.conflicts;
       if (conflicts.length > 0) {
         let start = 0;
@@ -1333,7 +1368,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           const targets = applyToAll ? conflicts.slice(start) : [conflicts[start]];
           if (choice === "replace" || choice === "keep-both") {
             const resolved = await moveItems(targets.map((c) => c.src), destination, choice);
+            if (!resolved.ok && resolved.error) allErrors.push(resolved.error);
             allErrors.push(...resolved.errors);
+            moved = moved || resolved.moved.length > 0;
           }
           if (applyToAll) break;
           start += 1;
@@ -1342,7 +1379,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         const n = detected.alreadyThere.length;
         setMoveNotice(n === 1 ? "Already in this folder." : `${n} items are already in this folder.`);
       }
-      return allErrors.length > 0 ? { ok: false, error: allErrors.join("; ") } : { ok: true };
+      return allErrors.length > 0
+        ? { ok: false, error: [...new Set(allErrors)].join("; "), moved }
+        : { ok: true, moved };
     },
     [askConflict],
   );
@@ -1479,8 +1518,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               outcome = { ok: true };
             }
           } else {
-            outcome = await runMoveWithConflicts(realSources, destination);
-            didMove = outcome.ok;
+            const fallback = await runMoveWithConflicts(realSources, destination);
+            outcome = fallback;
+            didMove = fallback.moved;
           }
           // Phase 6 undo: record the reverse move (each item back to its original
           // parent) when at least one item actually moved. The executor only
@@ -2557,6 +2597,78 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           onConfirm={(dest) => { void handleMoveToConfirm(dest); }}
           onCancel={() => setMoveToPrompt(null)}
         />
+      )}
+
+      {fileContextMenu && (
+        <div
+          className="context-menu file-context-menu"
+          role="menu"
+          style={{ left: fileContextMenu.x, top: fileContextMenu.y }}
+          onPointerDown={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            role="menuitem"
+            onClick={() => {
+              const path = fileContextMenu.path;
+              setFileContextMenu(null);
+              void openPath(path).catch((error: unknown) => {
+                toast.error(error instanceof Error ? error.message : String(error));
+              });
+            }}
+          >
+            <Icon name={fileContextMenu.isDir ? "folder-open" : "explorer"} size={13} />
+            {fileContextMenu.isDir ? "Open in File Explorer" : "Open"}
+          </button>
+          {fileContextMenu.isDir && (
+            <button
+              role="menuitem"
+              onClick={() => {
+                const path = fileContextMenu.path;
+                setFileContextMenu(null);
+                openLocation(path);
+              }}
+            >
+              <Icon name="explorer" size={13} />
+              Open in FileTree
+            </button>
+          )}
+          <button
+            role="menuitem"
+            onClick={() => {
+              const path = fileContextMenu.path;
+              setFileContextMenu(null);
+              void revealPath(path).catch((error: unknown) => {
+                toast.error(error instanceof Error ? error.message : String(error));
+              });
+            }}
+          >
+            <Icon name="folder" size={13} />
+            Reveal in File Explorer
+          </button>
+          <div className="menu-separator" />
+          <button
+            role="menuitem"
+            onClick={() => {
+              setFileContextMenu(null);
+              setMoveToPrompt({ mode: "move" });
+            }}
+          >
+            <Icon name="arrow-repeat" size={13} />
+            Move to...
+          </button>
+          <button
+            role="menuitem"
+            onClick={() => {
+              const id = fileContextMenu.id;
+              setFileContextMenu(null);
+              handleCompress(id);
+            }}
+          >
+            <Icon name="file-zip" size={13} />
+            Compress
+          </button>
+        </div>
       )}
 
       {moveNotice && <div className="move-toast" role="status">{moveNotice}</div>}

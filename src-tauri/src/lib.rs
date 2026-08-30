@@ -128,6 +128,27 @@ fn reveal_path(state: State<'_, Arc<V2Store>>, path: String) -> Result<(), Strin
     filetree_core::reveal_system_path(&path)
 }
 
+#[tauri::command]
+async fn move_items(
+    state: State<'_, Arc<V2Store>>,
+    paths: Vec<String>,
+    destination: String,
+    conflict: Option<String>,
+) -> Result<filetree_core::MoveItemsResult, String> {
+    if paths.is_empty() || paths.len() > 1_000 {
+        return Err("Select between 1 and 1,000 items to move".to_string());
+    }
+    require_authorized_path(&state, &destination)?;
+    for path in &paths {
+        require_authorized_path(&state, path)?;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        filetree_core::move_items(paths, destination, conflict)
+    })
+    .await
+    .map_err(|error| format!("Move worker failed: {error}"))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeDragResponse {
@@ -401,6 +422,7 @@ pub fn run() {
             bookmarks_set,
             open_path,
             reveal_path,
+            move_items,
             native_drag,
             file_icon,
             file_thumbnail,
