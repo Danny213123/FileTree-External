@@ -74,6 +74,40 @@ pub fn set_keep_awake(active: bool) {
     windows_native::set_keep_awake(active);
 }
 
+pub fn shell_icon_data_url(extension: &str) -> Option<String> {
+    use base64::Engine as _;
+    windows_native::shell_icon_png(extension).map(|png| {
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        )
+    })
+}
+
+pub fn shell_thumbnail_data_url(path: &str, size: i32, icon_fallback: bool) -> Option<String> {
+    use base64::Engine as _;
+    windows_native::shell_thumbnail_png(path, size, icon_fallback).map(|png| {
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        )
+    })
+}
+
+pub struct NativeDragOutcome {
+    pub outcome: String,
+    pub drop_x: i32,
+    pub drop_y: i32,
+}
+
+pub fn start_native_drag(paths: Vec<String>) -> Result<NativeDragOutcome, String> {
+    windows_native::native_drag_files(paths).map(|result| NativeDragOutcome {
+        outcome: result.outcome,
+        drop_x: result.drop_x,
+        drop_y: result.drop_y,
+    })
+}
+
 pub fn run_cli() {
     cli::run();
 }

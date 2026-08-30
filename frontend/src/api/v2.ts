@@ -61,10 +61,20 @@ export interface V2MemoryStats {
   retainedScanHandles: number;
 }
 
+export interface NativeDragResponse {
+  outcome: "internal" | "external-move" | "external-copy" | "cancel";
+  clientX: number | null;
+  clientY: number | null;
+}
+
 const pageCache = new V2PageCache<V2NodePage>();
 
 export function isTauriV2(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+export async function startNativeDrag(paths: string[]): Promise<NativeDragResponse> {
+  return invoke<NativeDragResponse>("native_drag", { paths });
 }
 
 export function toNodeRecord(item: V2NodeItem): NodeRecord {

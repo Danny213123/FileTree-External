@@ -5,11 +5,12 @@ import { formatDate } from "../utils/formatDate";
 import { openPath, revealPath } from "../api/client";
 import { Icon } from "./Icon";
 import { FileIcon } from "./FileIcon";
+import { ShellThumbnail } from "./ShellThumbnail";
 
 // #25 Duplicate group preview: a lightweight side-by-side look at every member
 // of a duplicate group before deleting/linking. Reuses the existing preview
-// machinery — the `/api/thumbnail` endpoint for images/videos and `FileIcon`
-// for everything else — so the user can visually confirm the copies match.
+// machinery — the bounded Windows Shell thumbnail cache for images/videos and
+// `FileIcon` for everything else — so the user can visually confirm the copies match.
 
 const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "tif", "tiff", "avif", "heic", "ico"]);
 const VIDEO_EXTS = new Set(["mp4", "mkv", "mov", "avi", "wmv", "webm", "m4v", "flv"]);
@@ -33,17 +34,17 @@ function MemberThumb({ file }: { file: DupeFileV2 }) {
   if (isMedia && !error) {
     return (
       <div className="dgp-thumb">
-        <img
-          src={`/api/thumbnail?path=${encodeURIComponent(file.path)}`}
+        <ShellThumbnail
+          path={file.path}
           alt={file.name}
-          onError={() => setError(true)}
+          onUnavailable={() => setError(true)}
         />
       </div>
     );
   }
   return (
     <div className="dgp-thumb dgp-thumb-icon">
-      <FileIcon ext={ext} isDir={false} isBundle={false} />
+      <FileIcon ext={ext} path={file.path} isDir={false} isBundle={false} />
     </div>
   );
 }

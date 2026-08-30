@@ -3,6 +3,7 @@ import type { NodeRecord, Unit } from "../api/types";
 import { formatBytes, formatCount } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
 import { isImage, isVideo } from "../lib/thumbs";
+import { ShellThumbnail } from "./ShellThumbnail";
 
 interface Props {
   node: NodeRecord;
@@ -50,11 +51,11 @@ export function NodeTooltip({ node, unit, anchorX, anchorY, thumbPath }: Props) 
 
       {effectiveThumb && !thumbError && (
         <div className="node-tooltip-thumb">
-          <img
-            src={`/api/thumbnail?path=${encodeURIComponent(effectiveThumb)}`}
+          <ShellThumbnail
+            path={effectiveThumb}
             alt=""
             onLoad={() => setThumbLoaded(true)}
-            onError={() => setThumbError(true)}
+            onUnavailable={() => setThumbError(true)}
             style={{ maxWidth: "100%", maxHeight: 320, display: "block" }}
           />
         </div>

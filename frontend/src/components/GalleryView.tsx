@@ -6,10 +6,11 @@ import { formatBytes } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
+import { ShellThumbnail } from "./ShellThumbnail";
 
 // Media gallery view (roadmap #8). A virtualized, responsive thumbnail grid over
 // the current scan tree (images + videos), capitalizing on the server-side
-// thumbnail cache (/api/thumbnail). Filter by type and sort by size/date/name;
+// bounded Windows Shell thumbnail cache. Filter by type and sort by size/date/name;
 // clicking a cell selects + reveals it in the tree (onNavigate).
 //
 // Virtualization is row-based: the container width determines the column count,
@@ -27,10 +28,6 @@ interface GalleryViewProps {
   nodeById: Map<number, NodeRecord>;
   /** Reveal + select a node in the tree. */
   onNavigate: (id: number) => void;
-}
-
-function thumbUrl(path: string): string {
-  return `/api/thumbnail?path=${encodeURIComponent(path)}`;
 }
 
 export function GalleryView({ nodeById, onNavigate }: GalleryViewProps) {
@@ -216,12 +213,12 @@ function GalleryCell({
         {failed ? (
           <span className="gallery-fallback"><Icon name={video ? "film" : "image"} size={30} /></span>
         ) : (
-          <img
-            src={thumbUrl(node.path)}
+          <ShellThumbnail
+            path={node.path}
             alt={node.name}
             loading="lazy"
             draggable={false}
-            onError={() => setFailed(true)}
+            onUnavailable={() => setFailed(true)}
           />
         )}
         {video && <span className="gallery-badge"><Icon name="film" size={11} /></span>}

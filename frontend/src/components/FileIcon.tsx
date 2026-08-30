@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { loadShellIcon, loadShellThumbnail } from "../lib/shellImages";
 
 // Module-level: tracks extensions whose shell icon fetch failed.
 // Persists across virtualizer component recreation so all rows for the same
@@ -41,17 +42,49 @@ function badgeLabel(ext: string): string {
 
 interface FileIconProps {
   ext: string;
+  path?: string;
   isDir: boolean;
   isBundle: boolean;
   onMouseEnter?: (e: React.MouseEvent) => void;
   onMouseLeave?: (e: React.MouseEvent) => void;
 }
 
-export function FileIcon({ ext, isDir, isBundle, onMouseEnter, onMouseLeave }: FileIconProps) {
+const THUMBNAIL_EXTENSIONS = new Set([
+  "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "heic", "avif", "raw",
+  "mp4", "mkv", "mov", "avi", "wmv", "webm", "m4v", "mpeg", "mpg", "ts",
+]);
+
+export function FileIcon({ ext, path, isDir, isBundle, onMouseEnter, onMouseLeave }: FileIconProps) {
   const lext = ext.toLowerCase();
   // Initialize from ICON_FAILED so all instances for the same extension agree,
   // but still use useState so a fresh app load can retry after a transient failure.
   const [imgFailed, setImgFailed] = useState(() => ICON_FAILED.has(lext));
+  const [source, setSource] = useState<string | null>(null);
+
+  useEffect(() => {
+    setImgFailed(ICON_FAILED.has(lext));
+  }, [lext]);
+
+  useEffect(() => {
+    if (isDir || isBundle || !lext || imgFailed) {
+      setSource(null);
+      return;
+    }
+    let disposed = false;
+    setSource(null);
+    const pending = path && THUMBNAIL_EXTENSIONS.has(lext)
+      ? loadShellThumbnail(path, 32, true).then((value) => value ?? loadShellIcon(lext))
+      : loadShellIcon(lext);
+    void pending.then((value) => {
+      if (disposed) return;
+      if (value) setSource(value);
+      else {
+        ICON_FAILED.add(lext);
+        setImgFailed(true);
+      }
+    });
+    return () => { disposed = true; };
+  }, [imgFailed, isBundle, isDir, lext, path]);
 
   if (isBundle) {
     return <span className="kind kind-bundle">≡</span>;
@@ -75,15 +108,17 @@ export function FileIcon({ ext, isDir, isBundle, onMouseEnter, onMouseLeave }: F
         onMouseEnter={onMouseEnter}
         onMouseLeave={onMouseLeave}
       >
-        <img
-          className="kind-shell-icon"
-          src={`/api/file-icon?ext=${encodeURIComponent(lext)}`}
-          width={16}
-          height={16}
-          alt=""
-          draggable={false}
-          onError={() => { ICON_FAILED.add(lext); setImgFailed(true); }}
-        />
+        {source ? (
+          <img
+            className="kind-shell-icon"
+            src={source}
+            width={16}
+            height={16}
+            alt=""
+            draggable={false}
+            onError={() => { ICON_FAILED.add(lext); setImgFailed(true); }}
+          />
+        ) : <span className="kind-file-generic" />}
       </span>
     );
   }

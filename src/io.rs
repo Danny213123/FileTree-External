@@ -66,7 +66,7 @@ pub(crate) fn open_path(path: &str) -> io::Result<()> {
                 show: i32,
             ) -> isize;
         }
-        unsafe {
+        let result = unsafe {
             ShellExecuteW(
                 0,
                 verb_w.as_ptr(),
@@ -74,7 +74,12 @@ pub(crate) fn open_path(path: &str) -> io::Result<()> {
                 std::ptr::null(),
                 std::ptr::null(),
                 1, // SW_SHOWNORMAL
-            );
+            )
+        };
+        if result <= 32 {
+            return Err(io::Error::other(format!(
+                "Windows could not open this path (ShellExecuteW code {result})"
+            )));
         }
     }
     #[cfg(target_os = "macos")]

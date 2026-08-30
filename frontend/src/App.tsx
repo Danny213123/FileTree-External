@@ -266,11 +266,13 @@ export default function App() {
   // server-side like metric/unit. `unit` stays per-tab (in useTreeState).
   const [decimals, setDecimals] = useState(2);
   const [visibleColumns, setVisibleColumns] = useState<Set<SortKey>>(DEFAULT_VISIBLE_COLUMNS);
-  // #7: folder double-click action — open in File Explorer (default) vs drill in.
+  // #7: folder double-click action — drill in by default, with Explorer as an
+  // explicit preference. This also keeps folder navigation working if a shell
+  // association is unavailable or rejects the request.
   // #9: size heat-tint on table rows. Both are simple localStorage-backed UI
   // toggles (no server round-trip), initialized once from localStorage.
   const [folderDblClickExplorer, setFolderDblClickExplorer] = useState(() => {
-    try { return localStorage.getItem("filetree_folder_dblclick_explorer") !== "0"; } catch { return true; }
+    try { return localStorage.getItem("filetree_folder_dblclick_explorer") === "1"; } catch { return false; }
   });
   const [heatTint, setHeatTint] = useState(() => {
     try { return localStorage.getItem("filetree_heat_tint") === "1"; } catch { return false; }
@@ -1002,7 +1004,20 @@ export default function App() {
     // Real Explorer drag-in still flows through externalDrop. Capture the
     // unsubscribe so cleanup removes exactly this listener — keeping the count at
     // 1 even under StrictMode double-mount.
-    const unsubExternalDrop = eAPI?.onExternalDrop?.((paths) => paths.forEach((p) => handleOpenInNewTab(p)));
+    const handleExternalPaths = (paths: string[], clientX?: number, clientY?: number) => {
+      if (paths.length === 0) return;
+      const el = clientX == null || clientY == null
+        ? null
+        : document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+      const folderRow = el?.closest<HTMLElement>('.row[data-node-dir="1"]');
+      const destFolder = folderRow?.dataset.nodePath;
+      if (destFolder) {
+        void getActiveRefRef.current()?.dropExternalInto(paths, destFolder);
+        return;
+      }
+      paths.forEach((p) => handleOpenInNewTab(p));
+    };
+    const unsubExternalDrop = eAPI?.onExternalDrop?.((paths) => handleExternalPaths(paths));
     const pathForFile = (file: File) => {
       try {
         return eAPI?.getPathForFile?.(file) || (file as unknown as { path?: string }).path || "";
@@ -1024,18 +1039,55 @@ export default function App() {
       // Explorer drag-in (#9): if dropped onto a folder row, move/copy INTO it
       // (Explorer-like) through the guarded engine; the row exposes its path +
       // dir flag (see TreeTable). Dropping on empty/background opens new tabs.
-      const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
-      const folderRow = el?.closest<HTMLElement>('.row[data-node-dir="1"]');
-      const destFolder = folderRow?.dataset.nodePath;
-      if (destFolder) {
-        void getActiveRefRef.current()?.dropExternalInto(paths, destFolder);
-        return;
-      }
-      paths.forEach((p) => handleOpenInNewTab(p));
+      handleExternalPaths(paths, e.clientX, e.clientY);
     };
+    let tauriUnlisten: (() => void) | undefined;
+    let disposed = false;
+    let nativeDropTarget: HTMLElement | null = null;
+    const clearNativeDropTarget = () => {
+      nativeDropTarget?.classList.remove("native-drop-target");
+      nativeDropTarget = null;
+    };
+    const markNativeDropTarget = (clientX: number, clientY: number) => {
+      const next = (document.elementFromPoint(clientX, clientY) as HTMLElement | null)
+        ?.closest<HTMLElement>('.row[data-node-dir="1"]') ?? null;
+      if (next === nativeDropTarget) return;
+      clearNativeDropTarget();
+      nativeDropTarget = next;
+      nativeDropTarget?.classList.add("native-drop-target");
+    };
+    if (isTauriV2()) {
+      void Promise.all([
+        import("@tauri-apps/api/webview"),
+        import("@tauri-apps/api/window"),
+      ]).then(async ([{ getCurrentWebview }, { getCurrentWindow }]) => {
+        const scaleFactor = await getCurrentWindow().scaleFactor();
+        const unlisten = await getCurrentWebview().onDragDropEvent((event) => {
+          const payload = event.payload;
+          if (payload.type === "leave") {
+            clearNativeDropTarget();
+            return;
+          }
+          const logical = payload.position.toLogical(scaleFactor);
+          if (payload.type === "enter" || payload.type === "over") {
+            markNativeDropTarget(logical.x, logical.y);
+            return;
+          }
+          clearNativeDropTarget();
+          if ((window as unknown as { __FILETREE_NATIVE_DRAG_ACTIVE__?: boolean }).__FILETREE_NATIVE_DRAG_ACTIVE__) {
+            return;
+          }
+          handleExternalPaths(payload.paths, logical.x, logical.y);
+        });
+        if (disposed) unlisten(); else tauriUnlisten = unlisten;
+      }).catch((error) => console.warn("Tauri drag/drop listener failed", error));
+    }
     window.addEventListener("dragover", onDragOver);
     window.addEventListener("drop", onDrop);
     return () => {
+      disposed = true;
+      clearNativeDropTarget();
+      tauriUnlisten?.();
       window.removeEventListener("dragover", onDragOver);
       window.removeEventListener("drop", onDrop);
       unsubExternalDrop?.();

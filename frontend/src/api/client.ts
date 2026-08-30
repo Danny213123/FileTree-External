@@ -351,30 +351,28 @@ export async function fetchServerSearch(opts: {
   signal?: AbortSignal;
 }): Promise<ServerSearchResult> {
   if (isTauriV2() && opts.scanId) {
-    const wanted = Math.min(2_000, Math.max(1, opts.limit ?? 500));
-    const matches: NodeRecord[] = [];
-    let total = 0;
-    for (let offset = 0; offset < wanted; offset += 500) {
-      if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      const page = await scanPage({
-        scanId: opts.scanId,
-        parentId: null,
-        offset,
-        limit: Math.min(500, wanted - offset),
-        search: opts.query,
-        regex: opts.regex,
-        minSize: opts.minSize,
-        maxSize: opts.maxSize,
-        modifiedAfter: opts.modifiedAfter,
-        modifiedBefore: opts.modifiedBefore,
-        ext: opts.ext,
-        category: opts.category,
-      });
-      total = page.total;
-      matches.push(...page.items.map(toNodeRecord));
-      if (!page.hasMore) break;
-    }
-    return { matches, total, capped: matches.length < total };
+    // One bounded query per edit. Tauri invokes cannot be cancelled once SQLite
+    // has started, so issuing four sequential pages caused old keystrokes to
+    // pile up and made the desktop appear to crash on large scans.
+    if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const wanted = Math.min(500, Math.max(1, opts.limit ?? 500));
+    const page = await scanPage({
+      scanId: opts.scanId,
+      parentId: null,
+      offset: 0,
+      limit: wanted,
+      search: opts.query,
+      regex: opts.regex,
+      minSize: opts.minSize,
+      maxSize: opts.maxSize,
+      modifiedAfter: opts.modifiedAfter,
+      modifiedBefore: opts.modifiedBefore,
+      ext: opts.ext,
+      category: opts.category,
+    });
+    if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const matches = page.items.map(toNodeRecord);
+    return { matches, total: page.total, capped: matches.length < page.total };
   }
   const params = new URLSearchParams({ path: opts.rootPath });
   if (opts.query) params.set("q", opts.query);

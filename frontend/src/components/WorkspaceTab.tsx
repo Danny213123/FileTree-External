@@ -1027,14 +1027,19 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const handleDblClick = useCallback((id: number) => {
     const node = treeRef.current.nodeById.get(id);
     if (!node) return;
-    // #7: a folder double-click either opens File Explorer (default) or drills
-    // into the folder in-app, per the user's setting. Files always open in their
-    // default app.
-    if (node.dir && !folderDblClickExplorerRef.current) {
-      openLocation(node.path);
+    // Drill into folders in-app by default. When Explorer opening is selected,
+    // fall back to in-app navigation if the Windows shell rejects the request.
+    if (node.dir) {
+      if (!folderDblClickExplorerRef.current) {
+        openLocation(node.path);
+        return;
+      }
+      void openPath(node.path).catch(() => openLocation(node.path));
       return;
     }
-    openPath(node.path);
+    void openPath(node.path).catch((error: unknown) => {
+      toast.error(error instanceof Error ? error.message : String(error));
+    });
   }, [openLocation]);
 
   const handleSortChange = useCallback((k: SortKey) => { treeRef.current.setSortKey(k); }, []);
@@ -2076,8 +2081,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // (debounced + abortable) into state, then re-sorted client-side by the active
   // table sort. Full mode keeps the synchronous in-memory search above.
   const [lazySearch, setLazySearch] = useState<{ matches: NodeRecord[]; capped: boolean }>({ matches: [], capped: false });
+  const lazySearchRequestRef = useRef(0);
   const lazyMode = !!data?.lazy;
   useEffect(() => {
+    const requestId = ++lazySearchRequestRef.current;
     if (!lazyMode || activeView !== "search") { setLazySearch({ matches: [], capped: false }); return; }
     const q = searchQuery.trim();
     const hasFilters = filtersActive(searchFilters);
@@ -2089,13 +2096,17 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         rootPath: data!.rootPath,
         scanId: data!.scanId,
         query: searchQuery,
-        limit: 2000,
+        limit: 500,
         signal: controller.signal,
         ...params,
       })
-        .then((res) => setLazySearch({ matches: res.matches, capped: res.capped }))
+        .then((res) => {
+          if (requestId === lazySearchRequestRef.current) {
+            setLazySearch({ matches: res.matches, capped: res.capped });
+          }
+        })
         .catch((err: unknown) => { if (!(err instanceof DOMException && err.name === "AbortError")) console.warn("server search failed", err); });
-    }, 200);
+    }, 350);
     return () => { controller.abort(); clearTimeout(t); };
   }, [lazyMode, activeView, searchQuery, searchFilters, data]);
 

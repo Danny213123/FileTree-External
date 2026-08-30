@@ -5,7 +5,7 @@ use filetree_core::v2::{
 use filetree_core::{
     CompressionFilesRequest, CompressionStartRequest, CompressionStartResult, DesktopRuntime,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use tauri::ipc::Channel;
@@ -39,8 +39,14 @@ fn scan_find(state: State<'_, Arc<V2Store>>, root_path: String) -> Option<ScanHa
 }
 
 #[tauri::command]
-fn scan_page(state: State<'_, Arc<V2Store>>, query: ScanQuery) -> Result<NodePage, String> {
-    state.query_nodes(query)
+async fn scan_page(state: State<'_, Arc<V2Store>>, query: ScanQuery) -> Result<NodePage, String> {
+    // Search/sort over a multi-million-row scan is blocking SQLite work. Keep it
+    // off Tauri's command/event thread so typing, painting and cancellation stay
+    // responsive while the bounded page is produced.
+    let store = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || store.query_nodes(query))
+        .await
+        .map_err(|error| format!("Scan query worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -120,6 +126,78 @@ fn open_path(state: State<'_, Arc<V2Store>>, path: String) -> Result<(), String>
 fn reveal_path(state: State<'_, Arc<V2Store>>, path: String) -> Result<(), String> {
     require_authorized_path(&state, &path)?;
     filetree_core::reveal_system_path(&path)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeDragResponse {
+    outcome: String,
+    client_x: Option<f64>,
+    client_y: Option<f64>,
+}
+
+#[tauri::command]
+fn native_drag(
+    window: tauri::WebviewWindow,
+    state: State<'_, Arc<V2Store>>,
+    paths: Vec<String>,
+) -> Result<NativeDragResponse, String> {
+    if paths.is_empty() || paths.len() > 1_000 {
+        return Err("Select between 1 and 1,000 items to drag".to_string());
+    }
+    for path in &paths {
+        require_authorized_path(&state, path)?;
+    }
+    // This command intentionally remains synchronous: OLE must inherit the UI
+    // thread's active mouse capture for SHDoDragDrop to own the gesture.
+    let result = filetree_core::start_native_drag(paths)?;
+    let position = window.inner_position().map_err(|error| error.to_string())?;
+    let size = window.inner_size().map_err(|error| error.to_string())?;
+    let scale = window.scale_factor().map_err(|error| error.to_string())?;
+    let inside = result.drop_x >= position.x
+        && result.drop_y >= position.y
+        && result.drop_x < position.x.saturating_add(size.width as i32)
+        && result.drop_y < position.y.saturating_add(size.height as i32);
+    let outcome = if result.outcome != "cancel" && inside {
+        "internal".to_string()
+    } else if result.outcome == "move" {
+        "external-move".to_string()
+    } else if result.outcome == "copy" {
+        "external-copy".to_string()
+    } else {
+        "cancel".to_string()
+    };
+    Ok(NativeDragResponse {
+        client_x: inside.then_some((result.drop_x - position.x) as f64 / scale),
+        client_y: inside.then_some((result.drop_y - position.y) as f64 / scale),
+        outcome,
+    })
+}
+
+#[tauri::command]
+async fn file_icon(extension: String) -> Result<Option<String>, String> {
+    if extension.len() > 32 || !extension.chars().all(|value| value.is_ascii_alphanumeric()) {
+        return Err("Invalid file extension".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || filetree_core::shell_icon_data_url(&extension))
+        .await
+        .map_err(|error| format!("Shell icon worker failed: {error}"))
+}
+
+#[tauri::command]
+async fn file_thumbnail(
+    state: State<'_, Arc<V2Store>>,
+    path: String,
+    size: i32,
+    icon_fallback: bool,
+) -> Result<Option<String>, String> {
+    require_authorized_path(&state, &path)?;
+    let size = size.clamp(16, 512);
+    tauri::async_runtime::spawn_blocking(move || {
+        filetree_core::shell_thumbnail_data_url(&path, size, icon_fallback)
+    })
+    .await
+    .map_err(|error| format!("Shell thumbnail worker failed: {error}"))
 }
 
 #[tauri::command]
@@ -323,6 +401,9 @@ pub fn run() {
             bookmarks_set,
             open_path,
             reveal_path,
+            native_drag,
+            file_icon,
+            file_thumbnail,
             secret_get,
             secret_set,
             secret_delete,

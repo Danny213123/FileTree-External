@@ -1015,10 +1015,11 @@ input:focus, select:focus {
   overflow: hidden;
 }
 
-.row:hover { background: var(--hover); }
+.row:hover:not(.selected) { background: var(--vsc-list-hover); }
 .row.selected { background: var(--selected); border-bottom-color: rgba(0,120,212,0.12); }
 .row.selected.primary-selected { box-shadow: inset 0 0 0 1px rgba(0,120,212,0.22); }
-.row.drop-target { background: rgba(74,144,217,0.25); outline: 1px dashed var(--accent); outline-offset: -1px; }
+.row.drop-target,
+.row.native-drop-target { background: rgba(74,144,217,0.25); outline: 1px dashed var(--accent); outline-offset: -1px; }
 
 /* Floating drop-destination pill that tracks the cursor during a drag-over. */
 .drop-move-pill {
@@ -1157,6 +1158,15 @@ input:focus, select:focus {
   height: 16px;
   object-fit: contain;
   image-rendering: auto;
+}
+
+.kind-file-generic {
+  display: block;
+  width: 12px;
+  height: 14px;
+  border: 1px solid var(--text-3);
+  border-radius: 1px;
+  opacity: 0.65;
 }
 
 /* File badge: solid background, white bold text — fallback for non-Windows */
@@ -5817,7 +5827,7 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 .row.heat:not(.selected):not(.drop-target) {
   background: color-mix(in srgb, var(--accent) calc(var(--heat, 0) * 100%), transparent);
 }
-.row.heat:not(.selected):not(.drop-target):hover { background: var(--hover); }
+.row.heat:not(.selected):not(.drop-target):hover { background: var(--vsc-list-hover); }
 
 /* #11 diff-on-rescan transient row highlights (fade out after the tint clears
    upstream). Added rows get a positive (accent/green) tint; size-changed rows a

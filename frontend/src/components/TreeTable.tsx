@@ -9,6 +9,8 @@ import { Icon } from "./Icon";
 import { eqPath, isNoOpMove } from "../lib/agent";
 import { attributeLetters, attributeList } from "../lib/attributes";
 import { pickFolderThumb, isImage, isVideo } from "../lib/thumbs";
+import { isTauriV2, startNativeDrag, type NativeDragResponse } from "../api/v2";
+import { loadShellThumbnail } from "../lib/shellImages";
 
 const ROW_HEIGHT = 23;
 // Smallest a column may be dragged to, so a header never collapses to nothing.
@@ -345,6 +347,13 @@ function TreeTableInner({
     setDropPillPos(null);
   }, []);
 
+  const clearNativeDrag = useCallback(() => {
+    nativeDragOriginRef.current = false;
+    lastFolderTargetRef.current = null;
+    nativeFolderTabPathRef.current = null;
+    nativeDragHadDirRef.current = false;
+  }, []);
+
   // Mark `id` as the live drop target and move the pill to the cursor. Cancels
   // any pending debounced clear so crossing between a row's children is stable.
   const markDropTarget = useCallback((id: number, x: number, y: number) => {
@@ -522,8 +531,11 @@ function TreeTableInner({
     }
     // Warm the image so its bytes are ready (decoded) by the time the card opens.
     if (thumbPath) {
-      const img = new Image();
-      img.src = `/api/thumbnail?path=${encodeURIComponent(thumbPath)}`;
+      void loadShellThumbnail(thumbPath).then((source) => {
+        if (!source) return;
+        const img = new Image();
+        img.src = source;
+      });
     }
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
     hoverTimerRef.current = setTimeout(() => setTooltip({ node, x, y, thumbPath }), 150);
@@ -651,18 +663,48 @@ function TreeTableInner({
     }
   }, [onMoveItems, reportInternalMoveError, resetDragState]);
 
+  const finishTauriNativeDrag = useCallback((info: NativeDragResponse, paths: string[]) => {
+    const folderTabPath = nativeFolderTabPathRef.current;
+    if (info.outcome !== "internal" || info.clientX == null || info.clientY == null) {
+      clearNativeDrag();
+      resetDragState();
+      if (info.outcome === "external-move") {
+        onAfterExternalMoveRef.current?.();
+      }
+      return;
+    }
+
+    const element = document.elementFromPoint(info.clientX, info.clientY) as HTMLElement | null;
+    const tabStrip = element?.closest<HTMLElement>("[data-tabstrip]");
+    if (tabStrip && folderTabPath) {
+      const groupId = tabStrip.dataset.groupId || undefined;
+      clearNativeDrag();
+      resetDragState();
+      onOpenFolderInTabRef.current?.(folderTabPath, groupId);
+      return;
+    }
+    const overTree = !!element?.closest(".table-pane");
+    const destination = overTree
+      ? element?.closest<HTMLElement>('.row[data-node-dir="1"]')?.dataset.nodePath
+      : undefined;
+    const movable = destination
+      ? paths.filter((source) => source && !isNoOpMove(source, destination))
+      : [];
+    clearNativeDrag();
+    if (destination && movable.length > 0) {
+      resetDragState();
+      window.setTimeout(() => { void runInternalMove(movable, destination); }, 0);
+      return;
+    }
+    resetDragState();
+  }, [clearNativeDrag, resetDragState, runInternalMove]);
+
   // When a native (file) drag-out ends back over FileTree, main sends the drop
   // point so we hit-test the destination folder and perform the move ourselves
   // (Chromium can't complete its own drop while the modal drag loop runs).
   useEffect(() => {
     const api = electronAPI();
     if (!api?.onNativeDropInternal) return;
-    const clearNativeDrag = () => {
-      nativeDragOriginRef.current = false;
-      lastFolderTargetRef.current = null;
-      nativeFolderTabPathRef.current = null;
-      nativeDragHadDirRef.current = false;
-    };
     const offInternal = api.onNativeDropInternal((clientX, clientY, paths) => {
       const origin = nativeDragOriginRef.current;
       const tracked = lastFolderTargetRef.current;
@@ -750,7 +792,7 @@ function TreeTableInner({
       onAfterExternalMoveRef.current?.();
     });
     return () => { offInternal?.(); offEnd?.(); offSettled?.(); };
-  }, [runInternalMove, resetDragState]);
+  }, [clearNativeDrag, runInternalMove, resetDragState]);
 
   return (
     <div
@@ -935,7 +977,7 @@ function TreeTableInner({
                   // payload is path-agnostic and accepts directories, so folders
                   // drag out to Explorer (a true move) exactly like files. Only
                   // the pure-web fallback (no Electron API) uses the HTML5 drag.
-                  const useNativeDrag = !!api;
+                  const useNativeDrag = !!api || isTauriV2();
                   if (useNativeDrag) {
                     // Hand the drag to the native shell drag (fire-and-forget so
                     // the renderer stays responsive). Chromium still fires
@@ -954,8 +996,24 @@ function TreeTableInner({
                     nativeFolderTabPathRef.current =
                       draggedNodes.length === 1 && draggedNodes[0].dir ? draggedPaths[0] : null;
                     nativeDragHadDirRef.current = draggedNodes.some((draggedNode) => draggedNode.dir);
-                    api.diag?.(`[diag] native dragstart paths=${draggedPaths.length}`);
-                    api.startDrag(draggedPaths);
+                    if (api) {
+                      api.diag?.(`[diag] native dragstart paths=${draggedPaths.length}`);
+                      api.startDrag(draggedPaths);
+                    } else {
+                      const dragWindow = window as unknown as { __FILETREE_NATIVE_DRAG_ACTIVE__?: boolean };
+                      dragWindow.__FILETREE_NATIVE_DRAG_ACTIVE__ = true;
+                      void startNativeDrag(draggedPaths)
+                        .then((info) => {
+                          dragWindow.__FILETREE_NATIVE_DRAG_ACTIVE__ = false;
+                          finishTauriNativeDrag(info, draggedPaths);
+                        })
+                        .catch((error: unknown) => {
+                          dragWindow.__FILETREE_NATIVE_DRAG_ACTIVE__ = false;
+                          clearNativeDrag();
+                          resetDragState();
+                          reportInternalMoveError(error instanceof Error ? error.message : String(error));
+                        });
+                    }
                   }
                 }}
                 onDragEnd={() => {
@@ -1037,6 +1095,7 @@ function TreeTableInner({
                   )}
                   <FileIcon
                     ext={node.extension ?? ""}
+                    path={node.path}
                     isDir={node.dir}
                     isBundle={isBundle}
                   />

@@ -7,6 +7,7 @@ import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
 import { pickFolderThumb } from "../lib/thumbs";
+import { ShellThumbnail } from "./ShellThumbnail";
 
 const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "tif", "tiff", "avif", "heic", "ico"]);
 const VIDEO_EXTS = new Set(["mp4", "mkv", "mov", "avi", "wmv", "webm", "m4v", "flv"]);
@@ -137,10 +138,10 @@ function MediaPreview({ node, unit }: { node: NodeRecord; unit: Unit }) {
   return (
     <div className="preview-block">
       <div className="preview-media">
-        <img
-          src={`/api/thumbnail?path=${encodeURIComponent(node.path)}`}
+        <ShellThumbnail
+          path={node.path}
           alt={node.name}
-          onError={() => setError(true)}
+          onUnavailable={() => setError(true)}
         />
       </div>
       <FileMeta node={node} unit={unit} />
@@ -185,7 +186,7 @@ function IconPreview({ node, unit }: { node: NodeRecord; unit: Unit }) {
   return (
     <div className="preview-block preview-iconly">
       <div className="preview-icon-big">
-        <FileIcon ext={ext} isDir={false} isBundle={false} />
+        <FileIcon ext={ext} path={node.path} isDir={false} isBundle={false} />
       </div>
       <FileMeta node={node} unit={unit} />
     </div>
@@ -212,10 +213,10 @@ function FolderPreview({ node, unit, nodeById, bookmarks }: {
     return (
       <div className="preview-block">
         <div className="preview-media">
-          <img
-            src={`/api/thumbnail?path=${encodeURIComponent(thumb)}`}
+          <ShellThumbnail
+            path={thumb}
             alt={node.name}
-            onError={() => setError(true)}
+            onUnavailable={() => setError(true)}
           />
         </div>
         <FileMeta node={node} unit={unit} />
