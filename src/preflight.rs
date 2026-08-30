@@ -40,7 +40,11 @@ pub(crate) fn free_space(path: &Path) -> Option<u64> {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| path.to_path_buf())
     };
-    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut free_to_caller: u64 = 0;
     let ok = unsafe {
         GetDiskFreeSpaceExW(
@@ -50,11 +54,7 @@ pub(crate) fn free_space(path: &Path) -> Option<u64> {
             std::ptr::null_mut(),
         )
     };
-    if ok != 0 {
-        Some(free_to_caller)
-    } else {
-        None
-    }
+    if ok != 0 { Some(free_to_caller) } else { None }
 }
 
 #[cfg(not(windows))]
@@ -86,7 +86,11 @@ pub(crate) fn disk_space(path: &Path) -> Option<(u64, u64)> {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| path.to_path_buf())
     };
-    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut free_to_caller: u64 = 0;
     let mut total: u64 = 0;
     let ok = unsafe {
@@ -164,7 +168,10 @@ pub(crate) fn validate_name(name: &str) -> Result<(), String> {
         return Err("Name cannot be empty.".to_string());
     }
     const INVALID: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-    if let Some(c) = name.chars().find(|c| INVALID.contains(c) || (*c as u32) < 0x20) {
+    if let Some(c) = name
+        .chars()
+        .find(|c| INVALID.contains(c) || (*c as u32) < 0x20)
+    {
         return Err(format!("Name contains an invalid character: {c:?}"));
     }
     if name.ends_with(' ') || name.ends_with('.') {

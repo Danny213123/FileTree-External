@@ -70,10 +70,22 @@ impl SheetWriter {
             match cell {
                 Cell::Text(s) => write_inline_str_cell(&mut self.out, c, row_num, s),
                 Cell::Int(n) => {
-                    let _ = write!(self.out, "<c r=\"{}{}\"><v>{}</v></c>", col_letters(c), row_num, n);
+                    let _ = write!(
+                        self.out,
+                        "<c r=\"{}{}\"><v>{}</v></c>",
+                        col_letters(c),
+                        row_num,
+                        n
+                    );
                 }
                 Cell::Float(f) => {
-                    let _ = write!(self.out, "<c r=\"{}{}\"><v>{}</v></c>", col_letters(c), row_num, f);
+                    let _ = write!(
+                        self.out,
+                        "<c r=\"{}{}\"><v>{}</v></c>",
+                        col_letters(c),
+                        row_num,
+                        f
+                    );
                 }
             }
         }
@@ -129,7 +141,12 @@ fn build_workbook_xml(sheet_name: &str) -> String {
 }
 
 fn write_inline_str_cell(out: &mut String, col: usize, row: usize, value: &str) {
-    let _ = write!(out, "<c r=\"{}{}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">", col_letters(col), row);
+    let _ = write!(
+        out,
+        "<c r=\"{}{}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">",
+        col_letters(col),
+        row
+    );
     // Formula-injection hardening (mirrors the CSV export): neutralize a leading
     // = + - @ TAB CR with a single quote so a spreadsheet treats the cell as
     // literal text rather than a formula. Headers never trigger this.

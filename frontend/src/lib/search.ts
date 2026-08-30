@@ -4,9 +4,10 @@ import { compareNodes } from "../hooks/useTreeState";
 /**
  * Shared search matcher used by both the activity-bar Search list and the
  * main-area results table. Case-insensitive substring match over BOTH the node
- * name AND its full path (so extension / folder-path queries hit), skipping
- * aggregated bundle nodes (id < 0). Matches are sorted by the active table
- * sort and capped at `limit`.
+ * name AND its full path, skipping aggregated bundle nodes (id < 0). Plain
+ * words are ANDed; phrases, exclusions, field scopes, and wildcards are
+ * compiled by {@link compileNameMatcher}. Matches are sorted by the active
+ * table sort and capped at `limit`.
  *
  * Returns [] for queries shorter than 2 characters (after trim).
  */
@@ -17,13 +18,14 @@ export function searchNodes(
   sortDir: 1 | -1,
   limit: number,
 ): NodeRecord[] {
-  const q = query.trim().toLowerCase();
+  const q = query.trim();
   if (q.length < 2) return [];
 
+  const matcher = compileNameMatcher(q, false);
   const matches: NodeRecord[] = [];
   for (const node of nodeById.values()) {
     if (node.id < 0) continue; // skip aggregated bundle nodes
-    if (node.name.toLowerCase().includes(q) || (node.path && node.path.toLowerCase().includes(q))) {
+    if (matcher.test(node.name, node.path || "", node)) {
       matches.push(node);
     }
   }
@@ -149,9 +151,99 @@ export function toServerSearchParams(filters: SearchFilters, now = Date.now()): 
 
 /** A compiled name matcher: `test(name, path)` plus an `invalid` flag set when a
  *  regex query failed to compile (callers show a subtle invalid state). */
+export interface SearchMatchTarget {
+  dir?: boolean;
+  extension?: string;
+}
+
+export type SearchField = "any" | "name" | "path" | "ext" | "type";
+
+export interface SearchTerm {
+  value: string;
+  field: SearchField;
+  excluded: boolean;
+}
+
 export interface NameMatcher {
-  test: (name: string, path: string) => boolean;
+  test: (name: string, path: string, target?: SearchMatchTarget) => boolean;
   invalid: boolean;
+}
+
+/** Parse a compact query language without allocating a token per file.
+ *  Examples: `summer vacation`, `"annual report"`, `-backup`, `ext:mp4`. */
+export function parseSearchTerms(query: string): SearchTerm[] {
+  const rawTokens: string[] = [];
+  let token = "";
+  let quoted = false;
+  for (const character of query) {
+    if (character === '"') {
+      quoted = !quoted;
+    } else if (/\s/.test(character) && !quoted) {
+      if (token) rawTokens.push(token);
+      token = "";
+    } else {
+      token += character;
+    }
+  }
+  if (token) rawTokens.push(token);
+
+  return rawTokens.flatMap((rawToken): SearchTerm[] => {
+    let raw = rawToken;
+    const excluded = raw.startsWith("-") && raw.length > 1;
+    if (excluded) raw = raw.slice(1);
+    let field: SearchField = "any";
+    let value = raw;
+    const separator = raw.indexOf(":");
+    if (separator > 0 && separator < raw.length - 1) {
+      const candidate = raw.slice(0, separator).toLowerCase();
+      const aliases: Record<string, SearchField | undefined> = {
+        name: "name",
+        path: "path",
+        in: "path",
+        ext: "ext",
+        extension: "ext",
+        type: "type",
+        kind: "type",
+      };
+      const scoped = aliases[candidate];
+      if (scoped) {
+        field = scoped;
+        value = raw.slice(separator + 1);
+      }
+    }
+    value = value.trim().toLowerCase();
+    return value ? [{ value, field, excluded }] : [];
+  });
+}
+
+function wildcardMatcher(value: string): (candidate: string) => boolean {
+  if (!value.includes("*") && !value.includes("?")) {
+    return (candidate) => candidate.includes(value);
+  }
+  const source = value
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  const expression = new RegExp(`^${source}$`, "i");
+  return (candidate) => expression.test(candidate);
+}
+
+function inferredExtension(name: string, target?: SearchMatchTarget): string {
+  const supplied = target?.extension?.replace(/^\./, "").toLowerCase();
+  if (supplied) return supplied;
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
+
+function typeMatches(value: string, name: string, target?: SearchMatchTarget): boolean {
+  if (["folder", "folders", "directory", "directories", "dir"].includes(value)) return !!target?.dir;
+  if (["file", "files"].includes(value)) return target?.dir === false;
+  if (target?.dir) return false;
+  const category = ({ images: "image", videos: "video", documents: "document", archives: "archive", executables: "executable" } as Record<string, string>)[value] ?? value;
+  if (category in CATEGORY_EXTS) {
+    return CATEGORY_EXTS[category as Exclude<FileCategory, "any" | "folder">].has(inferredExtension(name, target));
+  }
+  return wildcardMatcher(value.replace(/^\./, ""))(inferredExtension(name, target));
 }
 
 export function compileNameMatcher(query: string, regex: boolean): NameMatcher {
@@ -165,9 +257,27 @@ export function compileNameMatcher(query: string, regex: boolean): NameMatcher {
       return { test: () => false, invalid: true };
     }
   }
-  const lower = q.toLowerCase();
+  const terms = parseSearchTerms(q).map((term) => ({
+    ...term,
+    matches: wildcardMatcher(term.field === "ext" ? term.value.replace(/^\./, "") : term.value),
+  }));
   return {
-    test: (name, path) => name.toLowerCase().includes(lower) || (!!path && path.toLowerCase().includes(lower)),
+    test: (name, path, target) => {
+      const lowerName = name.toLowerCase();
+      const lowerPath = path.toLowerCase();
+      const extension = inferredExtension(name, target);
+      return terms.every((term) => {
+        let matched: boolean;
+        switch (term.field) {
+          case "name": matched = term.matches(lowerName); break;
+          case "path": matched = term.matches(lowerPath); break;
+          case "ext": matched = term.matches(extension); break;
+          case "type": matched = typeMatches(term.value, name, target); break;
+          default: matched = term.matches(lowerName) || term.matches(lowerPath); break;
+        }
+        return term.excluded ? !matched : matched;
+      });
+    },
     invalid: false,
   };
 }
@@ -260,7 +370,7 @@ export function searchNodesAdvanced(
   const matches: NodeRecord[] = [];
   for (const node of nodeById.values()) {
     if (node.id < 0) continue;
-    if (!nameMatchAll && !matcher.test(node.name, node.path || "")) continue;
+    if (!nameMatchAll && !matcher.test(node.name, node.path || "", node)) continue;
     if (!predicate(node)) continue;
     matches.push(node);
   }

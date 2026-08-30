@@ -1,0 +1,14 @@
+{
+  "name": "filetree-v2",
+  "private": true,
+  "version": "2.0.0",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:frontend": "npm --prefix frontend run build",
+    "test": "npm --prefix frontend test -- --run"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

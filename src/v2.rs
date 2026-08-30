@@ -1,0 +1,2707 @@
+//! FileTree v2 bounded-storage core.
+//!
+//! The v1 scanner returned one `Vec<NodeRecord>` and the renderer then built
+//! several complete maps over it. That made resident memory proportional to the
+//! number of files and multiplied the cost for every open tab. V2 writes scan
+//! rows through a bounded channel into a per-scan SQLite database and exposes
+//! only paginated DTOs.
+
+use base64::Engine;
+use regex::RegexBuilder;
+use rusqlite::functions::FunctionFlags;
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub const TREE_PAGE_DEFAULT: usize = 500;
+pub const TREE_PAGE_MAX: usize = 500;
+pub const COMPRESSION_PAGE_MAX: usize = 250;
+pub const SCAN_CHANNEL_CAPACITY: usize = 8_192;
+pub const SCAN_TRANSACTION_ROWS: usize = 10_000;
+pub const SCAN_DISK_BUDGET_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub const SQLITE_CACHE_KIB: i64 = 8 * 1024;
+pub const MANAGED_MEMORY_BUDGET_BYTES: u64 = 96 * 1024 * 1024;
+pub const SETTINGS_JSON_MAX_BYTES: usize = 1024 * 1024;
+pub const BOOKMARKS_JSON_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+static NEXT_SCAN_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ScanRequest {
+    pub root: String,
+    pub include_hidden: bool,
+    pub follow_links: bool,
+    pub exclude_patterns: Vec<String>,
+    pub threads: usize,
+}
+
+impl Default for ScanRequest {
+    fn default() -> Self {
+        Self {
+            root: String::new(),
+            include_hidden: true,
+            follow_links: false,
+            exclude_patterns: Vec::new(),
+            threads: std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(4)
+                .clamp(1, 16),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanHandle {
+    pub scan_id: String,
+    pub root_path: String,
+    pub database_path: String,
+    pub status: String,
+    pub node_count: u64,
+    pub started_at: u64,
+    pub elapsed_ms: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanProgress {
+    pub scan_id: String,
+    pub stage: String,
+    pub node_count: u64,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ScanQuery {
+    pub scan_id: String,
+    pub parent_id: Option<i64>,
+    pub offset: usize,
+    pub limit: usize,
+    pub search: String,
+    pub sort: String,
+    pub direction: String,
+    pub directories_only: bool,
+    pub files_only: bool,
+    pub regex: bool,
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    pub modified_after: Option<u64>,
+    pub modified_before: Option<u64>,
+    pub ext: String,
+    pub category: String,
+}
+
+impl Default for ScanQuery {
+    fn default() -> Self {
+        Self {
+            scan_id: String::new(),
+            parent_id: Some(0),
+            offset: 0,
+            limit: TREE_PAGE_DEFAULT,
+            search: String::new(),
+            sort: "size".to_string(),
+            direction: "desc".to_string(),
+            directories_only: false,
+            files_only: false,
+            regex: false,
+            min_size: None,
+            max_size: None,
+            modified_after: None,
+            modified_before: None,
+            ext: String::new(),
+            category: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodePageItem {
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub is_link: bool,
+    pub hidden: bool,
+    pub readonly: bool,
+    pub size: u64,
+    pub allocated: u64,
+    pub files: u64,
+    pub folders: u64,
+    pub modified_ms: u64,
+    pub created_ms: u64,
+    pub accessed_ms: u64,
+    pub depth: u32,
+    pub errors: u64,
+    pub extension: String,
+    pub owner: String,
+    pub attributes: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodePage {
+    pub items: Vec<NodePageItem>,
+    pub total: u64,
+    pub offset: usize,
+    pub limit: usize,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompressionSummary {
+    pub id: String,
+    pub status: String,
+    pub total: u64,
+    pub processed: u64,
+    pub active: u64,
+    pub saved_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompressionFileItem {
+    pub index: usize,
+    pub path: String,
+    pub kind: String,
+    pub status: String,
+    pub stage: String,
+    pub pct: u64,
+    pub orig_bytes: u64,
+    pub new_bytes: u64,
+    pub saved_bytes: u64,
+    pub pct_saved: f64,
+    pub error: Option<String>,
+    pub reason: String,
+    pub encoder: String,
+    pub disposition: String,
+    pub out_path: String,
+    pub duration_ms: u64,
+    pub elapsed_ms: u64,
+    pub fps: Option<f64>,
+    pub processing_rate: Option<f64>,
+    pub output_bytes: u64,
+    pub started_at: u64,
+    pub updated_at: u64,
+    pub finished_at: u64,
+    pub attempt: usize,
+    pub tool: String,
+    pub tool_version: String,
+    pub command: String,
+    pub stderr: String,
+    pub recycled: bool,
+    pub queue_position: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompressionFilePage {
+    pub id: String,
+    pub items: Vec<CompressionFileItem>,
+    pub total: u64,
+    pub total_matches: u64,
+    pub offset: usize,
+    pub limit: usize,
+    pub facets: HashMap<String, HashMap<String, u64>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompressionFileRecord {
+    pub job_id: String,
+    pub index: usize,
+    pub path: String,
+    pub kind: String,
+    pub status: String,
+    pub stage: String,
+    pub pct: u64,
+    pub orig_bytes: u64,
+    pub new_bytes: u64,
+    pub error: Option<String>,
+    pub reason: String,
+    pub encoder: String,
+    pub disposition: String,
+    pub out_path: String,
+    pub duration_ms: u64,
+    pub fps: Option<f64>,
+    pub started_at: u64,
+    pub updated_at: u64,
+    pub finished_at: u64,
+    pub attempt: usize,
+    pub tool: String,
+    pub tool_version: String,
+    pub command: String,
+    pub stderr: String,
+    pub recycled: bool,
+    pub queue_position: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CompressionPageQuery {
+    pub offset: usize,
+    pub limit: usize,
+    pub search: String,
+    pub status: String,
+    pub kind: String,
+    pub encoder: String,
+    pub outcome: String,
+    pub disposition: String,
+    pub path: String,
+    pub attention: bool,
+    pub sort: String,
+    pub direction: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryStats {
+    pub working_set_bytes: Option<u64>,
+    pub private_bytes: Option<u64>,
+    pub managed_budget_bytes: u64,
+    pub scan_index_bytes: u64,
+    pub active_scans: usize,
+    pub retained_scan_handles: usize,
+}
+
+#[derive(Debug)]
+struct ScanJob {
+    handle: ScanHandle,
+    cancel: Arc<AtomicBool>,
+    terminal: bool,
+}
+
+#[derive(Debug)]
+enum CompressionWrite {
+    File(CompressionFileRecord),
+    JobState {
+        id: String,
+        status: String,
+        saved_bytes: u64,
+    },
+}
+
+#[derive(Debug)]
+pub struct V2Store {
+    root: PathBuf,
+    scans_dir: PathBuf,
+    state_path: PathBuf,
+    jobs: Mutex<HashMap<String, ScanJob>>,
+    compression_tx: SyncSender<CompressionWrite>,
+}
+
+impl V2Store {
+    pub fn open_default() -> Result<Arc<Self>, String> {
+        let local = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        Self::open(local.join("FileTree").join("v2"))
+    }
+
+    pub fn open(root: PathBuf) -> Result<Arc<Self>, String> {
+        let scans_dir = root.join("scans");
+        fs::create_dir_all(&scans_dir).map_err(|error| error.to_string())?;
+        let state_path = root.join("state.db");
+        let (compression_tx, compression_rx) =
+            std::sync::mpsc::sync_channel::<CompressionWrite>(SCAN_CHANNEL_CAPACITY);
+        let store = Arc::new(Self {
+            root,
+            scans_dir,
+            state_path,
+            jobs: Mutex::new(HashMap::new()),
+            compression_tx,
+        });
+        store
+            .initialize_state()
+            .map_err(|error| error.to_string())?;
+        store
+            .import_v1_catalog()
+            .map_err(|error| error.to_string())?;
+        spawn_compression_writer(store.state_path.clone(), compression_rx);
+        Ok(store)
+    }
+
+    pub fn data_root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn start_scan<F>(
+        self: &Arc<Self>,
+        request: ScanRequest,
+        progress: F,
+    ) -> Result<ScanHandle, String>
+    where
+        F: Fn(ScanProgress) + Send + Sync + 'static,
+    {
+        let root = PathBuf::from(request.root.trim());
+        if !root.is_dir() {
+            return Err(format!("Scan root is not a directory: {}", root.display()));
+        }
+        let scan_id = new_scan_id();
+        let db_path = self.scans_dir.join(format!("{scan_id}.db"));
+        let started_at = now_ms();
+        let handle = ScanHandle {
+            scan_id: scan_id.clone(),
+            root_path: root.to_string_lossy().into_owned(),
+            database_path: db_path.to_string_lossy().into_owned(),
+            status: "scanning".to_string(),
+            node_count: 0,
+            started_at,
+            elapsed_ms: 0,
+            error: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.jobs.lock_unpoisoned().insert(
+            scan_id.clone(),
+            ScanJob {
+                handle: handle.clone(),
+                cancel: Arc::clone(&cancel),
+                terminal: false,
+            },
+        );
+
+        let store = Arc::clone(self);
+        let thread_handle = handle.clone();
+        std::thread::Builder::new()
+            .name(format!("scan-{scan_id}"))
+            .spawn(move || {
+                let started = Instant::now();
+                let callback: Arc<dyn Fn(ScanProgress) + Send + Sync> = Arc::new(progress);
+                let outcome = run_bounded_scan(
+                    &thread_handle.scan_id,
+                    &root,
+                    &db_path,
+                    &request,
+                    &cancel,
+                    Arc::clone(&callback),
+                );
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let (status, nodes, error_message) = match outcome {
+                    Ok(nodes) if cancel.load(Ordering::Relaxed) => ("cancelled", nodes, None),
+                    Ok(nodes) => ("done", nodes, None),
+                    Err(error) => {
+                        let _ = write_scan_metadata(&db_path, "error", 0, elapsed_ms, Some(&error));
+                        ("error", 0, Some(error))
+                    }
+                };
+                {
+                    let mut jobs = store.jobs.lock_unpoisoned();
+                    if let Some(job) = jobs.get_mut(&thread_handle.scan_id) {
+                        job.handle.status = status.to_string();
+                        job.handle.node_count = nodes;
+                        job.handle.elapsed_ms = elapsed_ms;
+                        job.handle.error = error_message.clone();
+                        job.terminal = true;
+                    }
+                    prune_job_handles(&mut jobs);
+                }
+                let _ = store.upsert_scan_catalog(
+                    &thread_handle.scan_id,
+                    &root,
+                    &db_path,
+                    status,
+                    nodes,
+                );
+                let _ = store.enforce_scan_disk_budget();
+                callback(ScanProgress {
+                    scan_id: thread_handle.scan_id,
+                    stage: status.to_string(),
+                    node_count: nodes,
+                    elapsed_ms,
+                });
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(handle)
+    }
+
+    pub fn cancel_scan(&self, scan_id: &str) -> bool {
+        let jobs = self.jobs.lock_unpoisoned();
+        let Some(job) = jobs.get(scan_id) else {
+            return false;
+        };
+        if job.terminal {
+            return false;
+        }
+        job.cancel.store(true, Ordering::Relaxed);
+        true
+    }
+
+    pub fn scan_status(&self, scan_id: &str) -> Option<ScanHandle> {
+        if let Some(job) = self.jobs.lock_unpoisoned().get(scan_id) {
+            return Some(job.handle.clone());
+        }
+        self.catalog_handle(scan_id).ok().flatten()
+    }
+
+    pub fn find_completed_scan(&self, root_path: &str) -> Option<ScanHandle> {
+        let conn = self.open_state().ok()?;
+        let handle = conn
+            .query_row(
+                "SELECT scan_id,root_path,db_path,status,node_count,created_at FROM scan_catalog \
+                 WHERE root_path=?1 COLLATE NOCASE AND status='done' ORDER BY last_used DESC LIMIT 1",
+                params![root_path],
+                |row| {
+                    Ok(ScanHandle {
+                        scan_id: row.get(0)?,
+                        root_path: row.get(1)?,
+                        database_path: row.get(2)?,
+                        status: row.get(3)?,
+                        node_count: row.get::<_, i64>(4)?.max(0) as u64,
+                        started_at: row.get::<_, i64>(5)?.max(0) as u64,
+                        elapsed_ms: 0,
+                        error: None,
+                    })
+                },
+            )
+            .optional()
+            .ok()??;
+        if !Path::new(&handle.database_path).is_file() {
+            return None;
+        }
+        self.touch_scan(&handle.scan_id).ok();
+        Some(handle)
+    }
+
+    pub fn query_nodes(&self, mut query: ScanQuery) -> Result<NodePage, String> {
+        if !safe_scan_id(&query.scan_id) {
+            return Err("Invalid scan id".to_string());
+        }
+        query.limit = query.limit.clamp(1, TREE_PAGE_MAX);
+        let db_path = self.scans_dir.join(format!("{}.db", query.scan_id));
+        let conn = open_scan_connection(&db_path).map_err(|error| error.to_string())?;
+        let mut clauses = vec!["1=1".to_string()];
+        let mut values: Vec<Value> = Vec::new();
+        if let Some(parent) = query.parent_id {
+            clauses.push("n.parent_id = ?".to_string());
+            values.push(Value::Integer(parent));
+        }
+        if query.directories_only {
+            clauses.push("n.is_dir = 1".to_string());
+        }
+        if query.files_only {
+            clauses.push("n.is_dir = 0".to_string());
+        }
+        if let Some(min_size) = query.min_size {
+            clauses.push("n.size >= ?".to_string());
+            values.push(Value::Integer(as_sql_i64(min_size)));
+        }
+        if let Some(max_size) = query.max_size {
+            clauses.push("n.size <= ?".to_string());
+            values.push(Value::Integer(as_sql_i64(max_size)));
+        }
+        if let Some(modified_after) = query.modified_after {
+            clauses.push("n.modified_ms >= ?".to_string());
+            values.push(Value::Integer(as_sql_i64(modified_after)));
+        }
+        if let Some(modified_before) = query.modified_before {
+            clauses.push("n.modified_ms <= ?".to_string());
+            values.push(Value::Integer(as_sql_i64(modified_before)));
+        }
+        append_extension_filter(&mut clauses, &mut values, &query.ext);
+        append_category_filter(&mut clauses, &mut values, &query.category);
+        if !query.search.trim().is_empty() {
+            if query.regex {
+                let expression = RegexBuilder::new(query.search.trim())
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|error| format!("Invalid regular expression: {error}"))?;
+                conn.create_scalar_function(
+                    "filetree_regex",
+                    1,
+                    FunctionFlags::SQLITE_DETERMINISTIC,
+                    move |context| {
+                        let name = context.get::<String>(0)?;
+                        Ok(expression.is_match(&name))
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                clauses.push("filetree_regex(n.name) = 1".to_string());
+            } else {
+                for term in parse_search_terms(&query.search) {
+                    append_search_term(&mut clauses, &mut values, &term);
+                }
+            }
+        }
+        let where_sql = clauses.join(" AND ");
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM nodes n LEFT JOIN nodes p ON p.id = n.parent_id WHERE {where_sql}"
+        );
+        let total: u64 = conn
+            .query_row(&count_sql, params_from_iter(values.iter()), |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        let order = sort_column(&query.sort);
+        let direction = if query.direction.eq_ignore_ascii_case("asc") {
+            "ASC"
+        } else {
+            "DESC"
+        };
+        let page_sql = format!(
+            r#"SELECT n.id,n.parent_id,n.name,
+               CASE WHEN n.is_dir=1 THEN n.dir_path
+                    WHEN p.dir_path IS NULL OR p.dir_path='' THEN n.name
+                    WHEN substr(p.dir_path,-1,1) IN ('\','/') THEN p.dir_path || n.name
+                    ELSE p.dir_path || '\' || n.name END,
+               n.is_dir,n.is_link,n.hidden,n.readonly,n.size,n.allocated,n.files,n.folders,
+               n.modified_ms,n.created_ms,n.accessed_ms,n.depth,n.errors,n.extension,n.owner,n.attributes
+               FROM nodes n LEFT JOIN nodes p ON p.id=n.parent_id
+               WHERE {where_sql} ORDER BY {order} {direction}, n.id ASC LIMIT ? OFFSET ?"#
+        );
+        let mut page_values = values;
+        page_values.push(Value::Integer(query.limit as i64));
+        page_values.push(Value::Integer(query.offset as i64));
+        let mut stmt = conn.prepare(&page_sql).map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params_from_iter(page_values.iter()), node_from_row)
+            .map_err(|error| error.to_string())?;
+        let items = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        self.touch_scan(&query.scan_id).ok();
+        Ok(NodePage {
+            has_more: query.offset.saturating_add(items.len()) < total as usize,
+            items,
+            total,
+            offset: query.offset,
+            limit: query.limit,
+        })
+    }
+
+    pub fn set_scan_pinned(&self, scan_id: &str, pinned: bool) -> Result<(), String> {
+        let conn = self.open_state().map_err(|error| error.to_string())?;
+        conn.execute(
+            "UPDATE scan_catalog SET pinned=?2,last_used=?3 WHERE scan_id=?1",
+            params![scan_id, pinned as i64, now_ms() as i64],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn mark_scans_stale_for_path(&self, path: &Path) -> Result<usize, String> {
+        let resolved = if path.exists() {
+            fs::canonicalize(path).ok()
+        } else {
+            path.parent()
+                .and_then(|parent| fs::canonicalize(parent).ok())
+        };
+        let Some(resolved) = resolved else {
+            return Ok(0);
+        };
+        let conn = self.open_state().map_err(|error| error.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT scan_id,root_path FROM scan_catalog WHERE status='done'")
+            .map_err(|error| error.to_string())?;
+        let stale = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .filter_map(|(id, root)| fs::canonicalize(root).ok().map(|root| (id, root)))
+            .filter(|(_, root)| resolved.starts_with(root))
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        drop(stmt);
+        for id in &stale {
+            conn.execute(
+                "UPDATE scan_catalog SET status='stale',last_used=?2 WHERE scan_id=?1",
+                params![id, now_ms() as i64],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(stale.len())
+    }
+
+    pub fn source_path_is_authorized(&self, path: &str) -> bool {
+        let requested = Path::new(path);
+        let resolved = if requested.exists() {
+            fs::canonicalize(requested).ok()
+        } else {
+            requested
+                .parent()
+                .and_then(|parent| fs::canonicalize(parent).ok())
+        };
+        let Some(resolved) = resolved else {
+            return false;
+        };
+        let Ok(conn) = self.open_state() else {
+            return false;
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT root_path FROM scan_catalog WHERE status IN ('scanning','done') ORDER BY last_used DESC",
+        ) else { return false };
+        let Ok(roots) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return false;
+        };
+        roots
+            .filter_map(Result::ok)
+            .filter_map(|root| fs::canonicalize(root).ok())
+            .any(|root| resolved.starts_with(root))
+    }
+
+    pub fn load_json_setting(&self, key: &str, fallback: &str) -> Result<String, String> {
+        let conn = self.open_state().map_err(|error| error.to_string())?;
+        conn.query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or_else(|| fallback.to_string()))
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn save_json_setting(
+        &self,
+        key: &str,
+        value: &str,
+        max_bytes: usize,
+    ) -> Result<(), String> {
+        if value.len() > max_bytes {
+            return Err(format!("Setting {key} exceeds the {max_bytes}-byte limit"));
+        }
+        serde_json::from_str::<serde_json::Value>(value)
+            .map_err(|error| format!("Invalid JSON for setting {key}: {error}"))?;
+        let conn = self.open_state().map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,?2,?3)\
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            params![key, value, now_ms() as i64],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn persist_compression_job<I>(
+        &self,
+        id: &str,
+        status: &str,
+        total: usize,
+        settings_json: &str,
+        files: I,
+    ) -> Result<(), String>
+    where
+        I: IntoIterator<Item = CompressionFileRecord>,
+    {
+        if !safe_job_id(id) {
+            return Err("Invalid compression job id".to_string());
+        }
+        serde_json::from_str::<serde_json::Value>(settings_json)
+            .map_err(|error| format!("Invalid compression settings: {error}"))?;
+        let mut conn = self.open_state().map_err(|error| error.to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let now = now_ms() as i64;
+        tx.execute(
+            "INSERT INTO compression_jobs(id,status,total,processed,active,saved_bytes,settings_json,created_at,updated_at)\
+             VALUES(?1,?2,?3,0,0,0,?4,?5,?5)\
+             ON CONFLICT(id) DO UPDATE SET status=excluded.status,total=excluded.total,settings_json=excluded.settings_json,updated_at=excluded.updated_at",
+            params![id, status, total as i64, settings_json, now],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM compression_files WHERE job_id=?1", params![id])
+            .map_err(|error| error.to_string())?;
+        {
+            let mut statement = tx
+                .prepare(COMPRESSION_FILE_UPSERT_SQL)
+                .map_err(|error| error.to_string())?;
+            for file in files {
+                persist_compression_file(&mut statement, &file)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn queue_compression_file(&self, file: CompressionFileRecord, terminal: bool) {
+        match self.compression_tx.try_send(CompressionWrite::File(file)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(CompressionWrite::File(file))) if terminal => {
+                let _ = self.compression_tx.send(CompressionWrite::File(file));
+            }
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    pub fn queue_compression_job_state(&self, id: &str, status: &str, saved_bytes: u64) {
+        let _ = self.compression_tx.send(CompressionWrite::JobState {
+            id: id.to_string(),
+            status: status.to_string(),
+            saved_bytes,
+        });
+    }
+
+    pub fn delete_compression_job(&self, id: &str) -> Result<(), String> {
+        if !safe_job_id(id) {
+            return Err("Invalid compression job id".to_string());
+        }
+        let mut conn = self.open_state().map_err(|error| error.to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM compression_files WHERE job_id=?1", params![id])
+            .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM compression_jobs WHERE id=?1", params![id])
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn query_compression_files(
+        &self,
+        id: &str,
+        query: CompressionPageQuery,
+    ) -> Result<Option<CompressionFilePage>, String> {
+        if !safe_job_id(id) {
+            return Ok(None);
+        }
+        let conn = self.open_state().map_err(|error| error.to_string())?;
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM compression_jobs WHERE id=?1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let now = now_ms();
+        let mut where_sql = "job_id=?1".to_string();
+        let mut values = vec![Value::Text(id.to_string())];
+        let search = query.search.trim();
+        if !search.is_empty() {
+            let value = Value::Text(format!("%{}%", escape_like(&search.to_ascii_lowercase())));
+            where_sql.push_str(
+                " AND (LOWER(path) LIKE ? ESCAPE '\\' OR LOWER(reason) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(error_text,'')) LIKE ? ESCAPE '\\')",
+            );
+            values.extend([value.clone(), value.clone(), value]);
+        }
+        push_csv_sql(&mut where_sql, &mut values, "status", &query.status);
+        push_csv_sql(&mut where_sql, &mut values, "kind", &query.kind);
+        push_csv_sql(&mut where_sql, &mut values, "reason", &query.outcome);
+        push_csv_sql(
+            &mut where_sql,
+            &mut values,
+            "disposition",
+            &query.disposition,
+        );
+        if !query.encoder.trim().is_empty() {
+            where_sql.push_str(" AND LOWER(encoder) LIKE ? ESCAPE '\\'");
+            values.push(Value::Text(format!(
+                "%{}%",
+                escape_like(&query.encoder.trim().to_ascii_lowercase())
+            )));
+        }
+        if !query.path.trim().is_empty() {
+            where_sql.push_str(" AND LOWER(path) LIKE ? ESCAPE '\\'");
+            values.push(Value::Text(format!(
+                "%{}%",
+                escape_like(&query.path.trim().to_ascii_lowercase())
+            )));
+        }
+        if query.attention {
+            where_sql.push_str(" AND (status='error' OR (status='running' AND updated_at<?))");
+            values.push(Value::Integer(now.saturating_sub(120_000) as i64));
+        }
+
+        let total = conn
+            .query_row(
+                "SELECT total FROM compression_jobs WHERE id=?1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .max(0) as u64;
+        let total_matches = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM compression_files WHERE {where_sql}"),
+                params_from_iter(values.iter()),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .max(0) as u64;
+
+        let sort = compression_sort_sql(&query.sort);
+        let direction = if query.direction.eq_ignore_ascii_case("desc") {
+            "DESC"
+        } else {
+            "ASC"
+        };
+        let limit = query.limit.clamp(1, COMPRESSION_PAGE_MAX);
+        let offset = query.offset.min(total_matches as usize);
+        let mut page_values = values.clone();
+        page_values.push(Value::Integer(now.saturating_sub(15_000) as i64));
+        page_values.push(Value::Integer(limit as i64));
+        page_values.push(Value::Integer(offset as i64));
+        let sql = format!(
+            "SELECT id,path,kind,status,stage,progress,original_bytes,output_bytes,error_text,reason,encoder,disposition,out_path,duration_ms,fps,started_at,updated_at,finished_at,attempt,tool,tool_version,command_text,stderr_text,recycled,queue_position \
+             FROM compression_files WHERE {where_sql} \
+             ORDER BY CASE WHEN status='running' THEN 0 WHEN finished_at>0 AND finished_at>=? THEN 1 ELSE 2 END ASC,\
+                      CASE WHEN status='running' THEN started_at ELSE 0 END ASC,\
+                      CASE WHEN finished_at>0 AND finished_at>=? THEN finished_at ELSE 0 END DESC,\
+                      {sort} {direction},id ASC LIMIT ? OFFSET ?"
+        );
+        // The recent-finish cutoff is referenced twice in the ORDER BY.
+        let cutoff = page_values.remove(page_values.len() - 3);
+        let insert_at = page_values.len() - 2;
+        page_values.insert(insert_at, cutoff.clone());
+        page_values.insert(insert_at, cutoff);
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params_from_iter(page_values.iter()), |row| {
+                compression_item_from_row(row, now)
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+
+        let mut facets = HashMap::new();
+        for (name, column) in [
+            ("status", "status"),
+            ("type", "kind"),
+            ("encoder", "encoder"),
+            ("outcome", "reason"),
+            ("disposition", "disposition"),
+        ] {
+            let facet_sql = format!(
+                "SELECT {column},COUNT(*) FROM compression_files WHERE {where_sql} AND {column}<>'' GROUP BY {column} ORDER BY {column}"
+            );
+            let mut statement = conn
+                .prepare(&facet_sql)
+                .map_err(|error| error.to_string())?;
+            let values_for_facet = statement
+                .query_map(params_from_iter(values.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?.max(0) as u64,
+                    ))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<rusqlite::Result<HashMap<_, _>>>()
+                .map_err(|error| error.to_string())?;
+            facets.insert(name.to_string(), values_for_facet);
+        }
+
+        Ok(Some(CompressionFilePage {
+            id: id.to_string(),
+            items: rows,
+            total,
+            total_matches,
+            offset,
+            limit,
+            facets,
+        }))
+    }
+
+    pub fn memory_stats(&self) -> MemoryStats {
+        let (working_set_bytes, private_bytes) = process_memory_bytes();
+        let active_scans = self
+            .jobs
+            .lock_unpoisoned()
+            .values()
+            .filter(|job| !job.terminal)
+            .count();
+        MemoryStats {
+            working_set_bytes,
+            private_bytes,
+            managed_budget_bytes: MANAGED_MEMORY_BUDGET_BYTES,
+            scan_index_bytes: directory_size(&self.scans_dir),
+            active_scans,
+            retained_scan_handles: self.jobs.lock_unpoisoned().len(),
+        }
+    }
+
+    pub fn enforce_scan_disk_budget(&self) -> Result<u64, String> {
+        let active: HashSet<String> = self
+            .jobs
+            .lock_unpoisoned()
+            .iter()
+            .filter(|(_, job)| !job.terminal)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let conn = self.open_state().map_err(|error| error.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT scan_id,db_path,pinned,last_used FROM scan_catalog ORDER BY last_used ASC",
+            )
+            .map_err(|error| error.to_string())?;
+        let entries = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        let mut total = directory_size(&self.scans_dir);
+        let mut freed = 0u64;
+        for (scan_id, path, pinned, _) in entries {
+            if total <= SCAN_DISK_BUDGET_BYTES {
+                break;
+            }
+            if pinned || active.contains(&scan_id) {
+                continue;
+            }
+            let bytes = database_family_size(&path);
+            remove_database_family(&path);
+            conn.execute(
+                "DELETE FROM scan_catalog WHERE scan_id=?1",
+                params![scan_id],
+            )
+            .map_err(|error| error.to_string())?;
+            total = total.saturating_sub(bytes);
+            freed = freed.saturating_add(bytes);
+        }
+        Ok(freed)
+    }
+
+    fn initialize_state(&self) -> rusqlite::Result<()> {
+        let conn = self.open_state()?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);\
+             INSERT INTO schema_info(version) SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM schema_info);\
+             CREATE TABLE IF NOT EXISTS scan_catalog(\
+               scan_id TEXT PRIMARY KEY, root_path TEXT NOT NULL, db_path TEXT NOT NULL,\
+               status TEXT NOT NULL, node_count INTEGER NOT NULL DEFAULT 0,\
+               created_at INTEGER NOT NULL, last_used INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0\
+             );\
+             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);\
+             CREATE TABLE IF NOT EXISTS secrets(key TEXT PRIMARY KEY,value BLOB NOT NULL,updated_at INTEGER NOT NULL);\
+             CREATE TABLE IF NOT EXISTS compression_jobs(\
+               id TEXT PRIMARY KEY,status TEXT NOT NULL,total INTEGER NOT NULL DEFAULT 0,\
+               processed INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 0,\
+               saved_bytes INTEGER NOT NULL DEFAULT 0,settings_json TEXT NOT NULL DEFAULT '{}',\
+               created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL\
+             );\
+             CREATE TABLE IF NOT EXISTS compression_files(\
+               job_id TEXT NOT NULL,id INTEGER NOT NULL,path TEXT NOT NULL,status TEXT NOT NULL,\
+               stage TEXT NOT NULL,progress REAL NOT NULL DEFAULT 0,original_bytes INTEGER NOT NULL DEFAULT 0,\
+               output_bytes INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL,\
+               kind TEXT NOT NULL DEFAULT 'other',reason TEXT NOT NULL DEFAULT '',\
+               encoder TEXT NOT NULL DEFAULT '',disposition TEXT NOT NULL DEFAULT '',\
+               out_path TEXT NOT NULL DEFAULT '',error_text TEXT,duration_ms INTEGER NOT NULL DEFAULT 0,\
+               fps REAL,started_at INTEGER NOT NULL DEFAULT 0,finished_at INTEGER NOT NULL DEFAULT 0,\
+               attempt INTEGER NOT NULL DEFAULT 0,tool TEXT NOT NULL DEFAULT '',\
+               tool_version TEXT NOT NULL DEFAULT '',command_text TEXT NOT NULL DEFAULT '',\
+               stderr_text TEXT NOT NULL DEFAULT '',recycled INTEGER NOT NULL DEFAULT 0,queue_position INTEGER,\
+               PRIMARY KEY(job_id,id)\
+             );\
+             CREATE INDEX IF NOT EXISTS compression_files_status ON compression_files(job_id,status,id);\
+             CREATE TABLE IF NOT EXISTS legacy_catalog(\
+               source_path TEXT PRIMARY KEY,kind TEXT NOT NULL,size INTEGER NOT NULL,modified_ms INTEGER NOT NULL,\
+               imported_at INTEGER NOT NULL\
+             );"
+        )?;
+        for (name, definition) in [
+            ("kind", "TEXT NOT NULL DEFAULT 'other'"),
+            ("reason", "TEXT NOT NULL DEFAULT ''"),
+            ("encoder", "TEXT NOT NULL DEFAULT ''"),
+            ("disposition", "TEXT NOT NULL DEFAULT ''"),
+            ("out_path", "TEXT NOT NULL DEFAULT ''"),
+            ("error_text", "TEXT"),
+            ("duration_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ("fps", "REAL"),
+            ("started_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("finished_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("attempt", "INTEGER NOT NULL DEFAULT 0"),
+            ("tool", "TEXT NOT NULL DEFAULT ''"),
+            ("tool_version", "TEXT NOT NULL DEFAULT ''"),
+            ("command_text", "TEXT NOT NULL DEFAULT ''"),
+            ("stderr_text", "TEXT NOT NULL DEFAULT ''"),
+            ("recycled", "INTEGER NOT NULL DEFAULT 0"),
+            ("queue_position", "INTEGER"),
+        ] {
+            ensure_column(&conn, "compression_files", name, definition)?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS compression_files_activity ON compression_files(job_id,status,finished_at,started_at);\
+             CREATE INDEX IF NOT EXISTS compression_files_size ON compression_files(job_id,original_bytes,id);\
+             CREATE INDEX IF NOT EXISTS compression_files_queue ON compression_files(job_id,queue_position,id);",
+        )?;
+        Ok(())
+    }
+
+    fn open_state(&self) -> rusqlite::Result<Connection> {
+        let conn = Connection::open(&self.state_path)?;
+        configure_connection(&conn)?;
+        Ok(conn)
+    }
+
+    pub fn load_secret_blob(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        validate_secret_key(key)?;
+        self.open_state()
+            .map_err(|error| error.to_string())?
+            .query_row(
+                "SELECT value FROM secrets WHERE key=?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn save_secret_blob(&self, key: &str, value: &[u8]) -> Result<(), String> {
+        validate_secret_key(key)?;
+        if value.len() > 64 * 1024 {
+            return Err("Encrypted secret exceeds the 64 KiB limit".to_string());
+        }
+        self.open_state()
+            .map_err(|error| error.to_string())?
+            .execute(
+                "INSERT INTO secrets(key,value,updated_at) VALUES(?1,?2,?3)\
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![key, value, now_ms() as i64],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_secret(&self, key: &str) -> Result<(), String> {
+        validate_secret_key(key)?;
+        self.open_state()
+            .map_err(|error| error.to_string())?
+            .execute("DELETE FROM secrets WHERE key=?1", params![key])
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn upsert_scan_catalog(
+        &self,
+        scan_id: &str,
+        root: &Path,
+        db_path: &Path,
+        status: &str,
+        node_count: u64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.open_state()?;
+        let now = now_ms() as i64;
+        conn.execute(
+            "INSERT INTO scan_catalog(scan_id,root_path,db_path,status,node_count,created_at,last_used,pinned)\
+             VALUES(?1,?2,?3,?4,?5,?6,?6,0)\
+             ON CONFLICT(scan_id) DO UPDATE SET status=excluded.status,node_count=excluded.node_count,last_used=excluded.last_used",
+            params![scan_id, root.to_string_lossy(), db_path.to_string_lossy(), status, node_count as i64, now],
+        )?;
+        Ok(())
+    }
+
+    fn catalog_handle(&self, scan_id: &str) -> rusqlite::Result<Option<ScanHandle>> {
+        let conn = self.open_state()?;
+        conn.query_row(
+            "SELECT scan_id,root_path,db_path,status,node_count,created_at FROM scan_catalog WHERE scan_id=?1",
+            params![scan_id],
+            |row| {
+                Ok(ScanHandle {
+                    scan_id: row.get(0)?,
+                    root_path: row.get(1)?,
+                    database_path: row.get(2)?,
+                    status: row.get(3)?,
+                    node_count: row.get::<_, i64>(4)?.max(0) as u64,
+                    started_at: row.get::<_, i64>(5)?.max(0) as u64,
+                    elapsed_ms: 0,
+                    error: None,
+                })
+            },
+        )
+        .optional()
+    }
+
+    fn touch_scan(&self, scan_id: &str) -> rusqlite::Result<()> {
+        self.open_state()?.execute(
+            "UPDATE scan_catalog SET last_used=?2 WHERE scan_id=?1",
+            params![scan_id, now_ms() as i64],
+        )?;
+        Ok(())
+    }
+
+    fn import_v1_catalog(&self) -> rusqlite::Result<()> {
+        let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) else {
+            return Ok(());
+        };
+        let legacy_root = appdata.join("FileTree");
+        if !legacy_root.is_dir() {
+            return Ok(());
+        }
+        let conn = self.open_state()?;
+        for (kind, path) in [
+            ("jobs", legacy_root.join("jobs")),
+            ("snapshots", legacy_root.join("snapshots")),
+            ("audit", legacy_root.join("audit.jsonl")),
+            ("compression-log", legacy_root.join("compression-log.jsonl")),
+            ("no-gain", legacy_root.join("compression-no-gain.jsonl")),
+            ("tags", legacy_root.join("tags.json")),
+            ("hash-cache", legacy_root.join("hash_cache_v2.json")),
+            ("secrets", legacy_root.join("secrets.json")),
+        ] {
+            if !path.exists() {
+                continue;
+            }
+            let metadata = fs::metadata(&path).ok();
+            let size = metadata.as_ref().map(|value| value.len()).unwrap_or(0);
+            let modified = metadata
+                .and_then(|value| value.modified().ok())
+                .map(system_time_ms)
+                .unwrap_or(0);
+            conn.execute(
+                "INSERT OR IGNORE INTO legacy_catalog(source_path,kind,size,modified_ms,imported_at) VALUES(?1,?2,?3,?4,?5)",
+                params![path.to_string_lossy(), kind, size as i64, modified as i64, now_ms() as i64],
+            )?;
+        }
+        for (key, path, fallback, max_bytes) in [
+            (
+                "app.settings",
+                legacy_root.join("settings.json"),
+                "{}",
+                SETTINGS_JSON_MAX_BYTES,
+            ),
+            (
+                "app.bookmarks",
+                legacy_root.join("bookmarks.json"),
+                "[]",
+                BOOKMARKS_JSON_MAX_BYTES,
+            ),
+        ] {
+            let exists = conn
+                .query_row("SELECT 1 FROM settings WHERE key=?1", params![key], |_| {
+                    Ok(())
+                })
+                .optional()?
+                .is_some();
+            if exists {
+                continue;
+            }
+            let value = fs::read_to_string(path).unwrap_or_else(|_| fallback.to_string());
+            if value.len() <= max_bytes && serde_json::from_str::<serde_json::Value>(&value).is_ok()
+            {
+                conn.execute(
+                    "INSERT INTO settings(key,value,updated_at) VALUES(?1,?2,?3)",
+                    params![key, value, now_ms() as i64],
+                )?;
+            }
+        }
+        if let Ok(text) = fs::read_to_string(legacy_root.join("secrets.json")) {
+            if let Ok(entries) = serde_json::from_str::<HashMap<String, String>>(&text) {
+                for (key, encoded) in entries {
+                    if validate_secret_key(&key).is_err() {
+                        continue;
+                    }
+                    let exists = conn
+                        .query_row("SELECT 1 FROM secrets WHERE key=?1", params![key], |_| {
+                            Ok(())
+                        })
+                        .optional()?
+                        .is_some();
+                    if exists {
+                        continue;
+                    }
+                    let decoded = if let Some(plain) = encoded.strip_prefix("plain:") {
+                        base64::engine::general_purpose::STANDARD.decode(plain).ok()
+                    } else {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .ok()
+                            .and_then(|cipher| {
+                                crate::windows_native::unprotect_secret(&cipher).ok()
+                            })
+                    };
+                    let Some(decoded) = decoded else { continue };
+                    let Ok(cipher) = crate::windows_native::protect_secret(&decoded) else {
+                        continue;
+                    };
+                    conn.execute(
+                        "INSERT INTO secrets(key,value,updated_at) VALUES(?1,?2,?3)",
+                        params![key, cipher, now_ms() as i64],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn run_bounded_scan(
+    scan_id: &str,
+    root: &Path,
+    db_path: &Path,
+    request: &ScanRequest,
+    cancel: &Arc<AtomicBool>,
+    progress: Arc<dyn Fn(ScanProgress) + Send + Sync>,
+) -> Result<u64, String> {
+    if db_path.exists() {
+        remove_database_family(db_path);
+    }
+    let started = Instant::now();
+    let (row_tx, row_rx) = std::sync::mpsc::sync_channel::<ScanRow>(SCAN_CHANNEL_CAPACITY);
+    let writer_path = db_path.to_path_buf();
+    let root_text = root.to_string_lossy().into_owned();
+    let writer = std::thread::Builder::new()
+        .name(format!("scan-writer-{scan_id}"))
+        .spawn(move || write_scan_rows(&writer_path, &root_text, row_rx))
+        .map_err(|error| error.to_string())?;
+
+    let next_id = Arc::new(AtomicI64::new(1));
+    let node_count = Arc::new(AtomicU64::new(1));
+    let queue = Arc::new(DirectoryQueue::new(DirectoryTask {
+        id: 0,
+        path: root.to_path_buf(),
+        depth: 0,
+    }));
+    let visited = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
+    if request.follow_links {
+        if let Ok(canonical) = fs::canonicalize(root) {
+            visited.lock_unpoisoned().insert(canonical);
+        }
+    }
+
+    row_tx
+        .send(scan_row(0, None, root, root, 0, true, false))
+        .map_err(|error| error.to_string())?;
+    let threads = request.threads.clamp(1, 16);
+    let mut workers = Vec::with_capacity(threads);
+    for worker_id in 0..threads {
+        let tx = row_tx.clone();
+        let queue = Arc::clone(&queue);
+        let next_id = Arc::clone(&next_id);
+        let node_count = Arc::clone(&node_count);
+        let cancel = Arc::clone(cancel);
+        let request = request.clone();
+        let progress = Arc::clone(&progress);
+        let scan_id = scan_id.to_string();
+        let started = started;
+        let visited = Arc::clone(&visited);
+        workers.push(
+            std::thread::Builder::new()
+                .name(format!("scan-enumerator-{worker_id}"))
+                .spawn(move || {
+                    while let Some(task) = queue.claim(&cancel) {
+                        if cancel.load(Ordering::Relaxed) {
+                            queue.finish();
+                            break;
+                        }
+                        if let Ok(entries) = fs::read_dir(&task.path) {
+                            for entry in entries.flatten() {
+                                if cancel.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                let path = entry.path();
+                                let name = entry.file_name().to_string_lossy().into_owned();
+                                if !request.include_hidden && is_hidden_name(&name) {
+                                    continue;
+                                }
+                                if request.exclude_patterns.iter().any(|pattern| {
+                                    wildcard_match(pattern, &name)
+                                        || wildcard_match(pattern, &path.to_string_lossy())
+                                }) {
+                                    continue;
+                                }
+                                let Ok(file_type) = entry.file_type() else {
+                                    continue;
+                                };
+                                let is_link = file_type.is_symlink();
+                                let is_dir = file_type.is_dir()
+                                    || (is_link && request.follow_links && path.is_dir());
+                                let id = next_id.fetch_add(1, Ordering::Relaxed);
+                                let row = scan_row(
+                                    id,
+                                    Some(task.id),
+                                    &path,
+                                    &path,
+                                    task.depth.saturating_add(1),
+                                    is_dir,
+                                    is_link,
+                                );
+                                if tx.send(row).is_err() {
+                                    cancel.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                                let count = node_count.fetch_add(1, Ordering::Relaxed) + 1;
+                                if is_dir && (!is_link || request.follow_links) {
+                                    let should_queue = if request.follow_links {
+                                        fs::canonicalize(&path)
+                                            .ok()
+                                            .map(|canonical| {
+                                                visited.lock_unpoisoned().insert(canonical)
+                                            })
+                                            .unwrap_or(false)
+                                    } else {
+                                        true
+                                    };
+                                    if should_queue {
+                                        queue.push(DirectoryTask {
+                                            id,
+                                            path,
+                                            depth: task.depth.saturating_add(1),
+                                        });
+                                    }
+                                }
+                                if count % 2_048 == 0 {
+                                    progress(ScanProgress {
+                                        scan_id: scan_id.clone(),
+                                        stage: "scanning".to_string(),
+                                        node_count: count,
+                                        elapsed_ms: started.elapsed().as_millis() as u64,
+                                    });
+                                }
+                            }
+                        }
+                        queue.finish();
+                    }
+                })
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    drop(row_tx);
+    for worker in workers {
+        if worker.join().is_err() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    let writer_result = writer
+        .join()
+        .map_err(|_| "Scan writer panicked".to_string())?;
+    let rows = writer_result?;
+    let status = if cancel.load(Ordering::Relaxed) {
+        "cancelled"
+    } else {
+        "done"
+    };
+    write_scan_metadata(
+        db_path,
+        status,
+        rows,
+        started.elapsed().as_millis() as u64,
+        None,
+    )?;
+    Ok(rows)
+}
+
+#[derive(Debug)]
+struct DirectoryTask {
+    id: i64,
+    path: PathBuf,
+    depth: u32,
+}
+
+#[derive(Debug)]
+struct DirectoryQueueState {
+    pending: VecDeque<DirectoryTask>,
+    active: usize,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct DirectoryQueue {
+    state: Mutex<DirectoryQueueState>,
+    cv: Condvar,
+}
+
+impl DirectoryQueue {
+    fn new(root: DirectoryTask) -> Self {
+        Self {
+            state: Mutex::new(DirectoryQueueState {
+                pending: VecDeque::from([root]),
+                active: 0,
+                closed: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn claim(&self, cancel: &AtomicBool) -> Option<DirectoryTask> {
+        let mut state = self.state.lock_unpoisoned();
+        loop {
+            if state.closed || cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(task) = state.pending.pop_front() {
+                state.active += 1;
+                return Some(task);
+            }
+            if state.active == 0 {
+                state.closed = true;
+                self.cv.notify_all();
+                return None;
+            }
+            state = self
+                .cv
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn push(&self, task: DirectoryTask) {
+        let mut state = self.state.lock_unpoisoned();
+        if !state.closed {
+            state.pending.push_back(task);
+            self.cv.notify_one();
+        }
+    }
+
+    fn finish(&self) {
+        let mut state = self.state.lock_unpoisoned();
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 && state.pending.is_empty() {
+            state.closed = true;
+        }
+        self.cv.notify_all();
+    }
+}
+
+#[derive(Debug)]
+struct ScanRow {
+    id: i64,
+    parent_id: Option<i64>,
+    name: String,
+    dir_path: String,
+    is_dir: bool,
+    is_link: bool,
+    hidden: bool,
+    readonly: bool,
+    size: u64,
+    allocated: u64,
+    files: u64,
+    folders: u64,
+    modified_ms: u64,
+    created_ms: u64,
+    accessed_ms: u64,
+    depth: u32,
+    errors: u64,
+    extension: String,
+    owner: String,
+    attributes: u32,
+}
+
+fn scan_row(
+    id: i64,
+    parent_id: Option<i64>,
+    path: &Path,
+    dir_path: &Path,
+    depth: u32,
+    is_dir: bool,
+    is_link: bool,
+) -> ScanRow {
+    let metadata = fs::metadata(path).ok();
+    let size = if is_dir {
+        0
+    } else {
+        metadata.as_ref().map(|value| value.len()).unwrap_or(0)
+    };
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let extension = if is_dir {
+        String::new()
+    } else {
+        path.extension()
+            .map(|value| value.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    ScanRow {
+        id,
+        parent_id,
+        name: name.clone(),
+        dir_path: if is_dir {
+            dir_path.to_string_lossy().into_owned()
+        } else {
+            String::new()
+        },
+        is_dir,
+        is_link,
+        hidden: is_hidden_name(&name),
+        readonly: metadata
+            .as_ref()
+            .map(|value| value.permissions().readonly())
+            .unwrap_or(false),
+        size,
+        allocated: size,
+        files: (!is_dir) as u64,
+        folders: 0,
+        modified_ms: metadata
+            .as_ref()
+            .and_then(|value| value.modified().ok())
+            .map(system_time_ms)
+            .unwrap_or(0),
+        created_ms: metadata
+            .as_ref()
+            .and_then(|value| value.created().ok())
+            .map(system_time_ms)
+            .unwrap_or(0),
+        accessed_ms: metadata
+            .as_ref()
+            .and_then(|value| value.accessed().ok())
+            .map(system_time_ms)
+            .unwrap_or(0),
+        depth,
+        errors: 0,
+        extension,
+        owner: String::new(),
+        attributes: 0,
+    }
+}
+
+fn write_scan_rows(
+    db_path: &Path,
+    root_path: &str,
+    receiver: std::sync::mpsc::Receiver<ScanRow>,
+) -> Result<u64, String> {
+    let mut conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    configure_connection(&conn).map_err(|error| error.to_string())?;
+    create_scan_schema(&conn).map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata(key,value) VALUES('rootPath',?1)",
+        params![root_path],
+    )
+    .map_err(|error| error.to_string())?;
+    let mut batch = Vec::with_capacity(SCAN_TRANSACTION_ROWS);
+    let mut total = 0u64;
+    for row in receiver {
+        batch.push(row);
+        if batch.len() >= SCAN_TRANSACTION_ROWS {
+            insert_scan_batch(&mut conn, &batch).map_err(|error| error.to_string())?;
+            total += batch.len() as u64;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        insert_scan_batch(&mut conn, &batch).map_err(|error| error.to_string())?;
+        total += batch.len() as u64;
+    }
+    aggregate_scan(&conn).map_err(|error| error.to_string())?;
+    Ok(total)
+}
+
+const COMPRESSION_FILE_UPSERT_SQL: &str = "INSERT INTO compression_files(job_id,id,path,kind,status,stage,progress,original_bytes,output_bytes,error_text,reason,encoder,disposition,out_path,duration_ms,fps,started_at,updated_at,finished_at,attempt,tool,tool_version,command_text,stderr_text,recycled,queue_position)\
+     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)\
+     ON CONFLICT(job_id,id) DO UPDATE SET path=excluded.path,kind=excluded.kind,status=excluded.status,stage=excluded.stage,progress=excluded.progress,original_bytes=excluded.original_bytes,output_bytes=excluded.output_bytes,error_text=excluded.error_text,reason=excluded.reason,encoder=excluded.encoder,disposition=excluded.disposition,out_path=excluded.out_path,duration_ms=excluded.duration_ms,fps=excluded.fps,started_at=excluded.started_at,updated_at=excluded.updated_at,finished_at=excluded.finished_at,attempt=excluded.attempt,tool=excluded.tool,tool_version=excluded.tool_version,command_text=excluded.command_text,stderr_text=excluded.stderr_text,recycled=excluded.recycled,queue_position=excluded.queue_position";
+
+fn persist_compression_file(
+    statement: &mut rusqlite::Statement<'_>,
+    file: &CompressionFileRecord,
+) -> rusqlite::Result<usize> {
+    statement.execute(params![
+        file.job_id,
+        file.index as i64,
+        file.path,
+        file.kind,
+        file.status,
+        file.stage,
+        file.pct as f64,
+        as_sql_i64(file.orig_bytes),
+        as_sql_i64(file.new_bytes),
+        file.error,
+        file.reason,
+        file.encoder,
+        file.disposition,
+        file.out_path,
+        as_sql_i64(file.duration_ms),
+        file.fps,
+        as_sql_i64(file.started_at),
+        as_sql_i64(file.updated_at),
+        as_sql_i64(file.finished_at),
+        file.attempt as i64,
+        file.tool,
+        file.tool_version,
+        file.command,
+        file.stderr,
+        file.recycled as i64,
+        file.queue_position.map(|value| value as i64),
+    ])
+}
+
+fn spawn_compression_writer(state_path: PathBuf, receiver: Receiver<CompressionWrite>) {
+    let _ = std::thread::Builder::new()
+        .name("compression-state-writer".to_string())
+        .spawn(move || {
+            while let Ok(first) = receiver.recv() {
+                let mut files = HashMap::<(String, usize), CompressionFileRecord>::new();
+                let mut jobs = HashMap::<String, (String, u64)>::new();
+                collect_compression_write(first, &mut files, &mut jobs);
+                let deadline = Instant::now() + Duration::from_millis(100);
+                while files.len() + jobs.len() < 512 && Instant::now() < deadline {
+                    match receiver.try_recv() {
+                        Ok(write) => collect_compression_write(write, &mut files, &mut jobs),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+                let Ok(mut conn) = Connection::open(&state_path) else {
+                    continue;
+                };
+                if configure_connection(&conn).is_err() {
+                    continue;
+                }
+                let Ok(tx) = conn.transaction() else {
+                    continue;
+                };
+                let mut failed = false;
+                if let Ok(mut statement) = tx.prepare(COMPRESSION_FILE_UPSERT_SQL) {
+                    for file in files.values() {
+                        if persist_compression_file(&mut statement, file).is_err() {
+                            failed = true;
+                            break;
+                        }
+                    }
+                } else {
+                    failed = true;
+                }
+                if !failed {
+                    for (id, (status, saved_bytes)) in jobs {
+                        if tx
+                            .execute(
+                                "UPDATE compression_jobs SET status=?2,saved_bytes=?3,updated_at=?4 WHERE id=?1",
+                                params![id, status, as_sql_i64(saved_bytes), now_ms() as i64],
+                            )
+                            .is_err()
+                        {
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                if !failed {
+                    let _ = tx.commit();
+                }
+            }
+        });
+}
+
+fn collect_compression_write(
+    write: CompressionWrite,
+    files: &mut HashMap<(String, usize), CompressionFileRecord>,
+    jobs: &mut HashMap<String, (String, u64)>,
+) {
+    match write {
+        CompressionWrite::File(file) => {
+            files.insert((file.job_id.clone(), file.index), file);
+        }
+        CompressionWrite::JobState {
+            id,
+            status,
+            saved_bytes,
+        } => {
+            jobs.insert(id, (status, saved_bytes));
+        }
+    }
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
+    let exists = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    if !exists {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
+    Ok(())
+}
+
+fn push_csv_sql(sql: &mut String, values: &mut Vec<Value>, column: &str, filter: &str) {
+    let parts = filter
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return;
+    }
+    sql.push_str(" AND LOWER(");
+    sql.push_str(column);
+    sql.push_str(") IN (");
+    for (index, part) in parts.into_iter().enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+        values.push(Value::Text(part));
+    }
+    sql.push(')');
+}
+
+fn compression_sort_sql(sort: &str) -> &'static str {
+    match sort {
+        "queue" => "COALESCE(queue_position,9223372036854775807)",
+        "name" => "path COLLATE NOCASE",
+        "size" => "original_bytes",
+        "progress" => "progress",
+        "elapsed" => {
+            "CASE WHEN duration_ms>0 THEN duration_ms WHEN started_at>0 THEN (unixepoch('subsec')*1000-started_at) ELSE 0 END"
+        }
+        "eta" => {
+            "CASE WHEN progress>0 THEN ((CASE WHEN duration_ms>0 THEN duration_ms WHEN started_at>0 THEN (unixepoch('subsec')*1000-started_at) ELSE 0 END)*(100-progress)/progress) ELSE 9223372036854775807 END"
+        }
+        "speed" => {
+            "CASE WHEN progress>0 AND started_at>0 THEN (original_bytes*progress)/(unixepoch('subsec')*1000-started_at+1) ELSE 0 END"
+        }
+        "savings" => "MAX(0,original_bytes-output_bytes)",
+        "result" => "reason COLLATE NOCASE",
+        "start" => "started_at",
+        "finish" => "finished_at",
+        _ => "COALESCE(queue_position,id)",
+    }
+}
+
+fn compression_item_from_row(
+    row: &rusqlite::Row<'_>,
+    now: u64,
+) -> rusqlite::Result<CompressionFileItem> {
+    let pct = row.get::<_, f64>(5)?.clamp(0.0, 100.0).round() as u64;
+    let orig_bytes = row.get::<_, i64>(6)?.max(0) as u64;
+    let new_bytes = row.get::<_, i64>(7)?.max(0) as u64;
+    let duration_ms = row.get::<_, i64>(13)?.max(0) as u64;
+    let started_at = row.get::<_, i64>(15)?.max(0) as u64;
+    let elapsed_ms = if duration_ms > 0 {
+        duration_ms
+    } else if started_at > 0 {
+        now.saturating_sub(started_at)
+    } else {
+        0
+    };
+    let saved_bytes = orig_bytes.saturating_sub(new_bytes);
+    let processing_rate = (elapsed_ms > 0).then(|| {
+        orig_bytes.saturating_mul(pct).saturating_div(100) as f64 * 1000.0 / elapsed_ms as f64
+    });
+    Ok(CompressionFileItem {
+        index: row.get::<_, i64>(0)?.max(0) as usize,
+        path: row.get(1)?,
+        kind: row.get(2)?,
+        status: row.get(3)?,
+        stage: row.get(4)?,
+        pct,
+        orig_bytes,
+        new_bytes,
+        saved_bytes,
+        pct_saved: if orig_bytes > 0 {
+            saved_bytes as f64 * 100.0 / orig_bytes as f64
+        } else {
+            0.0
+        },
+        error: row.get(8)?,
+        reason: row.get(9)?,
+        encoder: row.get(10)?,
+        disposition: row.get(11)?,
+        out_path: row.get(12)?,
+        duration_ms,
+        elapsed_ms,
+        fps: row.get(14)?,
+        processing_rate,
+        output_bytes: new_bytes,
+        started_at,
+        updated_at: row.get::<_, i64>(16)?.max(0) as u64,
+        finished_at: row.get::<_, i64>(17)?.max(0) as u64,
+        attempt: row.get::<_, i64>(18)?.max(0) as usize,
+        tool: row.get(19)?,
+        tool_version: row.get(20)?,
+        command: row.get(21)?,
+        stderr: row.get(22)?,
+        recycled: row.get::<_, i64>(23)? != 0,
+        queue_position: row
+            .get::<_, Option<i64>>(24)?
+            .map(|value| value.max(0) as usize),
+    })
+}
+
+fn safe_job_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
+fn validate_secret_key(key: &str) -> Result<(), String> {
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err("Invalid secret key".to_string());
+    }
+    Ok(())
+}
+
+fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(Duration::from_secs(10))?;
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL;\
+         PRAGMA synchronous=NORMAL;\
+         PRAGMA temp_store=FILE;\
+         PRAGMA mmap_size=0;\
+         PRAGMA cache_size=-{SQLITE_CACHE_KIB};\
+         PRAGMA cache_spill=ON;\
+         PRAGMA foreign_keys=ON;"
+    ))?;
+    Ok(())
+}
+
+fn create_scan_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);\
+         CREATE TABLE nodes(\
+           id INTEGER PRIMARY KEY,parent_id INTEGER,name TEXT NOT NULL,dir_path TEXT NOT NULL DEFAULT '',\
+           is_dir INTEGER NOT NULL,is_link INTEGER NOT NULL,hidden INTEGER NOT NULL,readonly INTEGER NOT NULL,\
+           size INTEGER NOT NULL,allocated INTEGER NOT NULL,files INTEGER NOT NULL,folders INTEGER NOT NULL,\
+           modified_ms INTEGER NOT NULL,created_ms INTEGER NOT NULL,accessed_ms INTEGER NOT NULL,\
+           depth INTEGER NOT NULL,errors INTEGER NOT NULL,extension TEXT NOT NULL,owner TEXT NOT NULL,attributes INTEGER NOT NULL\
+         );\
+         CREATE INDEX nodes_parent ON nodes(parent_id,id);\
+         CREATE INDEX nodes_parent_size ON nodes(parent_id,size DESC,id);\
+         CREATE INDEX nodes_parent_name ON nodes(parent_id,name COLLATE NOCASE,id);\
+         CREATE INDEX nodes_extension ON nodes(extension,id);\
+         CREATE INDEX nodes_depth ON nodes(depth,is_dir,id);"
+    )?;
+    Ok(())
+}
+
+fn insert_scan_batch(conn: &mut Connection, batch: &[ScanRow]) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO nodes(id,parent_id,name,dir_path,is_dir,is_link,hidden,readonly,size,allocated,files,folders,\
+             modified_ms,created_ms,accessed_ms,depth,errors,extension,owner,attributes)\
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)"
+        )?;
+        for row in batch {
+            stmt.execute(params![
+                row.id,
+                row.parent_id,
+                row.name,
+                row.dir_path,
+                row.is_dir as i64,
+                row.is_link as i64,
+                row.hidden as i64,
+                row.readonly as i64,
+                as_sql_i64(row.size),
+                as_sql_i64(row.allocated),
+                as_sql_i64(row.files),
+                as_sql_i64(row.folders),
+                as_sql_i64(row.modified_ms),
+                as_sql_i64(row.created_ms),
+                as_sql_i64(row.accessed_ms),
+                row.depth as i64,
+                as_sql_i64(row.errors),
+                row.extension,
+                row.owner,
+                row.attributes as i64,
+            ])?;
+        }
+    }
+    tx.commit()
+}
+
+fn aggregate_scan(conn: &Connection) -> rusqlite::Result<()> {
+    let max_depth: i64 = conn.query_row("SELECT COALESCE(MAX(depth),0) FROM nodes", [], |row| {
+        row.get(0)
+    })?;
+    for depth in (0..=max_depth).rev() {
+        conn.execute(
+            "UPDATE nodes AS parent SET \
+               size=COALESCE((SELECT SUM(child.size) FROM nodes child WHERE child.parent_id=parent.id),0),\
+               allocated=COALESCE((SELECT SUM(child.allocated) FROM nodes child WHERE child.parent_id=parent.id),0),\
+               files=COALESCE((SELECT SUM(child.files) FROM nodes child WHERE child.parent_id=parent.id),0),\
+               folders=COALESCE((SELECT SUM(child.folders + child.is_dir) FROM nodes child WHERE child.parent_id=parent.id),0),\
+               errors=COALESCE((SELECT SUM(child.errors) FROM nodes child WHERE child.parent_id=parent.id),0),\
+               modified_ms=MAX(modified_ms,COALESCE((SELECT MAX(child.modified_ms) FROM nodes child WHERE child.parent_id=parent.id),0))\
+             WHERE parent.is_dir=1 AND parent.depth=?1",
+            params![depth],
+        )?;
+    }
+    conn.execute_batch("PRAGMA optimize;")?;
+    Ok(())
+}
+
+fn write_scan_metadata(
+    db_path: &Path,
+    status: &str,
+    nodes: u64,
+    elapsed_ms: u64,
+    error: Option<&str>,
+) -> Result<(), String> {
+    let conn = open_scan_connection(db_path).map_err(|value| value.to_string())?;
+    for (key, value) in [
+        ("status", status.to_string()),
+        ("nodeCount", nodes.to_string()),
+        ("elapsedMs", elapsed_ms.to_string()),
+        ("scannedAt", now_ms().to_string()),
+        ("error", error.unwrap_or("").to_string()),
+    ] {
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,?2)",
+            params![key, value],
+        )
+        .map_err(|value| value.to_string())?;
+    }
+    Ok(())
+}
+
+fn open_scan_connection(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    configure_connection(&conn)?;
+    Ok(conn)
+}
+
+fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodePageItem> {
+    Ok(NodePageItem {
+        id: row.get(0)?,
+        parent_id: row.get(1)?,
+        name: row.get(2)?,
+        path: row.get(3)?,
+        is_dir: row.get::<_, i64>(4)? != 0,
+        is_link: row.get::<_, i64>(5)? != 0,
+        hidden: row.get::<_, i64>(6)? != 0,
+        readonly: row.get::<_, i64>(7)? != 0,
+        size: row.get::<_, i64>(8)?.max(0) as u64,
+        allocated: row.get::<_, i64>(9)?.max(0) as u64,
+        files: row.get::<_, i64>(10)?.max(0) as u64,
+        folders: row.get::<_, i64>(11)?.max(0) as u64,
+        modified_ms: row.get::<_, i64>(12)?.max(0) as u64,
+        created_ms: row.get::<_, i64>(13)?.max(0) as u64,
+        accessed_ms: row.get::<_, i64>(14)?.max(0) as u64,
+        depth: row.get::<_, i64>(15)?.max(0) as u32,
+        errors: row.get::<_, i64>(16)?.max(0) as u64,
+        extension: row.get(17)?,
+        owner: row.get(18)?,
+        attributes: row.get::<_, i64>(19)?.max(0) as u32,
+    })
+}
+
+fn sort_column(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "name" => "n.name COLLATE NOCASE",
+        "allocated" => "n.allocated",
+        "files" => "n.files",
+        "folders" => "n.folders",
+        "modified" | "modifiedms" => "n.modified_ms",
+        "created" | "createdms" => "n.created_ms",
+        "accessed" | "accessedms" => "n.accessed_ms",
+        "extension" => "n.extension COLLATE NOCASE",
+        "depth" => "n.depth",
+        _ => "n.size",
+    }
+}
+
+fn prune_job_handles(jobs: &mut HashMap<String, ScanJob>) {
+    const RETAINED: usize = 64;
+    if jobs.len() <= RETAINED {
+        return;
+    }
+    let mut terminal = jobs
+        .iter()
+        .filter(|(_, job)| job.terminal)
+        .map(|(id, job)| (id.clone(), job.handle.started_at))
+        .collect::<Vec<_>>();
+    terminal.sort_by_key(|(_, started)| *started);
+    let remove = jobs.len().saturating_sub(RETAINED);
+    for (id, _) in terminal.into_iter().take(remove) {
+        jobs.remove(&id);
+    }
+}
+
+fn new_scan_id() -> String {
+    format!(
+        "{:x}-{:x}-{:x}",
+        now_ms(),
+        std::process::id(),
+        NEXT_SCAN_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn safe_scan_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
+fn now_ms() -> u64 {
+    system_time_ms(SystemTime::now())
+}
+
+fn system_time_ms(value: SystemTime) -> u64 {
+    value
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn as_sql_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+fn is_hidden_name(name: &str) -> bool {
+    name.starts_with('.') && name != "." && name != ".."
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchField {
+    Any,
+    Name,
+    Path,
+    Extension,
+    Type,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SearchTerm {
+    value: String,
+    field: SearchField,
+    excluded: bool,
+}
+
+fn parse_search_terms(query: &str) -> Vec<SearchTerm> {
+    let mut raw_tokens = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    for character in query.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            value if value.is_whitespace() && !quoted => {
+                if !token.is_empty() {
+                    raw_tokens.push(std::mem::take(&mut token));
+                }
+            }
+            value => token.push(value),
+        }
+    }
+    if !token.is_empty() {
+        raw_tokens.push(token);
+    }
+
+    raw_tokens
+        .into_iter()
+        .filter_map(|mut raw| {
+            let excluded = raw.starts_with('-') && raw.len() > 1;
+            if excluded {
+                raw.remove(0);
+            }
+            let (field, value) = match raw.find(':') {
+                Some(separator) if separator > 0 && separator < raw.len() - 1 => {
+                    let field = match raw[..separator].to_ascii_lowercase().as_str() {
+                        "name" => SearchField::Name,
+                        "path" | "in" => SearchField::Path,
+                        "ext" | "extension" => SearchField::Extension,
+                        "type" | "kind" => SearchField::Type,
+                        _ => SearchField::Any,
+                    };
+                    if field == SearchField::Any {
+                        (field, raw.clone())
+                    } else {
+                        (field, raw[separator + 1..].to_string())
+                    }
+                }
+                _ => (SearchField::Any, raw),
+            };
+            let value = value.trim().to_ascii_lowercase();
+            (!value.is_empty()).then_some(SearchTerm {
+                value,
+                field,
+                excluded,
+            })
+        })
+        .collect()
+}
+
+fn append_search_term(clauses: &mut Vec<String>, values: &mut Vec<Value>, term: &SearchTerm) {
+    let mut sql = match term.field {
+        SearchField::Any => {
+            let pattern = search_like_pattern(&term.value);
+            values.push(Value::Text(pattern.clone()));
+            values.push(Value::Text(pattern));
+            format!(
+                "(LOWER(n.name) LIKE ? ESCAPE '\\' OR LOWER({}) LIKE ? ESCAPE '\\')",
+                node_path_sql()
+            )
+        }
+        SearchField::Name => {
+            values.push(Value::Text(search_like_pattern(&term.value)));
+            "LOWER(n.name) LIKE ? ESCAPE '\\'".to_string()
+        }
+        SearchField::Path => {
+            values.push(Value::Text(search_like_pattern(&term.value)));
+            format!("LOWER({}) LIKE ? ESCAPE '\\'", node_path_sql())
+        }
+        SearchField::Extension => {
+            values.push(Value::Text(search_like_pattern(
+                term.value.trim_start_matches('.'),
+            )));
+            "LOWER(n.extension) LIKE ? ESCAPE '\\'".to_string()
+        }
+        SearchField::Type => category_clause(&term.value, values).unwrap_or_else(|| {
+            values.push(Value::Text(search_like_pattern(
+                term.value.trim_start_matches('.'),
+            )));
+            "(n.is_dir=0 AND LOWER(n.extension) LIKE ? ESCAPE '\\')".to_string()
+        }),
+    };
+    if term.excluded {
+        sql = format!("NOT ({sql})");
+    }
+    clauses.push(sql);
+}
+
+fn append_extension_filter(clauses: &mut Vec<String>, values: &mut Vec<Value>, raw: &str) {
+    let mut extensions = raw
+        .split(|character: char| character.is_whitespace() || character == ',')
+        .map(|extension| {
+            extension
+                .trim()
+                .trim_start_matches(|character| character == '.' || character == '*')
+                .to_ascii_lowercase()
+        })
+        .filter(|extension| !extension.is_empty())
+        .collect::<Vec<_>>();
+    extensions.sort_unstable();
+    extensions.dedup();
+    if extensions.is_empty() {
+        return;
+    }
+    let placeholders = vec!["?"; extensions.len()].join(",");
+    clauses.push(format!(
+        "(n.is_dir=0 AND LOWER(n.extension) IN ({placeholders}))"
+    ));
+    values.extend(extensions.into_iter().map(Value::Text));
+}
+
+fn append_category_filter(clauses: &mut Vec<String>, values: &mut Vec<Value>, category: &str) {
+    let category = category.trim().to_ascii_lowercase();
+    if category.is_empty() || category == "any" {
+        return;
+    }
+    if let Some(clause) = category_clause(&category, values) {
+        clauses.push(clause);
+    }
+}
+
+fn category_clause(category: &str, values: &mut Vec<Value>) -> Option<String> {
+    match category {
+        "folder" | "folders" | "directory" | "directories" | "dir" => {
+            Some("n.is_dir=1".to_string())
+        }
+        "file" | "files" => Some("n.is_dir=0".to_string()),
+        _ => {
+            let extensions = category_extensions(category)?;
+            let placeholders = vec!["?"; extensions.len()].join(",");
+            values.extend(
+                extensions
+                    .iter()
+                    .map(|extension| Value::Text((*extension).to_string())),
+            );
+            Some(format!(
+                "(n.is_dir=0 AND LOWER(n.extension) IN ({placeholders}))"
+            ))
+        }
+    }
+}
+
+fn category_extensions(category: &str) -> Option<&'static [&'static str]> {
+    match category {
+        "image" | "images" => Some(&[
+            "jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff", "svg", "heic", "heif",
+            "ico", "raw", "cr2", "nef", "arw", "dng",
+        ]),
+        "video" | "videos" => Some(&[
+            "mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "ts", "m2ts",
+            "3gp",
+        ]),
+        "audio" => Some(&[
+            "mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "aiff", "alac", "opus", "mid",
+        ]),
+        "document" | "documents" => Some(&[
+            "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf", "odt", "ods", "odp",
+            "md", "csv", "epub", "pages",
+        ]),
+        "archive" | "archives" => Some(&[
+            "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "cab", "tgz", "zst", "lz",
+        ]),
+        "code" => Some(&[
+            "js", "ts", "jsx", "tsx", "py", "rs", "go", "java", "c", "cpp", "h", "hpp", "cs", "rb",
+            "php", "html", "css", "json", "xml", "yaml", "yml", "sh", "sql", "swift", "kt", "lua",
+            "vue",
+        ]),
+        "executable" | "executables" => Some(&[
+            "exe", "msi", "dll", "bat", "cmd", "com", "ps1", "app", "sys", "scr",
+        ]),
+        _ => None,
+    }
+}
+
+fn node_path_sql() -> &'static str {
+    "CASE WHEN n.is_dir=1 THEN n.dir_path WHEN p.dir_path IS NULL OR p.dir_path='' THEN n.name WHEN substr(p.dir_path,-1,1) IN ('\\','/') THEN p.dir_path || n.name ELSE p.dir_path || '\\' || n.name END"
+}
+
+fn search_like_pattern(value: &str) -> String {
+    let has_wildcard = value.contains('*') || value.contains('?');
+    let mut pattern = String::with_capacity(value.len() + 2);
+    if !has_wildcard {
+        pattern.push('%');
+    }
+    for character in value.chars() {
+        match character {
+            '*' => pattern.push('%'),
+            '?' => pattern.push('_'),
+            '\\' => pattern.push_str("\\\\"),
+            '%' => pattern.push_str("\\%"),
+            '_' => pattern.push_str("\\_"),
+            value => pattern.push(value),
+        }
+    }
+    if !has_wildcard {
+        pattern.push('%');
+    }
+    pattern
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.replace('\\', "/").to_ascii_lowercase();
+    let value = value.replace('\\', "/").to_ascii_lowercase();
+    let (p, v) = (pattern.as_bytes(), value.as_bytes());
+    let (mut pi, mut vi, mut star, mut mark) = (0usize, 0usize, None, 0usize);
+    while vi < v.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == v[vi]) {
+            pi += 1;
+            vi += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            pi += 1;
+            mark = vi;
+        } else if let Some(star_index) = star {
+            pi = star_index + 1;
+            mark += 1;
+            vi = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn directory_size(path: &Path) -> u64 {
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+fn database_family_size(path: &Path) -> u64 {
+    let mut total = fs::metadata(path).map(|value| value.len()).unwrap_or(0);
+    for suffix in ["-wal", "-shm"] {
+        total += fs::metadata(format!("{}{suffix}", path.to_string_lossy()))
+            .map(|value| value.len())
+            .unwrap_or(0);
+    }
+    total
+}
+
+fn remove_database_family(path: &Path) {
+    let _ = fs::remove_file(path);
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", path.to_string_lossy()));
+    }
+}
+
+trait LockUnpoisoned<T> {
+    fn lock_unpoisoned(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> LockUnpoisoned<T> for Mutex<T> {
+    fn lock_unpoisoned(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(windows)]
+fn process_memory_bytes() -> (Option<u64>, Option<u64>) {
+    #[repr(C)]
+    struct ProcessMemoryCountersEx {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(
+            process: isize,
+            counters: *mut ProcessMemoryCountersEx,
+            cb: u32,
+        ) -> i32;
+    }
+    let mut counters = ProcessMemoryCountersEx {
+        cb: std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
+        page_fault_count: 0,
+        peak_working_set_size: 0,
+        working_set_size: 0,
+        quota_peak_paged_pool_usage: 0,
+        quota_paged_pool_usage: 0,
+        quota_peak_non_paged_pool_usage: 0,
+        quota_non_paged_pool_usage: 0,
+        pagefile_usage: 0,
+        peak_pagefile_usage: 0,
+        private_usage: 0,
+    };
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
+        )
+    };
+    if ok == 0 {
+        (None, None)
+    } else {
+        (
+            Some(counters.working_set_size as u64),
+            Some(counters.private_usage as u64),
+        )
+    }
+}
+
+#[cfg(not(windows))]
+fn process_memory_bytes() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_store(name: &str) -> Arc<V2Store> {
+        let root = std::env::temp_dir().join(format!("filetree-v2-{name}-{}", new_scan_id()));
+        V2Store::open(root).expect("open v2 store")
+    }
+
+    #[test]
+    fn wildcard_matching_is_case_insensitive() {
+        assert!(wildcard_match("*.MP4", "folder/test.mp4"));
+        assert!(wildcard_match("folder/*", "Folder/test.mp4"));
+        assert!(!wildcard_match("*.zip", "test.mp4"));
+    }
+
+    #[test]
+    fn search_query_parser_supports_tokens_phrases_exclusions_and_scopes() {
+        assert_eq!(
+            parse_search_terms(
+                r#"summer "annual report" -backup name:final in:archive ext:pdf type:document"#
+            ),
+            vec![
+                SearchTerm {
+                    value: "summer".to_string(),
+                    field: SearchField::Any,
+                    excluded: false,
+                },
+                SearchTerm {
+                    value: "annual report".to_string(),
+                    field: SearchField::Any,
+                    excluded: false,
+                },
+                SearchTerm {
+                    value: "backup".to_string(),
+                    field: SearchField::Any,
+                    excluded: true,
+                },
+                SearchTerm {
+                    value: "final".to_string(),
+                    field: SearchField::Name,
+                    excluded: false,
+                },
+                SearchTerm {
+                    value: "archive".to_string(),
+                    field: SearchField::Path,
+                    excluded: false,
+                },
+                SearchTerm {
+                    value: "pdf".to_string(),
+                    field: SearchField::Extension,
+                    excluded: false,
+                },
+                SearchTerm {
+                    value: "document".to_string(),
+                    field: SearchField::Type,
+                    excluded: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_search_is_tokenized_filtered_and_paginated_in_sqlite() {
+        let store = temp_store("search");
+        let source = store.data_root().join("fixture");
+        fs::create_dir_all(source.join("Finance Archive")).unwrap();
+        fs::write(source.join("Summer Vacation 2024.mp4"), vec![1u8; 40]).unwrap();
+        fs::write(source.join("Summer Backup 2024.mp4"), vec![2u8; 60]).unwrap();
+        fs::write(
+            source
+                .join("Finance Archive")
+                .join("Annual Report Final.pdf"),
+            vec![3u8; 20],
+        )
+        .unwrap();
+        let handle = store
+            .start_scan(
+                ScanRequest {
+                    root: source.to_string_lossy().into_owned(),
+                    threads: 2,
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
+        for _ in 0..200 {
+            let status = store.scan_status(&handle.scan_id).unwrap();
+            if status.status != "scanning" {
+                assert_eq!(status.status, "done");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let tokenized = store
+            .query_nodes(ScanQuery {
+                scan_id: handle.scan_id.clone(),
+                parent_id: None,
+                search: "summer 2024 -backup".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(tokenized.total, 1);
+        assert_eq!(tokenized.items[0].name, "Summer Vacation 2024.mp4");
+
+        let scoped = store
+            .query_nodes(ScanQuery {
+                scan_id: handle.scan_id.clone(),
+                parent_id: None,
+                search: r#""annual report" path:"finance archive" ext:p?f"#.to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(scoped.total, 1);
+        assert_eq!(scoped.items[0].name, "Annual Report Final.pdf");
+
+        let filtered = store
+            .query_nodes(ScanQuery {
+                scan_id: handle.scan_id.clone(),
+                parent_id: None,
+                category: "video".to_string(),
+                min_size: Some(50),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.items[0].name, "Summer Backup 2024.mp4");
+
+        let regex = store
+            .query_nodes(ScanQuery {
+                scan_id: handle.scan_id,
+                parent_id: None,
+                search: "^annual.*final\\.pdf$".to_string(),
+                regex: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(regex.total, 1);
+    }
+
+    #[test]
+    fn scan_pages_are_bounded_and_aggregated() {
+        let store = temp_store("page");
+        let source = store.data_root().join("fixture");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("a.bin"), vec![1u8; 10]).unwrap();
+        fs::write(source.join("nested").join("b.bin"), vec![2u8; 20]).unwrap();
+        let request = ScanRequest {
+            root: source.to_string_lossy().into_owned(),
+            threads: 2,
+            ..Default::default()
+        };
+        let handle = store.start_scan(request, |_| {}).unwrap();
+        for _ in 0..200 {
+            let status = store.scan_status(&handle.scan_id).unwrap();
+            if status.status != "scanning" {
+                assert_eq!(status.status, "done");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let root = store
+            .query_nodes(ScanQuery {
+                scan_id: handle.scan_id.clone(),
+                parent_id: None,
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(root.items.len(), 1);
+        assert_eq!(root.items[0].size, 30);
+        let children = store
+            .query_nodes(ScanQuery {
+                scan_id: handle.scan_id,
+                parent_id: Some(0),
+                limit: 5000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(children.total, 2);
+        assert_eq!(children.limit, TREE_PAGE_MAX);
+    }
+
+    #[test]
+    fn scan_id_rejects_path_traversal() {
+        assert!(!safe_scan_id("../state"));
+        assert!(safe_scan_id("abc-123"));
+    }
+
+    #[test]
+    fn json_settings_are_bounded_and_persisted() {
+        let store = temp_store("settings");
+        assert_eq!(store.load_json_setting("app.settings", "{}").unwrap(), "{}");
+        store
+            .save_json_setting("app.settings", r#"{"darkMode":true}"#, 128)
+            .unwrap();
+        assert_eq!(
+            store.load_json_setting("app.settings", "{}").unwrap(),
+            r#"{"darkMode":true}"#
+        );
+        assert!(
+            store
+                .save_json_setting("app.settings", "invalid", 128)
+                .is_err()
+        );
+        assert!(
+            store
+                .save_json_setting("app.settings", r#"{"value":"too large"}"#, 8)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compression_files_are_persisted_filtered_and_paged() {
+        let store = temp_store("compression-page");
+        let record = |index: usize, status: &str, size: u64| CompressionFileRecord {
+            job_id: "abc-123".to_string(),
+            index,
+            path: format!(r"C:\fixture\file-{index}.mp4"),
+            kind: "video".to_string(),
+            status: status.to_string(),
+            stage: if status == "running" {
+                "encoding"
+            } else {
+                "queued"
+            }
+            .to_string(),
+            pct: if status == "running" { 25 } else { 0 },
+            orig_bytes: size,
+            new_bytes: 0,
+            error: None,
+            reason: String::new(),
+            encoder: "nvenc_h264".to_string(),
+            disposition: String::new(),
+            out_path: String::new(),
+            duration_ms: 0,
+            fps: Some(120.0),
+            started_at: if status == "running" { now_ms() } else { 0 },
+            updated_at: now_ms(),
+            finished_at: 0,
+            attempt: usize::from(status == "running"),
+            tool: "HandBrakeCLI".to_string(),
+            tool_version: "1.10".to_string(),
+            command: String::new(),
+            stderr: String::new(),
+            recycled: false,
+            queue_position: (status == "pending").then_some(index),
+        };
+        store
+            .persist_compression_job(
+                "abc-123",
+                "running",
+                3,
+                "{}",
+                [
+                    record(0, "pending", 10),
+                    record(1, "running", 20),
+                    record(2, "pending", 30),
+                ],
+            )
+            .unwrap();
+        let page = store
+            .query_compression_files(
+                "abc-123",
+                CompressionPageQuery {
+                    limit: 2,
+                    sort: "size".to_string(),
+                    direction: "desc".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.total_matches, 3);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].index, 1, "active work stays pinned first");
+
+        let pending = store
+            .query_compression_files(
+                "abc-123",
+                CompressionPageQuery {
+                    status: "pending".to_string(),
+                    limit: 250,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.total_matches, 2);
+        assert_eq!(pending.facets["status"]["pending"], 2);
+    }
+}

@@ -126,7 +126,11 @@ fn owner_of_win(path: &str) -> Option<String> {
         Vec::new()
     };
 
-    if let Some(name) = sid_cache().lock().ok().and_then(|c| c.get(&sid_bytes).cloned()) {
+    if let Some(name) = sid_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&sid_bytes).cloned())
+    {
         unsafe { LocalFree(psd) };
         return if name.is_empty() { None } else { Some(name) };
     }
@@ -217,11 +221,7 @@ fn string_sid(
     let slice = unsafe { std::slice::from_raw_parts(out, len) };
     let s = String::from_utf16_lossy(slice);
     unsafe { local_free(out as *mut std::ffi::c_void) };
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 #[cfg(windows)]

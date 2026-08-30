@@ -22,6 +22,7 @@ import {
   fetchCompressTelemetry,
   listCompressJobs,
   openPath,
+  setCompressionPresence,
   pauseCompressJob,
   prioritizeCompressFiles,
   removeQueuedCompressJob,
@@ -321,18 +322,17 @@ export function CompressionMonitor({ focusJobId }: Props) {
   }, [cacheVersion]);
 
   useEffect(() => {
-    const api = (window as unknown as {
-      electronAPI?: { setCompressionState?: (state: { active: boolean; enabled: boolean; status: string; progress: number }) => void };
-    }).electronAPI;
-    if (!api?.setCompressionState) return;
     const totalBytes = selectedJob?.totalBytes ?? 0;
     const completedBytes = selectedJob?.workCompletedBytes ?? 0;
-    api.setCompressionState({
+    void setCompressionPresence({
       enabled: layout.keepAwake,
       active: layout.keepAwake && jobs.some((job) => ["running", "pausing"].includes(job.status)),
       status: selectedJob?.status ?? "idle",
       progress: totalBytes > 0 ? completedBytes / totalBytes : 0,
     });
+    return () => {
+      void setCompressionPresence({ enabled: false, active: false, status: "idle", progress: 0 });
+    };
   }, [selectedJob, layout.keepAwake]);
 
   const processed = selectedJob ? selectedJob.done + selectedJob.skipped + selectedJob.errors : 0;

@@ -5,12 +5,14 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: "dist",
-    // Fixed output names so Rust include_str!/include_bytes! paths are stable
+    // Content hashes prevent WebView2 from serving an older embedded renderer
+    // after an application upgrade. Tauri packages the entire directory, so v2
+    // no longer needs the fixed paths used by the removed Rust asset server.
     rollupOptions: {
       output: {
-        entryFileNames: "assets/index.js",
-        chunkFileNames: "assets/[name].js",
-        assetFileNames: "assets/[name].[ext]",
+        entryFileNames: "assets/[name]-[hash].js",
+        chunkFileNames: "assets/[name]-[hash].js",
+        assetFileNames: "assets/[name]-[hash].[ext]",
       },
     },
     // Inline small assets (fonts, images) into CSS/JS to avoid extra embed paths

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::export::push_json_string;
-use crate::model::{node_abs_path, DupesProgress, HashCacheEntry, NodeRecord};
+use crate::model::{DupesProgress, HashCacheEntry, NodeRecord, node_abs_path};
 
 /// Upper bound on resident `(path)->hash` cache entries. A long session can
 /// otherwise grow the map without limit; surplus entries are evicted (a miss
@@ -75,7 +75,11 @@ struct FastHasher {
 
 impl FastHasher {
     fn new(seed: u64) -> Self {
-        FastHasher { hash: seed ^ 0xcbf2_9ce4_8422_2325, carry: [0u8; 8], carry_len: 0 }
+        FastHasher {
+            hash: seed ^ 0xcbf2_9ce4_8422_2325,
+            carry: [0u8; 8],
+            carry_len: 0,
+        }
     }
 
     #[inline]
@@ -224,7 +228,11 @@ fn files_identical(a: &Path, b: &Path) -> io::Result<bool> {
 /// Partition a set of same-size, same-hash candidate indices into byte-identical
 /// equivalence classes. Virtually always returns a single class, but guards
 /// against hash collisions when the caller asked for byte confirmation.
-fn byte_confirm_partition(indices: &[usize], files: &[HashInput], errors: &Mutex<Vec<String>>) -> Vec<Vec<usize>> {
+fn byte_confirm_partition(
+    indices: &[usize],
+    files: &[HashInput],
+    errors: &Mutex<Vec<String>>,
+) -> Vec<Vec<usize>> {
     let mut classes: Vec<Vec<usize>> = Vec::new();
     'outer: for &idx in indices {
         for class in classes.iter_mut() {
@@ -235,10 +243,11 @@ fn byte_confirm_partition(indices: &[usize], files: &[HashInput], errors: &Mutex
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    errors
-                        .lock()
-                        .expect("hash errors lock")
-                        .push(format!("{}: {}", files[idx].path.display(), e));
+                    errors.lock().expect("hash errors lock").push(format!(
+                        "{}: {}",
+                        files[idx].path.display(),
+                        e
+                    ));
                     continue 'outer;
                 }
             }
@@ -262,15 +271,17 @@ where
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| loop {
-                if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
-                    break;
+            scope.spawn(|| {
+                loop {
+                    if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= count {
+                        break;
+                    }
+                    f(i);
                 }
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= count {
-                    break;
-                }
-                f(i);
             });
         }
     });
@@ -339,10 +350,11 @@ pub(crate) fn hash_candidate_groups(
                 sample_fp[i].store(fp, Ordering::Relaxed);
                 sample_done[i].store(true, Ordering::Relaxed);
             }
-            Err(e) => errors
-                .lock()
-                .expect("hash errors lock")
-                .push(format!("{}: {}", files[i].path.display(), e)),
+            Err(e) => errors.lock().expect("hash errors lock").push(format!(
+                "{}: {}",
+                files[i].path.display(),
+                e
+            )),
         }
     });
     if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
@@ -373,7 +385,8 @@ pub(crate) fn hash_candidate_groups(
     }
 
     if let Some(p) = progress {
-        p.files_hashing.store(need_full.len() as u64, Ordering::Relaxed);
+        p.files_hashing
+            .store(need_full.len() as u64, Ordering::Relaxed);
         p.files_hashed.store(0, Ordering::Relaxed);
     }
 
@@ -383,10 +396,11 @@ pub(crate) fn hash_candidate_groups(
         let i = need_full[k];
         match content_hash_file(&files[i].path) {
             Ok(h) => computed.lock().expect("computed lock").push((i, h)),
-            Err(e) => errors
-                .lock()
-                .expect("hash errors lock")
-                .push(format!("{}: {}", files[i].path.display(), e)),
+            Err(e) => errors.lock().expect("hash errors lock").push(format!(
+                "{}: {}",
+                files[i].path.display(),
+                e
+            )),
         }
         if let Some(p) = progress {
             p.files_hashed.fetch_add(1, Ordering::Relaxed);
@@ -491,7 +505,11 @@ pub(crate) fn exact_matches_via_hash_cache(
 ) -> Vec<(usize, usize, u8)> {
     let inputs: Vec<HashInput> = files
         .iter()
-        .map(|f| HashInput { path: f.path.clone(), size: f.size, mtime: f.modified })
+        .map(|f| HashInput {
+            path: f.path.clone(),
+            size: f.size,
+            mtime: f.modified,
+        })
         .collect();
     let (groups, _errors) =
         hash_candidate_groups(&inputs, false, cache, cache_path, progress, cancel, threads);
@@ -510,7 +528,10 @@ pub(crate) fn exact_matches_via_hash_cache(
 /// line: `["path",size,mtime,hash]`). `load_hash_cache` parses these trailing
 /// rows even when they follow a previously written bracketed array, so the file
 /// is grown in place rather than fully rewritten on every dedup.
-pub(crate) fn append_hash_cache(path: &Path, entries: &[(PathBuf, HashCacheEntry)]) -> io::Result<()> {
+pub(crate) fn append_hash_cache(
+    path: &Path,
+    entries: &[(PathBuf, HashCacheEntry)],
+) -> io::Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -542,7 +563,9 @@ pub(crate) fn append_hash_cache(path: &Path, entries: &[(PathBuf, HashCacheEntry
 /// tidy snapshot once at startup and keep the file bounded across restarts.
 pub(crate) fn load_hash_cache(path: &Path) -> (HashMap<PathBuf, HashCacheEntry>, bool) {
     let mut map = HashMap::new();
-    let Ok(raw) = fs::read_to_string(path) else { return (map, false); };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return (map, false);
+    };
     let mut rows = 0usize;
     let mut capped = false;
     for line in raw.lines() {
@@ -561,7 +584,15 @@ pub(crate) fn load_hash_cache(path: &Path) -> (HashMap<PathBuf, HashCacheEntry>,
             }
             // Re-mint `seq` in file order: rows written earlier (older) get smaller
             // stamps, so runtime eviction drops them first. `seq` is not persisted.
-            map.insert(key, HashCacheEntry { size, mtime, hash, seq: next_hash_cache_seq() });
+            map.insert(
+                key,
+                HashCacheEntry {
+                    size,
+                    mtime,
+                    hash,
+                    seq: next_hash_cache_seq(),
+                },
+            );
         }
     }
     let should_compact = capped || rows > map.len();
@@ -571,7 +602,10 @@ pub(crate) fn load_hash_cache(path: &Path) -> (HashMap<PathBuf, HashCacheEntry>,
 /// Persist (compact) the whole hash cache as a JSON array of
 /// `["path", size, mtime, hash]` rows. This is the full-rewrite/compaction path;
 /// steady-state growth uses the cheaper incremental `append_hash_cache`.
-pub(crate) fn save_hash_cache(path: &Path, cache: &HashMap<PathBuf, HashCacheEntry>) -> io::Result<()> {
+pub(crate) fn save_hash_cache(
+    path: &Path,
+    cache: &HashMap<PathBuf, HashCacheEntry>,
+) -> io::Result<()> {
     let mut out = String::from("[\n");
     let mut first = true;
     for (p, e) in cache {
@@ -617,14 +651,16 @@ pub(crate) struct DupeFilter2 {
     pub(crate) extensions: Vec<String>,
 }
 
-pub(crate) fn build_candidates_from_nodes(nodes: &[NodeRecord], filter: &DupeFilter2) -> Vec<DupeFileV2> {
+pub(crate) fn build_candidates_from_nodes(
+    nodes: &[NodeRecord],
+    filter: &DupeFilter2,
+) -> Vec<DupeFileV2> {
     nodes
         .iter()
         .filter(|n| !n.is_dir && n.size >= filter.min_size.max(1))
         .filter(|n| filter.max_size.map_or(true, |max| n.size <= max))
         .filter(|n| {
-            filter.extensions.is_empty()
-                || filter.extensions.contains(&n.extension.to_lowercase())
+            filter.extensions.is_empty() || filter.extensions.contains(&n.extension.to_lowercase())
         })
         .map(|n| DupeFileV2 {
             // Files no longer store their absolute path (interned away to cut
@@ -747,8 +783,16 @@ pub(crate) fn scan_filename(
     for (a, b) in candidate_pairs {
         // Optionally skip pairs with different extensions
         if !mix_kinds {
-            let ext_a = files[a].path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let ext_b = files[b].path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let ext_a = files[a]
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let ext_b = files[b]
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
             if !ext_a.eq_ignore_ascii_case(ext_b) {
                 continue;
             }
@@ -797,7 +841,11 @@ fn read_id3v2(path: &Path) -> HashMap<String, String> {
             let mut v1 = [0u8; 128];
             if f.read_exact(&mut v1).is_ok() && &v1[0..3] == b"TAG" {
                 let decode = |s: &[u8]| {
-                    let s = s.iter().take_while(|&&b| b != 0).cloned().collect::<Vec<u8>>();
+                    let s = s
+                        .iter()
+                        .take_while(|&&b| b != 0)
+                        .cloned()
+                        .collect::<Vec<u8>>();
                     String::from_utf8_lossy(&s).trim().to_string()
                 };
                 tags.insert("title".into(), decode(&v1[3..33]));
@@ -826,15 +874,21 @@ fn read_id3v2(path: &Path) -> HashMap<String, String> {
 
         let frame_size = if version >= 4 {
             let mut sb = [0u8; 4];
-            if f.read_exact(&mut sb).is_err() { break; }
+            if f.read_exact(&mut sb).is_err() {
+                break;
+            }
             syncsafe_to_u32(&sb)
         } else {
             let mut sb = [0u8; 4];
-            if f.read_exact(&mut sb).is_err() { break; }
+            if f.read_exact(&mut sb).is_err() {
+                break;
+            }
             u32::from_be_bytes(sb)
         };
         let mut flags = [0u8; 2];
-        if f.read_exact(&mut flags).is_err() { break; }
+        if f.read_exact(&mut flags).is_err() {
+            break;
+        }
 
         pos += 10 + frame_size;
 
@@ -865,32 +919,59 @@ fn read_id3v2(path: &Path) -> HashMap<String, String> {
         };
 
         // Text encoding byte at data[0]: 0=latin1, 1=utf16, 3=utf8
-        if data.is_empty() { continue; }
+        if data.is_empty() {
+            continue;
+        }
         let encoding = data[0];
         let text_bytes = &data[1..];
         let text = match encoding {
             1 => {
                 // UTF-16 with BOM
-                if text_bytes.len() < 2 { continue; }
+                if text_bytes.len() < 2 {
+                    continue;
+                }
                 let is_le = text_bytes[0] == 0xFF && text_bytes[1] == 0xFE;
-                let start = if text_bytes[0] == 0xFF || text_bytes[0] == 0xFE { 2 } else { 0 };
+                let start = if text_bytes[0] == 0xFF || text_bytes[0] == 0xFE {
+                    2
+                } else {
+                    0
+                };
                 let words: Vec<u16> = text_bytes[start..]
                     .chunks(2)
                     .filter(|c| c.len() == 2)
-                    .map(|c| if is_le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
+                    .map(|c| {
+                        if is_le {
+                            u16::from_le_bytes([c[0], c[1]])
+                        } else {
+                            u16::from_be_bytes([c[0], c[1]])
+                        }
+                    })
                     .take_while(|&w| w != 0)
                     .collect();
                 String::from_utf16_lossy(&words).trim().to_string()
             }
             3 => {
                 // UTF-8
-                let end = text_bytes.iter().position(|&b| b == 0).unwrap_or(text_bytes.len());
-                String::from_utf8_lossy(&text_bytes[..end]).trim().to_string()
+                let end = text_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(text_bytes.len());
+                String::from_utf8_lossy(&text_bytes[..end])
+                    .trim()
+                    .to_string()
             }
             _ => {
                 // Latin-1
-                let end = text_bytes.iter().position(|&b| b == 0).unwrap_or(text_bytes.len());
-                text_bytes[..end].iter().map(|&b| b as char).collect::<String>().trim().to_string()
+                let end = text_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(text_bytes.len());
+                text_bytes[..end]
+                    .iter()
+                    .map(|&b| b as char)
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
             }
         };
 
@@ -939,11 +1020,7 @@ pub(crate) fn scan_audio(
             let tags = read_id3v2(&files[idx].path);
             active_tags
                 .iter()
-                .map(|&t| {
-                    tags.get(t)
-                        .map(|v| get_words(v))
-                        .unwrap_or_default()
-                })
+                .map(|&t| tags.get(t).map(|v| get_words(v)).unwrap_or_default())
                 .collect()
         })
         .collect();
@@ -1021,7 +1098,9 @@ pub(crate) fn matches_to_groups(
             (Some(gid), None) => {
                 // Check that b matches every existing member of the group
                 let all_match = groups[gid].iter().all(|&m| {
-                    if m == a { return true; }
+                    if m == a {
+                        return true;
+                    }
                     let key = (m.min(b), m.max(b));
                     pair_score.get(&key).copied().unwrap_or(0) > 0
                 });
@@ -1032,7 +1111,9 @@ pub(crate) fn matches_to_groups(
             }
             (None, Some(gid)) => {
                 let all_match = groups[gid].iter().all(|&m| {
-                    if m == b { return true; }
+                    if m == b {
+                        return true;
+                    }
                     let key = (m.min(a), m.max(a));
                     pair_score.get(&key).copied().unwrap_or(0) > 0
                 });
@@ -1083,7 +1164,11 @@ pub(crate) fn matches_to_groups(
                 })
                 .collect();
 
-            DupeGroupV2 { files: file_objs, score: group_score, waste }
+            DupeGroupV2 {
+                files: file_objs,
+                score: group_score,
+                waste,
+            }
         })
         .collect();
 
@@ -1109,14 +1194,14 @@ pub(crate) enum ReprioritizeCriterion {
 impl ReprioritizeCriterion {
     pub(crate) fn from_str(s: &str) -> Option<Self> {
         match s {
-            "largest"     => Some(Self::Largest),
-            "smallest"    => Some(Self::Smallest),
-            "newest"      => Some(Self::Newest),
-            "oldest"      => Some(Self::Oldest),
-            "shortestPath"=> Some(Self::ShortestPath),
+            "largest" => Some(Self::Largest),
+            "smallest" => Some(Self::Smallest),
+            "newest" => Some(Self::Newest),
+            "oldest" => Some(Self::Oldest),
+            "shortestPath" => Some(Self::ShortestPath),
             "longestPath" => Some(Self::LongestPath),
-            "alphaFirst"  => Some(Self::AlphaFirst),
-            "alphaLast"   => Some(Self::AlphaLast),
+            "alphaFirst" => Some(Self::AlphaFirst),
+            "alphaLast" => Some(Self::AlphaLast),
             _ => None,
         }
     }
@@ -1124,17 +1209,19 @@ impl ReprioritizeCriterion {
 
 pub(crate) fn reprioritize(groups: &mut [DupeGroupV2], criterion: ReprioritizeCriterion) {
     for group in groups.iter_mut() {
-        group.files.sort_by(|a, b| {
-            match criterion {
-                ReprioritizeCriterion::Largest     => b.size.cmp(&a.size),
-                ReprioritizeCriterion::Smallest    => a.size.cmp(&b.size),
-                ReprioritizeCriterion::Newest      => b.modified.cmp(&a.modified),
-                ReprioritizeCriterion::Oldest      => a.modified.cmp(&b.modified),
-                ReprioritizeCriterion::ShortestPath => a.path.as_os_str().len().cmp(&b.path.as_os_str().len()),
-                ReprioritizeCriterion::LongestPath  => b.path.as_os_str().len().cmp(&a.path.as_os_str().len()),
-                ReprioritizeCriterion::AlphaFirst  => a.name.cmp(&b.name),
-                ReprioritizeCriterion::AlphaLast   => b.name.cmp(&a.name),
+        group.files.sort_by(|a, b| match criterion {
+            ReprioritizeCriterion::Largest => b.size.cmp(&a.size),
+            ReprioritizeCriterion::Smallest => a.size.cmp(&b.size),
+            ReprioritizeCriterion::Newest => b.modified.cmp(&a.modified),
+            ReprioritizeCriterion::Oldest => a.modified.cmp(&b.modified),
+            ReprioritizeCriterion::ShortestPath => {
+                a.path.as_os_str().len().cmp(&b.path.as_os_str().len())
             }
+            ReprioritizeCriterion::LongestPath => {
+                b.path.as_os_str().len().cmp(&a.path.as_os_str().len())
+            }
+            ReprioritizeCriterion::AlphaFirst => a.name.cmp(&b.name),
+            ReprioritizeCriterion::AlphaLast => b.name.cmp(&a.name),
         });
         for (pos, f) in group.files.iter_mut().enumerate() {
             f.is_ref = pos == 0;
@@ -1167,7 +1254,11 @@ pub(crate) fn action_delete(paths: &[PathBuf], permanent: bool) -> Vec<String> {
             .err()
             .map(|e| crate::preflight::describe_fs_error(e, path));
         crate::audit::record(crate::audit::Entry {
-            op: if permanent { "permanent-delete" } else { "delete" },
+            op: if permanent {
+                "permanent-delete"
+            } else {
+                "delete"
+            },
             disposition: if permanent { "permanent" } else { "recycle" },
             src: std::slice::from_ref(&path_str),
             error: err_text.as_deref(),
@@ -1261,7 +1352,11 @@ pub(crate) fn action_move(src_dst: &[(PathBuf, PathBuf)]) -> Vec<String> {
             }
         }
         // Keep-both on collision: route to a unique name rather than overwrite.
-        let target = if dst.exists() { unique_dst(dst) } else { dst.clone() };
+        let target = if dst.exists() {
+            unique_dst(dst)
+        } else {
+            dst.clone()
+        };
         // Try atomic rename first; fall back to copy + remove for cross-device.
         // Pre-flight the destination's free space before starting a copy we
         // might not be able to finish (Phase 3).
@@ -1334,7 +1429,11 @@ pub(crate) fn action_copy(src_dst: &[(PathBuf, PathBuf)]) -> Vec<String> {
                 continue;
             }
         }
-        let target = if dst.exists() { unique_dst(dst) } else { dst.clone() };
+        let target = if dst.exists() {
+            unique_dst(dst)
+        } else {
+            dst.clone()
+        };
         // Pre-flight the destination's free space before starting the copy
         // (Phase 3) — don't begin a copy we can't finish.
         let dest_dir = target.parent().unwrap_or_else(|| target.as_path());
@@ -1380,8 +1479,14 @@ pub(crate) struct IgnoreList {
 
 impl IgnoreList {
     pub(crate) fn add(&mut self, a: &Path, b: &Path) {
-        self.pairs.entry(a.to_owned()).or_default().insert(b.to_owned());
-        self.pairs.entry(b.to_owned()).or_default().insert(a.to_owned());
+        self.pairs
+            .entry(a.to_owned())
+            .or_default()
+            .insert(b.to_owned());
+        self.pairs
+            .entry(b.to_owned())
+            .or_default()
+            .insert(a.to_owned());
     }
 
     pub(crate) fn are_ignored(&self, a: &Path, b: &Path) -> bool {
@@ -1410,7 +1515,9 @@ impl IgnoreList {
                     (b.clone(), a.clone())
                 };
                 if seen.insert(key) {
-                    if !first { out.push_str(",\n"); }
+                    if !first {
+                        out.push_str(",\n");
+                    }
                     first = false;
                     out.push('[');
                     push_json_string(&mut out, &a.to_string_lossy());
@@ -1510,16 +1617,18 @@ pub(crate) fn write_groups_to_json<W: Write>(
 ) -> io::Result<()> {
     const FLUSH_THRESHOLD: usize = 64 * 1024;
     let mode_str = match mode {
-        ScanMode::Exact    => "exact",
+        ScanMode::Exact => "exact",
         ScanMode::Filename => "filename",
-        ScanMode::Audio    => "audio",
+        ScanMode::Audio => "audio",
     };
     let mut out = String::new();
     out.push_str("{\"mode\":");
     push_json_string(&mut out, mode_str);
     out.push_str(",\"groups\":[");
     for (gi, group) in groups.iter().enumerate() {
-        if gi > 0 { out.push(','); }
+        if gi > 0 {
+            out.push(',');
+        }
         out.push_str("{\"score\":");
         out.push_str(&group.score.to_string());
         out.push_str(",\"waste\":");
@@ -1530,11 +1639,17 @@ pub(crate) fn write_groups_to_json<W: Write>(
         // fallback as for the client-first content path.
         let reference = group.files.first();
         for (fi, f) in group.files.iter().enumerate() {
-            if fi > 0 { out.push(','); }
+            if fi > 0 {
+                out.push(',');
+            }
             let is_ref = f.is_ref;
             let (name_m, size_m, date_m): (u8, u8, u8) = match reference {
                 Some(r) if !is_ref => (
-                    if f.name.eq_ignore_ascii_case(&r.name) { 100 } else { 0 },
+                    if f.name.eq_ignore_ascii_case(&r.name) {
+                        100
+                    } else {
+                        0
+                    },
                     if f.size == r.size { 100 } else { 0 },
                     if f.modified == r.modified { 100 } else { 0 },
                 ),
@@ -1579,7 +1694,9 @@ pub(crate) fn write_groups_to_json<W: Write>(
     }
     out.push_str("],\"errors\":[");
     for (i, e) in errors.iter().enumerate() {
-        if i > 0 { out.push(','); }
+        if i > 0 {
+            out.push(',');
+        }
         push_json_string(&mut out, e);
     }
     out.push_str("],\"ignoredCount\":");

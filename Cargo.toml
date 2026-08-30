@@ -1,16 +1,23 @@
+[workspace]
+members = [".", "crates/filetree-cli", "src-tauri"]
+default-members = [".", "crates/filetree-cli"]
+resolver = "3"
+
 [package]
-name = "filetree"
-version = "1.14.7"
+name = "filetree-core"
+version = "2.0.0"
 edition = "2024"
+autobins = false
 description = "A standalone Windows disk-usage explorer with real-time threaded scans."
 repository = "https://github.com/Danny213123/FileTree"
 readme = "README.md"
 publish = false
 
+[lib]
+name = "filetree_core"
+path = "src/lib.rs"
+
 [dependencies]
-# Compile the built renderer (frontend/dist) into the binary so the single
-# executable can serve every Vite-emitted chunk without shipping loose files.
-include_dir = "0.7"
 # Checksum actions (GET /api/checksum). RustCrypto hashers, streamed in chunks so
 # a large file is never loaded whole.
 md-5 = "0.11.0"
@@ -20,6 +27,14 @@ sha2 = "0.11.0"
 # `*-sys` crates (needing a C toolchain and slowing the build), none of which a
 # standard `.zip` needs — Deflated entries are universally readable.
 zip = { version = "8", default-features = false, features = ["deflate"] }
+# FileTree v2 stores scans and long-lived job metadata on disk instead of
+# retaining complete object graphs in Rust and Chromium heaps. SQLite is
+# statically bundled so portable builds have no external runtime dependency.
+rusqlite = { version = "0.37", features = ["bundled", "functions"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
 
 # Release builds are CPU-bound on the filesystem walk and the duplicate hash
 # pipeline, so trade longer compile time for a faster binary: link-time
@@ -29,3 +44,4 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 [profile.release]
 lto = true
 codegen-units = 1
+strip = true

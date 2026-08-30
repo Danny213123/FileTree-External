@@ -1,4 +1,4 @@
-/target
+**/target/
 /dist-portable
 /*.exe
 /*.log
@@ -27,10 +27,10 @@
 
 # Frontend build artifacts
 /frontend/node_modules/
-
-# Electron deps
-/electron/node_modules/
+/node_modules/
 /frontend/frontend/
+/artifacts/
+/src-tauri/gen/
 
 # Local dev helper
 run.bat
@@ -40,7 +40,7 @@ run.bat
 /.verify_*.png
 
 # --- Build outputs / stray files (not needed to build or run) ---
-# Packaged Electron app (regenerate via build-portable.bat)
+# Packaged desktop app (regenerate via build-portable.bat)
 /dist-electron/
 # Logs anywhere (e.g. .cursor/debug-*.log)
 *.log
@@ -49,8 +49,5 @@ run.bat
 *.csv
 /electron/taglinter.yml
 
-# --- electron-builder packaging output (large binaries; never tracked) ---
-# The portable .exe and NSIS installer are produced here by `npm run package`.
-# If you ever need the binaries in the repo, ship them via a GitHub Release or
-# Git LFS instead of committing them.
-/electron/release/
+# Tauri installers are release artifacts, not source.
+/target/release/bundle/

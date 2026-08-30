@@ -16,17 +16,18 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
+use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::compress_tools::{self, HandbrakeCaps, ImageKind};
 use crate::export::push_json_string;
-use crate::io::{acquire_compress, CompressLane, LockRecover};
-use crate::model::AppState;
+use crate::io::{CompressLane, LockRecover, acquire_compress};
 
 /// Hard per-job worker ceiling. Two concurrent files keep both NVENC engines
 /// occupied without spreading disk, memory, and verification bandwidth across
@@ -167,7 +168,14 @@ impl FileState {
             reason: Mutex::new(String::new()),
             duration_ms: AtomicU64::new(0),
             encoder: Mutex::new(String::new()),
-            stage: Mutex::new(if status == "done" { "terminal" } else { "queued" }.to_string()),
+            stage: Mutex::new(
+                if status == "done" {
+                    "terminal"
+                } else {
+                    "queued"
+                }
+                .to_string(),
+            ),
             fps_bits: AtomicU64::new(0),
             started_at: AtomicU64::new(0),
             updated_at: AtomicU64::new(crate::io::now_ms()),
@@ -183,7 +191,7 @@ impl FileState {
 
 #[derive(Debug, Default)]
 pub(crate) struct JobQueue {
-    pending: VecDeque<usize>,
+    pub(crate) pending: VecDeque<usize>,
     active: usize,
 }
 
@@ -296,22 +304,57 @@ pub(crate) struct CompressJob {
     /// paginated files endpoint and compact job summaries.
     pub(crate) events: Mutex<JobEvents>,
     pub(crate) events_cv: Condvar,
+    pub(crate) event_sink: Mutex<Option<JobEventSink>>,
     pub(crate) runner_started: AtomicBool,
     pub(crate) finished: AtomicBool,
     pub(crate) manifest_path: PathBuf,
 }
 
+#[derive(Default)]
+pub(crate) struct CompressionRuntimeState {
+    pub(crate) jobs: Mutex<HashMap<String, Arc<CompressJob>>>,
+    pub(crate) path_changed: Mutex<Option<Arc<dyn Fn(&Path) + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for CompressionRuntimeState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompressionRuntimeState")
+            .field("jobs", &self.jobs.lock_recover().len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl CompressJob {
     /// Append one NDJSON event line and wake any stream reader tailing the buffer.
     fn emit(&self, line: String) {
-        let mut events = self.events.lock_recover();
-        if events.lines.len() >= LIVE_EVENT_CAPACITY {
-            events.lines.pop_front();
-            events.base = events.base.saturating_add(1);
+        {
+            let mut events = self.events.lock_recover();
+            if events.lines.len() >= LIVE_EVENT_CAPACITY {
+                events.lines.pop_front();
+                events.base = events.base.saturating_add(1);
+            }
+            events.lines.push_back(line.clone());
         }
-        events.lines.push_back(line);
         self.events_cv.notify_all();
+        let sink = self.event_sink.lock_recover().clone();
+        if let Some(sink) = sink {
+            (sink.0)(&line);
+        }
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct JobEventSink(pub(crate) Arc<dyn Fn(&str) + Send + Sync>);
+
+impl std::fmt::Debug for JobEventSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JobEventSink(..)")
+    }
+}
+
+pub(crate) fn set_job_event_sink(job: &CompressJob, sink: JobEventSink) {
+    *job.event_sink.lock_recover() = Some(sink);
 }
 
 /// `%APPDATA%\FileTree\jobs\` — where per-job manifests live.
@@ -346,9 +389,7 @@ pub(crate) fn new_job_id() -> String {
 /// Guard the externally-supplied id used to build a manifest path / registry
 /// key against traversal: only the characters `new_job_id` emits are allowed.
 pub(crate) fn is_safe_job_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 fn path_fingerprint(path: &str) -> u64 {
@@ -384,9 +425,7 @@ pub(crate) fn active_path_conflict(
         return None;
     }
     jobs.values().find_map(|job| {
-        if job.finished.load(Ordering::SeqCst)
-            || job.path_fingerprints.is_disjoint(requested)
-        {
+        if job.finished.load(Ordering::SeqCst) || job.path_fingerprints.is_disjoint(requested) {
             return None;
         }
         Some(ActivePathConflict {
@@ -480,7 +519,11 @@ impl CompressOptions {
         true
     }
     fn resolved_zip_level(&self) -> i64 {
-        if self.zip_level < 0 { 6 } else { self.zip_level.clamp(0, 9) }
+        if self.zip_level < 0 {
+            6
+        } else {
+            self.zip_level.clamp(0, 9)
+        }
     }
 }
 
@@ -554,6 +597,7 @@ pub(crate) fn create_job(
         manifest_last_write_ms: AtomicU64::new(crate::io::now_ms()),
         events: Mutex::new(JobEvents::new()),
         events_cv: Condvar::new(),
+        event_sink: Mutex::new(None),
         runner_started: AtomicBool::new(false),
         finished: AtomicBool::new(false),
         manifest_path: jobs_dir().join(format!("{id}.json")),
@@ -602,26 +646,47 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
     let text = std::fs::read_to_string(&manifest_path).ok()?;
     let root = crate::json::parse(&text)?;
 
-    let preset = root.get("preset").and_then(|v| v.as_str()).unwrap_or("balanced");
+    let preset = root
+        .get("preset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("balanced");
     // Tri-state disposition with back-compat: prefer the new `originalAction`
     // string; if absent, derive from the legacy `recycleOriginals` boolean
     // (true => Recycle, false => Keep) so older manifests resume unchanged.
     let original_action = match root.get("originalAction").and_then(|v| v.as_str()) {
         Some(s) => OriginalAction::from_str(s),
         None => {
-            let legacy = root.get("recycleOriginals").and_then(|v| v.as_bool()).unwrap_or(true);
-            if legacy { OriginalAction::Recycle } else { OriginalAction::Keep }
+            let legacy = root
+                .get("recycleOriginals")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if legacy {
+                OriginalAction::Recycle
+            } else {
+                OriginalAction::Keep
+            }
         }
     };
-    let tag_filename = root.get("tagFilename").and_then(|v| v.as_bool()).unwrap_or(true);
+    let tag_filename = root
+        .get("tagFilename")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let concurrency = root
         .get("concurrency")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or(0);
-    let encoder = root.get("encoder").and_then(|v| v.as_str()).unwrap_or("auto").to_string();
+    let encoder = root
+        .get("encoder")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto")
+        .to_string();
     let use_gpu = root.get("useGpu").and_then(|v| v.as_bool()).unwrap_or(true);
-    let codec = root.get("codec").and_then(|v| v.as_str()).unwrap_or("h264").to_string();
+    let codec = root
+        .get("codec")
+        .and_then(|v| v.as_str())
+        .unwrap_or("h264")
+        .to_string();
     let zip_level = root
         .get("zipLevel")
         .and_then(|v| v.as_f64())
@@ -665,14 +730,27 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
     let mut files = Vec::with_capacity(files_arr.len());
     let mut carried_saved = 0u64;
     for (i, f) in files_arr.iter().enumerate() {
-        let path = f.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let path = f
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let kind = FileKind::from_str(f.get("kind").and_then(|v| v.as_str()).unwrap_or("other"));
         let orig = f.get("origBytes").and_then(|v| v.as_u64()).unwrap_or(0);
-        let prev_status = f.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+        let prev_status = f
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending");
         // Only a genuine completed compress is preserved; skipped/error/pending
         // all re-run.
         let resume_done = prev_status == "done";
-        let state = FileState::new(i, path, kind, orig, if resume_done { "done" } else { "pending" });
+        let state = FileState::new(
+            i,
+            path,
+            kind,
+            orig,
+            if resume_done { "done" } else { "pending" },
+        );
         state.attempt.store(
             f.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             Ordering::Relaxed,
@@ -726,9 +804,10 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
                     *target.lock_recover() = value.to_string();
                 }
             }
-            state
-                .duration_ms
-                .store(f.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0), Ordering::Relaxed);
+            state.duration_ms.store(
+                f.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0),
+                Ordering::Relaxed,
+            );
             carried_saved = carried_saved.saturating_add(orig.saturating_sub(newb));
         }
         files.push(state);
@@ -742,9 +821,7 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
     let mut pending_order = files
         .iter()
         .enumerate()
-        .filter_map(|(i, file)| {
-            (file.status.lock_recover().as_str() != "done").then_some(i)
-        })
+        .filter_map(|(i, file)| (file.status.lock_recover().as_str() != "done").then_some(i))
         .collect::<Vec<_>>();
     let persisted_order = root
         .get("queueOrder")
@@ -753,7 +830,9 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
             values
                 .iter()
                 .filter_map(|v| v.as_u64().map(|n| n as usize))
-                .filter(|&i| i < files.len() && files[i].status.lock_recover().as_str() == "pending")
+                .filter(|&i| {
+                    i < files.len() && files[i].status.lock_recover().as_str() == "pending"
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -797,7 +876,9 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         queue: Mutex::new(JobQueue { pending, active: 0 }),
         queue_cv: Condvar::new(),
         active_elapsed_ms: AtomicU64::new(
-            root.get("activeElapsedMs").and_then(|v| v.as_u64()).unwrap_or(0),
+            root.get("activeElapsedMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
         ),
         active_started_at: AtomicU64::new(crate::io::now_ms()),
         queue_rank: AtomicU64::new(
@@ -811,6 +892,7 @@ pub(crate) fn job_from_manifest(id: &str) -> Option<Arc<CompressJob>> {
         manifest_last_write_ms: AtomicU64::new(crate::io::now_ms()),
         events: Mutex::new(JobEvents::new()),
         events_cv: Condvar::new(),
+        event_sink: Mutex::new(None),
         runner_started: AtomicBool::new(false),
         finished: AtomicBool::new(false),
         manifest_path,
@@ -931,7 +1013,11 @@ fn video_quality(
             // offset used by every built-in preset. Height 0 keeps the source.
             let base = custom_quality_or_default(custom_q);
             let q = (base + 2).min(40);
-            let h = if custom_h == 0 { None } else { Some(custom_h.to_string()) };
+            let h = if custom_h == 0 {
+                None
+            } else {
+                Some(custom_h.to_string())
+            };
             (q.to_string(), h)
         }
         _ => ("26".to_string(), Some("1080".to_string())),
@@ -942,7 +1028,11 @@ fn video_quality(
 /// Clamp a custom RF base into the supported 16..=40 window, substituting the
 /// default 26 when unset (0).
 fn custom_quality_or_default(custom_q: u32) -> u32 {
-    if custom_q == 0 { 26 } else { custom_q.clamp(16, 40) }
+    if custom_q == 0 {
+        26
+    } else {
+        custom_q.clamp(16, 40)
+    }
 }
 
 /// The encoder + a human-readable codec parameter string for one file, derived
@@ -1056,7 +1146,7 @@ fn ratio(orig: u64, new_bytes: u64) -> f64 {
 /// guarantees the job is ALWAYS finalized: every non-terminal file is reconciled
 /// to a terminal internal error and the job is closed out, so no panic anywhere
 /// in the runner can ever strand the batch.
-pub(crate) fn spawn_job(state: Arc<AppState>, job: Arc<CompressJob>) {
+pub(crate) fn spawn_job(state: Arc<CompressionRuntimeState>, job: Arc<CompressJob>) {
     if job
         .runner_started
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
@@ -1065,10 +1155,10 @@ pub(crate) fn spawn_job(state: Arc<AppState>, job: Arc<CompressJob>) {
         return;
     }
     std::thread::spawn(move || {
+        let registry_state = Arc::clone(&state);
         let guard_job = Arc::clone(&job);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_job(state, job)
-        }));
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(state, job)));
         if let Err(payload) = outcome {
             let msg = panic_message(payload.as_ref());
             crate::compress_debug::log_force(&format!(
@@ -1076,6 +1166,42 @@ pub(crate) fn spawn_job(state: Arc<AppState>, job: Arc<CompressJob>) {
                 guard_job.id
             ));
             force_finalize_job(&guard_job);
+        }
+        registry_state.jobs.lock_recover().remove(&guard_job.id);
+    });
+}
+
+pub(crate) fn subscribe_job_events<F>(job: Arc<CompressJob>, callback: F)
+where
+    F: Fn(String) + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut cursor = 0u64;
+        loop {
+            let batch;
+            {
+                let mut events = job.events.lock_recover();
+                while cursor >= events.base.saturating_add(events.lines.len() as u64)
+                    && !job.finished.load(Ordering::SeqCst)
+                {
+                    let (next, _) = job
+                        .events_cv
+                        .wait_timeout(events, Duration::from_secs(1))
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    events = next;
+                }
+                let end = events.base.saturating_add(events.lines.len() as u64);
+                if cursor >= end && job.finished.load(Ordering::SeqCst) {
+                    break;
+                }
+                cursor = cursor.max(events.base);
+                let start = cursor.saturating_sub(events.base) as usize;
+                batch = events.lines.iter().skip(start).cloned().collect::<Vec<_>>();
+                cursor = end;
+            }
+            for line in batch {
+                callback(line);
+            }
         }
     });
 }
@@ -1098,14 +1224,17 @@ pub(crate) fn create_queued_job(
 fn finish_active_interval(job: &CompressJob) {
     let started = job.active_started_at.swap(0, Ordering::SeqCst);
     if started > 0 {
-        job.active_elapsed_ms
-            .fetch_add(crate::io::now_ms().saturating_sub(started), Ordering::Relaxed);
+        job.active_elapsed_ms.fetch_add(
+            crate::io::now_ms().saturating_sub(started),
+            Ordering::Relaxed,
+        );
     }
 }
 
 fn begin_active_interval(job: &CompressJob) {
     if job.active_started_at.load(Ordering::Relaxed) == 0 {
-        job.active_started_at.store(crate::io::now_ms(), Ordering::Relaxed);
+        job.active_started_at
+            .store(crate::io::now_ms(), Ordering::Relaxed);
     }
 }
 
@@ -1196,7 +1325,9 @@ pub(crate) fn skip_pending(job: &Arc<CompressJob>, indices: &[usize]) -> usize {
     });
     drop(queue);
     for index in &skipped {
-        let Some(file) = job.files.get(*index) else { continue };
+        let Some(file) = job.files.get(*index) else {
+            continue;
+        };
         if file.status.lock_recover().as_str() != "pending" {
             continue;
         }
@@ -1225,8 +1356,8 @@ pub(crate) fn skip_pending(job: &Arc<CompressJob>, indices: &[usize]) -> usize {
     skipped.len()
 }
 
-pub(crate) fn reorder_queued_jobs(state: &AppState, ids: &[String]) -> usize {
-    let jobs = state.compress_jobs.lock_recover();
+pub(crate) fn reorder_queued_jobs(state: &CompressionRuntimeState, ids: &[String]) -> usize {
+    let jobs = state.jobs.lock_recover();
     let mut changed = 0;
     for (position, id) in ids.iter().enumerate() {
         let Some(job) = jobs.get(id) else { continue };
@@ -1240,8 +1371,8 @@ pub(crate) fn reorder_queued_jobs(state: &AppState, ids: &[String]) -> usize {
     changed
 }
 
-pub(crate) fn remove_queued_job(state: &AppState, id: &str) -> Result<(), String> {
-    let mut jobs = state.compress_jobs.lock_recover();
+pub(crate) fn remove_queued_job(state: &CompressionRuntimeState, id: &str) -> Result<(), String> {
+    let mut jobs = state.jobs.lock_recover();
     let Some(job) = jobs.get(id).map(Arc::clone) else {
         return Err("Unknown queued job".to_string());
     };
@@ -1272,12 +1403,18 @@ pub(crate) fn selective_retry_from_manifest(
                 requested.contains(index)
             } else {
                 matches!(
-                    file.get("status").and_then(|v| v.as_str()).unwrap_or("pending"),
+                    file.get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("pending"),
                     "error" | "skipped"
                 )
             }
         })
-        .filter_map(|(_, file)| file.get("path").and_then(|v| v.as_str()).map(str::to_string))
+        .filter_map(|(_, file)| {
+            file.get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
         .collect::<Vec<_>>();
     if paths.is_empty() {
         return None;
@@ -1289,27 +1426,59 @@ pub(crate) fn selective_retry_from_manifest(
         .unwrap_or(OriginalAction::Recycle);
     let opts = CompressOptions {
         original_action,
-        tag_filename: root.get("tagFilename").and_then(|v| v.as_bool()).unwrap_or(true),
-        concurrency: root.get("concurrency").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-        encoder: root.get("encoder").and_then(|v| v.as_str()).unwrap_or("auto").to_string(),
+        tag_filename: root
+            .get("tagFilename")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        concurrency: root
+            .get("concurrency")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize,
+        encoder: root
+            .get("encoder")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto")
+            .to_string(),
         use_gpu: root.get("useGpu").and_then(|v| v.as_bool()).unwrap_or(true),
-        codec: root.get("codec").and_then(|v| v.as_str()).unwrap_or("h264").to_string(),
-        zip_level: root.get("zipLevel").and_then(|v| v.as_f64()).unwrap_or(-1.0) as i64,
-        min_size_bytes: root.get("minSizeBytes").and_then(|v| v.as_u64()).unwrap_or(0),
-        custom_max_height: root.get("customMaxHeight").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        custom_quality: root.get("customQuality").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        output_dir: root.get("outputDir").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        codec: root
+            .get("codec")
+            .and_then(|v| v.as_str())
+            .unwrap_or("h264")
+            .to_string(),
+        zip_level: root
+            .get("zipLevel")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(-1.0) as i64,
+        min_size_bytes: root
+            .get("minSizeBytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        custom_max_height: root
+            .get("customMaxHeight")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+        custom_quality: root
+            .get("customQuality")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+        output_dir: root
+            .get("outputDir")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
     };
     Some(create_job(
         &paths,
-        root.get("preset").and_then(|v| v.as_str()).unwrap_or("balanced"),
+        root.get("preset")
+            .and_then(|v| v.as_str())
+            .unwrap_or("balanced"),
         &opts,
     ))
 }
 
 /// Restore persisted queued jobs and run one queued batch at a time. Encoder
 /// lane gates still coordinate this scheduler with any manually resumed job.
-pub(crate) fn start_queue_scheduler(state: Arc<AppState>) {
+pub(crate) fn start_queue_scheduler(state: Arc<CompressionRuntimeState>) {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -1317,47 +1486,79 @@ pub(crate) fn start_queue_scheduler(state: Arc<AppState>) {
     if let Ok(entries) = std::fs::read_dir(jobs_dir()) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if !is_safe_job_id(id) {
                 continue;
             }
-            let is_queued = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| crate::json::parse(&text))
-                .and_then(|root| root.get("status").and_then(|v| v.as_str()).map(|s| s == "queued"))
-                .unwrap_or(false);
+            // Status is emitted near the beginning of every FileTree manifest.
+            // Reading the whole file here made startup allocate and parse every
+            // 100+ MB legacy job merely to discover that it was already done.
+            let is_queued = manifest_status_bounded(&path).as_deref() == Some("queued");
             if !is_queued {
                 continue;
             }
             if let Some(job) = job_from_manifest(id) {
                 *job.status.lock_recover() = "queued".to_string();
                 job.active_started_at.store(0, Ordering::Relaxed);
-                state.compress_jobs.lock_recover().entry(id.to_string()).or_insert(job);
+                state
+                    .jobs
+                    .lock_recover()
+                    .entry(id.to_string())
+                    .or_insert(job);
             }
         }
     }
-    std::thread::spawn(move || loop {
-        let next = {
-            let jobs = state.compress_jobs.lock_recover();
-            let blocked = jobs.values().any(|job| {
-                matches!(job.status.lock_recover().as_str(), "running" | "pausing" | "paused")
-                    && !job.finished.load(Ordering::SeqCst)
-            });
-            if blocked {
-                None
-            } else {
-                jobs.values()
-                    .filter(|job| job.status.lock_recover().as_str() == "queued")
-                    .min_by_key(|job| job.queue_rank.load(Ordering::Relaxed))
-                    .map(Arc::clone)
+    std::thread::spawn(move || {
+        loop {
+            let next = {
+                let jobs = state.jobs.lock_recover();
+                let blocked = jobs.values().any(|job| {
+                    matches!(
+                        job.status.lock_recover().as_str(),
+                        "running" | "pausing" | "paused"
+                    ) && !job.finished.load(Ordering::SeqCst)
+                });
+                if blocked {
+                    None
+                } else {
+                    jobs.values()
+                        .filter(|job| job.status.lock_recover().as_str() == "queued")
+                        .min_by_key(|job| job.queue_rank.load(Ordering::Relaxed))
+                        .map(Arc::clone)
+                }
+            };
+            if let Some(job) = next {
+                let _ = resume_job(&job);
+                spawn_job(Arc::clone(&state), job);
             }
-        };
-        if let Some(job) = next {
-            let _ = resume_job(&job);
-            spawn_job(Arc::clone(&state), job);
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
     });
+}
+
+fn manifest_status_bounded(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    Read::take(file, 8 * 1024).read_to_end(&mut bytes).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    manifest_status_from_prefix(text)
+}
+
+fn manifest_status_from_prefix(text: &str) -> Option<String> {
+    let marker = "\"status\"";
+    let tail = text.get(text.find(marker)? + marker.len()..)?;
+    let tail = tail.trim_start();
+    let tail = tail.strip_prefix(':')?.trim_start();
+    let value = tail.strip_prefix('"')?;
+    let end = value.find('"')?;
+    let status = value.get(..end)?;
+    matches!(
+        status,
+        "queued" | "running" | "pausing" | "paused" | "done" | "cancelled" | "error"
+    )
+    .then(|| status.to_string())
 }
 
 /// Safety net invoked only when [`run_job`] itself panicked (an orchestration
@@ -1407,7 +1608,15 @@ fn force_finalize_job(job: &Arc<CompressJob>) {
     *job.status.lock_recover() = status.to_string();
     write_manifest(job);
     let total_saved = job.saved_bytes.load(Ordering::Relaxed);
-    job.emit(ev_done(&job.id, done, error, skipped, verify_failed, job.total, total_saved));
+    job.emit(ev_done(
+        &job.id,
+        done,
+        error,
+        skipped,
+        verify_failed,
+        job.total,
+        total_saved,
+    ));
     job.finished.store(true, Ordering::SeqCst);
     job.events_cv.notify_all();
 }
@@ -1510,7 +1719,7 @@ fn terminal_tallies(job: &CompressJob) -> (usize, usize, usize, usize) {
     (done, error, skipped, verify_failed)
 }
 
-fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
+fn run_job(state: Arc<CompressionRuntimeState>, job: Arc<CompressJob>) {
     job.emit(ev_job_start(&job.id, job.total));
     // Persist the all-pending baseline before the first potentially multi-hour
     // encode. A crash during file one must still leave a resumable job.
@@ -1521,7 +1730,11 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     // run_job's own setup is contained by `spawn_job`'s guard and the job still
     // finalizes with no file left pending. Compiled out of non-test builds.
     #[cfg(test)]
-    if job.files.iter().any(|f| f.path.contains("__FORCE_ORCH_PANIC__")) {
+    if job
+        .files
+        .iter()
+        .any(|f| f.path.contains("__FORCE_ORCH_PANIC__"))
+    {
         panic!("forced orchestration panic for test");
     }
 
@@ -1542,8 +1755,17 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
     if crate::compress_debug::enabled() {
         let mut l = format!(
             "[job_start] job={} preset={} originalAction={} tag={} files={} concurrency={} encoder={} codec={} useGpu={} zipLevel={} minSizeBytes={}",
-            job.id, job.preset, job.original_action.as_str(), job.tag_filename, job.total,
-            job.concurrency, job.encoder, job.codec, job.use_gpu, job.zip_level, job.min_size_bytes
+            job.id,
+            job.preset,
+            job.original_action.as_str(),
+            job.tag_filename,
+            job.total,
+            job.concurrency,
+            job.encoder,
+            job.codec,
+            job.use_gpu,
+            job.zip_level,
+            job.min_size_bytes
         );
         l.push_str(&format!(" handbrake={}", tool_desc(&hb)));
         l.push_str(&format!(" image={}", tool_desc(&img)));
@@ -1554,9 +1776,16 @@ fn run_job(state: Arc<AppState>, job: Arc<CompressJob>) {
         let eff = compress_tools::EffectiveCaps::compute(&caps, hw);
         l.push_str(&format!(
             " gpuCaps=[nvenc:{}/{}/{} qsv:{}/{}/{} vce:{}/{}/{} x265:{}]",
-            caps.nvenc_h264, caps.nvenc_h265, caps.nvenc_av1,
-            caps.qsv_h264, caps.qsv_h265, caps.qsv_av1,
-            caps.vce_h264, caps.vce_h265, caps.vce_av1, caps.x265
+            caps.nvenc_h264,
+            caps.nvenc_h265,
+            caps.nvenc_av1,
+            caps.qsv_h264,
+            caps.qsv_h265,
+            caps.qsv_av1,
+            caps.vce_h264,
+            caps.vce_h265,
+            caps.vce_av1,
+            caps.x265
         ));
         l.push_str(&format!(
             " adapters=[nvidia:{} intel:{} amd:{}] effectiveGpu=[nvenc:{} qsv:{} vce:{}]",
@@ -1805,7 +2034,12 @@ fn record_internal_error(job: &Arc<CompressJob>, i: usize, counts: &Counts, mess
         f.path,
         Reason::ErrorInternal.as_str(),
     ));
-    job.emit(ev_error(i, &f.path, message, Reason::ErrorInternal.as_str()));
+    job.emit(ev_error(
+        i,
+        &f.path,
+        message,
+        Reason::ErrorInternal.as_str(),
+    ));
     checkpoint_manifest(job);
 }
 
@@ -1841,7 +2075,7 @@ fn record_internal_error_guarded(job: &Arc<CompressJob>, i: usize, counts: &Coun
 /// event, manifest checkpoint). Runs on a pool worker thread. Returns `true` when
 /// the worker should stop (the job was cancelled mid-file).
 fn process_and_record(
-    state: &Arc<AppState>,
+    state: &Arc<CompressionRuntimeState>,
     job: &Arc<CompressJob>,
     i: usize,
     hb: &compress_tools::ToolInfo,
@@ -1883,8 +2117,13 @@ fn process_and_record(
 
     // Fallback tool/params for outcomes that never spawned an encoder; the live
     // path overrides these from the genuine encoder via EncodeMeta.
-    let (fallback_tool, fallback_params) =
-        pipeline_params(f.kind, &job.preset, img_kind, job.custom_quality, job.custom_max_height);
+    let (fallback_tool, fallback_params) = pipeline_params(
+        f.kind,
+        &job.preset,
+        img_kind,
+        job.custom_quality,
+        job.custom_max_height,
+    );
     let fallback_version = match f.kind {
         FileKind::Video => hb.version.as_deref().unwrap_or(""),
         FileKind::Image => img.version.as_deref().unwrap_or(""),
@@ -1893,14 +2132,39 @@ fn process_and_record(
 
     let mut stop = false;
     match outcome {
-        FileOutcome::Done { out_path, new_bytes, recycled, disposition, disposition_error, tagged, diag, meta } => {
-            let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
-            let codec_params = if meta.codec_params.is_empty() { fallback_params.clone() } else { meta.codec_params.clone() };
-            let tool_version = if meta.tool_version.is_empty() { fallback_version } else { meta.tool_version.as_str() };
+        FileOutcome::Done {
+            out_path,
+            new_bytes,
+            recycled,
+            disposition,
+            disposition_error,
+            tagged,
+            diag,
+            meta,
+        } => {
+            let tool = if meta.tool.is_empty() {
+                fallback_tool
+            } else {
+                meta.tool.as_str()
+            };
+            let codec_params = if meta.codec_params.is_empty() {
+                fallback_params.clone()
+            } else {
+                meta.codec_params.clone()
+            };
+            let tool_version = if meta.tool_version.is_empty() {
+                fallback_version
+            } else {
+                meta.tool_version.as_str()
+            };
             // A successful encode that followed a failed GPU attempt is recorded
             // as a distinct `gpu_fallback` outcome, carrying the GPU failure detail
             // so it's never a silent CPU run.
-            let reason = if meta.gpu_fallback.is_some() { Reason::GpuFallback } else { Reason::Success };
+            let reason = if meta.gpu_fallback.is_some() {
+                Reason::GpuFallback
+            } else {
+                Reason::Success
+            };
             let fallback_detail = meta.gpu_fallback.clone().unwrap_or_default();
             f.new_bytes.store(new_bytes, Ordering::Relaxed);
             f.recycled.store(recycled, Ordering::Relaxed);
@@ -1950,16 +2214,55 @@ fn process_and_record(
             });
             log_throughput_debug(&job.id, i, orig, new_bytes, duration_ms, meta.fps);
             log_file_debug(
-                &job.id, i, &f.path, kind_str, orig, tool, &diag, &out_path, new_bytes,
-                "compressed", reason.as_str(), duration_ms, recycled,
-                disposition_error.as_deref(), Some(tagged),
+                &job.id,
+                i,
+                &f.path,
+                kind_str,
+                orig,
+                tool,
+                &diag,
+                &out_path,
+                new_bytes,
+                "compressed",
+                reason.as_str(),
+                duration_ms,
+                recycled,
+                disposition_error.as_deref(),
+                Some(tagged),
             );
-            job.emit(ev_file_done(i, &out_path, orig, new_bytes, saved, recycled, disposition, reason.as_str(), "done"));
+            job.emit(ev_file_done(
+                i,
+                &out_path,
+                orig,
+                new_bytes,
+                saved,
+                recycled,
+                disposition,
+                reason.as_str(),
+                "done",
+            ));
         }
-        FileOutcome::Skipped { reason, new_bytes, diag, meta } => {
-            let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
-            let codec_params = if meta.codec_params.is_empty() { fallback_params.clone() } else { meta.codec_params.clone() };
-            let tool_version = if meta.tool_version.is_empty() { fallback_version } else { meta.tool_version.as_str() };
+        FileOutcome::Skipped {
+            reason,
+            new_bytes,
+            diag,
+            meta,
+        } => {
+            let tool = if meta.tool.is_empty() {
+                fallback_tool
+            } else {
+                meta.tool.as_str()
+            };
+            let codec_params = if meta.codec_params.is_empty() {
+                fallback_params.clone()
+            } else {
+                meta.codec_params.clone()
+            };
+            let tool_version = if meta.tool_version.is_empty() {
+                fallback_version
+            } else {
+                meta.tool_version.as_str()
+            };
             f.new_bytes.store(new_bytes, Ordering::Relaxed);
             *f.status.lock_recover() = "skipped".to_string();
             *f.reason.lock_recover() = reason.as_str().to_string();
@@ -1999,15 +2302,55 @@ fn process_and_record(
                 stderr_excerpt: &diag.stderr_tail,
             });
             log_file_debug(
-                &job.id, i, &f.path, kind_str, orig, tool, &diag, "", new_bytes,
-                "skipped", reason.as_str(), duration_ms, false, None, None,
+                &job.id,
+                i,
+                &f.path,
+                kind_str,
+                orig,
+                tool,
+                &diag,
+                "",
+                new_bytes,
+                "skipped",
+                reason.as_str(),
+                duration_ms,
+                false,
+                None,
+                None,
             );
-            job.emit(ev_file_done(i, "", orig, new_bytes, 0, false, "", reason.as_str(), "skipped"));
+            job.emit(ev_file_done(
+                i,
+                "",
+                orig,
+                new_bytes,
+                0,
+                false,
+                "",
+                reason.as_str(),
+                "skipped",
+            ));
         }
-        FileOutcome::Error { reason, message, diag, meta } => {
-            let tool = if meta.tool.is_empty() { fallback_tool } else { meta.tool.as_str() };
-            let codec_params = if meta.codec_params.is_empty() { fallback_params.clone() } else { meta.codec_params.clone() };
-            let tool_version = if meta.tool_version.is_empty() { fallback_version } else { meta.tool_version.as_str() };
+        FileOutcome::Error {
+            reason,
+            message,
+            diag,
+            meta,
+        } => {
+            let tool = if meta.tool.is_empty() {
+                fallback_tool
+            } else {
+                meta.tool.as_str()
+            };
+            let codec_params = if meta.codec_params.is_empty() {
+                fallback_params.clone()
+            } else {
+                meta.codec_params.clone()
+            };
+            let tool_version = if meta.tool_version.is_empty() {
+                fallback_version
+            } else {
+                meta.tool_version.as_str()
+            };
             *f.error.lock_recover() = Some(message.clone());
             *f.status.lock_recover() = "error".to_string();
             *f.reason.lock_recover() = reason.as_str().to_string();
@@ -2049,8 +2392,21 @@ fn process_and_record(
                 stderr_excerpt: &diag.stderr_tail,
             });
             log_file_debug(
-                &job.id, i, &f.path, kind_str, orig, tool, &diag, "", 0,
-                "error", reason.as_str(), duration_ms, false, None, None,
+                &job.id,
+                i,
+                &f.path,
+                kind_str,
+                orig,
+                tool,
+                &diag,
+                "",
+                0,
+                "error",
+                reason.as_str(),
+                duration_ms,
+                false,
+                None,
+                None,
             );
             // Always persist a compact entry for FAILURES (even when verbose debug
             // logging is off): a failing encode is exactly what a user needs the
@@ -2062,10 +2418,20 @@ fn process_and_record(
                     job.id,
                     f.path,
                     reason.as_str(),
-                    diag.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
+                    diag.exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
                     message,
-                    if diag.command.is_empty() { String::new() } else { format!(" cmd={:?}", diag.command) },
-                    if tail.trim().is_empty() { String::new() } else { format!(" stderr_tail={:?}", tail.trim()) },
+                    if diag.command.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" cmd={:?}", diag.command)
+                    },
+                    if tail.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" stderr_tail={:?}", tail.trim())
+                    },
                 ));
             }
             job.emit(ev_error(i, &f.path, &message, reason.as_str()));
@@ -2091,7 +2457,14 @@ fn process_and_record(
 
 /// Per-file throughput line (MB/s + encode fps + wall time) for tuning and
 /// before/after benchmarking. No-op when debug logging is off.
-fn log_throughput_debug(job_id: &str, index: usize, orig: u64, new_bytes: u64, duration_ms: u64, fps: Option<f64>) {
+fn log_throughput_debug(
+    job_id: &str,
+    index: usize,
+    orig: u64,
+    new_bytes: u64,
+    duration_ms: u64,
+    fps: Option<f64>,
+) {
     if !crate::compress_debug::enabled() {
         return;
     }
@@ -2299,8 +2672,18 @@ enum FileOutcome {
     /// Output produced but not smaller than the original (deleted, original kept).
     /// Output not produced or not smaller; `reason` distinguishes a no-gain skip
     /// from a too-small (below threshold) skip. Original untouched.
-    Skipped { reason: Reason, new_bytes: u64, diag: EncodeDiag, meta: EncodeMeta },
-    Error { reason: Reason, message: String, diag: EncodeDiag, meta: EncodeMeta },
+    Skipped {
+        reason: Reason,
+        new_bytes: u64,
+        diag: EncodeDiag,
+        meta: EncodeMeta,
+    },
+    Error {
+        reason: Reason,
+        message: String,
+        diag: EncodeDiag,
+        meta: EncodeMeta,
+    },
     /// Job cancelled mid-encode; partial output deleted, original untouched.
     Cancelled,
 }
@@ -2315,10 +2698,36 @@ fn is_already_compressed_ext(path: &Path) -> bool {
         .unwrap_or_default();
     matches!(
         ext.as_str(),
-        "zip" | "7z" | "rar" | "gz" | "bz2" | "xz" | "zst" | "lz4" | "cab" | "tgz"
-            | "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "heic"
-            | "mp4" | "mkv" | "mov" | "m4v" | "webm" | "m4a" | "aac" | "mp3" | "ogg" | "flac"
-            | "docx" | "xlsx" | "pptx"
+        "zip"
+            | "7z"
+            | "rar"
+            | "gz"
+            | "bz2"
+            | "xz"
+            | "zst"
+            | "lz4"
+            | "cab"
+            | "tgz"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "webp"
+            | "avif"
+            | "heic"
+            | "mp4"
+            | "mkv"
+            | "mov"
+            | "m4v"
+            | "webm"
+            | "m4a"
+            | "aac"
+            | "mp3"
+            | "ogg"
+            | "flac"
+            | "docx"
+            | "xlsx"
+            | "pptx"
     )
 }
 
@@ -2327,7 +2736,11 @@ fn is_already_compressed_ext(path: &Path) -> bool {
 /// does not imply that every source inside it has already been processed.
 fn has_compressed_filename_tag(path: &Path) -> bool {
     path.file_name()
-        .map(|name| name.to_string_lossy().to_ascii_lowercase().contains("[compressed]"))
+        .map(|name| {
+            name.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("[compressed]")
+        })
         .unwrap_or(false)
 }
 
@@ -2393,8 +2806,7 @@ fn media_pre_skip(kind: FileKind, path: &Path, orig: u64) -> Option<&'static str
             const EFFICIENT_IMAGE_CAP: u64 = 2 * 1024 * 1024;
             if orig < IMAGE_MIN_BYTES {
                 Some("image already small")
-            } else if matches!(ext.as_str(), "avif" | "heic" | "webp")
-                && orig < EFFICIENT_IMAGE_CAP
+            } else if matches!(ext.as_str(), "avif" | "heic" | "webp") && orig < EFFICIENT_IMAGE_CAP
             {
                 Some("already an efficient image codec")
             } else {
@@ -2423,7 +2835,7 @@ fn source_modified_ms(path: &Path) -> u64 {
 }
 
 fn process_file(
-    state: &Arc<AppState>,
+    state: &Arc<CompressionRuntimeState>,
     job: &Arc<CompressJob>,
     index: usize,
     hb: &compress_tools::ToolInfo,
@@ -2448,8 +2860,7 @@ fn process_file(
     if !input.is_file() {
         return FileOutcome::Error {
             reason: Reason::ErrorSourceMissing,
-            message: "source no longer exists - may have been recycled by a prior run"
-                .to_string(),
+            message: "source no longer exists - may have been recycled by a prior run".to_string(),
             diag: EncodeDiag::default(),
             meta: EncodeMeta::default(),
         };
@@ -2582,7 +2993,11 @@ fn process_file(
         return FileOutcome::Skipped {
             reason: Reason::SkippedNoGain,
             new_bytes: orig,
-            diag: EncodeDiag { command: "pre-skip (already compressed)".to_string(), exit_code: Some(0), stderr_tail: String::new() },
+            diag: EncodeDiag {
+                command: "pre-skip (already compressed)".to_string(),
+                exit_code: Some(0),
+                stderr_tail: String::new(),
+            },
             meta,
         };
     }
@@ -2594,7 +3009,12 @@ fn process_file(
     // size check would produce) but without the wasted encode.
     if let Some(reason) = media_pre_skip(kind, &input, orig) {
         let mut meta = EncodeMeta::default();
-        meta.tool = if kind == FileKind::Video { "handbrake" } else { "ffmpeg" }.to_string();
+        meta.tool = if kind == FileKind::Video {
+            "handbrake"
+        } else {
+            "ffmpeg"
+        }
+        .to_string();
         meta.tool_version = "pre-skip".to_string();
         meta.codec_params = format!("pre-skip: {reason}");
         return FileOutcome::Skipped {
@@ -2650,8 +3070,9 @@ fn process_file(
             }
             _ => return FileOutcome::Error {
                 reason: Reason::ErrorToolMissing,
-                message: "no image encoder installed - install ffmpeg or ImageMagick to compress images"
-                    .to_string(),
+                message:
+                    "no image encoder installed - install ffmpeg or ImageMagick to compress images"
+                        .to_string(),
                 diag: EncodeDiag::default(),
                 meta: EncodeMeta::default(),
             },
@@ -2676,7 +3097,11 @@ fn process_file(
             return FileOutcome::Error {
                 reason: Reason::ErrorSpawn,
                 message: error,
-                diag: EncodeDiag { command, exit_code: None, stderr_tail: String::new() },
+                diag: EncodeDiag {
+                    command,
+                    exit_code: None,
+                    stderr_tail: String::new(),
+                },
                 meta,
             };
         }
@@ -2727,16 +3152,20 @@ fn process_file(
     if new_bytes >= orig && orig > 0 {
         let _ = std::fs::remove_file(&out);
         if meta.gpu_fallback.is_none()
-            && std::fs::metadata(&input).map(|metadata| metadata.len()).ok() == Some(orig)
+            && std::fs::metadata(&input)
+                .map(|metadata| metadata.len())
+                .ok()
+                == Some(orig)
             && source_modified_ms(&input) == source_modified
         {
-            crate::compress_log::remember_unchanged_no_gain(
-                &input_str,
-                orig,
-                source_modified,
-            );
+            crate::compress_log::remember_unchanged_no_gain(&input_str, orig, source_modified);
         }
-        return FileOutcome::Skipped { reason: Reason::SkippedNoGain, new_bytes, diag, meta };
+        return FileOutcome::Skipped {
+            reason: Reason::SkippedNoGain,
+            new_bytes,
+            diag,
+            meta,
+        };
     }
 
     // Deep-verify gate (HARD): re-decode / CRC-check the produced output BEFORE
@@ -2860,14 +3289,22 @@ fn process_file(
     // The parent directory's tree changed (new file, possibly recycled/deleted
     // original).
     if let Some(parent) = input.parent() {
-        state
-            .scan_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .invalidate(&parent.to_string_lossy());
+        let callback = state.path_changed.lock_recover().clone();
+        if let Some(callback) = callback {
+            callback(parent);
+        }
     }
 
-    FileOutcome::Done { out_path: out_str, new_bytes, recycled, disposition, disposition_error, tagged, diag, meta }
+    FileOutcome::Done {
+        out_path: out_str,
+        new_bytes,
+        recycled,
+        disposition,
+        disposition_error,
+        tagged,
+        diag,
+        meta,
+    }
 }
 
 // ── Deep output verification (the post-encode integrity gate) ─────────────────
@@ -2902,7 +3339,9 @@ fn run_verify_capture(job: &Arc<CompressJob>, index: usize, mut cmd: Command) ->
     use std::io::Read;
     use std::process::Stdio;
     compress_tools::no_window(&mut cmd);
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -2964,8 +3403,12 @@ fn run_verify_capture(job: &Arc<CompressJob>, index: usize, mut cmd: Command) ->
     if let Some(mut c) = job.children.lock_recover().remove(&index) {
         let _ = c.wait();
     }
-    let stdout = out_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
-    let stderr = err_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+    let stdout = out_handle
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = err_handle
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
     let (success, exit_code) = match exit_status {
         Some(st) => (st.success(), st.code()),
         None => (false, None),
@@ -3065,7 +3508,9 @@ fn verify_media(
             if !run.success {
                 return Verify::Failed(format!(
                     "ffmpeg hardware re-decode exited {}: {}",
-                    run.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                    run.exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".into()),
                     safe_tail(run.stderr.trim(), 400)
                 ));
             }
@@ -3137,7 +3582,9 @@ fn verify_image(
             Err(e) if e == "cancelled" => return Verify::Cancelled,
             Err(e) => return Verify::Failed(format!("ImageMagick rejected output: {e}")),
         };
-        let od = magick_identify_dims(job, index, magick, orig).ok().flatten();
+        let od = magick_identify_dims(job, index, magick, orig)
+            .ok()
+            .flatten();
         return match (od, nd) {
             (Some(o), Some(n)) if o != n => Verify::Failed(format!(
                 "output dimensions {}x{} != original {}x{}",
@@ -3148,7 +3595,9 @@ fn verify_image(
     }
     if let Some(ffmpeg) = ff.path.as_ref() {
         let mut cmd = Command::new(ffmpeg);
-        cmd.args(["-v", "error", "-xerror", "-i"]).arg(out).args(["-f", "null", "-"]);
+        cmd.args(["-v", "error", "-xerror", "-i"])
+            .arg(out)
+            .args(["-f", "null", "-"]);
         let run = run_verify_capture(job, index, cmd);
         if run.cancelled {
             return Verify::Cancelled;
@@ -3188,7 +3637,10 @@ fn magick_identify_dims(
     file: &Path,
 ) -> Result<Option<(u64, u64)>, String> {
     let mut cmd = Command::new(magick);
-    cmd.arg("identify").arg("-regard-warnings").args(["-format", "%w %h\\n"]).arg(file);
+    cmd.arg("identify")
+        .arg("-regard-warnings")
+        .args(["-format", "%w %h\\n"])
+        .arg(file);
     let run = run_verify_capture(job, index, cmd);
     if run.cancelled {
         return Err("cancelled".to_string());
@@ -3199,7 +3651,9 @@ fn magick_identify_dims(
     if !run.success {
         return Err(format!(
             "identify exit {}: {}",
-            run.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+            run.exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into()),
             safe_tail(run.stderr.trim(), 300)
         ));
     }
@@ -3245,7 +3699,10 @@ fn probe_duration_secs(
 fn parse_ffmpeg_duration(s: &str) -> Option<f64> {
     let idx = s.find("Duration:")?;
     let rest = s[idx + "Duration:".len()..].trim_start();
-    let token: String = rest.chars().take_while(|c| !c.is_whitespace() && *c != ',').collect();
+    let token: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != ',')
+        .collect();
     if token.starts_with("N/A") {
         return None;
     }
@@ -3291,7 +3748,9 @@ fn parse_dims_pair(s: &str) -> Option<(u64, u64)> {
 /// Count HandBrake `--scan` titles from its log output (one `+ title N:` header
 /// per detected title).
 fn handbrake_scan_title_count(s: &str) -> usize {
-    s.lines().filter(|l| l.trim_start().starts_with("+ title ")).count()
+    s.lines()
+        .filter(|l| l.trim_start().starts_with("+ title "))
+        .count()
 }
 
 /// Return at most the last `max` bytes of `s`, snapped UP to the nearest UTF-8
@@ -3587,7 +4046,11 @@ fn run_handbrake(
     // A claimed worker can still wait behind another job's global GPU sessions.
     // Show that honestly instead of presenting a frozen 0% "Encoding" row.
     *job.files[index].stage.lock_recover() = "waiting_gpu".to_string();
-    job.emit(ev_progress(job, index, job.files[index].pct.load(Ordering::Relaxed)));
+    job.emit(ev_progress(
+        job,
+        index,
+        job.files[index].pct.load(Ordering::Relaxed),
+    ));
 
     // Acquire the hardware session permit. Cancelled while queued => no work.
     let _permit = match acquire_compress(enc.lane, &job.cancel) {
@@ -3595,7 +4058,11 @@ fn run_handbrake(
         None => return EncodeResult::Cancelled,
     };
     *job.files[index].stage.lock_recover() = "encoding".to_string();
-    job.emit(ev_progress(job, index, job.files[index].pct.load(Ordering::Relaxed)));
+    job.emit(ev_progress(
+        job,
+        index,
+        job.files[index].pct.load(Ordering::Relaxed),
+    ));
 
     let args = build_handbrake_args(input, out, &enc.hb, &quality, enc_preset, max_height);
     let mut cmd = Command::new(hb);
@@ -3671,7 +4138,13 @@ fn run_magick_image(
 /// Lossless zip pipeline for non-media files (built-in, no external tool). Runs
 /// inline (no child), so cancellation is observed between files rather than
 /// mid-zip. `level` is the Deflate level (0 stores). Acquires the zip lane.
-fn run_zip(job: &Arc<CompressJob>, index: usize, input: &Path, out: &Path, level: i64) -> EncodeResult {
+fn run_zip(
+    job: &Arc<CompressJob>,
+    index: usize,
+    input: &Path,
+    out: &Path,
+    level: i64,
+) -> EncodeResult {
     let _permit = match acquire_compress(CompressLane::Zip, &job.cancel) {
         Some(p) => p,
         None => return EncodeResult::Cancelled,
@@ -3679,14 +4152,22 @@ fn run_zip(job: &Arc<CompressJob>, index: usize, input: &Path, out: &Path, level
     let f = &job.files[index];
     f.pct.store(10, Ordering::Relaxed);
     job.emit(ev_progress(job, index, 10));
-    let command = format!("zip (deflate level={level}, built-in) {} -> {}", input.display(), out.display());
+    let command = format!(
+        "zip (deflate level={level}, built-in) {} -> {}",
+        input.display(),
+        out.display()
+    );
     match crate::archive::compress_with_level(&[input.to_string_lossy().into_owned()], out, level) {
         Ok(()) => {
             f.pct.store(100, Ordering::Relaxed);
             job.emit(ev_progress(job, index, 100));
             EncodeResult::Done {
                 success: true,
-                diag: EncodeDiag { command, exit_code: Some(0), stderr_tail: String::new() },
+                diag: EncodeDiag {
+                    command,
+                    exit_code: Some(0),
+                    stderr_tail: String::new(),
+                },
                 fps: None,
             }
         }
@@ -3755,7 +4236,9 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     job.files[index]
         .updated_at
         .store(crate::io::now_ms(), Ordering::Relaxed);
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -3871,7 +4354,11 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
         };
         return EncodeResult::Done {
             success: false,
-            diag: EncodeDiag { command, exit_code: None, stderr_tail },
+            diag: EncodeDiag {
+                command,
+                exit_code: None,
+                stderr_tail,
+            },
             fps,
         };
     }
@@ -3881,7 +4368,11 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     };
     EncodeResult::Done {
         success,
-        diag: EncodeDiag { command, exit_code, stderr_tail },
+        diag: EncodeDiag {
+            command,
+            exit_code,
+            stderr_tail,
+        },
         fps,
     }
 }
@@ -3959,7 +4450,9 @@ fn read_progress<R: std::io::Read>(
                 }
                 if let Some(f) = parse_fps(&line) {
                     last_fps = Some(f);
-                    job.files[index].fps_bits.store(f.to_bits(), Ordering::Relaxed);
+                    job.files[index]
+                        .fps_bits
+                        .store(f.to_bits(), Ordering::Relaxed);
                 }
                 commit(&line, &mut tail, &mut tail_bytes);
                 line.clear();
@@ -3987,7 +4480,10 @@ fn parse_fps(line: &str) -> Option<f64> {
     let pos = lower.find("fps")?;
     // ffmpeg style: `fps=NN`
     if let Some(eq) = lower[pos..].strip_prefix("fps=") {
-        let num: String = eq.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        let num: String = eq
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
         return num.parse::<f64>().ok();
     }
     // HandBrake style: a number preceding `fps`. Scan backwards from `pos`.
@@ -4054,7 +4550,11 @@ fn add_compressed_tag(path: &str) {
 
     let text = crate::tags::load_tags_json();
     let items = crate::json::parse(&text)
-        .and_then(|v| v.get("items").and_then(|a| a.as_array()).map(|a| a.to_vec()))
+        .and_then(|v| {
+            v.get("items")
+                .and_then(|a| a.as_array())
+                .map(|a| a.to_vec())
+        })
         .unwrap_or_default();
 
     let mut out: Vec<(String, Vec<String>, Option<String>)> = Vec::new();
@@ -4067,9 +4567,16 @@ fn add_compressed_tag(path: &str) {
         let mut tags: Vec<String> = it
             .get("tags")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
-        let color = it.get("color").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let color = it
+            .get("color")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         if paths_eq(p, path) {
             found = true;
             if !tags.iter().any(|t| t == "COMPRESSED") {
@@ -4108,7 +4615,8 @@ fn add_compressed_tag(path: &str) {
 }
 
 fn paths_eq(a: &str, b: &str) -> bool {
-    a.replace('\\', "/").eq_ignore_ascii_case(&b.replace('\\', "/"))
+    a.replace('\\', "/")
+        .eq_ignore_ascii_case(&b.replace('\\', "/"))
 }
 
 // ── Manifest + JSON serialization ────────────────────────────────────────────
@@ -4147,8 +4655,35 @@ fn write_manifest(job: &CompressJob) {
     // Serialize concurrent rewrites (multiple files finish in parallel) so the
     // manifest can never be torn; recover a poisoned lock — it guards only I/O.
     let _guard = job.manifest_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = std::fs::create_dir_all(jobs_dir());
-    let mut s = String::with_capacity(256 + job.files.len() * 96);
+    match write_manifest_stream(job) {
+        Ok(()) => job
+            .manifest_last_write_ms
+            .store(crate::io::now_ms(), Ordering::Relaxed),
+        Err(error) => {
+            job.manifest_dirty.fetch_add(1, Ordering::Relaxed);
+            let _ = std::fs::remove_file(manifest_temp_path(&job.manifest_path));
+            crate::compress_debug::log_force(&format!(
+                "[manifest_error] job={} path={:?} error={error}",
+                job.id, job.manifest_path
+            ));
+        }
+    }
+}
+
+/// Stream a resumable legacy manifest through a fixed-size buffer. Large jobs
+/// used to allocate the complete 70+ MB JSON document for every checkpoint,
+/// briefly doubling the scheduler's memory. SQLite remains the v2 monitor store,
+/// while this compact streaming path preserves crash recovery compatibility.
+fn write_manifest_stream(job: &CompressJob) -> io::Result<()> {
+    std::fs::create_dir_all(jobs_dir())?;
+    let temp_path = manifest_temp_path(&job.manifest_path);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp_path)?;
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    let mut s = String::with_capacity(2 * 1024);
     s.push_str("{\"id\":");
     push_json_string(&mut s, &job.id);
     s.push_str(",\"status\":");
@@ -4160,7 +4695,11 @@ fn write_manifest(job: &CompressJob) {
     // Keep the legacy boolean too so a downgraded/older reader still honors the
     // recoverable-vs-destroy intent (Delete maps to recycle=false there).
     s.push_str(",\"recycleOriginals\":");
-    s.push_str(if matches!(job.original_action, OriginalAction::Recycle) { "true" } else { "false" });
+    s.push_str(if matches!(job.original_action, OriginalAction::Recycle) {
+        "true"
+    } else {
+        "false"
+    });
     s.push_str(",\"tagFilename\":");
     s.push_str(if job.tag_filename { "true" } else { "false" });
     s.push_str(",\"concurrency\":");
@@ -4190,33 +4729,81 @@ fn write_manifest(job: &CompressJob) {
     s.push_str(",\"savedBytes\":");
     s.push_str(&job.saved_bytes.load(Ordering::Relaxed).to_string());
     s.push_str(",\"queueOrder\":[");
-    for (i, index) in job.queue.lock_recover().pending.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
+    writer.write_all(s.as_bytes())?;
+    {
+        let queue = job.queue.lock_recover();
+        for (i, index) in queue.pending.iter().enumerate() {
+            if i > 0 {
+                writer.write_all(b",")?;
+            }
+            write!(writer, "{index}")?;
         }
-        s.push_str(&index.to_string());
     }
-    s.push(']');
-    s.push_str(",\"files\":[");
+    writer.write_all(b"],\"files\":[")?;
+    s.clear();
     for (i, f) in job.files.iter().enumerate() {
         if i > 0 {
-            s.push(',');
+            writer.write_all(b",")?;
         }
         push_file_json(&mut s, f);
+        writer.write_all(s.as_bytes())?;
+        s.clear();
     }
-    s.push_str("]}");
-    match std::fs::write(&job.manifest_path, s) {
-        Ok(()) => job
-            .manifest_last_write_ms
-            .store(crate::io::now_ms(), Ordering::Relaxed),
-        Err(error) => {
-            job.manifest_dirty.fetch_add(1, Ordering::Relaxed);
-            crate::compress_debug::log_force(&format!(
-                "[manifest_error] job={} path={:?} error={error}",
-                job.id, job.manifest_path
-            ));
-        }
+    writer.write_all(b"]}")?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    replace_manifest_file(&temp_path, &job.manifest_path)
+}
+
+fn manifest_temp_path(path: &Path) -> PathBuf {
+    let mut temp = path.to_path_buf();
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("compression-job.json");
+    temp.set_file_name(format!("{name}.tmp"));
+    temp
+}
+
+#[cfg(windows)]
+fn replace_manifest_file(temp: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     }
+
+    let existing = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replacement = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            replacement.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_manifest_file(temp: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::rename(temp, destination)
 }
 
 fn push_file_json(s: &mut String, f: &FileState) {
@@ -4235,7 +4822,11 @@ fn push_file_json(s: &mut String, f: &FileState) {
     s.push_str(",\"newBytes\":");
     s.push_str(&f.new_bytes.load(Ordering::Relaxed).to_string());
     s.push_str(",\"recycled\":");
-    s.push_str(if f.recycled.load(Ordering::Relaxed) { "true" } else { "false" });
+    s.push_str(if f.recycled.load(Ordering::Relaxed) {
+        "true"
+    } else {
+        "false"
+    });
     s.push_str(",\"disposition\":");
     push_json_string(s, &f.disposition.lock_recover());
     s.push_str(",\"outPath\":");
@@ -4266,7 +4857,9 @@ fn push_file_json(s: &mut String, f: &FileState) {
     s.push_str(",\"processingRate\":");
     let started = f.started_at.load(Ordering::Relaxed);
     let elapsed = if f.finished_at.load(Ordering::Relaxed) > started && started > 0 {
-        f.finished_at.load(Ordering::Relaxed).saturating_sub(started)
+        f.finished_at
+            .load(Ordering::Relaxed)
+            .saturating_sub(started)
     } else if started > 0 {
         crate::io::now_ms().saturating_sub(started)
     } else {
@@ -4275,8 +4868,13 @@ fn push_file_json(s: &mut String, f: &FileState) {
     if elapsed == 0 {
         s.push_str("null");
     } else {
-        let completed = orig.saturating_mul(f.pct.load(Ordering::Relaxed)).saturating_div(100);
-        s.push_str(&format!("{:.2}", completed as f64 * 1000.0 / elapsed as f64));
+        let completed = orig
+            .saturating_mul(f.pct.load(Ordering::Relaxed))
+            .saturating_div(100);
+        s.push_str(&format!(
+            "{:.2}",
+            completed as f64 * 1000.0 / elapsed as f64
+        ));
     }
     s.push_str(",\"outputBytes\":");
     s.push_str(&newb.to_string());
@@ -4358,8 +4956,8 @@ pub(crate) fn job_full_json(job: &CompressJob) -> String {
         "finalizing",
         "terminal",
     ]
-        .iter()
-        .enumerate()
+    .iter()
+    .enumerate()
     {
         if i > 0 {
             s.push(',');
@@ -4398,7 +4996,10 @@ pub(crate) fn job_full_json_from_manifest(id: &str) -> Option<String> {
     let path = jobs_dir().join(format!("{id}.json"));
     let text = std::fs::read_to_string(&path).ok()?;
     let root = crate::json::parse(&text)?;
-    let status = root.get("status").and_then(|v| v.as_str()).unwrap_or("error");
+    let status = root
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("error");
     let saved = root.get("savedBytes").and_then(|v| v.as_u64()).unwrap_or(0);
     let files = root.get("files").and_then(|v| v.as_array());
     let total = root
@@ -4427,7 +5028,10 @@ pub(crate) fn job_full_json_from_manifest(id: &str) -> Option<String> {
             let idx = f.get("index").and_then(|v| v.as_u64()).unwrap_or(i as u64);
             let path = f.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let kind = f.get("kind").and_then(|v| v.as_str()).unwrap_or("other");
-            let fstatus = f.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+            let fstatus = f
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pending");
             let pct = f.get("pct").and_then(|v| v.as_u64()).unwrap_or(0);
             let orig = f.get("origBytes").and_then(|v| v.as_u64()).unwrap_or(0);
             let newb = f.get("newBytes").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -4550,35 +5154,97 @@ impl FilePageItem {
     }
 
     fn from_manifest(value: &crate::json::JsonValue, fallback_index: usize) -> Self {
-        let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+        let status = value
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending");
         FilePageItem {
-            index: value.get("index").and_then(|v| v.as_u64()).unwrap_or(fallback_index as u64) as usize,
-            path: value.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            kind: value.get("kind").and_then(|v| v.as_str()).unwrap_or("other").to_string(),
+            index: value
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(fallback_index as u64) as usize,
+            path: value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            kind: value
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("other")
+                .to_string(),
             status: status.to_string(),
             stage: value
                 .get("stage")
                 .and_then(|v| v.as_str())
-                .unwrap_or(if matches!(status, "done" | "error" | "skipped") { "terminal" } else { "queued" })
+                .unwrap_or(if matches!(status, "done" | "error" | "skipped") {
+                    "terminal"
+                } else {
+                    "queued"
+                })
                 .to_string(),
-            pct: value.get("pct").and_then(|v| v.as_u64()).unwrap_or(if status == "done" { 100 } else { 0 }),
+            pct: value
+                .get("pct")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if status == "done" { 100 } else { 0 }),
             orig_bytes: value.get("origBytes").and_then(|v| v.as_u64()).unwrap_or(0),
             new_bytes: value.get("newBytes").and_then(|v| v.as_u64()).unwrap_or(0),
-            reason: value.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            encoder: value.get("encoder").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            disposition: value.get("disposition").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            out_path: value.get("outPath").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            error: value.get("error").and_then(|v| v.as_str()).map(str::to_string),
-            duration_ms: value.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0),
+            reason: value
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            encoder: value
+                .get("encoder")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            disposition: value
+                .get("disposition")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            out_path: value
+                .get("outPath")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            error: value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            duration_ms: value
+                .get("durationMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
             fps: value.get("fps").and_then(|v| v.as_f64()),
             started_at: value.get("startedAt").and_then(|v| v.as_u64()).unwrap_or(0),
             updated_at: value.get("updatedAt").and_then(|v| v.as_u64()).unwrap_or(0),
-            finished_at: value.get("finishedAt").and_then(|v| v.as_u64()).unwrap_or(0),
+            finished_at: value
+                .get("finishedAt")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
             attempt: value.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            tool: value.get("tool").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            tool_version: value.get("toolVersion").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            command: value.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            stderr: value.get("stderr").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            tool: value
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            tool_version: value
+                .get("toolVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            command: value
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            stderr: value
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             queue_position: None,
         }
     }
@@ -4618,10 +5284,16 @@ fn page_item_matches(file: &FilePageItem, query: &JobFilesQuery, now: u64) -> bo
     (search.is_empty()
         || file.path.to_ascii_lowercase().contains(&search)
         || file.reason.to_ascii_lowercase().contains(&search)
-        || file.error.as_deref().unwrap_or("").to_ascii_lowercase().contains(&search))
+        || file
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains(&search))
         && csv_filter(&file.status, &query.status)
         && csv_filter(&file.kind, &query.kind)
-        && (encoder_filter.is_empty() || file.encoder.to_ascii_lowercase().contains(&encoder_filter))
+        && (encoder_filter.is_empty()
+            || file.encoder.to_ascii_lowercase().contains(&encoder_filter))
         && csv_filter(&file.reason, &query.outcome)
         && csv_filter(&file.disposition, &query.disposition)
         && (path_filter.is_empty() || file.path.to_ascii_lowercase().contains(&path_filter))
@@ -4638,27 +5310,51 @@ fn activity_rank(file: &FilePageItem, now: u64) -> u8 {
     }
 }
 
-fn compare_page_items(a: &FilePageItem, b: &FilePageItem, query: &JobFilesQuery, now: u64) -> std::cmp::Ordering {
+fn compare_page_items(
+    a: &FilePageItem,
+    b: &FilePageItem,
+    query: &JobFilesQuery,
+    now: u64,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering as Cmp;
     let rank = activity_rank(a, now).cmp(&activity_rank(b, now));
     if rank != Cmp::Equal {
         return rank;
     }
     let cmp = match query.sort.as_str() {
-        "queue" => a.queue_position.unwrap_or(usize::MAX).cmp(&b.queue_position.unwrap_or(usize::MAX)),
-        "name" => file_name_of(&a.path).to_ascii_lowercase().cmp(&file_name_of(&b.path).to_ascii_lowercase()),
+        "queue" => a
+            .queue_position
+            .unwrap_or(usize::MAX)
+            .cmp(&b.queue_position.unwrap_or(usize::MAX)),
+        "name" => file_name_of(&a.path)
+            .to_ascii_lowercase()
+            .cmp(&file_name_of(&b.path).to_ascii_lowercase()),
         "size" => a.orig_bytes.cmp(&b.orig_bytes),
         "progress" => a.pct.cmp(&b.pct),
         "elapsed" => a.elapsed_ms(now).cmp(&b.elapsed_ms(now)),
         "eta" => {
             let ae = a.elapsed_ms(now);
             let be = b.elapsed_ms(now);
-            let av = if a.pct > 0 { ae.saturating_mul(100 - a.pct) / a.pct } else { u64::MAX };
-            let bv = if b.pct > 0 { be.saturating_mul(100 - b.pct) / b.pct } else { u64::MAX };
+            let av = if a.pct > 0 {
+                ae.saturating_mul(100 - a.pct) / a.pct
+            } else {
+                u64::MAX
+            };
+            let bv = if b.pct > 0 {
+                be.saturating_mul(100 - b.pct) / b.pct
+            } else {
+                u64::MAX
+            };
             av.cmp(&bv)
         }
-        "speed" => a.processing_rate(now).unwrap_or(0.0).total_cmp(&b.processing_rate(now).unwrap_or(0.0)),
-        "savings" => a.orig_bytes.saturating_sub(a.new_bytes).cmp(&b.orig_bytes.saturating_sub(b.new_bytes)),
+        "speed" => a
+            .processing_rate(now)
+            .unwrap_or(0.0)
+            .total_cmp(&b.processing_rate(now).unwrap_or(0.0)),
+        "savings" => a
+            .orig_bytes
+            .saturating_sub(a.new_bytes)
+            .cmp(&b.orig_bytes.saturating_sub(b.new_bytes)),
         "result" => a.reason.cmp(&b.reason),
         "start" => a.started_at.cmp(&b.started_at),
         "finish" => a.finished_at.cmp(&b.finished_at),
@@ -4668,11 +5364,17 @@ fn compare_page_items(a: &FilePageItem, b: &FilePageItem, query: &JobFilesQuery,
             } else if activity_rank(a, now) == 1 {
                 b.finished_at.cmp(&a.finished_at)
             } else {
-                a.queue_position.unwrap_or(a.index).cmp(&b.queue_position.unwrap_or(b.index))
+                a.queue_position
+                    .unwrap_or(a.index)
+                    .cmp(&b.queue_position.unwrap_or(b.index))
             }
         }
     };
-    if query.direction.eq_ignore_ascii_case("desc") { cmp.reverse() } else { cmp }
+    if query.direction.eq_ignore_ascii_case("desc") {
+        cmp.reverse()
+    } else {
+        cmp
+    }
 }
 
 fn push_page_item_json(out: &mut String, file: &FilePageItem, now: u64) {
@@ -4788,11 +5490,38 @@ pub(crate) fn job_files_page_json(
     }
     out.push_str("],\"facets\":{");
     for (facet_index, (name, values)) in [
-        ("status", items.iter().map(|f| f.status.as_str()).collect::<Vec<_>>()),
-        ("type", items.iter().map(|f| f.kind.as_str()).collect::<Vec<_>>()),
-        ("encoder", items.iter().map(|f| f.encoder.as_str()).filter(|v| !v.is_empty()).collect::<Vec<_>>()),
-        ("outcome", items.iter().map(|f| f.reason.as_str()).filter(|v| !v.is_empty()).collect::<Vec<_>>()),
-        ("disposition", items.iter().map(|f| f.disposition.as_str()).filter(|v| !v.is_empty()).collect::<Vec<_>>()),
+        (
+            "status",
+            items.iter().map(|f| f.status.as_str()).collect::<Vec<_>>(),
+        ),
+        (
+            "type",
+            items.iter().map(|f| f.kind.as_str()).collect::<Vec<_>>(),
+        ),
+        (
+            "encoder",
+            items
+                .iter()
+                .map(|f| f.encoder.as_str())
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "outcome",
+            items
+                .iter()
+                .map(|f| f.reason.as_str())
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "disposition",
+            items
+                .iter()
+                .map(|f| f.disposition.as_str())
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>(),
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -4865,7 +5594,10 @@ struct JobSummary {
 
 /// Job ids are `<unixMs>-<counter>`; the prefix is the creation time.
 fn created_at_from_id(id: &str) -> u64 {
-    id.split('-').next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
+    id.split('-')
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Manifest file's last-modified time in epoch ms (0 when unavailable). Doubles
@@ -4880,7 +5612,9 @@ fn manifest_mtime_ms(path: &Path) -> u64 {
 }
 
 fn manifest_signature(path: &Path) -> (u64, u64) {
-    let Ok(metadata) = std::fs::metadata(path) else { return (0, 0) };
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return (0, 0);
+    };
     let modified = metadata
         .modified()
         .ok()
@@ -4905,7 +5639,11 @@ fn normalize_persisted_status(status: &str) -> String {
 fn summary_from_cached_value(id: &str, value: &crate::json::JsonValue) -> JobSummary {
     let number = |key: &str| value.get(key).and_then(|item| item.as_u64()).unwrap_or(0);
     let string = |key: &str, fallback: &str| {
-        value.get(key).and_then(|item| item.as_str()).unwrap_or(fallback).to_string()
+        value
+            .get(key)
+            .and_then(|item| item.as_str())
+            .unwrap_or(fallback)
+            .to_string()
     };
     let total = number("total") as usize;
     let done = number("done") as usize;
@@ -4938,7 +5676,10 @@ fn summary_from_cached_value(id: &str, value: &crate::json::JsonValue) -> JobSum
         concurrency: number("concurrency").clamp(1, MAX_COMPRESSION_WORKERS as u64) as usize,
         encoder: string("encoder", "auto"),
         codec: string("codec", "h264"),
-        use_gpu: value.get("useGpu").and_then(|item| item.as_bool()).unwrap_or(true),
+        use_gpu: value
+            .get("useGpu")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(true),
         original_action: string("originalAction", "recycle"),
         output_dir: string("outputDir", ""),
         queue_rank: value
@@ -4961,7 +5702,10 @@ fn summary_from_cached_value(id: &str, value: &crate::json::JsonValue) -> JobSum
 fn load_summary_sidecar(id: &str, manifest: &Path, signature: (u64, u64)) -> Option<JobSummary> {
     let text = std::fs::read_to_string(summary_sidecar_path(manifest)).ok()?;
     let root = crate::json::parse(&text)?;
-    if root.get("sourceModifiedMs").and_then(|value| value.as_u64()) != Some(signature.0)
+    if root
+        .get("sourceModifiedMs")
+        .and_then(|value| value.as_u64())
+        != Some(signature.0)
         || root.get("sourceLength").and_then(|value| value.as_u64()) != Some(signature.1)
     {
         return None;
@@ -5009,7 +5753,9 @@ fn summary_from_live(job: &CompressJob) -> JobSummary {
             }
             "running" => {
                 active_count += 1;
-                let active_work = orig.saturating_mul(f.pct.load(Ordering::Relaxed)).saturating_div(100);
+                let active_work = orig
+                    .saturating_mul(f.pct.load(Ordering::Relaxed))
+                    .saturating_div(100);
                 active_work_bytes = active_work_bytes.saturating_add(active_work);
                 work_completed_bytes = work_completed_bytes.saturating_add(active_work);
             }
@@ -5068,16 +5814,25 @@ fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
         }
     }
     if let Some(summary) = load_summary_sidecar(id, path, signature) {
-        cache
-            .lock_recover()
-            .insert(path.to_path_buf(), (signature.0, signature.1, summary.clone()));
+        cache.lock_recover().insert(
+            path.to_path_buf(),
+            (signature.0, signature.1, summary.clone()),
+        );
         return Some(summary);
     }
 
     let text = std::fs::read_to_string(path).ok()?;
     let root = crate::json::parse(&text)?;
-    let status = normalize_persisted_status(root.get("status").and_then(|v| v.as_str()).unwrap_or("error"));
-    let preset = root.get("preset").and_then(|v| v.as_str()).unwrap_or("balanced").to_string();
+    let status = normalize_persisted_status(
+        root.get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error"),
+    );
+    let preset = root
+        .get("preset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("balanced")
+        .to_string();
     let saved_bytes = root.get("savedBytes").and_then(|v| v.as_u64()).unwrap_or(0);
     let files = root.get("files").and_then(|v| v.as_array());
     let total = root
@@ -5093,7 +5848,11 @@ fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
         for f in files {
             let orig = f.get("origBytes").and_then(|v| v.as_u64()).unwrap_or(0);
             total_bytes = total_bytes.saturating_add(orig);
-            match f.get("status").and_then(|v| v.as_str()).unwrap_or("pending") {
+            match f
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pending")
+            {
                 "done" => {
                     done += 1;
                     work_completed_bytes = work_completed_bytes.saturating_add(orig);
@@ -5103,7 +5862,9 @@ fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
                     errors += 1;
                     work_completed_bytes = work_completed_bytes.saturating_add(orig);
                     failed_bytes = failed_bytes.saturating_add(orig);
-                    if f.get("reason").and_then(|v| v.as_str()) == Some(Reason::ErrorVerifyFailed.as_str()) {
+                    if f.get("reason").and_then(|v| v.as_str())
+                        == Some(Reason::ErrorVerifyFailed.as_str())
+                    {
                         verify_failed += 1;
                     }
                 }
@@ -5152,15 +5913,27 @@ fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
             .and_then(|v| v.as_u64())
             .unwrap_or(MAX_COMPRESSION_WORKERS as u64) as usize)
             .clamp(1, MAX_COMPRESSION_WORKERS),
-        encoder: root.get("encoder").and_then(|v| v.as_str()).unwrap_or("auto").to_string(),
-        codec: root.get("codec").and_then(|v| v.as_str()).unwrap_or("h264").to_string(),
+        encoder: root
+            .get("encoder")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto")
+            .to_string(),
+        codec: root
+            .get("codec")
+            .and_then(|v| v.as_str())
+            .unwrap_or("h264")
+            .to_string(),
         use_gpu: root.get("useGpu").and_then(|v| v.as_bool()).unwrap_or(true),
         original_action: root
             .get("originalAction")
             .and_then(|v| v.as_str())
             .unwrap_or("recycle")
             .to_string(),
-        output_dir: root.get("outputDir").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        output_dir: root
+            .get("outputDir")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         queue_rank: root
             .get("queueRank")
             .and_then(|v| v.as_u64())
@@ -5173,9 +5946,10 @@ fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
         resumable: remaining > 0,
     };
     write_summary_sidecar(path, signature, &summary);
-    cache
-        .lock_recover()
-        .insert(path.to_path_buf(), (signature.0, signature.1, summary.clone()));
+    cache.lock_recover().insert(
+        path.to_path_buf(),
+        (signature.0, signature.1, summary.clone()),
+    );
     Some(summary)
 }
 
@@ -5245,11 +6019,11 @@ fn push_summary_json(s: &mut String, j: &JobSummary) {
 /// (authoritative for jobs running in this process) merged with on-disk
 /// manifests under `%APPDATA%\FileTree\jobs\` (so jobs left over from a previous
 /// session show up as interrupted/resumable). Newest first.
-pub(crate) fn list_jobs_json(state: &AppState) -> String {
+pub(crate) fn list_jobs_json(state: &CompressionRuntimeState) -> String {
     let mut summaries: Vec<JobSummary> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     {
-        let jobs = state.compress_jobs.lock_recover();
+        let jobs = state.jobs.lock_recover();
         for job in jobs.values() {
             seen.insert(job.id.clone());
             summaries.push(summary_from_live(job));
@@ -5261,7 +6035,9 @@ pub(crate) fn list_jobs_json(state: &AppState) -> String {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if !is_safe_job_id(stem) || seen.contains(stem) {
                 continue;
             }
@@ -5290,7 +6066,10 @@ pub(crate) fn list_jobs_json(state: &AppState) -> String {
     body
 }
 
-pub(crate) fn compress_telemetry_json(state: &AppState, selected_id: &str) -> String {
+pub(crate) fn compress_telemetry_json(
+    state: &CompressionRuntimeState,
+    selected_id: &str,
+) -> String {
     static CACHE: Mutex<Option<(u64, String, String)>> = Mutex::new(None);
     let now = crate::io::now_ms();
     if let Some((sampled, id, json)) = CACHE.lock_recover().as_ref() {
@@ -5299,11 +6078,7 @@ pub(crate) fn compress_telemetry_json(state: &AppState, selected_id: &str) -> St
         }
     }
 
-    let selected = state
-        .compress_jobs
-        .lock_recover()
-        .get(selected_id)
-        .map(Arc::clone);
+    let selected = state.jobs.lock_recover().get(selected_id).map(Arc::clone);
     let (fallback_sessions, live_fps, destination_drive, child_pids) = selected
         .as_ref()
         .map(|job| {
@@ -5367,10 +6142,12 @@ pub(crate) fn compress_telemetry_json(state: &AppState, selected_id: &str) -> St
                     nvidia_fps = Some(nvidia_fps.unwrap_or(0.0_f64) + value);
                 }
                 if let Some(value) = parse(3) {
-                    gpu_memory_used = Some(gpu_memory_used.unwrap_or(0.0_f64) + value * 1024.0 * 1024.0);
+                    gpu_memory_used =
+                        Some(gpu_memory_used.unwrap_or(0.0_f64) + value * 1024.0 * 1024.0);
                 }
                 if let Some(value) = parse(4) {
-                    gpu_memory_total = Some(gpu_memory_total.unwrap_or(0.0_f64) + value * 1024.0 * 1024.0);
+                    gpu_memory_total =
+                        Some(gpu_memory_total.unwrap_or(0.0_f64) + value * 1024.0 * 1024.0);
                 }
             }
         }
@@ -5811,9 +6588,15 @@ mod encoder_tests {
         assert_eq!(hardware_decoder_for_encoder("qsv_h265"), Some("qsv"));
         assert_eq!(hardware_decoder_for_encoder("vce_h264"), None);
         assert_eq!(hardware_decoder_for_encoder("x264"), None);
-        assert_eq!(ffmpeg_hwaccel_for_encoder("nvenc_h264"), Some(("cuda", "cuda")));
+        assert_eq!(
+            ffmpeg_hwaccel_for_encoder("nvenc_h264"),
+            Some(("cuda", "cuda"))
+        );
         assert_eq!(ffmpeg_hwaccel_for_encoder("qsv_h265"), Some(("qsv", "qsv")));
-        assert_eq!(ffmpeg_hwaccel_for_encoder("vce_h264"), Some(("d3d11va", "d3d11")));
+        assert_eq!(
+            ffmpeg_hwaccel_for_encoder("vce_h264"),
+            Some(("d3d11va", "d3d11"))
+        );
         assert_eq!(ffmpeg_hwaccel_for_encoder("x264"), None);
     }
 
@@ -5884,7 +6667,11 @@ mod encoder_tests {
 
     #[test]
     fn progress_events_report_waiting_and_finalizing_stages() {
-        let job = create_job(&["video.mp4".to_string()], "balanced", &CompressOptions::default());
+        let job = create_job(
+            &["video.mp4".to_string()],
+            "balanced",
+            &CompressOptions::default(),
+        );
         *job.files[0].stage.lock_recover() = "waiting_gpu".to_string();
         assert!(ev_progress(&job, 0, 0).contains("\"stage\":\"waiting_gpu\""));
         *job.files[0].stage.lock_recover() = "finalizing".to_string();
@@ -5898,13 +6685,20 @@ mod encoder_tests {
             Some(42.53)
         );
         assert_eq!(parse_percent("Scanning title 1 of 1, 100.00 %"), None);
-        assert_eq!(parse_percent("libhb: scan thread found 1 valid title(s)"), None);
+        assert_eq!(
+            parse_percent("libhb: scan thread found 1 valid title(s)"),
+            None
+        );
     }
 
     #[cfg(windows)]
     #[test]
     fn child_stdout_drives_live_handbrake_progress() {
-        let job = create_job(&["stdout-progress.mp4".to_string()], "balanced", &CompressOptions::default());
+        let job = create_job(
+            &["stdout-progress.mp4".to_string()],
+            "balanced",
+            &CompressOptions::default(),
+        );
         let mut cmd = Command::new("powershell");
         cmd.args([
             "-NoProfile",
@@ -5933,7 +6727,12 @@ mod encoder_tests {
         let events = job.events.lock_recover();
         assert_eq!(events.lines.len(), LIVE_EVENT_CAPACITY);
         assert_eq!(events.base, 100);
-        assert!(events.lines.front().is_some_and(|line| line.contains("\"index\":100")));
+        assert!(
+            events
+                .lines
+                .front()
+                .is_some_and(|line| line.contains("\"index\":100"))
+        );
     }
 
     #[test]
@@ -5956,11 +6755,17 @@ mod encoder_tests {
     #[test]
     fn compressed_filename_tag_is_case_insensitive_and_filename_scoped() {
         use std::path::Path;
-        assert!(has_compressed_filename_tag(Path::new("movie [COMPRESSED].mp4")));
-        assert!(has_compressed_filename_tag(Path::new("movie [compressed] (1).MKV")));
+        assert!(has_compressed_filename_tag(Path::new(
+            "movie [COMPRESSED].mp4"
+        )));
+        assert!(has_compressed_filename_tag(Path::new(
+            "movie [compressed] (1).MKV"
+        )));
         let tagged_parent = Path::new("[COMPRESSED]").join("movie.mp4");
         assert!(!has_compressed_filename_tag(&tagged_parent));
-        assert!(!has_compressed_filename_tag(Path::new("movie compressed.mp4")));
+        assert!(!has_compressed_filename_tag(Path::new(
+            "movie compressed.mp4"
+        )));
     }
 
     #[test]
@@ -5978,7 +6783,10 @@ mod encoder_tests {
             custom_quality: 0,
             output_dir: String::new(),
         };
-        let paths = vec!["C:\\batch\\a.mp4".to_string(), "C:\\batch\\b.mp4".to_string()];
+        let paths = vec![
+            "C:\\batch\\a.mp4".to_string(),
+            "C:\\batch\\b.mp4".to_string(),
+        ];
         let job = create_job(&paths, "balanced", &opts);
         let mut jobs = HashMap::new();
         jobs.insert(job.id.clone(), Arc::clone(&job));
@@ -6001,6 +6809,25 @@ mod encoder_tests {
         assert!(!manifest_checkpoint_due(199_533, 255, 29_999));
         assert!(manifest_checkpoint_due(199_533, 256, 0));
         assert!(manifest_checkpoint_due(199_533, 1, 30_000));
+    }
+
+    #[test]
+    fn queued_manifest_status_is_read_from_a_bounded_prefix() {
+        let padding = "x".repeat(100_000);
+        let text =
+            format!("{{  \"id\": \"job\", \"status\" : \"queued\", \"files\":[\"{padding}\"]}}");
+        assert_eq!(
+            manifest_status_from_prefix(&text),
+            Some("queued".to_string())
+        );
+        assert_eq!(
+            manifest_status_from_prefix("{\"status\":\"done\",\"files\":[]}"),
+            Some("done".to_string())
+        );
+        assert_eq!(
+            manifest_status_from_prefix("{\"status\":\"unknown\"}"),
+            None
+        );
     }
 }
 
@@ -6068,7 +6895,11 @@ mod manifest_tests {
             output_dir: String::new(),
         };
         let job = create_job(
-            &["a.mp4".to_string(), "b.png".to_string(), "c.txt".to_string()],
+            &[
+                "a.mp4".to_string(),
+                "b.png".to_string(),
+                "c.txt".to_string(),
+            ],
             "high",
             &opts,
         );
@@ -6151,7 +6982,11 @@ mod manifest_tests {
         // needed (we drive the loop directly), but give them sizes so the run is
         // representative.
         let job = create_job(
-            &["a.bin".to_string(), "b.bin".to_string(), "c.bin".to_string()],
+            &[
+                "a.bin".to_string(),
+                "b.bin".to_string(),
+                "c.bin".to_string(),
+            ],
             "balanced",
             &CompressOptions::default(),
         );
@@ -6171,31 +7006,33 @@ mod manifest_tests {
             let counts = Arc::clone(&counts);
             let schedule = Arc::clone(&schedule);
             let cursor = Arc::clone(&cursor);
-            handles.push(std::thread::spawn(move || loop {
-                let k = cursor.fetch_add(1, O::Relaxed);
-                if k >= schedule.len() {
-                    break;
-                }
-                let i = schedule[k];
-                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    let f = &job.files[i];
-                    *f.status.lock_recover() = "running".to_string();
-                    if i == 1 {
-                        // Panic WHILE holding the shared events lock → poisons it.
-                        // The old `.lock().expect(...)` everywhere else would then
-                        // cascade-panic; `lock_recover` must keep the pool alive.
-                        let _held = job.events.lock_recover();
-                        panic!("boom while holding events lock");
+            handles.push(std::thread::spawn(move || {
+                loop {
+                    let k = cursor.fetch_add(1, O::Relaxed);
+                    if k >= schedule.len() {
+                        break;
                     }
-                    // A normal success path also touches the shared events lock.
-                    job.emit(ev_file_done(i, "", 10, 10, 0, false, "", "success", "done"));
-                    *f.status.lock_recover() = "done".to_string();
-                    counts.done.fetch_add(1, O::Relaxed);
-                }));
-                if let Err(payload) = result {
-                    let msg = panic_message(payload.as_ref());
-                    // This itself locks the now-poisoned events lock via job.emit.
-                    record_internal_error(&job, i, &counts, &msg);
+                    let i = schedule[k];
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        let f = &job.files[i];
+                        *f.status.lock_recover() = "running".to_string();
+                        if i == 1 {
+                            // Panic WHILE holding the shared events lock → poisons it.
+                            // The old `.lock().expect(...)` everywhere else would then
+                            // cascade-panic; `lock_recover` must keep the pool alive.
+                            let _held = job.events.lock_recover();
+                            panic!("boom while holding events lock");
+                        }
+                        // A normal success path also touches the shared events lock.
+                        job.emit(ev_file_done(i, "", 10, 10, 0, false, "", "success", "done"));
+                        *f.status.lock_recover() = "done".to_string();
+                        counts.done.fetch_add(1, O::Relaxed);
+                    }));
+                    if let Err(payload) = result {
+                        let msg = panic_message(payload.as_ref());
+                        // This itself locks the now-poisoned events lock via job.emit.
+                        record_internal_error(&job, i, &counts, &msg);
+                    }
                 }
             }));
         }
@@ -6228,8 +7065,11 @@ mod manifest_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (home, _restore) = redirect_home();
 
-        let dir = std::env::temp_dir()
-            .join(format!("ft-earlyexit-{}-{}", std::process::id(), new_job_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ft-earlyexit-{}-{}",
+            std::process::id(),
+            new_job_id()
+        ));
         std::fs::create_dir_all(&dir).expect("tmp dir");
 
         // 24 files: every other one is a nonexistent source that fails per-file.
@@ -6242,7 +7082,11 @@ mod manifest_tests {
             std::fs::write(&good, &payload).expect("write good");
             paths.push(good.to_string_lossy().into_owned());
             // A source that does not exist → per-file ErrorSourceMissing.
-            paths.push(dir.join(format!("missing{n}.bin")).to_string_lossy().into_owned());
+            paths.push(
+                dir.join(format!("missing{n}.bin"))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
         let total = paths.len();
 
@@ -6263,15 +7107,21 @@ mod manifest_tests {
         // good files that follow (the exact "rest of the batch left pending" bug).
         for (i, f) in job.files.iter().enumerate() {
             // Odd indices are the nonexistent sources (see the loop above).
-            f.orig_bytes
-                .store(if i % 2 == 1 { 10_000_000 } else { 8 * 1024 }, Ordering::Relaxed);
+            f.orig_bytes.store(
+                if i % 2 == 1 { 10_000_000 } else { 8 * 1024 },
+                Ordering::Relaxed,
+            );
         }
 
         run_job(test_state(), Arc::clone(&job));
 
         // The job actually finished and was NOT (spuriously) cancelled.
         assert!(job.finished.load(Ordering::SeqCst), "job must finish");
-        assert_ne!(*job.status.lock_recover(), "cancelled", "no cancel happened");
+        assert_ne!(
+            *job.status.lock_recover(),
+            "cancelled",
+            "no cancel happened"
+        );
 
         // EVERY file reached a terminal state — none left pending/running.
         let mut pending = Vec::new();
@@ -6288,16 +7138,26 @@ mod manifest_tests {
             pending.is_empty(),
             "every input must reach a terminal state; left behind: {pending:?}"
         );
-        assert_eq!(done + skipped + errors, total, "post==pre: all files accounted for");
+        assert_eq!(
+            done + skipped + errors,
+            total,
+            "post==pre: all files accounted for"
+        );
 
         // The batch did NOT halt at the first failure: all 12 nonexistent files
         // are errors AND all 12 good files progressed past their failing peers.
-        assert_eq!(errors, 12, "all nonexistent sources must be terminal errors");
+        assert_eq!(
+            errors, 12,
+            "all nonexistent sources must be terminal errors"
+        );
         assert_eq!(done + skipped, 12, "all good files must reach done/skipped");
 
         // The live summary the UI reads must show zero pending after completion.
         let sum = summary_from_live(&job);
-        assert_eq!(sum.pending, 0, "no file may linger as pending in the summary");
+        assert_eq!(
+            sum.pending, 0,
+            "no file may linger as pending in the summary"
+        );
         assert_eq!(sum.done + sum.skipped + sum.errors, sum.total);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6317,8 +7177,11 @@ mod manifest_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (home, _restore) = redirect_home();
 
-        let dir = std::env::temp_dir()
-            .join(format!("ft-panic-iso-{}-{}", std::process::id(), new_job_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ft-panic-iso-{}-{}",
+            std::process::id(),
+            new_job_id()
+        ));
         std::fs::create_dir_all(&dir).expect("tmp dir");
 
         let payload = vec![b'A'; 8 * 1024];
@@ -6345,14 +7208,20 @@ mod manifest_tests {
         // Panicking files schedule FIRST (largest), so a single worker meets them
         // before any good file — the most sensitive layout for an isolation bug.
         for (i, f) in job.files.iter().enumerate() {
-            f.orig_bytes
-                .store(if i % 2 == 0 { 10_000_000 } else { 8 * 1024 }, Ordering::Relaxed);
+            f.orig_bytes.store(
+                if i % 2 == 0 { 10_000_000 } else { 8 * 1024 },
+                Ordering::Relaxed,
+            );
         }
 
         run_job(test_state(), Arc::clone(&job));
 
         assert!(job.finished.load(Ordering::SeqCst), "job must finish");
-        assert_ne!(*job.status.lock_recover(), "cancelled", "no cancel happened");
+        assert_ne!(
+            *job.status.lock_recover(),
+            "cancelled",
+            "no cancel happened"
+        );
 
         let mut pending = Vec::new();
         let (mut done, mut skipped, mut internal_errors, mut other_errors) = (0, 0, 0, 0);
@@ -6367,13 +7236,23 @@ mod manifest_tests {
                 other => pending.push(format!("#{i}={other}")),
             }
         }
-        assert!(pending.is_empty(), "no file may be left pending/running: {pending:?}");
+        assert!(
+            pending.is_empty(),
+            "no file may be left pending/running: {pending:?}"
+        );
         assert_eq!(done + skipped + internal_errors + other_errors, total);
         // All 8 panicking files were caught and recorded as internal errors…
-        assert_eq!(internal_errors, 8, "every panicking file must be error_internal");
+        assert_eq!(
+            internal_errors, 8,
+            "every panicking file must be error_internal"
+        );
         // …and the 8 good files that FOLLOW them in the schedule still completed —
         // proving the panic did not halt the pool (would be 0 if isolation broke).
-        assert_eq!(done + skipped, 8, "all good files must reach a terminal success");
+        assert_eq!(
+            done + skipped,
+            8,
+            "all good files must reach a terminal success"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
@@ -6390,8 +7269,8 @@ mod manifest_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (home, _restore) = redirect_home();
 
-        let dir = std::env::temp_dir()
-            .join(format!("ft-orch-{}-{}", std::process::id(), new_job_id()));
+        let dir =
+            std::env::temp_dir().join(format!("ft-orch-{}-{}", std::process::id(), new_job_id()));
         std::fs::create_dir_all(&dir).expect("tmp dir");
 
         // Real files; one name trips the orchestration-panic injector at the very
@@ -6417,7 +7296,10 @@ mod manifest_tests {
             std::thread::sleep(std::time::Duration::from_millis(25));
             waited += 25;
         }
-        assert!(job.finished.load(Ordering::SeqCst), "job must be finalized even after an orchestration panic");
+        assert!(
+            job.finished.load(Ordering::SeqCst),
+            "job must be finalized even after an orchestration panic"
+        );
 
         // No file may be left pending/running; the job did not silently abandon
         // the batch. (run_job panicked before scheduling, so all are force-failed.)
@@ -6426,14 +7308,26 @@ mod manifest_tests {
             .iter()
             .filter(|f| matches!(f.status.lock_recover().as_str(), "pending" | "running"))
             .count();
-        assert_eq!(pending, 0, "no file may remain pending after force-finalize");
+        assert_eq!(
+            pending, 0,
+            "no file may remain pending after force-finalize"
+        );
         let terminal = job
             .files
             .iter()
-            .filter(|f| matches!(f.status.lock_recover().as_str(), "done" | "skipped" | "error"))
+            .filter(|f| {
+                matches!(
+                    f.status.lock_recover().as_str(),
+                    "done" | "skipped" | "error"
+                )
+            })
             .count();
         assert_eq!(terminal, total, "every file must reach a terminal state");
-        assert_eq!(*job.status.lock_recover(), "error", "an aborted run finalizes as a resumable error");
+        assert_eq!(
+            *job.status.lock_recover(),
+            "error",
+            "an aborted run finalizes as a resumable error"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
@@ -6448,8 +7342,11 @@ mod manifest_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (home, _restore) = redirect_home();
 
-        let dir = std::env::temp_dir()
-            .join(format!("ft-exhaust-{}-{}", std::process::id(), new_job_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ft-exhaust-{}-{}",
+            std::process::id(),
+            new_job_id()
+        ));
         std::fs::create_dir_all(&dir).expect("tmp dir");
 
         let payload = vec![b'A'; 8 * 1024];
@@ -6475,8 +7372,10 @@ mod manifest_tests {
         let job = create_job(&paths, "balanced", &opts);
         // Panicking files largest ⇒ scheduled first (sort is size desc).
         for (i, f) in job.files.iter().enumerate() {
-            f.orig_bytes
-                .store(if i < 12 { 10_000_000 } else { 8 * 1024 }, Ordering::Relaxed);
+            f.orig_bytes.store(
+                if i < 12 { 10_000_000 } else { 8 * 1024 },
+                Ordering::Relaxed,
+            );
         }
 
         run_job(test_state(), Arc::clone(&job));
@@ -6487,11 +7386,19 @@ mod manifest_tests {
             .iter()
             .filter(|f| matches!(f.status.lock_recover().as_str(), "pending" | "running"))
             .count();
-        assert_eq!(pending, 0, "no file may be left pending with a pool of workers");
+        assert_eq!(
+            pending, 0,
+            "no file may be left pending with a pool of workers"
+        );
         let terminal = job
             .files
             .iter()
-            .filter(|f| matches!(f.status.lock_recover().as_str(), "done" | "skipped" | "error"))
+            .filter(|f| {
+                matches!(
+                    f.status.lock_recover().as_str(),
+                    "done" | "skipped" | "error"
+                )
+            })
             .count();
         assert_eq!(terminal, total, "every file must reach a terminal state");
 
@@ -6511,8 +7418,11 @@ mod manifest_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (home, _restore) = redirect_home();
 
-        let dir = std::env::temp_dir()
-            .join(format!("ft-recpanic-{}-{}", std::process::id(), new_job_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ft-recpanic-{}-{}",
+            std::process::id(),
+            new_job_id()
+        ));
         std::fs::create_dir_all(&dir).expect("tmp dir");
 
         let payload = vec![b'A'; 8 * 1024];
@@ -6578,9 +7488,18 @@ mod manifest_tests {
         // SAFETY: serialized by ENV_LOCK.
         unsafe { std::env::set_var("FILETREE_ENCODE_INACTIVITY_MS", "1500") };
 
-        let job = create_job(&["hang.bin".to_string()], "balanced", &CompressOptions::default());
+        let job = create_job(
+            &["hang.bin".to_string()],
+            "balanced",
+            &CompressOptions::default(),
+        );
         let mut cmd = Command::new("powershell");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]);
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ]);
 
         let start = Instant::now();
         let result = run_child(&job, 0, cmd);
@@ -6618,7 +7537,11 @@ mod manifest_tests {
     /// Build a one-file job whose single file is `FileKind::Other`, for driving
     /// `verify_output` through the zip/archive path without spawning encoders.
     fn other_job() -> Arc<CompressJob> {
-        create_job(&["x.bin".to_string()], "balanced", &CompressOptions::default())
+        create_job(
+            &["x.bin".to_string()],
+            "balanced",
+            &CompressOptions::default(),
+        )
     }
 
     fn empty_tool() -> compress_tools::ToolInfo {
@@ -6634,19 +7557,35 @@ mod manifest_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (home, _restore) = redirect_home();
 
-        let dir = std::env::temp_dir().join(format!("ft-verify-{}-{}", std::process::id(), new_job_id()));
+        let dir =
+            std::env::temp_dir().join(format!("ft-verify-{}-{}", std::process::id(), new_job_id()));
         std::fs::create_dir_all(&dir).expect("tmp dir");
         let original = dir.join("data.txt");
-        std::fs::write(&original, b"the original payload that must survive").expect("write original");
+        std::fs::write(&original, b"the original payload that must survive")
+            .expect("write original");
         let archive = dir.join("data [COMPRESSED].zip");
-        crate::archive::compress_with_level(&[original.to_string_lossy().into_owned()], &archive, 6)
-            .expect("zip created");
+        crate::archive::compress_with_level(
+            &[original.to_string_lossy().into_owned()],
+            &archive,
+            6,
+        )
+        .expect("zip created");
 
         let job = other_job();
 
         // A well-formed archive passes.
         assert!(matches!(
-            verify_output(&job, 0, &archive, FileKind::Other, &original, &empty_tool(), &empty_tool(), &empty_tool(), None),
+            verify_output(
+                &job,
+                0,
+                &archive,
+                FileKind::Other,
+                &original,
+                &empty_tool(),
+                &empty_tool(),
+                &empty_tool(),
+                None
+            ),
             Verify::Ok
         ));
 
@@ -6655,10 +7594,23 @@ mod manifest_tests {
         let bytes = std::fs::read(&archive).unwrap();
         std::fs::write(&archive, &bytes[..bytes.len() / 2]).expect("truncate");
         assert!(matches!(
-            verify_output(&job, 0, &archive, FileKind::Other, &original, &empty_tool(), &empty_tool(), &empty_tool(), None),
+            verify_output(
+                &job,
+                0,
+                &archive,
+                FileKind::Other,
+                &original,
+                &empty_tool(),
+                &empty_tool(),
+                &empty_tool(),
+                None
+            ),
             Verify::Failed(_)
         ));
-        assert!(original.exists(), "original must be preserved when verification fails");
+        assert!(
+            original.exists(),
+            "original must be preserved when verification fails"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
@@ -6668,14 +7620,18 @@ mod manifest_tests {
     /// disposition helper used after a verify pass. (c) "Keep" leaves it alone.
     #[test]
     fn delete_permanent_removes_and_keep_leaves_original() {
-        let dir = std::env::temp_dir().join(format!("ft-dispo-{}-{}", std::process::id(), new_job_id()));
+        let dir =
+            std::env::temp_dir().join(format!("ft-dispo-{}-{}", std::process::id(), new_job_id()));
         std::fs::create_dir_all(&dir).expect("tmp dir");
 
         // Delete permanently.
         let to_delete = dir.join("gone.txt");
         std::fs::write(&to_delete, b"bye").unwrap();
         crate::recycle::delete_permanent(&to_delete).expect("delete_permanent");
-        assert!(!to_delete.exists(), "Delete must permanently remove the original");
+        assert!(
+            !to_delete.exists(),
+            "Delete must permanently remove the original"
+        );
 
         // Keep: nothing is invoked, so the file simply remains.
         let kept = dir.join("stays.txt");
@@ -6714,7 +7670,10 @@ mod manifest_tests {
         assert_eq!(sum.done, 1);
         assert_eq!(sum.skipped, 1);
         assert_eq!(sum.errors, 2);
-        assert_eq!(sum.verify_failed, 1, "verify-failed is tallied from error_verify_failed");
+        assert_eq!(
+            sum.verify_failed, 1,
+            "verify-failed is tallied from error_verify_failed"
+        );
         assert_eq!(sum.pending, 1);
         // Every file is accounted for: done + skipped + errors + pending == total.
         assert_eq!(sum.done + sum.skipped + sum.errors + sum.pending, sum.total);
@@ -6732,7 +7691,10 @@ mod manifest_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (home, _restore) = redirect_home();
 
-        for (legacy, expect) in [("true", OriginalAction::Recycle), ("false", OriginalAction::Keep)] {
+        for (legacy, expect) in [
+            ("true", OriginalAction::Recycle),
+            ("false", OriginalAction::Keep),
+        ] {
             let id = new_job_id();
             let path = jobs_dir().join(format!("{id}.json"));
             std::fs::create_dir_all(jobs_dir()).unwrap();
@@ -6748,25 +7710,9 @@ mod manifest_tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Minimal `AppState` for driving `process_file` directly in a unit test.
-    fn test_state() -> Arc<AppState> {
-        Arc::new(AppState {
-            initial_path: std::env::temp_dir(),
-            last_scan: std::sync::RwLock::new(None),
-            scan_cache: std::sync::RwLock::new(crate::model::ScanCache::new()),
-            icon_cache: Mutex::new(HashMap::new()),
-            thumbnail_cache: Mutex::new(HashMap::new()),
-            dupes_progress: Arc::new(crate::model::DupesProgress::default()),
-            dupes_cancel: Arc::new(AtomicBool::new(false)),
-            ignore_list: std::sync::RwLock::new(crate::model::IgnoreList::default()),
-            ignore_list_path: std::env::temp_dir().join("ft-test-ignore.json"),
-            hash_cache: Mutex::new(HashMap::new()),
-            hash_cache_path: std::env::temp_dir().join("ft-test-hash.json"),
-            auth_token: None,
-            scan_roots: std::sync::RwLock::new(Vec::new()),
-            compress_roots: std::sync::RwLock::new(Vec::new()),
-            compress_jobs: Mutex::new(HashMap::new()),
-        })
+    /// Minimal runtime state for driving `process_file` directly in a unit test.
+    fn test_state() -> Arc<CompressionRuntimeState> {
+        Arc::new(CompressionRuntimeState::default())
     }
 
     /// A file below the minimum-size threshold is skipped (`SkippedTooSmall`)
@@ -6778,28 +7724,51 @@ mod manifest_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (home, _restore) = redirect_home();
 
-        let dir = std::env::temp_dir().join(format!("ft-minsize-{}-{}", std::process::id(), new_job_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ft-minsize-{}-{}",
+            std::process::id(),
+            new_job_id()
+        ));
         std::fs::create_dir_all(&dir).expect("tmp dir");
         let tiny = dir.join("tiny.bin");
         std::fs::write(&tiny, b"only a few bytes").expect("write tiny");
         let before = std::fs::read(&tiny).unwrap();
 
         // Threshold well above the tiny file's size.
-        let opts = CompressOptions { min_size_bytes: 1_000_000, ..CompressOptions::default() };
+        let opts = CompressOptions {
+            min_size_bytes: 1_000_000,
+            ..CompressOptions::default()
+        };
         let job = create_job(&[tiny.to_string_lossy().into_owned()], "balanced", &opts);
         let state = test_state();
         let none_tool = compress_tools::ToolInfo::default();
 
-        let outcome = process_file(&state, &job, 0, &none_tool, &none_tool, &none_tool, None, &HandbrakeCaps::default());
+        let outcome = process_file(
+            &state,
+            &job,
+            0,
+            &none_tool,
+            &none_tool,
+            &none_tool,
+            None,
+            &HandbrakeCaps::default(),
+        );
         match outcome {
             FileOutcome::Skipped { reason, .. } => assert_eq!(reason.as_str(), "skipped_too_small"),
             _ => panic!("expected a SkippedTooSmall outcome"),
         }
         // Original untouched; no [COMPRESSED] output produced.
         assert!(tiny.exists(), "original must be untouched");
-        assert_eq!(std::fs::read(&tiny).unwrap(), before, "original bytes unchanged");
+        assert_eq!(
+            std::fs::read(&tiny).unwrap(),
+            before,
+            "original bytes unchanged"
+        );
         let out = output_path(&tiny, FileKind::Other);
-        assert!(!out.exists(), "no output should be written for a too-small skip");
+        assert!(
+            !out.exists(),
+            "no output should be written for a too-small skip"
+        );
 
         // Summary-level reconciliation: a manifest with a skipped_too_small entry
         // is counted in the skipped bucket and done+skipped+error+pending==total.
@@ -6871,7 +7840,11 @@ mod manifest_tests {
             }
             _ => panic!("an incomplete download must skip before its pipeline"),
         }
-        assert_eq!(std::fs::read(&source).unwrap(), before, "source bytes changed");
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            before,
+            "source bytes changed"
+        );
         assert!(
             !output_path(&source, FileKind::Other).exists(),
             "an incomplete pre-skip must not create an output"
@@ -6883,7 +7856,10 @@ mod manifest_tests {
             "x.opdownload",
             "x.aria2",
         ] {
-            assert!(is_incomplete_download(Path::new(name)), "did not skip {name}");
+            assert!(
+                is_incomplete_download(Path::new(name)),
+                "did not skip {name}"
+            );
         }
         assert!(!is_incomplete_download(Path::new("archive.part1.rar")));
 
@@ -6908,7 +7884,11 @@ mod manifest_tests {
         let before = vec![5u8; 2 * 1024 * 1024];
         std::fs::write(&source, &before).expect("write tagged source");
         let source_path = source.to_string_lossy().into_owned();
-        let job = create_job(std::slice::from_ref(&source_path), "balanced", &CompressOptions::default());
+        let job = create_job(
+            std::slice::from_ref(&source_path),
+            "balanced",
+            &CompressOptions::default(),
+        );
         let state = test_state();
         let no_tool = compress_tools::ToolInfo::default();
 
@@ -6929,7 +7909,11 @@ mod manifest_tests {
             }
             _ => panic!("a tagged source must skip before encoder resolution"),
         }
-        assert_eq!(std::fs::read(&source).unwrap(), before, "source bytes changed");
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            before,
+            "source bytes changed"
+        );
         assert!(
             !output_path(&source, FileKind::Video).exists(),
             "a tagged pre-skip must not create a doubled-tag output"
@@ -6963,32 +7947,25 @@ mod manifest_tests {
         let caps = HandbrakeCaps::default();
         let source_bytes = std::fs::metadata(&source).unwrap().len();
         let modified_ms = source_modified_ms(&source);
-        assert!(modified_ms > 0, "test source must have a usable modified time");
-
-        crate::compress_log::remember_unchanged_no_gain(
-            &source_path,
-            source_bytes,
-            modified_ms,
+        assert!(
+            modified_ms > 0,
+            "test source must have a usable modified time"
         );
-        let no_gain_path = crate::compress_log::log_path()
-            .with_file_name("compress-no-gain-v1.csv");
-        assert!(no_gain_path.is_file(), "the no-gain fingerprint must be durable");
+
+        crate::compress_log::remember_unchanged_no_gain(&source_path, source_bytes, modified_ms);
+        let no_gain_path =
+            crate::compress_log::log_path().with_file_name("compress-no-gain-v1.csv");
+        assert!(
+            no_gain_path.is_file(),
+            "the no-gain fingerprint must be durable"
+        );
         let legacy_index = std::fs::read_to_string(&no_gain_path)
             .expect("read durable no-gain index")
             .replace("all-profiles", "v2|preset=balanced|codec=h264|quality=26");
         std::fs::write(&no_gain_path, legacy_index).expect("write legacy profile record");
         crate::compress_log::reset_no_gain_index_for_tests();
 
-        let skipped = process_file(
-            &state,
-            &job,
-            0,
-            &no_tool,
-            &no_tool,
-            &no_tool,
-            None,
-            &caps,
-        );
+        let skipped = process_file(&state, &job, 0, &no_tool, &no_tool, &no_tool, None, &caps);
         match skipped {
             FileOutcome::Skipped { reason, diag, .. } => {
                 assert_eq!(reason.as_str(), "skipped_prior_no_gain");
@@ -7104,14 +8081,20 @@ mod manifest_tests {
         std::fs::write(&small, b"source-bytes").unwrap();
         std::fs::write(&large, vec![7u8; 4096]).unwrap();
         let job = create_job(
-            &[small.to_string_lossy().into_owned(), large.to_string_lossy().into_owned()],
+            &[
+                small.to_string_lossy().into_owned(),
+                large.to_string_lossy().into_owned(),
+            ],
             "balanced",
             &CompressOptions::default(),
         );
 
         assert_eq!(pause_job(&job).unwrap(), "paused");
         assert_eq!(job.active_started_at.load(Ordering::Relaxed), 0);
-        assert!(resume_job(&job).unwrap(), "a never-started paused job needs a runner");
+        assert!(
+            resume_job(&job).unwrap(),
+            "a never-started paused job needs a runner"
+        );
         assert_eq!(job.status.lock_recover().as_str(), "running");
         assert_eq!(set_job_concurrency(&job, 99), 2);
         assert_eq!(set_job_concurrency(&job, 0), 1);
@@ -7135,7 +8118,11 @@ mod manifest_tests {
     fn graceful_pause_waits_for_active_claims() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (home, _restore) = redirect_home();
-        let job = create_job(&["a.bin".to_string()], "balanced", &CompressOptions::default());
+        let job = create_job(
+            &["a.bin".to_string()],
+            "balanced",
+            &CompressOptions::default(),
+        );
         job.queue.lock_recover().active = 1;
         assert_eq!(pause_job(&job).unwrap(), "pausing");
         assert_eq!(job.status.lock_recover().as_str(), "pausing");
@@ -7156,7 +8143,11 @@ mod manifest_tests {
             codec: "h265".to_string(),
             ..CompressOptions::default()
         };
-        let job = create_job(&["failed.mp4".to_string(), "skipped.jpg".to_string()], "high", &opts);
+        let job = create_job(
+            &["failed.mp4".to_string(), "skipped.jpg".to_string()],
+            "high",
+            &opts,
+        );
         *job.files[0].status.lock_recover() = "error".to_string();
         *job.files[0].reason.lock_recover() = Reason::ErrorEncoder.as_str().to_string();
         *job.files[1].status.lock_recover() = "skipped".to_string();
@@ -7177,21 +8168,33 @@ mod manifest_tests {
     #[test]
     fn paged_files_pin_active_then_recently_finished() {
         let job = create_job(
-            &["queued.bin".to_string(), "active.bin".to_string(), "recent.bin".to_string()],
+            &[
+                "queued.bin".to_string(),
+                "active.bin".to_string(),
+                "recent.bin".to_string(),
+            ],
             "balanced",
             &CompressOptions::default(),
         );
         let now = crate::io::now_ms();
         *job.files[1].status.lock_recover() = "running".to_string();
         *job.files[1].stage.lock_recover() = "encoding".to_string();
-        job.files[1].started_at.store(now - 5_000, Ordering::Relaxed);
+        job.files[1]
+            .started_at
+            .store(now - 5_000, Ordering::Relaxed);
         *job.files[2].status.lock_recover() = "done".to_string();
         *job.files[2].stage.lock_recover() = "terminal".to_string();
-        job.files[2].finished_at.store(now - 1_000, Ordering::Relaxed);
+        job.files[2]
+            .finished_at
+            .store(now - 1_000, Ordering::Relaxed);
         let json = job_files_page_json(
             Some(&job),
             &job.id,
-            &JobFilesQuery { limit: 250, sort: "name".to_string(), ..JobFilesQuery::default() },
+            &JobFilesQuery {
+                limit: 250,
+                sort: "name".to_string(),
+                ..JobFilesQuery::default()
+            },
         )
         .unwrap();
         let active = json.find("active.bin").unwrap();
@@ -7216,7 +8219,10 @@ mod manifest_tests {
         .unwrap();
 
         let first = summary_from_manifest(&id, &manifest_path).expect("first summary");
-        assert_eq!(first.status, "paused", "orphaned running jobs are resumable, not live");
+        assert_eq!(
+            first.status, "paused",
+            "orphaned running jobs are resumable, not live"
+        );
         assert!(summary_sidecar_path(&manifest_path).exists());
 
         std::fs::write(
@@ -7246,9 +8252,29 @@ mod manifest_tests {
                     index,
                     path: format!("D:\\synthetic\\video-{index:06}.mp4"),
                     kind: "video".to_string(),
-                    status: if active { "running" } else if recent { "done" } else { "pending" }.to_string(),
-                    stage: if active { "encoding" } else if recent { "terminal" } else { "queued" }.to_string(),
-                    pct: if active { 45 } else if recent { 100 } else { 0 },
+                    status: if active {
+                        "running"
+                    } else if recent {
+                        "done"
+                    } else {
+                        "pending"
+                    }
+                    .to_string(),
+                    stage: if active {
+                        "encoding"
+                    } else if recent {
+                        "terminal"
+                    } else {
+                        "queued"
+                    }
+                    .to_string(),
+                    pct: if active {
+                        45
+                    } else if recent {
+                        100
+                    } else {
+                        0
+                    },
                     orig_bytes: 64 * 1024 * 1024,
                     new_bytes: if recent { 40 * 1024 * 1024 } else { 0 },
                     reason: if recent { "success" } else { "" }.to_string(),
@@ -7258,9 +8284,17 @@ mod manifest_tests {
                     error: None,
                     duration_ms: 0,
                     fps: active.then_some(180.0),
-                    started_at: if active { now.saturating_sub(5_000 + index as u64) } else { 0 },
+                    started_at: if active {
+                        now.saturating_sub(5_000 + index as u64)
+                    } else {
+                        0
+                    },
                     updated_at: if active { now } else { 0 },
-                    finished_at: if recent { now.saturating_sub(1_000 + index as u64 / 40_000) } else { 0 },
+                    finished_at: if recent {
+                        now.saturating_sub(1_000 + index as u64 / 40_000)
+                    } else {
+                        0
+                    },
                     attempt: 1,
                     tool: "HandBrakeCLI".to_string(),
                     tool_version: "synthetic".to_string(),
@@ -7286,6 +8320,10 @@ mod manifest_tests {
             push_page_item_json(&mut first_page, file, now);
         }
         assert!(first_page.contains("video-000000.mp4"));
-        assert!(started.elapsed() < std::time::Duration::from_secs(10), "200k-file ordering took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "200k-file ordering took {:?}",
+            started.elapsed()
+        );
     }
 }

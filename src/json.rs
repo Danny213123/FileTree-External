@@ -268,7 +268,10 @@ mod tests {
         let v = parse(r#"{"a":1,"b":"x\ny","c":[1,2,3],"d":true,"e":null}"#).unwrap();
         assert_eq!(v.get("a").and_then(|n| n.as_u64()), Some(1));
         assert_eq!(v.get("b").and_then(|s| s.as_str()), Some("x\ny"));
-        assert_eq!(v.get("c").and_then(|a| a.as_array()).map(|a| a.len()), Some(3));
+        assert_eq!(
+            v.get("c").and_then(|a| a.as_array()).map(|a| a.len()),
+            Some(3)
+        );
         assert_eq!(v.get("d").and_then(|x| x.as_bool()), Some(true));
         assert!(matches!(v.get("e"), Some(JsonValue::Null)));
     }
@@ -276,7 +279,10 @@ mod tests {
     #[test]
     fn handles_escaped_paths() {
         let v = parse(r#"{"p":"C:\\Users\\a b\\f.txt"}"#).unwrap();
-        assert_eq!(v.get("p").and_then(|s| s.as_str()), Some("C:\\Users\\a b\\f.txt"));
+        assert_eq!(
+            v.get("p").and_then(|s| s.as_str()),
+            Some("C:\\Users\\a b\\f.txt")
+        );
     }
 
     #[test]

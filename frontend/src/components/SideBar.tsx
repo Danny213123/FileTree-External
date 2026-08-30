@@ -693,7 +693,7 @@ function SearchView(props: SideBarProps) {
 
     const consider = (node: NodeRecord, root: string, isCurrent: boolean) => {
       if (node.id < 0) return;
-      if (!nameMatchAll && !matcher.test(node.name, node.path || "")) return;
+      if (!nameMatchAll && !matcher.test(node.name, node.path || "", node)) return;
       if (!predicate(node)) return;
       hits.push({ node, root, isCurrent });
     };

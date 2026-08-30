@@ -59,7 +59,11 @@ fn set_hidden(path: &Path, hidden: bool) -> io::Result<()> {
         fn SetFileAttributesW(name: *const u16, attrs: u32) -> i32;
     }
 
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let current = unsafe { GetFileAttributesW(wide.as_ptr()) };
     if current == INVALID_FILE_ATTRIBUTES {
         return Err(io::Error::last_os_error());
@@ -114,9 +118,13 @@ fn set_times_impl(
     #[allow(non_snake_case)]
     unsafe extern "system" {
         fn CreateFileW(
-            name: *const u16, access: u32, share: u32,
-            sa: *mut std::ffi::c_void, disposition: u32,
-            flags: u32, tmpl: Handle,
+            name: *const u16,
+            access: u32,
+            share: u32,
+            sa: *mut std::ffi::c_void,
+            disposition: u32,
+            flags: u32,
+            tmpl: Handle,
         ) -> Handle;
         fn SetFileTime(
             handle: Handle,
@@ -131,10 +139,17 @@ fn set_times_impl(
     // is the gap (in 100-ns units) between 1601 and the Unix epoch (1970).
     fn to_filetime(ms: i64) -> FileTime {
         let ticks = ms * 10_000 + 116_444_736_000_000_000;
-        FileTime { low: (ticks as u64 & 0xFFFF_FFFF) as u32, high: ((ticks as u64) >> 32) as u32 }
+        FileTime {
+            low: (ticks as u64 & 0xFFFF_FFFF) as u32,
+            high: ((ticks as u64) >> 32) as u32,
+        }
     }
 
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     // FILE_FLAG_BACKUP_SEMANTICS is required to open a *directory* handle.
     let handle = unsafe {
         CreateFileW(
@@ -154,13 +169,25 @@ fn set_times_impl(
     let creation = created_ms.map(to_filetime);
     let access = accessed_ms.map(to_filetime);
     let write = modified_ms.map(to_filetime);
-    let cptr = creation.as_ref().map_or(std::ptr::null(), |f| f as *const FileTime);
-    let aptr = access.as_ref().map_or(std::ptr::null(), |f| f as *const FileTime);
-    let wptr = write.as_ref().map_or(std::ptr::null(), |f| f as *const FileTime);
+    let cptr = creation
+        .as_ref()
+        .map_or(std::ptr::null(), |f| f as *const FileTime);
+    let aptr = access
+        .as_ref()
+        .map_or(std::ptr::null(), |f| f as *const FileTime);
+    let wptr = write
+        .as_ref()
+        .map_or(std::ptr::null(), |f| f as *const FileTime);
 
     let ok = unsafe { SetFileTime(handle, cptr, aptr, wptr) };
-    let err = if ok == 0 { Some(io::Error::last_os_error()) } else { None };
-    unsafe { CloseHandle(handle); }
+    let err = if ok == 0 {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe {
+        CloseHandle(handle);
+    }
     match err {
         Some(e) => Err(e),
         None => Ok(()),

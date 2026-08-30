@@ -13,7 +13,7 @@ use crate::io::{
 };
 use crate::model::ScanOptions;
 use crate::scan::scan_path;
-use crate::server::run_server;
+use crate::v2_headless::run_v2_server;
 
 pub(crate) const APP_NAME: &str = "FileTree";
 pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -25,24 +25,17 @@ pub(crate) fn run() {
         return;
     }
 
-    // Default (no args): run headless server on default port so Electron can connect.
     if args.is_empty() {
-        if let Err(error) = run_server(current_dir_or_dot(), 7878) {
-            eprintln!("{}: {}", APP_NAME, error);
-            std::process::exit(1);
-        }
+        print_usage();
         return;
     }
 
     let result = match args[0].as_str() {
         "serve" => {
-            let initial_path = option_value(&args, "--path")
-                .map(PathBuf::from)
-                .unwrap_or_else(current_dir_or_dot);
             let port = option_value(&args, "--port")
                 .and_then(|value| value.parse::<u16>().ok())
                 .unwrap_or(7878);
-            run_server(initial_path, port)
+            run_v2_server(port)
         }
         "scan" => run_scan_command(&args[1..]),
         _ => {
@@ -62,8 +55,8 @@ fn print_usage() {
         "{APP_NAME} {APP_VERSION}
 
 Usage:
-  filetree                              Start server on port 7878 (for Electron)
-  filetree serve [--path PATH] [--port PORT]
+  filetree                              Show this help
+  filetree serve [--port PORT]          Start the paginated v2 headless API
   filetree scan PATH [--format json|csv|html|xml|xlsx] [--out FILE] [--threads N] [--exclude PATTERNS] [--owners]
 
 Examples:

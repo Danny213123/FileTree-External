@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
-use crate::dupes::{build_candidates_from_nodes, hash_candidate_groups, DupeFilter2, HashInput};
+use crate::dupes::{DupeFilter2, HashInput, build_candidates_from_nodes, hash_candidate_groups};
 use crate::export::push_json_string;
 use crate::io::now_ms;
 use crate::model::{HashCacheEntry, ScanResult};
@@ -31,7 +31,15 @@ const DOWNLOADS_BIG_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
 const DOWNLOADS_OLD_SECS: u64 = 180 * 24 * 60 * 60;
 
 /// Directory names treated as reclaimable build output.
-const ARTIFACT_NAMES: &[&str] = &["node_modules", "target", "dist", "build", ".next", "bin", "obj"];
+const ARTIFACT_NAMES: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    "bin",
+    "obj",
+];
 
 struct Item {
     path: String,
@@ -51,7 +59,11 @@ impl Bucket {
         self.total = self.total.saturating_add(size);
         self.count = self.count.saturating_add(1);
         if self.items.len() < ITEM_CAP {
-            self.items.push(Item { path, size, modified });
+            self.items.push(Item {
+                path,
+                size,
+                modified,
+            });
         }
     }
 }
@@ -119,7 +131,10 @@ fn dir_size(dir: &Path) -> (u64, u64) {
 }
 
 fn dir_modified(path: &Path) -> u64 {
-    fs::metadata(path).ok().map(|m| secs_from_modified(&m)).unwrap_or(0)
+    fs::metadata(path)
+        .ok()
+        .map(|m| secs_from_modified(&m))
+        .unwrap_or(0)
 }
 
 /// Canonicalize-and-dedupe a set of candidate directories so e.g. `%TEMP%` and
@@ -181,7 +196,12 @@ fn browser_cache_dirs() -> Vec<PathBuf> {
                 continue;
             }
             let profile = e.path();
-            for sub in ["Cache", "Code Cache", "GPUCache", "Service Worker\\CacheStorage"] {
+            for sub in [
+                "Cache",
+                "Code Cache",
+                "GPUCache",
+                "Service Worker\\CacheStorage",
+            ] {
                 let c = profile.join(sub);
                 if c.is_dir() {
                     dirs.push(c);
@@ -252,7 +272,11 @@ fn build_artifacts_walk(dir: &Path, bucket: &mut Bucket) {
         let name = e.file_name().to_string_lossy().to_ascii_lowercase();
         if ARTIFACT_NAMES.contains(&name.as_str()) {
             let (size, _count) = dir_size(&path);
-            bucket.add(path.to_string_lossy().into_owned(), size, dir_modified(&path));
+            bucket.add(
+                path.to_string_lossy().into_owned(),
+                size,
+                dir_modified(&path),
+            );
         } else {
             build_artifacts_walk(&path, bucket);
         }
@@ -279,7 +303,10 @@ fn recycle_bin_size() -> (u64, u64) {
     // A null root path queries the Recycle Bin across all drives.
     let ret = unsafe { SHQueryRecycleBinW(std::ptr::null(), &mut info) };
     if ret == 0 {
-        (info.i64_size.max(0) as u64, info.i64_num_items.max(0) as u64)
+        (
+            info.i64_size.max(0) as u64,
+            info.i64_num_items.max(0) as u64,
+        )
     } else {
         (0, 0)
     }
@@ -490,7 +517,11 @@ pub(crate) fn cleanup_scan_json(
         push_json_string(&mut out, label);
         out.push_str(",\"description\":");
         push_json_string(&mut out, description);
-        let _ = write!(out, ",\"total\":{},\"count\":{},\"items\":[", b.total, b.count);
+        let _ = write!(
+            out,
+            ",\"total\":{},\"count\":{},\"items\":[",
+            b.total, b.count
+        );
         for (j, it) in b.items.iter().enumerate() {
             if j > 0 {
                 out.push(',');

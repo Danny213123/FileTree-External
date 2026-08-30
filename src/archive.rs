@@ -17,8 +17,8 @@ use std::path::Path;
 
 use md5::Md5;
 use sha2::{Digest, Sha256};
-use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::CompressionMethod;
+use zip::write::{SimpleFileOptions, ZipWriter};
 
 /// I/O chunk for streaming file bodies (into the zip, out of the zip, through a
 /// hasher). 64 KiB keeps syscalls amortized without holding a whole file.
@@ -47,10 +47,36 @@ fn is_precompressed(path: &Path) -> bool {
         .unwrap_or_default();
     matches!(
         ext.as_str(),
-        "zip" | "7z" | "rar" | "gz" | "bz2" | "xz" | "zst" | "lz4" | "cab" | "tgz"
-            | "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "heic"
-            | "mp4" | "mkv" | "mov" | "m4v" | "webm" | "m4a" | "aac" | "mp3" | "ogg" | "flac"
-            | "docx" | "xlsx" | "pptx"
+        "zip"
+            | "7z"
+            | "rar"
+            | "gz"
+            | "bz2"
+            | "xz"
+            | "zst"
+            | "lz4"
+            | "cab"
+            | "tgz"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "webp"
+            | "avif"
+            | "heic"
+            | "mp4"
+            | "mkv"
+            | "mov"
+            | "m4v"
+            | "webm"
+            | "m4a"
+            | "aac"
+            | "mp3"
+            | "ogg"
+            | "flac"
+            | "docx"
+            | "xlsx"
+            | "pptx"
     )
 }
 
@@ -97,7 +123,8 @@ pub(crate) fn compress_with_level(paths: &[String], dest: &Path, level: i64) -> 
         if md.is_dir() {
             add_dir(&mut zip, src, &base, level, &mut buf)?;
         } else if md.is_file() {
-            zip.start_file(base, entry_options(src, level)).map_err(|e| e.to_string())?;
+            zip.start_file(base, entry_options(src, level))
+                .map_err(|e| e.to_string())?;
             stream_file(&mut zip, src, &mut buf)?;
         }
     }
@@ -128,7 +155,8 @@ fn add_dir<W: io::Write + io::Seek>(
         if ft.is_dir() {
             add_dir(zip, &path, &entry_name, level, buf)?;
         } else if ft.is_file() {
-            zip.start_file(entry_name, entry_options(&path, level)).map_err(|e| e.to_string())?;
+            zip.start_file(entry_name, entry_options(&path, level))
+                .map_err(|e| e.to_string())?;
             stream_file(zip, &path, buf)?;
         }
     }

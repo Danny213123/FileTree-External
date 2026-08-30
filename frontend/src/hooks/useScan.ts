@@ -3,6 +3,7 @@ import { scanStreamUrl } from "../api/client";
 import type { NodeRecord, ScanResult } from "../api/types";
 import type { ScanOptions } from "../api/client";
 import { getCached, setCached } from "../lib/scanCache";
+import { isTauriV2, runV2Scan } from "../api/v2";
 
 // The backend omits children[] and path to save bandwidth.
 // Multi-threaded scanning means array order != ID order, so we must use a Map for lookup.
@@ -48,11 +49,8 @@ export function reconstructChildren<T extends ScanResult>(result: T): T {
 // Node-count ceiling above which a scan is ingested in LAZY mode: the renderer
 // keeps only the root and fetches each directory's children on demand from the
 // backend's cached scan (GET /api/children), instead of materializing the whole
-// tree (the >10M-node black-screen OOM). Tuned to sit below the renderer's heap
-// headroom (electron raises --max-old-space-size to 8 GB) with margin: a full
-// scan of this many nodes still loads comfortably, beyond it we go lazy. Normal
-// scans (the overwhelming majority) stay well under this and keep today's exact
-// full-materialization fast path.
+// tree (the >10M-node black-screen OOM). This threshold now applies only to the
+// browser-compatible headless client; Tauri v2 is always disk-backed and lazy.
 export const LAZY_THRESHOLD = 1_500_000;
 
 export type ScanStatus = "idle" | "scanning" | "done" | "error" | "cancelled";
@@ -234,6 +232,31 @@ export function useScan(): UseScanReturn {
   const startScan = useCallback((opts: ScanOptions) => {
     if (controllerRef.current) return;
 
+    if (isTauriV2()) {
+      const controller = new AbortController();
+      controllerRef.current = controller;
+      setStatus("scanning");
+      setErrorMessage("");
+      setProgress(null);
+      setData(null);
+      void runV2Scan(opts, (value) => {
+        setProgress({ nodes: value.nodeCount, elapsed: value.elapsedMs });
+      }, controller.signal)
+        .then((result) => {
+          setData(result);
+          setStatus("done");
+          setProgress(null);
+        })
+        .catch((err: unknown) => {
+          if (err instanceof Error && err.name === "AbortError") return;
+          setErrorMessage(err instanceof Error ? err.message : String(err));
+          setStatus("error");
+          setProgress(null);
+        })
+        .finally(() => { controllerRef.current = null; });
+      return;
+    }
+
     // Serve from cache when available — avoids redundant network requests.
     // nocache forces a fresh fetch (e.g. the rescan right after a native move).
     const cached = opts.nocache ? null : getCached(opts.path);
@@ -290,6 +313,26 @@ export function useScan(): UseScanReturn {
     setErrorMessage("");
     setProgress(null);
     // NOTE: we intentionally do NOT call setData(null) here
+
+    if (isTauriV2()) {
+      return runV2Scan(opts, (value) => {
+        setProgress({ nodes: value.nodeCount, elapsed: value.elapsedMs });
+      }, controller.signal)
+        .then((result) => {
+          setData(result);
+          setStatus("done");
+          setProgress(null);
+          return result;
+        })
+        .catch((err: unknown) => {
+          if (err instanceof Error && err.name === "AbortError") return null;
+          setErrorMessage(err instanceof Error ? err.message : String(err));
+          setStatus("error");
+          setProgress(null);
+          return null;
+        })
+        .finally(() => { controllerRef.current = null; });
+    }
 
     const url = scanStreamUrl(opts);
     return fetch(url, { signal: controller.signal })

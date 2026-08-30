@@ -4,6 +4,29 @@ All notable changes to FileTree are documented here.
 
 This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
 
+## [2.0.0-alpha.1] - Unreleased
+
+### Changed
+
+- Replaced Electron, its preload bridge, N-API addon, bundled Chromium runtime, 8 GB V8 override, and desktop loopback server with a Tauri 2 shell and one software-composited WebView2 control. NVENC remains a separate HandBrake hardware-encoding process.
+- Split the application into the reusable `filetree-core`, standalone `filetree` CLI, and `filetree-desktop` Tauri crates. Desktop scans and compression controls use typed commands and bounded progress channels.
+- Replaced v2 full-tree scan retention with per-scan SQLite databases. Scanner rows cross an 8,192-record bounded channel, commit in 10,000-row transactions, and are served in 500-row pages.
+- Added a byte-aware sixteen-page renderer cache, inactive-tab row disposal and scan rehydration, 16 MiB thumbnail and 4 MiB icon budgets, a 96 MiB managed-memory target, and 10 GiB LRU scan-index eviction.
+- Added `%LOCALAPPDATA%\FileTree\v2\state.db` for scan metadata, settings, compression state, and a non-destructive v1 migration catalog. Existing v1 files are never removed.
+- Moved the existing hardware-only, two-worker compression scheduler into the in-process Tauri runtime, including pause/resume, hard stop, prioritize/skip, telemetry, paged reads, and live events. Terminal jobs are removed from the live registry after persistence.
+- Reworked file search into a shared tokenized query language for renderer and SQLite-backed scans. Plain terms combine with AND; quoted phrases, exclusions, `name:`/`path:`/`ext:`/`type:` scopes, `*`/`?` wildcards, and regular expressions are supported.
+- Fixed v2 paged search dropping size, modified-date, extension, and category filters before the SQLite query. Desktop and opt-in headless search now use the same typed filter contract.
+- Streamed compression manifest checkpoints through a bounded writer and restricted queue restoration to an 8 KiB status probe, eliminating the previous 70-135 MiB per-manifest allocation and startup parsing spike.
+- Content-hashed renderer assets, WebView cache bypass, and a dedicated v2 renderer profile prevent an older embedded frontend or experimental alpha cache from surviving a desktop upgrade. The memory harness now labels WebView2 process roles and terminates only the complete process tree it launched.
+- Inactive restored tabs no longer start scans until selected, and a scan result arriving after deactivation cannot refill that tab's bounded row-page cache.
+- Tauri v2 now restores tabs exclusively from the SQLite settings store instead of allowing stale renderer-local crash state to restart large scans. The legacy localStorage fallback remains available to browser and Electron clients.
+- Hardened aggregate memory measurement against Windows PID reuse by rejecting process-tree links where a purported child predates its live parent, and fail the gate when FileTree exits before the sampling deadline.
+
+### Validation gates
+
+- Production `2.0.0` remains blocked until the aggregate FileTree plus descendant WebView2 private working set passes 200 MiB at idle/100,000 files, 350 MiB at 1,000,000 files, and 500 MiB at 10,000,000 files, plus the planned soak, migration, shell-integration, and recovery tests.
+- A corrected one-minute clean-profile smoke gate settled at 134.42 MiB total, with a 136.26 MiB post-warmup peak across FileTree and six WebView2 descendants. The required ten-minute idle gate and all scan/soak gates remain open.
+
 ## [1.14.7] - 2026-08-24
 
 ### Fixed

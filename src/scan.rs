@@ -122,7 +122,11 @@ where
     // seed the queue with its own scan job; the path + depth the job needs travel
     // WITH the job, so a worker never has to read a shared node buffer to scan it.
     let initial_queue: VecDeque<DirJob> = if root_is_dir {
-        VecDeque::from([DirJob { id: 0, path: root_node.path.clone(), depth: 0 }])
+        VecDeque::from([DirJob {
+            id: 0,
+            path: root_node.path.clone(),
+            depth: 0,
+        }])
     } else {
         VecDeque::new()
     };
@@ -157,7 +161,11 @@ where
     let mut last_progress_nodes = 0usize;
     loop {
         // For large scans (> 50k nodes), halve the snapshot frequency.
-        let interval_ms = if last_progress_nodes > 50_000 { 3000 } else { 1500 };
+        let interval_ms = if last_progress_nodes > 50_000 {
+            3000
+        } else {
+            1500
+        };
         thread::sleep(Duration::from_millis(interval_ms));
         let scan_done = {
             let queue = shared.queue.lock().expect("queue lock poisoned");
@@ -183,8 +191,7 @@ where
     }
 
     let total_nodes = node_count_shared.load(Ordering::Relaxed);
-    let pending_errors =
-        std::mem::take(&mut *shared.errors.lock().expect("errors lock poisoned"));
+    let pending_errors = std::mem::take(&mut *shared.errors.lock().expect("errors lock poisoned"));
 
     Ok(finalize_scan_result(
         root_node,
@@ -260,7 +267,9 @@ pub(crate) fn finalize_scan_result(
     // directory's children always occupied one contiguous, ascending id block),
     // and `aggregate_nodes` re-sorts children anyway.
     for id in 0..nodes.len() {
-        let Some(parent) = nodes[id].parent else { continue };
+        let Some(parent) = nodes[id].parent else {
+            continue;
+        };
         if parent < nodes.len() {
             nodes[parent].children.push(id);
         }
@@ -278,7 +287,10 @@ pub(crate) fn finalize_scan_result(
     // Aggregation is O(n) and operates on the owned buffer (no shared lock held).
     aggregate_nodes(&mut nodes);
 
-    let root_path = nodes.first().map(|node| node.path.clone()).unwrap_or_default();
+    let root_path = nodes
+        .first()
+        .map(|node| node.path.clone())
+        .unwrap_or_default();
     // Compute capped analytics once here so responses/cache hits never recompute.
     let summary = crate::analytics::scan_summary(&nodes, scanned_at_ms);
 
@@ -459,8 +471,8 @@ fn scan_directory_win32(
     // Build the "dir_path\*" wide string for FindFirstFileExW.
     // Re-use dir_path as a &str to avoid a PathBuf round-trip.
     let pattern: Vec<u16> = {
-        use std::os::windows::ffi::OsStrExt;
         use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
         let mut wide: Vec<u16> = OsStr::new(dir_path).encode_wide().collect();
         if wide.last().copied() != Some(b'\\' as u16) && wide.last().copied() != Some(b'/' as u16) {
             wide.push(b'\\' as u16);
@@ -520,7 +532,9 @@ fn scan_directory_win32(
         let c0 = data.cFileName[0];
         let c1 = data.cFileName[1];
         if c0 == b'.' as u16 && (c1 == 0 || (c1 == b'.' as u16 && data.cFileName[2] == 0)) {
-            if unsafe { FindNextFileW(handle, find_data.as_mut_ptr()) } == 0 { break; }
+            if unsafe { FindNextFileW(handle, find_data.as_mut_ptr()) } == 0 {
+                break;
+            }
             continue;
         }
 
@@ -529,7 +543,9 @@ fn scan_directory_win32(
         let hidden = attrs & FILE_ATTRIBUTE_HIDDEN != 0;
 
         if hidden && !shared.options.include_hidden {
-            if unsafe { FindNextFileW(handle, find_data.as_mut_ptr()) } == 0 { break; }
+            if unsafe { FindNextFileW(handle, find_data.as_mut_ptr()) } == 0 {
+                break;
+            }
             continue;
         }
 
@@ -545,7 +561,9 @@ fn scan_directory_win32(
         if !shared.options.exclude_patterns.is_empty()
             && should_exclude(&shared.options.exclude_patterns, &name_str, &entry_path_str)
         {
-            if unsafe { FindNextFileW(handle, find_data.as_mut_ptr()) } == 0 { break; }
+            if unsafe { FindNextFileW(handle, find_data.as_mut_ptr()) } == 0 {
+                break;
+            }
             continue;
         }
 
@@ -565,10 +583,22 @@ fn scan_directory_win32(
                     Err(_) => (0u64, 0u64, 0u64, 0u64, 0u64),
                 }
             } else if is_dir {
-                (0u64, 0u64,
-                 filetime_to_ms(data.ftLastWriteTime.dwHighDateTime, data.ftLastWriteTime.dwLowDateTime),
-                 filetime_to_ms(data.ftCreationTime.dwHighDateTime,   data.ftCreationTime.dwLowDateTime),
-                 filetime_to_ms(data.ftLastAccessTime.dwHighDateTime, data.ftLastAccessTime.dwLowDateTime))
+                (
+                    0u64,
+                    0u64,
+                    filetime_to_ms(
+                        data.ftLastWriteTime.dwHighDateTime,
+                        data.ftLastWriteTime.dwLowDateTime,
+                    ),
+                    filetime_to_ms(
+                        data.ftCreationTime.dwHighDateTime,
+                        data.ftCreationTime.dwLowDateTime,
+                    ),
+                    filetime_to_ms(
+                        data.ftLastAccessTime.dwHighDateTime,
+                        data.ftLastAccessTime.dwLowDateTime,
+                    ),
+                )
             } else {
                 let s = ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64;
                 // Only call GetCompressedFileSizeW for compressed files — saves a syscall per file
@@ -577,9 +607,18 @@ fn scan_directory_win32(
                 } else {
                     s
                 };
-                let t  = filetime_to_ms(data.ftLastWriteTime.dwHighDateTime, data.ftLastWriteTime.dwLowDateTime);
-                let cr = filetime_to_ms(data.ftCreationTime.dwHighDateTime,   data.ftCreationTime.dwLowDateTime);
-                let ac = filetime_to_ms(data.ftLastAccessTime.dwHighDateTime, data.ftLastAccessTime.dwLowDateTime);
+                let t = filetime_to_ms(
+                    data.ftLastWriteTime.dwHighDateTime,
+                    data.ftLastWriteTime.dwLowDateTime,
+                );
+                let cr = filetime_to_ms(
+                    data.ftCreationTime.dwHighDateTime,
+                    data.ftCreationTime.dwLowDateTime,
+                );
+                let ac = filetime_to_ms(
+                    data.ftLastAccessTime.dwHighDateTime,
+                    data.ftLastAccessTime.dwLowDateTime,
+                );
                 (s, a, t, cr, ac)
             };
 
@@ -627,7 +666,11 @@ fn scan_directory_win32(
             // name (see `model::node_abs_path`), removing the largest per-file
             // allocation. `entry_path_str` is still moved into `depth_limit_paths`
             // below for the depth-limited-directory case.
-            path: if is_dir { entry_path_str.clone() } else { String::new() },
+            path: if is_dir {
+                entry_path_str.clone()
+            } else {
+                String::new()
+            },
             is_dir,
             is_link,
             hidden,
@@ -689,7 +732,12 @@ fn scan_directory_win32(
         let child_id = child.id;
         if sentinel == usize::MAX {
             let path_str = depth_limit_iter.next().unwrap_or_default();
-            add_scan_error(shared, child_id, &path_str, "depth limit reached".to_string());
+            add_scan_error(
+                shared,
+                child_id,
+                &path_str,
+                "depth limit reached".to_string(),
+            );
         } else if sentinel != usize::MAX - 1 {
             dirs_to_scan.push(DirJob {
                 id: child_id,
@@ -727,7 +775,12 @@ fn scan_directory_portable(
     let entries = match fs::read_dir(dir_path) {
         Ok(entries) => entries,
         Err(error) => {
-            add_scan_error(shared, dir_id, &dir_path.display().to_string(), error.to_string());
+            add_scan_error(
+                shared,
+                dir_id,
+                &dir_path.display().to_string(),
+                error.to_string(),
+            );
             return;
         }
     };
@@ -744,7 +797,12 @@ fn scan_directory_portable(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                add_scan_error(shared, dir_id, &dir_path.display().to_string(), error.to_string());
+                add_scan_error(
+                    shared,
+                    dir_id,
+                    &dir_path.display().to_string(),
+                    error.to_string(),
+                );
                 continue;
             }
         };
@@ -753,7 +811,12 @@ fn scan_directory_portable(
         let symlink_meta = match fs::symlink_metadata(&entry_path) {
             Ok(m) => m,
             Err(error) => {
-                add_scan_error(shared, dir_id, &entry_path.display().to_string(), error.to_string());
+                add_scan_error(
+                    shared,
+                    dir_id,
+                    &entry_path.display().to_string(),
+                    error.to_string(),
+                );
                 continue;
             }
         };
@@ -762,7 +825,12 @@ fn scan_directory_portable(
             match fs::metadata(&entry_path) {
                 Ok(m) => m,
                 Err(error) => {
-                    add_scan_error(shared, dir_id, &entry_path.display().to_string(), error.to_string());
+                    add_scan_error(
+                        shared,
+                        dir_id,
+                        &entry_path.display().to_string(),
+                        error.to_string(),
+                    );
                     continue;
                 }
             }
@@ -818,7 +886,11 @@ fn scan_directory_portable(
             // Path interning: files drop their path (rebuilt from parent dir +
             // name via `model::node_abs_path`); dirs keep it. `path_string` is
             // still moved into `depth_limit_paths` below for depth-limited dirs.
-            path: if is_dir { path_string.clone() } else { String::new() },
+            path: if is_dir {
+                path_string.clone()
+            } else {
+                String::new()
+            },
             is_dir,
             is_link,
             hidden,
@@ -833,7 +905,11 @@ fn scan_directory_portable(
             depth,
             errors: 0,
             children: Vec::new(),
-            extension: if is_file_like { extension_from_name(&local_nodes.last().map(|_| "").unwrap_or("")).to_string() } else { String::new() },
+            extension: if is_file_like {
+                extension_from_name(&local_nodes.last().map(|_| "").unwrap_or("")).to_string()
+            } else {
+                String::new()
+            },
             owner,
             // Raw Windows attribute bitmask is unavailable via std metadata on
             // non-Windows; the existing hidden/readonly bools still carry over.
@@ -875,7 +951,12 @@ fn scan_directory_portable(
         let child_id = child.id;
         if sentinel == usize::MAX {
             let path_str = depth_limit_iter.next().unwrap_or_default();
-            add_scan_error(shared, child_id, &path_str, "depth limit reached".to_string());
+            add_scan_error(
+                shared,
+                child_id,
+                &path_str,
+                "depth limit reached".to_string(),
+            );
         } else if sentinel != usize::MAX - 1 {
             dirs_to_scan.push(DirJob {
                 id: child_id,
@@ -902,17 +983,13 @@ fn add_scan_error(shared: &WorkerShared, node_id: usize, path: &str, message: St
     // The node owning this error may live in another worker's buffer, so the
     // per-node `errors` count can't be bumped here. Record `(node_id, error)` and
     // apply the increment in `finalize_scan_result`, where the full buffer exists.
-    shared
-        .errors
-        .lock()
-        .expect("errors lock poisoned")
-        .push((
-            node_id,
-            ScanError {
-                path: path.to_string(),
-                message,
-            },
-        ));
+    shared.errors.lock().expect("errors lock poisoned").push((
+        node_id,
+        ScanError {
+            path: path.to_string(),
+            message,
+        },
+    ));
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -960,11 +1037,11 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
             allocated = allocated.saturating_add(child.allocated);
             files = files.saturating_add(child.files);
             errors = errors.saturating_add(child.errors);
-            if modified_ms < child.modified_ms { modified_ms = child.modified_ms; }
+            if modified_ms < child.modified_ms {
+                modified_ms = child.modified_ms;
+            }
             if child.is_dir {
-                folders = folders
-                    .saturating_add(1)
-                    .saturating_add(child.folders);
+                folders = folders.saturating_add(1).saturating_add(child.folders);
             }
         }
 
@@ -1006,10 +1083,7 @@ pub(crate) fn aggregate_nodes(nodes: &mut [NodeRecord]) {
 /// parallelizes across scoped threads for large trees; below a threshold (or on
 /// a single core) it runs inline to avoid spawn overhead. Returns
 /// `(dir_id, sorted_children)` pairs for the caller to write back.
-fn sort_children_parallel(
-    nodes: &[NodeRecord],
-    dir_ids: &[usize],
-) -> Vec<(usize, Vec<usize>)> {
+fn sort_children_parallel(nodes: &[NodeRecord], dir_ids: &[usize]) -> Vec<(usize, Vec<usize>)> {
     let sort_one = |dir_id: usize| -> (usize, Vec<usize>) {
         let mut children = nodes[dir_id].children.clone();
         // A cached key lowercases each name once instead of twice per compare.
@@ -1161,7 +1235,10 @@ mod tests {
             assert_eq!(node.id, idx, "node at index {idx} must have id == index");
         }
         assert_eq!(result.nodes[2].size, 40, "dir should aggregate its child");
-        assert_eq!(result.nodes[0].size, 80, "root should aggregate the whole tree");
+        assert_eq!(
+            result.nodes[0].size, 80,
+            "root should aggregate the whole tree"
+        );
         assert_eq!(result.nodes[0].files, 3, "root should count every file");
     }
 
@@ -1208,7 +1285,10 @@ mod tests {
         );
         assert_eq!(result.nodes[0].size, 500, "root aggregates the whole chain");
         assert_eq!(result.nodes[0].files, 1, "root counts the single leaf file");
-        assert_eq!(result.nodes[0].folders, 2, "root counts both sub-directories");
+        assert_eq!(
+            result.nodes[0].folders, 2,
+            "root counts both sub-directories"
+        );
     }
 
     #[test]
@@ -1228,9 +1308,19 @@ mod tests {
 
         let result = finalize_scan_result(root, vec![vec![child]], 2, pending, 1_000_000, 0, 1);
 
-        assert_eq!(result.nodes[1].errors, 1, "deferred error should land on the node");
-        assert_eq!(result.nodes[0].errors, 1, "child error should roll up to root");
-        assert_eq!(result.errors.len(), 1, "the error message should be retained");
+        assert_eq!(
+            result.nodes[1].errors, 1,
+            "deferred error should land on the node"
+        );
+        assert_eq!(
+            result.nodes[0].errors, 1,
+            "child error should roll up to root"
+        );
+        assert_eq!(
+            result.errors.len(),
+            1,
+            "the error message should be retained"
+        );
     }
 
     #[test]
@@ -1367,8 +1457,8 @@ mod tests {
     #[test]
     fn functional_scan_aggregates_sizes_and_counts() {
         use std::fs;
-        let base = std::env::temp_dir()
-            .join(format!("filetree_func_{}_{}", std::process::id(), now_ms()));
+        let base =
+            std::env::temp_dir().join(format!("filetree_func_{}_{}", std::process::id(), now_ms()));
         let sub1 = base.join("sub1");
         let sub2 = sub1.join("sub2");
         fs::create_dir_all(&sub2).unwrap();
@@ -1417,8 +1507,14 @@ mod tests {
 
         // The live counter must have reached the true total (not stuck at 0).
         let seen = max_progress.load(Ordering::Relaxed);
-        assert!(seen > 0, "progress counter must increment above 0 (was {seen})");
-        assert_eq!(seen, total_nodes, "progress counter must reach the node total");
+        assert!(
+            seen > 0,
+            "progress counter must increment above 0 (was {seen})"
+        );
+        assert_eq!(
+            seen, total_nodes,
+            "progress counter must reach the node total"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -1440,8 +1536,11 @@ mod tests {
         use std::fs;
         use std::process::Command;
 
-        let base = std::env::temp_dir()
-            .join(format!("filetree_junction_{}_{}", std::process::id(), now_ms()));
+        let base = std::env::temp_dir().join(format!(
+            "filetree_junction_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
         let target = base.join("target");
         fs::create_dir_all(&target).expect("create target dir");
         fs::write(target.join("data.bin"), vec![b'x'; 1000]).expect("write target file");
@@ -1470,8 +1569,8 @@ mod tests {
             collect_owners: false,
         };
         let cancel = Arc::new(AtomicBool::new(false));
-        let result = scan_path_with_progress(options, cancel, |_, _| {})
-            .expect("scan should succeed");
+        let result =
+            scan_path_with_progress(options, cancel, |_, _| {}).expect("scan should succeed");
 
         let junction = result
             .nodes
@@ -1479,12 +1578,18 @@ mod tests {
             .find(|n| n.name == "link")
             .expect("junction node should be present in the scan");
         assert!(junction.is_link, "junction must be flagged is_link");
-        assert!(junction.is_dir, "a directory junction keeps FILE_ATTRIBUTE_DIRECTORY");
+        assert!(
+            junction.is_dir,
+            "a directory junction keeps FILE_ATTRIBUTE_DIRECTORY"
+        );
         assert_eq!(
             junction.size, 0,
             "reparse-point dir must not be recursed (size would be 1000 if it were)"
         );
-        assert_eq!(junction.errors, 0, "skipping a junction must not record an error");
+        assert_eq!(
+            junction.errors, 0,
+            "skipping a junction must not record an error"
+        );
 
         // The hard requirement: NO FindFirstFileExW error for the junction.
         assert!(

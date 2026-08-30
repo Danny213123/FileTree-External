@@ -187,8 +187,12 @@ fn load_no_gain_index(path: &Path) -> HashSet<NoGainKey> {
                 continue;
             }
             let source_path = col(&record, 3);
-            let Ok(source_bytes) = col(&record, 8).parse::<u64>() else { continue };
-            let Ok(metadata) = fs::metadata(source_path) else { continue };
+            let Ok(source_bytes) = col(&record, 8).parse::<u64>() else {
+                continue;
+            };
+            let Ok(metadata) = fs::metadata(source_path) else {
+                continue;
+            };
             if metadata.len() != source_bytes {
                 continue;
             }
@@ -215,7 +219,11 @@ fn ensure_no_gain_index<'a>(
     slot: &'a mut Option<(PathBuf, HashSet<NoGainKey>)>,
     path: &Path,
 ) -> &'a mut HashSet<NoGainKey> {
-    if slot.as_ref().map(|(loaded_path, _)| loaded_path != path).unwrap_or(true) {
+    if slot
+        .as_ref()
+        .map(|(loaded_path, _)| loaded_path != path)
+        .unwrap_or(true)
+    {
         *slot = Some((path.to_path_buf(), load_no_gain_index(path)));
     }
     &mut slot.as_mut().expect("no-gain cache initialized").1
@@ -233,30 +241,38 @@ pub(crate) fn was_unchanged_no_gain(
         return false;
     };
     let cache_path = no_gain_path();
-    let mut slot = NO_GAIN_INDEX.lock().unwrap_or_else(|error| error.into_inner());
+    let mut slot = NO_GAIN_INDEX
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     ensure_no_gain_index(&mut slot, &cache_path).contains(&key)
 }
 
 /// Remember a verified no-gain result. Duplicate fingerprints stay in memory
 /// and are not appended again, keeping the durable index compact across retries.
-pub(crate) fn remember_unchanged_no_gain(
-    path: &str,
-    source_bytes: u64,
-    source_modified_ms: u64,
-) {
+pub(crate) fn remember_unchanged_no_gain(path: &str, source_bytes: u64, source_modified_ms: u64) {
     let Some(key) = no_gain_key(path, source_bytes, source_modified_ms) else {
         return;
     };
     let cache_path = no_gain_path();
-    let mut slot = NO_GAIN_INDEX.lock().unwrap_or_else(|error| error.into_inner());
+    let mut slot = NO_GAIN_INDEX
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if !ensure_no_gain_index(&mut slot, &cache_path).insert(key.clone()) {
         return;
     }
     if let Some(parent) = cache_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let needs_header = fs::metadata(&cache_path).map(|metadata| metadata.len() == 0).unwrap_or(true);
-    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&cache_path) else { return };
+    let needs_header = fs::metadata(&cache_path)
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(true);
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cache_path)
+    else {
+        return;
+    };
     if needs_header && file.write_all(NO_GAIN_HEADER.as_bytes()).is_err() {
         return;
     }
@@ -272,7 +288,9 @@ pub(crate) fn remember_unchanged_no_gain(
 
 #[cfg(test)]
 pub(crate) fn reset_no_gain_index_for_tests() {
-    *NO_GAIN_INDEX.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    *NO_GAIN_INDEX
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
 }
 
 /// Append one CSV row. Best-effort: any error is silently ignored so the real
@@ -316,7 +334,9 @@ fn append_line(path: &Path, line: &str) -> io::Result<()> {
 /// any error leaves the existing (oversized) file untouched. Runs under the
 /// caller's `LOCK`, so no other writer can interleave.
 fn compact_if_needed(path: &Path) {
-    let too_big = fs::metadata(path).map(|m| m.len() >= MAX_BYTES).unwrap_or(false);
+    let too_big = fs::metadata(path)
+        .map(|m| m.len() >= MAX_BYTES)
+        .unwrap_or(false);
     if !too_big {
         return;
     }
@@ -329,7 +349,11 @@ fn compact_if_needed(path: &Path) {
         return;
     }
     // Drop a leading header row if present (re-emitted from the constant below).
-    if records.first().map(|r| r.first().map(|c| c == "ts").unwrap_or(false)).unwrap_or(false) {
+    if records
+        .first()
+        .map(|r| r.first().map(|c| c == "ts").unwrap_or(false))
+        .unwrap_or(false)
+    {
         records.remove(0);
     }
     let start = records.len().saturating_sub(KEEP_ROWS);
@@ -379,7 +403,10 @@ fn format_row(r: &Row) -> String {
     push_field(&mut s, if r.recycled { "true" } else { "false" });
     push_field(&mut s, r.error);
     push_field(&mut s, r.reason);
-    push_field(&mut s, &r.exit_code.map(|c| c.to_string()).unwrap_or_default());
+    push_field(
+        &mut s,
+        &r.exit_code.map(|c| c.to_string()).unwrap_or_default(),
+    );
     push_field(&mut s, r.tool_version);
     push_field(&mut s, r.command);
     // Last column: no trailing comma, then the row terminator.
@@ -485,7 +512,11 @@ fn push_record_json(s: &mut String, rec: &[String]) {
     s.push_str(",\"outPath\":");
     push_json_string(s, col(rec, 16));
     s.push_str(",\"recycled\":");
-    s.push_str(if col(rec, 17) == "true" { "true" } else { "false" });
+    s.push_str(if col(rec, 17) == "true" {
+        "true"
+    } else {
+        "false"
+    });
     s.push_str(",\"error\":");
     push_json_string(s, col(rec, 18));
     // Diagnostics columns (appended; absent in older rows → sensible defaults).
@@ -493,7 +524,14 @@ fn push_record_json(s: &mut String, rec: &[String]) {
     // to a badge in the UI.
     let reason = col(rec, 19);
     s.push_str(",\"reason\":");
-    push_json_string(s, if reason.is_empty() { col(rec, 7) } else { reason });
+    push_json_string(
+        s,
+        if reason.is_empty() {
+            col(rec, 7)
+        } else {
+            reason
+        },
+    );
     s.push_str(",\"exitCode\":");
     s.push_str(&inum(col(rec, 20)));
     s.push_str(",\"toolVersion\":");
@@ -508,7 +546,10 @@ fn push_record_json(s: &mut String, rec: &[String]) {
 /// Emit a JSON integer from a CSV cell, defaulting to `0` on a parse failure so
 /// the body is always valid JSON.
 fn num(cell: &str) -> String {
-    cell.trim().parse::<u64>().map(|n| n.to_string()).unwrap_or_else(|_| "0".to_string())
+    cell.trim()
+        .parse::<u64>()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 /// Emit a JSON integer (possibly negative) or `null` from a CSV cell. Used for

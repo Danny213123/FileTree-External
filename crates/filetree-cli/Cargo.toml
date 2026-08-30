@@ -1,0 +1,14 @@
+[package]
+name = "filetree-cli"
+version = "2.0.0"
+description = "FileTree command-line and opt-in headless server"
+authors = ["Danny213123"]
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "filetree"
+path = "src/main.rs"
+
+[dependencies]
+filetree-core = { path = "../.." }

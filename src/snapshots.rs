@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use crate::export::push_json_string;
 use crate::io::now_ms;
 use crate::json::{self, JsonValue};
-use crate::model::{node_abs_path, ScanResult};
+use crate::model::{ScanResult, node_abs_path};
 
 /// Cap on entries returned per diff bucket (added / removed / changed). A diff of
 /// two large drives can be enormous; the UI only needs the biggest movers.
@@ -92,7 +92,9 @@ fn snapshot_file(id: &str) -> PathBuf {
 fn is_safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 // ── Save ─────────────────────────────────────────────────────
@@ -199,7 +201,11 @@ fn meta_from_json(v: &JsonValue) -> Option<SnapMeta> {
     Some(SnapMeta {
         id: v.get("id")?.as_str()?.to_string(),
         created_at: v.get("createdAt").and_then(|x| x.as_u64()).unwrap_or(0),
-        path: v.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        path: v
+            .get("path")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         total: v.get("total").and_then(|x| x.as_u64()).unwrap_or(0),
         file_count: v.get("fileCount").and_then(|x| x.as_u64()).unwrap_or(0),
     })
@@ -283,9 +289,17 @@ pub(crate) fn load_snapshot(id: &str) -> Option<SnapData> {
     let text = fs::read_to_string(snapshot_file(id)).ok()?;
     let v = json::parse(&text)?;
     let meta = SnapMeta {
-        id: v.get("id").and_then(|x| x.as_str()).unwrap_or(id).to_string(),
+        id: v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or(id)
+            .to_string(),
         created_at: v.get("createdAt").and_then(|x| x.as_u64()).unwrap_or(0),
-        path: v.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        path: v
+            .get("path")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         total: v.get("total").and_then(|x| x.as_u64()).unwrap_or(0),
         file_count: v.get("fileCount").and_then(|x| x.as_u64()).unwrap_or(0),
     };
@@ -332,9 +346,7 @@ pub(crate) fn diff_json(a: &SnapData, b: &SnapData) -> String {
     removed.truncate(DIFF_CAP);
     changed.truncate(DIFF_CAP);
 
-    let mut out = String::with_capacity(
-        (added.len() + removed.len() + changed.len()) * 80 + 64,
-    );
+    let mut out = String::with_capacity((added.len() + removed.len() + changed.len()) * 80 + 64);
     out.push_str("{\"added\":[");
     for (i, (p, s)) in added.iter().enumerate() {
         if i > 0 {

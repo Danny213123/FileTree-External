@@ -121,8 +121,11 @@ fn run_powershell(script: &str) -> Result<String, String> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp: PathBuf =
-        std::env::temp_dir().join(format!("filetree_sched_{}_{}.ps1", std::process::id(), nonce));
+    let tmp: PathBuf = std::env::temp_dir().join(format!(
+        "filetree_sched_{}_{}.ps1",
+        std::process::id(),
+        nonce
+    ));
 
     std::fs::write(&tmp, script).map_err(|e| format!("could not stage task script: {e}"))?;
 

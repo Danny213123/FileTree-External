@@ -3,11 +3,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::dupes::{hash_candidate_groups, HashInput};
+use crate::dupes::{HashInput, hash_candidate_groups};
 use crate::export::{push_id_array, push_json_string};
 use crate::model::{
-    node_abs_path, AgeBucket, DuplicateCandidate, ExtensionStat, HashCacheEntry, NodeRecord,
-    ScanResult, ScanSummary,
+    AgeBucket, DuplicateCandidate, ExtensionStat, HashCacheEntry, NodeRecord, ScanResult,
+    ScanSummary, node_abs_path,
 };
 
 /// Filter parameters for duplicate search.
@@ -103,7 +103,9 @@ pub(crate) fn write_duplicates_full_json<W: Write>(
                 continue;
             }
         }
-        if !filter.extensions.is_empty() && !filter.extensions.contains(&node.extension.to_lowercase()) {
+        if !filter.extensions.is_empty()
+            && !filter.extensions.contains(&node.extension.to_lowercase())
+        {
             continue;
         }
         if !filter.name_pattern.is_empty() {
@@ -150,9 +152,13 @@ pub(crate) fn write_duplicates_full_json<W: Write>(
         let size = inputs[idxs[0]].size;
         if directional {
             let has_keep = filter.keep_prefix.is_empty()
-                || idxs.iter().any(|&k| path_at(k).starts_with(&filter.keep_prefix));
+                || idxs
+                    .iter()
+                    .any(|&k| path_at(k).starts_with(&filter.keep_prefix));
             let has_search = filter.search_prefix.is_empty()
-                || idxs.iter().any(|&k| path_at(k).starts_with(&filter.search_prefix));
+                || idxs
+                    .iter()
+                    .any(|&k| path_at(k).starts_with(&filter.search_prefix));
             if !has_keep || !has_search {
                 continue;
             }
@@ -162,7 +168,9 @@ pub(crate) fn write_duplicates_full_json<W: Write>(
 
     groups.sort_by(|left, right| {
         let lw = left.0.saturating_mul(left.2.len().saturating_sub(1) as u64);
-        let rw = right.0.saturating_mul(right.2.len().saturating_sub(1) as u64);
+        let rw = right
+            .0
+            .saturating_mul(right.2.len().saturating_sub(1) as u64);
         rw.cmp(&lw)
     });
     groups.truncate(limit);
@@ -177,22 +185,35 @@ pub(crate) fn write_duplicates_full_json<W: Write>(
         }
         // For directional mode, count only the search-side files as duplicates.
         let dupe_count = if directional && !filter.search_prefix.is_empty() {
-            idxs.iter().filter(|&&k| path_at(k).starts_with(&filter.search_prefix)).count()
+            idxs.iter()
+                .filter(|&&k| path_at(k).starts_with(&filter.search_prefix))
+                .count()
         } else {
             idxs.len().saturating_sub(1)
         };
         let waste = size.saturating_mul(dupe_count as u64);
         output.push('{');
-        output.push_str("\"size\":"); output.push_str(&size.to_string());
-        output.push_str(",\"hash\":"); push_json_string(&mut output, &format!("{hash:016x}"));
-        output.push_str(",\"waste\":"); output.push_str(&waste.to_string());
-        output.push_str(",\"count\":"); output.push_str(&idxs.len().to_string());
-        output.push_str(",\"directional\":"); output.push_str(if directional { "true" } else { "false" });
+        output.push_str("\"size\":");
+        output.push_str(&size.to_string());
+        output.push_str(",\"hash\":");
+        push_json_string(&mut output, &format!("{hash:016x}"));
+        output.push_str(",\"waste\":");
+        output.push_str(&waste.to_string());
+        output.push_str(",\"count\":");
+        output.push_str(&idxs.len().to_string());
+        output.push_str(",\"directional\":");
+        output.push_str(if directional { "true" } else { "false" });
         output.push_str(",\"files\":[");
         // In directional mode, sort originals first.
         let mut sorted: Vec<usize> = idxs.clone();
         if directional && !filter.keep_prefix.is_empty() {
-            sorted.sort_by_key(|&k| if path_at(k).starts_with(&filter.keep_prefix) { 0u8 } else { 1u8 });
+            sorted.sort_by_key(|&k| {
+                if path_at(k).starts_with(&filter.keep_prefix) {
+                    0u8
+                } else {
+                    1u8
+                }
+            });
         }
         for (fi, &k) in sorted.iter().enumerate() {
             if fi > 0 {
@@ -206,12 +227,18 @@ pub(crate) fn write_duplicates_full_json<W: Write>(
                 fi == 0
             };
             output.push('{');
-            output.push_str("\"id\":"); output.push_str(&node.id.to_string());
-            output.push_str(",\"name\":"); push_json_string(&mut output, &node.name);
-            output.push_str(",\"path\":"); push_json_string(&mut output, &path);
-            output.push_str(",\"size\":"); output.push_str(&node.size.to_string());
-            output.push_str(",\"modified\":"); output.push_str(&node.modified_ms.to_string());
-            output.push_str(",\"original\":"); output.push_str(if is_original { "true" } else { "false" });
+            output.push_str("\"id\":");
+            output.push_str(&node.id.to_string());
+            output.push_str(",\"name\":");
+            push_json_string(&mut output, &node.name);
+            output.push_str(",\"path\":");
+            push_json_string(&mut output, &path);
+            output.push_str(",\"size\":");
+            output.push_str(&node.size.to_string());
+            output.push_str(",\"modified\":");
+            output.push_str(&node.modified_ms.to_string());
+            output.push_str(",\"original\":");
+            output.push_str(if is_original { "true" } else { "false" });
             output.push('}');
         }
         output.push_str("]}");
@@ -271,7 +298,9 @@ pub(crate) fn exact_duplicates_json(
 
     groups.sort_by(|left, right| {
         let left_waste = left.0.saturating_mul(left.2.len().saturating_sub(1) as u64);
-        let right_waste = right.0.saturating_mul(right.2.len().saturating_sub(1) as u64);
+        let right_waste = right
+            .0
+            .saturating_mul(right.2.len().saturating_sub(1) as u64);
         right_waste.cmp(&left_waste)
     });
     groups.truncate(limit);
@@ -337,7 +366,9 @@ pub(crate) fn top_file_ids(nodes: &[NodeRecord], limit: usize) -> Vec<usize> {
     // Partition the `limit` largest to the front in O(n), then sort only those
     // (O(limit log limit)) instead of fully sorting every file id (O(n log n)).
     if ids.len() > limit {
-        ids.select_nth_unstable_by(limit, |left, right| nodes[*right].size.cmp(&nodes[*left].size));
+        ids.select_nth_unstable_by(limit, |left, right| {
+            nodes[*right].size.cmp(&nodes[*left].size)
+        });
         ids.truncate(limit);
     }
     ids.sort_by(|left, right| nodes[*right].size.cmp(&nodes[*left].size));
@@ -351,7 +382,9 @@ pub(crate) fn largest_dir_ids(nodes: &[NodeRecord], limit: usize) -> Vec<usize> 
         .map(|node| node.id)
         .collect();
     if ids.len() > limit {
-        ids.select_nth_unstable_by(limit, |left, right| nodes[*right].size.cmp(&nodes[*left].size));
+        ids.select_nth_unstable_by(limit, |left, right| {
+            nodes[*right].size.cmp(&nodes[*left].size)
+        });
         ids.truncate(limit);
     }
     ids.sort_by(|left, right| nodes[*right].size.cmp(&nodes[*left].size));
@@ -464,7 +497,14 @@ pub(crate) fn duplicate_candidates(nodes: &[NodeRecord], limit: usize) -> Vec<Du
 mod tests {
     use super::*;
 
-    fn mk(id: usize, parent: Option<usize>, name: &str, path: &str, is_dir: bool, size: u64) -> NodeRecord {
+    fn mk(
+        id: usize,
+        parent: Option<usize>,
+        name: &str,
+        path: &str,
+        is_dir: bool,
+        size: u64,
+    ) -> NodeRecord {
         NodeRecord {
             id,
             parent,
@@ -484,7 +524,11 @@ mod tests {
             depth: if parent.is_some() { 1 } else { 0 },
             errors: 0,
             children: Vec::new(),
-            extension: if is_dir { String::new() } else { "txt".to_string() },
+            extension: if is_dir {
+                String::new()
+            } else {
+                "txt".to_string()
+            },
             owner: String::new(),
             attributes: 0,
         }

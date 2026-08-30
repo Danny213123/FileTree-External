@@ -112,11 +112,7 @@ pub(crate) fn node_child_ids(nodes: &[NodeRecord], parent_id: usize) -> Vec<usiz
 
 /// Whether `node_id` is below `ancestor_id`, using parent pointers only. This
 /// remains valid after the memory-saving finalization step clears child lists.
-pub(crate) fn node_is_descendant(
-    nodes: &[NodeRecord],
-    node_id: usize,
-    ancestor_id: usize,
-) -> bool {
+pub(crate) fn node_is_descendant(nodes: &[NodeRecord], node_id: usize, ancestor_id: usize) -> bool {
     let mut current = Some(node_id);
     for _ in 0..=nodes.len() {
         let Some(id) = current else { return false };
@@ -203,7 +199,7 @@ pub(crate) struct WorkerShared {
 /// `phase`: 0=idle, 1=scanning, 2=hashing, 3=done.
 #[derive(Debug, Default)]
 pub(crate) struct DupesProgress {
-    pub(crate) phase: AtomicU64,         // 0=idle 1=scan 2=hash 3=done
+    pub(crate) phase: AtomicU64, // 0=idle 1=scan 2=hash 3=done
     pub(crate) files_scanned: AtomicU64,
     pub(crate) files_hashing: AtomicU64, // total files to hash
     pub(crate) files_hashed: AtomicU64,
@@ -293,7 +289,9 @@ impl ScanCache {
     }
 
     fn bump(&self) -> u64 {
-        self.tick.fetch_add(1, AtomicOrdering::Relaxed).wrapping_add(1)
+        self.tick
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .wrapping_add(1)
     }
 
     /// Look up `key`, returning a cheap `Arc` clone only when the entry is still
@@ -397,8 +395,13 @@ fn estimate_scan_bytes(result: &ScanResult) -> usize {
         .len()
         .saturating_mul(std::mem::size_of::<NodeRecord>());
     for n in &result.nodes {
-        bytes = bytes.saturating_add(n.name.len() + n.path.len() + n.extension.len() + n.owner.len());
-        bytes = bytes.saturating_add(n.children.len().saturating_mul(std::mem::size_of::<usize>()));
+        bytes =
+            bytes.saturating_add(n.name.len() + n.path.len() + n.extension.len() + n.owner.len());
+        bytes = bytes.saturating_add(
+            n.children
+                .len()
+                .saturating_mul(std::mem::size_of::<usize>()),
+        );
     }
     bytes = bytes.saturating_add(result.errors.len().saturating_mul(96));
     bytes
@@ -555,9 +558,15 @@ mod tests {
     fn newer_oversized_tree_replaces_previous_oversized_tree() {
         let mut cache = ScanCache::with_cap(1024);
 
-        cache.insert("large-old".to_string(), scan_with_payload("large-old", 2048));
+        cache.insert(
+            "large-old".to_string(),
+            scan_with_payload("large-old", 2048),
+        );
         cache.insert("small".to_string(), scan_with_payload("small", 16));
-        cache.insert("large-new".to_string(), scan_with_payload("large-new", 2048));
+        cache.insert(
+            "large-new".to_string(),
+            scan_with_payload("large-new", 2048),
+        );
 
         assert!(cache.get_any("large-new").is_some());
         assert!(cache.get_any("large-old").is_none());

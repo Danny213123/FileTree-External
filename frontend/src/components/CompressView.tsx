@@ -21,7 +21,7 @@ import {
   startCompressJob,
   cancelCompressJob,
   retryCompressJob,
-  fetchCompressJob,
+  fetchCompressJobFiles,
   streamCompressJob,
   listCompressJobs,
   shellContextMenu,
@@ -3086,11 +3086,15 @@ export function CompressInProgress({
 
   const loadDetail = useCallback(async (id: string, signal?: AbortSignal) => {
     setDetailLoading((prev) => new Set(prev).add(id));
-    const snap = await fetchCompressJob(id, signal);
+    const page = await fetchCompressJobFiles(
+      id,
+      { offset: 0, limit: 250, sort: "activity", direction: "desc" },
+      signal,
+    );
     if (signal?.aborted) return;
     setDetails((prev) => {
       const n = new Map(prev);
-      n.set(id, snap?.files ?? []);
+      n.set(id, page?.items ?? []);
       return n;
     });
     setDetailLoading((prev) => {
@@ -3191,7 +3195,10 @@ export function CompressInProgress({
   // Resolve a job's representative produced output (falls back to a source path).
   const jobOutputTarget = useCallback(
     async (id: string): Promise<string | null> => {
-      const files = details.get(id) ?? (await fetchCompressJob(id))?.files;
+      const files = details.get(id) ?? (await fetchCompressJobFiles(
+        id,
+        { offset: 0, limit: 250, sort: "activity", direction: "desc" },
+      ))?.items;
       const out =
         files?.find((f) => f.status === "done" && f.newBytes > 0) ??
         files?.find((f) => f.path);

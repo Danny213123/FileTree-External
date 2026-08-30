@@ -30,6 +30,8 @@ import type {
   CompressEvent,
   CompressLogRow,
 } from "./types";
+import { isTauriV2, scanPage, toNodeRecord } from "./v2";
+import { Channel, invoke } from "@tauri-apps/api/core";
 
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await fetch(url, { signal });
@@ -43,6 +45,7 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
  */
 export async function fetchAppVersion(signal?: AbortSignal): Promise<string> {
   try {
+    if (isTauriV2()) return (await invoke<{ version: string }>("app_version")).version;
     return (await getJson<{ version: string }>("/api/version", signal)).version;
   } catch {
     return "";
@@ -235,12 +238,34 @@ export class ScanStaleError extends Error {
  */
 export async function fetchChildren(opts: {
   rootPath: string;
+  scanId?: string;
   dirId: number;
   scannedAt?: number;
   sort?: string;
   dir?: "asc" | "desc";
   signal?: AbortSignal;
 }): Promise<NodeRecord[]> {
+  if (isTauriV2() && opts.scanId) {
+    const out: NodeRecord[] = [];
+    let offset = 0;
+    // A single expansion is capped at the same sixteen pages as the renderer
+    // LRU. Very wide folders remain bounded instead of recreating a giant map.
+    for (let pageIndex = 0; pageIndex < 16; pageIndex++) {
+      if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const page = await scanPage({
+        scanId: opts.scanId,
+        parentId: opts.dirId,
+        offset,
+        limit: 500,
+        sort: opts.sort,
+        direction: opts.dir,
+      });
+      out.push(...page.items.map(toNodeRecord));
+      offset += page.items.length;
+      if (!page.hasMore || page.items.length === 0) break;
+    }
+    return out;
+  }
   const out: NodeRecord[] = [];
   let offset = 0;
   // Bound the page loop defensively so a misbehaving server can't spin forever.
@@ -313,6 +338,7 @@ export interface ServerSearchResult {
  */
 export async function fetchServerSearch(opts: {
   rootPath: string;
+  scanId?: string;
   query: string;
   regex?: boolean;
   minSize?: number;
@@ -324,6 +350,32 @@ export async function fetchServerSearch(opts: {
   limit?: number;
   signal?: AbortSignal;
 }): Promise<ServerSearchResult> {
+  if (isTauriV2() && opts.scanId) {
+    const wanted = Math.min(2_000, Math.max(1, opts.limit ?? 500));
+    const matches: NodeRecord[] = [];
+    let total = 0;
+    for (let offset = 0; offset < wanted; offset += 500) {
+      if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const page = await scanPage({
+        scanId: opts.scanId,
+        parentId: null,
+        offset,
+        limit: Math.min(500, wanted - offset),
+        search: opts.query,
+        regex: opts.regex,
+        minSize: opts.minSize,
+        maxSize: opts.maxSize,
+        modifiedAfter: opts.modifiedAfter,
+        modifiedBefore: opts.modifiedBefore,
+        ext: opts.ext,
+        category: opts.category,
+      });
+      total = page.total;
+      matches.push(...page.items.map(toNodeRecord));
+      if (!page.hasMore) break;
+    }
+    return { matches, total, capped: matches.length < total };
+  }
   const params = new URLSearchParams({ path: opts.rootPath });
   if (opts.query) params.set("q", opts.query);
   if (opts.regex) params.set("regex", "1");
@@ -342,14 +394,17 @@ export async function fetchServerSearch(opts: {
 }
 
 export async function fetchDrives(): Promise<DriveList> {
+  if (isTauriV2()) return invoke<DriveList>("drives");
   return getJson<DriveList>("/api/drives");
 }
 
 export async function fetchSpecialFolders(): Promise<SpecialFolderList> {
+  if (isTauriV2()) return invoke<SpecialFolderList>("special_folders");
   return getJson<SpecialFolderList>("/api/special-folders");
 }
 
 export async function fetchConfig(): Promise<Config> {
+  if (isTauriV2()) return invoke<Config>("app_config");
   return getJson<Config>("/api/config");
 }
 
@@ -413,10 +468,18 @@ export async function fetchExactDuplicates(
 }
 
 export async function revealPath(path: string): Promise<void> {
+  if (isTauriV2()) {
+    await invoke("reveal_path", { path });
+    return;
+  }
   await postMutation("/api/reveal", { path });
 }
 
 export async function openPath(path: string): Promise<void> {
+  if (isTauriV2()) {
+    await invoke("open_path", { path });
+    return;
+  }
   await postMutation("/api/open", { path });
 }
 
@@ -481,12 +544,17 @@ export async function createFolder(path: string): Promise<void> {
 }
 
 export async function fetchBookmarks(): Promise<string[]> {
+  if (isTauriV2()) return invoke<string[]>("bookmarks_get");
   const res = await fetch("/api/bookmarks");
   if (!res.ok) return [];
   try { return await res.json() as string[]; } catch { return []; }
 }
 
 export async function saveBookmarks(paths: string[]): Promise<void> {
+  if (isTauriV2()) {
+    await invoke("bookmarks_set", { paths });
+    return;
+  }
   await postMutation("/api/bookmarks", paths);
 }
 
@@ -535,13 +603,34 @@ export interface AppSettings {
 }
 
 export async function fetchSettings(): Promise<AppSettings> {
+  if (isTauriV2()) return invoke<AppSettings>("app_settings_get");
   const res = await fetch("/api/settings");
   if (!res.ok) return {};
   try { return await res.json() as AppSettings; } catch { return {}; }
 }
 
 export async function saveSettings(settings: AppSettings): Promise<void> {
+  if (isTauriV2()) {
+    await invoke("app_settings_set", { settings });
+    return;
+  }
   await postMutation("/api/settings", settings);
+}
+
+export async function setCompressionPresence(state: {
+  enabled: boolean;
+  active: boolean;
+  status: string;
+  progress: number;
+}): Promise<void> {
+  if (!isTauriV2()) {
+    const legacy = (window as unknown as {
+      electronAPI?: { setCompressionState?: (value: typeof state) => void };
+    }).electronAPI?.setCompressionState;
+    legacy?.(state);
+    return;
+  }
+  await invoke("compression_presence", state);
 }
 
 // ── File text preview (read-only) ────────────────────────────
@@ -1554,9 +1643,14 @@ const COMPRESS_TOOLS_NONE: CompressTools = {
  */
 export async function fetchCompressTools(signal?: AbortSignal): Promise<CompressTools> {
   try {
-    const res = await fetch("/api/compress-tools", { signal });
-    if (!res.ok) return COMPRESS_TOOLS_NONE;
-    const data = (await res.json()) as Partial<CompressTools>;
+    const data = isTauriV2()
+      ? await invoke<Partial<CompressTools>>("compression_tools")
+      : await (async () => {
+          const res = await fetch("/api/compress-tools", { signal });
+          if (!res.ok) return null;
+          return res.json() as Promise<Partial<CompressTools>>;
+        })();
+    if (!data) return COMPRESS_TOOLS_NONE;
     return {
       handbrake: data.handbrake ?? { found: false },
       image: data.image ?? { found: false, kind: null },
@@ -1674,6 +1768,11 @@ export async function startCompressJob(body: CompressJobRequest): Promise<string
   else delete payload.customMaxHeight;
   if (body.customQuality !== undefined) payload.customQuality = body.customQuality;
   else delete payload.customQuality;
+  if (isTauriV2()) {
+    const result = await invoke<{ jobId: string; status: string }>("compression_start", { request: payload });
+    if (!result.jobId) throw new Error("Rust did not return a job id");
+    return result.jobId;
+  }
   const r = await postMutation("/api/compress-jobs", payload);
   if (!r.ok) throw new Error(mutateErrorText(r));
   const id = (r.data as { jobId?: string } | null)?.jobId;
@@ -1683,6 +1782,14 @@ export async function startCompressJob(body: CompressJobRequest): Promise<string
 
 /** Hard-cancel a running job (kills the active encoder child server-side). */
 export async function cancelCompressJob(id: string): Promise<{ ok: boolean; error?: string }> {
+  if (isTauriV2()) {
+    try {
+      const data = await compressJobMutation("/api/compress-jobs/cancel", { id });
+      return data.ok === false ? { ok: false, error: "Compression job was not found" } : { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   const r = await postMutation("/api/compress-jobs/cancel", { id });
   if (r.ok) return { ok: true };
   return { ok: false, error: mutateErrorText(r) };
@@ -1692,6 +1799,10 @@ async function compressJobMutation(
   path: string,
   body: Record<string, unknown>,
 ): Promise<Record<string, any>> {
+  if (isTauriV2()) {
+    const action = path.split("/").filter(Boolean).pop() ?? "";
+    return invoke<Record<string, any>>("compression_control", { action, request: body });
+  }
   const r = await postMutation(path, body);
   if (!r.ok) throw new Error(mutateErrorText(r));
   return (r.data ?? {}) as Record<string, any>;
@@ -1734,6 +1845,11 @@ export async function removeQueuedCompressJob(id: string): Promise<void> {
 /** Resume a job from its manifest (skips files already `done`). Returns the
  *  (possibly new) job id to re-attach the stream to. */
 export async function retryCompressJob(id: string): Promise<string> {
+  if (isTauriV2()) {
+    const data = await compressJobMutation("/api/compress-jobs/retry", { id });
+    if (!data.jobId) throw new Error("Rust did not return a job id");
+    return data.jobId as string;
+  }
   const r = await postMutation("/api/compress-jobs/retry", { id });
   if (!r.ok) throw new Error(mutateErrorText(r));
   const jobId = (r.data as { jobId?: string } | null)?.jobId;
@@ -1745,6 +1861,10 @@ export async function retryCompressJob(id: string): Promise<string> {
  *  tab. Returns [] on any error so the tab degrades gracefully. */
 export async function listCompressJobs(signal?: AbortSignal): Promise<CompressJobSummary[]> {
   try {
+    if (isTauriV2()) {
+      const data = await invoke<{ jobs?: CompressJobSummary[] }>("compression_list");
+      return Array.isArray(data?.jobs) ? data.jobs : [];
+    }
     const res = await fetch("/api/compress-jobs", { signal });
     if (!res.ok) return [];
     const data = (await res.json()) as { jobs?: CompressJobSummary[] } | null;
@@ -1754,13 +1874,44 @@ export async function listCompressJobs(signal?: AbortSignal): Promise<CompressJo
   }
 }
 
-/** Poll a job's full snapshot (fallback when the NDJSON stream errors). Returns
- *  null when the job can't be read (endpoint missing / 404). */
+/** Poll a job snapshot. Tauri v2 composes this from a compact summary and one
+ *  bounded file page so callers can never pull a 200,000-row payload into the
+ *  WebView. The opt-in legacy headless server keeps its compatibility route. */
 export async function fetchCompressJob(
   id: string,
   signal?: AbortSignal,
 ): Promise<CompressJob | null> {
   try {
+    if (isTauriV2()) {
+      const [summary, page] = await Promise.all([
+        listCompressJobs(signal).then((jobs) => jobs.find((job) => job.id === id) ?? null),
+        fetchCompressJobFiles(id, { offset: 0, limit: 250, sort: "activity" }, signal),
+      ]);
+      if (!summary) return null;
+      return {
+        id: summary.id,
+        status: summary.status,
+        total: summary.total,
+        savedBytes: summary.savedBytes,
+        preset: summary.preset,
+        totalBytes: summary.totalBytes,
+        workCompletedBytes: summary.workCompletedBytes,
+        successfulBytes: summary.successfulBytes,
+        skippedBytes: summary.skippedBytes,
+        failedBytes: summary.failedBytes,
+        activeWorkBytes: summary.activeWorkBytes,
+        activeCount: summary.activeCount,
+        activeElapsedMs: summary.activeElapsedMs,
+        concurrency: summary.concurrency,
+        encoder: summary.encoder,
+        codec: summary.codec,
+        useGpu: summary.useGpu,
+        originalAction: summary.originalAction,
+        outputDir: summary.outputDir,
+        queueRank: summary.queueRank,
+        files: page?.items ?? [],
+      };
+    }
     const res = await fetch(`/api/compress-jobs/${encodeURIComponent(id)}`, { signal });
     if (!res.ok) return null;
     return (await res.json()) as CompressJob;
@@ -1775,6 +1926,9 @@ export async function fetchCompressJobFiles(
   signal?: AbortSignal,
 ): Promise<CompressJobFilesPage | null> {
   try {
+    if (isTauriV2()) {
+      return invoke<CompressJobFilesPage | null>("compression_files", { id, query });
+    }
     const params = new URLSearchParams({ id });
     Object.entries(query).forEach(([key, value]) => {
       if (value !== undefined && value !== "" && value !== false) params.set(key, String(value));
@@ -1792,6 +1946,7 @@ export async function fetchCompressTelemetry(
   signal?: AbortSignal,
 ): Promise<CompressTelemetry | null> {
   try {
+    if (isTauriV2()) return invoke<CompressTelemetry>("compression_telemetry", { id });
     const res = await fetch(`/api/compress-jobs/telemetry?id=${encodeURIComponent(id)}`, { signal });
     if (!res.ok) return null;
     return (await res.json()) as CompressTelemetry;
@@ -1812,6 +1967,13 @@ export async function streamCompressJob(
   onEvent: (ev: CompressEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
+  if (isTauriV2()) {
+    const channel = new Channel<CompressEvent>();
+    channel.onmessage = onEvent;
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    await invoke("compression_subscribe", { id, onEvent: channel });
+    return;
+  }
   const res = await fetch(`/api/compress-jobs/stream?id=${encodeURIComponent(id)}`, { signal });
   if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
   const reader = res.body.getReader();

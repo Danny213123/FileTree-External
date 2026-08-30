@@ -107,7 +107,9 @@ fn append(path: &Path, entry: &str) -> io::Result<()> {
 /// Move the current log to a single `.1` sidecar once it exceeds [`MAX_BYTES`],
 /// so the active file restarts empty. Best-effort.
 fn rotate_if_needed(path: &Path) {
-    let too_big = fs::metadata(path).map(|m| m.len() >= MAX_BYTES).unwrap_or(false);
+    let too_big = fs::metadata(path)
+        .map(|m| m.len() >= MAX_BYTES)
+        .unwrap_or(false);
     if !too_big {
         return;
     }

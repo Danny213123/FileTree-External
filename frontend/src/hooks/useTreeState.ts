@@ -105,6 +105,7 @@ export interface LazyOptions {
   enabled: boolean;
   rootPath: string;
   scannedAt: number;
+  scanId?: string;
   /** Called when the backend reports the cached scan changed (409) — the host
    *  should refetch the scan. */
   onStale?: () => void;
@@ -272,6 +273,7 @@ function buildDirCache(
 // so without a bound a huge tree could materialise hundreds of thousands of rows
 // — the very freeze the bundle system avoids in the normal (unfiltered) view.
 const FILTER_ROW_CAP = 5000;
+const MAX_RETAINED_LAZY_NODES = 16 * 500;
 
 function collectVisibleRows(
   nodeById: Map<number, NodeRecord>,
@@ -411,9 +413,13 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
   const lazyRef = useRef<LazyOptions | undefined>(lazy);
   lazyRef.current = lazy;
   const [expanded, setExpanded] = useState<Set<number>>(new Set([0]));
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
   const [expandedAll, setExpandedAll] = useState(false);
   const [collapsedOverrides, setCollapsedOverrides] = useState<Set<number>>(new Set());
   const [selectedId, setSelectedId] = useState(0);
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
   const [sortKey, setSortKeyState] = useState<SortKey>("size");
   const [sortDir, setSortDir] = useState<1 | -1>(-1);
   const [filter, setFilter] = useState("");
@@ -525,27 +531,60 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
     loadingDirsRef.current.add(dirId);
     const requestRoot = lz.rootPath;
     const requestScannedAt = lz.scannedAt;
-    void fetchChildren({ rootPath: lz.rootPath, dirId, scannedAt: lz.scannedAt })
+    void fetchChildren({ rootPath: lz.rootPath, scanId: lz.scanId, dirId, scannedAt: lz.scannedAt })
       .then((fetched) => {
         const current = lazyRef.current;
         if (!current?.enabled
           || current.rootPath !== requestRoot
           || current.scannedAt !== requestScannedAt) return;
         setNodesState((prev) => {
+          let retained = prev;
+          const incomingIds = new Set(fetched.map((node) => node.id));
+          const required = Math.max(0, retained.length + fetched.length - MAX_RETAINED_LAZY_NODES);
+          if (required > 0) {
+            const protectedIds = new Set<number>([0, dirId, selectedIdRef.current, ...expandedRef.current]);
+            const byId = new Map(retained.map((node) => [node.id, node]));
+            for (const id of [...protectedIds]) {
+              let current = byId.get(id);
+              while (current?.parent != null) {
+                protectedIds.add(current.parent);
+                current = byId.get(current.parent);
+              }
+            }
+            const removedParents = new Set<number>();
+            let removed = 0;
+            retained = retained.filter((node) => {
+              if (removed >= required || protectedIds.has(node.id) || incomingIds.has(node.id)) return true;
+              if (node.parent != null && !expandedRef.current.has(node.parent)) {
+                removedParents.add(node.parent);
+                removed++;
+                return false;
+              }
+              return true;
+            });
+            if (removedParents.size > 0) {
+              const nextLoaded = new Set(loadedDirsRef.current);
+              for (const parent of removedParents) nextLoaded.delete(parent);
+              loadedDirsRef.current = nextLoaded;
+              setTimeout(() => setLoadedDirs(new Set(nextLoaded)), 0);
+            }
+          }
+          const capacity = Math.max(0, MAX_RETAINED_LAZY_NODES - retained.length);
+          const boundedFetched = fetched.slice(0, capacity);
           const byId = new Map<number, NodeRecord>();
-          for (const n of prev) byId.set(n.id, n);
+          for (const n of retained) byId.set(n.id, n);
           const dir = byId.get(dirId);
-          if (!dir) return prev;
+          if (!dir) return retained;
           const existing = new Set(dir.children);
           const childIds = [...dir.children];
           const added: NodeRecord[] = [];
-          for (const n of fetched) {
+          for (const n of boundedFetched) {
             if (byId.has(n.id)) continue; // already present (re-entrancy guard)
             added.push({ ...n, children: n.children ?? [] });
             if (!existing.has(n.id)) { childIds.push(n.id); existing.add(n.id); }
           }
-          if (added.length === 0 && childIds.length === dir.children.length) return prev;
-          const next = prev.map((x) => (x.id === dirId ? { ...x, children: childIds } : x));
+          if (added.length === 0 && childIds.length === dir.children.length) return retained;
+          const next = retained.map((x) => (x.id === dirId ? { ...x, children: childIds } : x));
           next.push(...added);
           return next;
         });

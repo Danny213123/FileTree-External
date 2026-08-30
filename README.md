@@ -1,14 +1,14 @@
 # FileTree
 
-A standalone Windows disk-usage explorer: point at a folder, see what's taking space, and clean it up. Single `.exe`, no installer.
+A low-memory Windows disk-usage explorer: point at a folder, see what's taking space, and clean it up. The v2 desktop uses Tauri 2 with one WebView2 control; Electron is no longer bundled.
 
-**Current version:** `1.14.7`
+**Current version:** `2.0.0` (performance release in pre-release validation)
 
 ## Features
 
 ### Disk Scanning And Navigation
 
-- Multi-threaded recursive scanner with live progress, cancellation, refresh, and a server-side scan cache.
+- Multi-threaded recursive scanner with live progress, cancellation, refresh, and per-scan SQLite indexes under `%LOCALAPPDATA%\FileTree\v2\scans`.
 - Real-time filesystem watching with incremental directory patching, so created, moved, renamed, and deleted items appear without a full rescan.
 - Multi-tab workspace with VS Code-style split editor panes, draggable tabs, a shared Explorer sidebar, and persisted pane layout.
 - Drive, common-folder, Recycle Bin, recent-path, and bookmark navigation.
@@ -21,8 +21,8 @@ A standalone Windows disk-usage explorer: point at a folder, see what's taking s
 - Virtualized Explorer-style details table with sortable/resizable columns, multi-select, keyboard-friendly selection, and configurable visible columns.
 - Rich column set including size, allocated size, counts, percent of parent, full path, folder path, type, attributes, dates, average file size, path length, directory level, and compression.
 - Automatic or fixed units, decimal-place control, resettable column presets, and persistent table preferences.
-- Activity-bar Search with sidebar results and a main-area file-table view; matches are case-insensitive across both name and full path.
-- Toolbar filters and advanced rules that surface matching files and folders across the whole scan.
+- Activity-bar Search with sidebar results and a main-area file-table view. Search is case-insensitive and tokenized: plain terms combine with AND, quoted phrases stay together, `-term` excludes, `name:`, `path:`, `ext:`, and `type:` narrow a term, and `*`/`?` provide wildcards. Optional regex, size ranges, modified-date ranges, extension, and category filters run in the same paged SQLite query.
+- Toolbar size, date, extension, category, and regex filters run against the paginated SQLite scan in v2, surfacing matching files and folders without loading the whole index into the renderer.
 - Treemap panel plus an interactive 3D treemap modal.
 - Side panels for Details, Extensions, Age Distribution, Top Files, Duplicates, Errors, Bookmarks, and AI Chat.
 - Hover info cards, image/video thumbnails, cached Windows Shell thumbnails, and representative folder thumbnails in hover cards and Inspector previews.
@@ -80,29 +80,32 @@ A standalone Windows disk-usage explorer: point at a folder, see what's taking s
 
 - Toolbar export to CSV or JSON for scan results and duplicate results.
 - Headless CLI scan mode with JSON or CSV output.
-- Embedded React frontend served by the Rust backend; the release binary includes the built renderer assets.
-- Portable Electron app and installer packaging; end users do not need Node.js or Rust.
+- Tauri 2 desktop shell with one WebView2 control, typed commands, bounded progress channels, and an embedded React frontend; no localhost desktop server or preload bridge.
+- Reusable `filetree-core`, standalone `filetree` CLI, and `filetree-desktop` Tauri crates in one Cargo workspace.
+- Portable Tauri app and NSIS installer packaging; end users do not need Node.js or Rust.
 - One-step portable build script that assembles `dist-portable\FileTree\FileTree.exe` and starts it by default.
-- Settings, bookmarks, open tabs, layout, columns, recent paths, and AI settings persisted under `%APPDATA%\FileTree`.
+- v2 scan indexes, settings, compression state, and migration catalog persisted under `%LOCALAPPDATA%\FileTree\v2`; v1 data remains untouched during copy-on-write migration.
 
 ### Performance
 
 - Release builds use link-time optimization for hot scan, hash, and JSON paths.
-- Sharded low-contention scanning, bounded concurrent full-tree scans, cached analytics, cached thumbnails, and streamed duplicate JSON.
-- Virtualized sidebars/tables, deferred heavy recomputes, memoized menus and filters, code-split 3D treemap, and requestAnimationFrame-buffered AI streaming.
+- Scanner output crosses an 8,192-row bounded channel into 10,000-row SQLite transactions; tree/search pages are capped at 500 rows and compression pages at 250.
+- The renderer retains at most sixteen tree pages (8,000 rows / 16 MiB), with 16 MiB thumbnail and 4 MiB icon budgets; inactive tabs release rows, watchers, treemaps, and page-cache entries.
+- Scan indexes are capped at 10 GiB with protected active/pinned scans and least-recently-used eviction. SQLite uses file-backed temporary work, disabled mmap, and an 8 MiB cache per connection.
+- Completed compression jobs are evicted from the live registry after their terminal event; the two-worker scheduler and source-preserving hardware-only encoder policy remain intact.
 
 ## Build
 
 Prerequisites: Rust stable (1.85+), Node.js 18+.
 
-To build the portable Electron app, run this from the repo root:
+To build the portable Tauri app, run this from the repo root:
 
 ```powershell
 .\build-portable.bat
 ```
 
-This runs the frontend build, compiles the Rust server with the fresh embedded
-assets, compiles Electron, assembles the portable app, and starts it:
+This builds the embedded frontend, Tauri desktop/NSIS installer, and standalone
+CLI, assembles the portable folder, and starts it:
 
 ```powershell
 .\dist-portable\FileTree\FileTree.exe
@@ -114,9 +117,8 @@ To rebuild without launching the app afterward:
 .\build-portable.bat -NoLaunch
 ```
 
-Keep the generated `FileTree` folder together when moving it to another
-machine; `FileTree.exe` expects its bundled runtime files and server binary
-beside it.
+`FileTree.exe` uses the WebView2 runtime included with current Windows 10/11
+systems. `filetree-cli.exe` provides headless scan and opt-in `serve` workflows.
 
 Manual server-only build:
 
@@ -127,18 +129,20 @@ npm install
 npm run build
 cd ..
 
-# Build the binary
-cargo build --release
+# Build the CLI and Tauri desktop
+cargo build --release -p filetree-cli
+npm run build
 ```
 
-The release executable is at `.\target\release\filetree.exe`.
+The desktop executable is at `.\target\release\FileTree.exe`; the CLI is at
+`.\target\release\filetree.exe`.
 
 ## Run
 
 Double-click the exe, or from a terminal:
 
 ```powershell
-.\target\release\filetree.exe
+.\target\release\FileTree.exe
 ```
 
 Optional CLI modes:

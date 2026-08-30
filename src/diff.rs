@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use crate::export::push_json_string;
 use crate::io::now_ms;
 use crate::json;
-use crate::model::{node_abs_path, ScanResult};
+use crate::model::{ScanResult, node_abs_path};
 
 const SNAPSHOT_VERSION: u32 = 1;
 /// Cap on the number of diff rows returned to the UI. The full per-path diff of
@@ -89,7 +89,9 @@ fn snapshot_file(id: &str) -> PathBuf {
 fn is_safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 // ── Save ─────────────────────────────────────────────────────
@@ -101,7 +103,10 @@ pub(crate) fn save_snapshot(result: &ScanResult, label: &str) -> io::Result<Snap
     fs::create_dir_all(&dir)?;
 
     let saved_at = now_ms();
-    let id = format!("{saved_at}-{:08x}", fnv1a(result.root_path.as_bytes()) & 0xffff_ffff);
+    let id = format!(
+        "{saved_at}-{:08x}",
+        fnv1a(result.root_path.as_bytes()) & 0xffff_ffff
+    );
     let total_size = result.nodes.first().map(|n| n.size).unwrap_or(0);
 
     let meta = SnapMeta {
@@ -178,18 +183,30 @@ fn read_manifest() -> Vec<SnapMeta> {
         Ok(t) => t,
         Err(_) => return Vec::new(),
     };
-    let Some(root) = json::parse(&text) else { return Vec::new() };
-    let Some(arr) = root.get("snapshots").and_then(|v| v.as_array()) else { return Vec::new() };
+    let Some(root) = json::parse(&text) else {
+        return Vec::new();
+    };
+    let Some(arr) = root.get("snapshots").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
     arr.iter().filter_map(meta_from_json).collect()
 }
 
 fn meta_from_json(v: &json::JsonValue) -> Option<SnapMeta> {
     Some(SnapMeta {
         id: v.get("id")?.as_str()?.to_string(),
-        root_path: v.get("rootPath").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        root_path: v
+            .get("rootPath")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         scanned_at: v.get("scannedAt").and_then(|x| x.as_u64()).unwrap_or(0),
         saved_at: v.get("savedAt").and_then(|x| x.as_u64()).unwrap_or(0),
-        label: v.get("label").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        label: v
+            .get("label")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         node_count: v.get("nodeCount").and_then(|x| x.as_u64()).unwrap_or(0),
         total_size: v.get("totalSize").and_then(|x| x.as_u64()).unwrap_or(0),
     })
@@ -252,7 +269,10 @@ pub(crate) fn list_snapshots_json() -> String {
 
 pub(crate) fn delete_snapshot(id: &str) -> io::Result<()> {
     if !is_safe_id(id) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid snapshot id"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid snapshot id",
+        ));
     }
     let _ = fs::remove_file(snapshot_file(id)); // best-effort; manifest is source of truth
     let mut metas = read_manifest();
@@ -273,13 +293,37 @@ pub(crate) fn load_snapshot(id: &str) -> Option<(SnapMeta, EntryMap)> {
     let meta_line = lines.next()?;
     let meta_json = json::parse(meta_line)?;
     let meta = SnapMeta {
-        id: meta_json.get("id").and_then(|x| x.as_str()).unwrap_or(id).to_string(),
-        root_path: meta_json.get("rootPath").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        scanned_at: meta_json.get("scannedAt").and_then(|x| x.as_u64()).unwrap_or(0),
-        saved_at: meta_json.get("savedAt").and_then(|x| x.as_u64()).unwrap_or(0),
-        label: meta_json.get("label").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        node_count: meta_json.get("nodeCount").and_then(|x| x.as_u64()).unwrap_or(0),
-        total_size: meta_json.get("totalSize").and_then(|x| x.as_u64()).unwrap_or(0),
+        id: meta_json
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or(id)
+            .to_string(),
+        root_path: meta_json
+            .get("rootPath")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        scanned_at: meta_json
+            .get("scannedAt")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        saved_at: meta_json
+            .get("savedAt")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        label: meta_json
+            .get("label")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        node_count: meta_json
+            .get("nodeCount")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        total_size: meta_json
+            .get("totalSize")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
     };
 
     let mut map: EntryMap = HashMap::with_capacity(meta.node_count as usize + 16);
@@ -288,7 +332,9 @@ pub(crate) fn load_snapshot(id: &str) -> Option<(SnapMeta, EntryMap)> {
             continue;
         }
         let Some(v) = json::parse(line) else { continue };
-        let Some(path) = v.get("p").and_then(|x| x.as_str()) else { continue };
+        let Some(path) = v.get("p").and_then(|x| x.as_str()) else {
+            continue;
+        };
         let entry = Entry {
             path: path.to_string(),
             size: v.get("s").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -313,7 +359,11 @@ pub(crate) fn scan_entry_map(result: &ScanResult) -> EntryMap {
         }
         map.insert(
             abs.to_lowercase(),
-            Entry { path: abs, size: n.size, is_dir: n.is_dir },
+            Entry {
+                path: abs,
+                size: n.size,
+                is_dir: n.is_dir,
+            },
         );
     }
     map
@@ -344,7 +394,12 @@ struct DiffRow {
 
 /// Compare two entry maps (`a` = older/base, `b` = newer/target) and emit the
 /// full diff response JSON consumed by the Compare UI.
-pub(crate) fn diff_response_json(a_meta: &SnapMeta, b_meta: &SnapMeta, a: &EntryMap, b: &EntryMap) -> String {
+pub(crate) fn diff_response_json(
+    a_meta: &SnapMeta,
+    b_meta: &SnapMeta,
+    a: &EntryMap,
+    b: &EntryMap,
+) -> String {
     let mut rows: Vec<DiffRow> = Vec::new();
     let (mut added, mut removed, mut grown, mut shrunk) = (0u64, 0u64, 0u64, 0u64);
     let mut net_delta: i64 = 0;
@@ -416,7 +471,11 @@ pub(crate) fn diff_response_json(a_meta: &SnapMeta, b_meta: &SnapMeta, a: &Entry
         ",\"summary\":{{\"added\":{added},\"removed\":{removed},\"grown\":{grown},\"shrunk\":{shrunk},\"netDelta\":{net_delta},\"oldTotal\":{},\"newTotal\":{},\"rowCount\":{total_rows},\"capped\":{}}}",
         a_meta.total_size,
         b_meta.total_size,
-        if total_rows > DIFF_ROW_CAP { "true" } else { "false" }
+        if total_rows > DIFF_ROW_CAP {
+            "true"
+        } else {
+            "false"
+        }
     );
     out.push_str(",\"rows\":[");
     for (i, r) in rows.iter().enumerate() {
@@ -463,7 +522,11 @@ mod tests {
     use super::*;
 
     fn entry(path: &str, size: u64, is_dir: bool) -> Entry {
-        Entry { path: path.to_string(), size, is_dir }
+        Entry {
+            path: path.to_string(),
+            size,
+            is_dir,
+        }
     }
 
     #[test]
@@ -471,15 +534,34 @@ mod tests {
         let mut a: EntryMap = HashMap::new();
         a.insert("c:\\x\\a.txt".into(), entry("C:\\x\\a.txt", 100, false));
         a.insert("c:\\x\\b.txt".into(), entry("C:\\x\\b.txt", 200, false));
-        a.insert("c:\\x\\gone.txt".into(), entry("C:\\x\\gone.txt", 50, false));
+        a.insert(
+            "c:\\x\\gone.txt".into(),
+            entry("C:\\x\\gone.txt", 50, false),
+        );
 
         let mut b: EntryMap = HashMap::new();
         b.insert("c:\\x\\a.txt".into(), entry("C:\\x\\a.txt", 100, false)); // unchanged
         b.insert("c:\\x\\b.txt".into(), entry("C:\\x\\b.txt", 500, false)); // grown +300
         b.insert("c:\\x\\new.txt".into(), entry("C:\\x\\new.txt", 80, false)); // added
 
-        let am = SnapMeta { id: "a".into(), root_path: "C:\\x".into(), scanned_at: 0, saved_at: 0, label: "".into(), node_count: 3, total_size: 350 };
-        let bm = SnapMeta { id: "b".into(), root_path: "C:\\x".into(), scanned_at: 0, saved_at: 0, label: "".into(), node_count: 3, total_size: 680 };
+        let am = SnapMeta {
+            id: "a".into(),
+            root_path: "C:\\x".into(),
+            scanned_at: 0,
+            saved_at: 0,
+            label: "".into(),
+            node_count: 3,
+            total_size: 350,
+        };
+        let bm = SnapMeta {
+            id: "b".into(),
+            root_path: "C:\\x".into(),
+            scanned_at: 0,
+            saved_at: 0,
+            label: "".into(),
+            node_count: 3,
+            total_size: 680,
+        };
         let json = diff_response_json(&am, &bm, &a, &b);
         assert!(json.contains("\"grown\":1"));
         assert!(json.contains("\"added\":1"));

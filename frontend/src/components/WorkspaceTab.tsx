@@ -45,6 +45,7 @@ import { Breadcrumb } from "./Breadcrumb";
 import { Icon } from "./Icon";
 import type { ScanStatus, ProgressStore } from "../hooks/useScan";
 import type { ScanResult, Metric, Unit } from "../api/types";
+import { releaseV2ScanPages } from "../api/v2";
 
 export interface WorkspaceTabHandle {
   getStatus: () => ScanStatus;
@@ -392,9 +393,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       enabled: true,
       rootPath: data.rootPath,
       scannedAt: data.scannedAt,
+      scanId: data.scanId,
       onStale: () => onStaleRef.current(),
     };
-  }, [data?.lazy, data?.rootPath, data?.scannedAt]);
+  }, [data?.lazy, data?.rootPath, data?.scannedAt, data?.scanId]);
   const tree = useTreeState(lazyOptions);
   // Latest tree snapshot for stable callbacks / async watch handlers (avoids
   // recreating callbacks every render and reading stale expansion state).
@@ -529,14 +531,24 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
 
   const hasStartedRef = useRef(false);
   useEffect(() => {
-    if (initialPath && !hasStartedRef.current) {
+    // Restored tabs are cheap handles until selected. Starting every persisted
+    // tab at launch opened several SQLite connections and filled page-cache
+    // entries that an inactive pane could not display.
+    if (active && initialPath && !hasStartedRef.current) {
       hasStartedRef.current = true;
       doScan(initialPath);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialPath]);
+  }, [active, initialPath]);
 
   useEffect(() => {
+    // A scan may finish just after its tab was deactivated. Do not let that late
+    // result repopulate renderer rows or the shared page cache.
+    if (!active && data?.lazy) {
+      if (data.scanId) releaseV2ScanPages(data.scanId);
+      tree.setNodes([]);
+      return;
+    }
     if (data === null) {
       tree.setNodes([]);
       isFirstChunkRef.current = true;
@@ -575,15 +587,15 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     if (data) setLargeScanDismissed(false);
     onStateChange();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data]);
+  }, [data, active]);
 
   // LAZY: wait until setNodes has actually committed the streamed root before
   // requesting its children. Calling ensureChildren in the data effect above
   // could race React's state commit and leave an expanded but empty root.
   useEffect(() => {
-    if (!data?.lazy || !tree.nodeById.has(0)) return;
+    if (!active || !data?.lazy || !tree.nodeById.has(0)) return;
     tree.ensureChildren(0);
-  }, [data?.lazy, data?.rootPath, data?.scannedAt, tree.nodeById, tree.ensureChildren]);
+  }, [active, data?.lazy, data?.rootPath, data?.scannedAt, tree.nodeById, tree.ensureChildren]);
 
   // Status transitions (idle→scanning→done/…) are rare and meaningful, so they
   // notify App. Progress ticks deliberately do NOT live here anymore: they flow
@@ -800,11 +812,28 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       fsEventsRef.current?.close();
       fsEventsRef.current = null;
       if (watchDebounceRef.current) { clearTimeout(watchDebounceRef.current); watchDebounceRef.current = null; }
+      if (data?.lazy) {
+        if (data.scanId) releaseV2ScanPages(data.scanId);
+        treeRef.current.setNodes([]);
+      }
     } else if (status === "done" && data) {
+      if (data.lazy && !treeRef.current.nodeById.has(0)) {
+        treeRef.current.setNodes(data.nodes ?? []);
+      }
       startWatch(data.rootPath);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
+
+  // Rehydrate lazily-expanded branches a level at a time after an inactive tab
+  // releases its node pages. Stable database IDs preserve selection/expansion.
+  useEffect(() => {
+    if (!active || !data?.lazy) return;
+    for (const id of tree.expanded) {
+      const node = tree.nodeById.get(id);
+      if (node?.dir) tree.ensureChildren(id);
+    }
+  }, [active, data?.lazy, tree.expanded, tree.nodeById, tree.ensureChildren]);
 
   // Record a user navigation in the history stack. Drops any forward entries
   // (classic browser semantics) and skips no-op pushes when re-navigating to
@@ -2058,6 +2087,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       const params = toServerSearchParams(searchFilters);
       void fetchServerSearch({
         rootPath: data!.rootPath,
+        scanId: data!.scanId,
         query: searchQuery,
         limit: 2000,
         signal: controller.signal,

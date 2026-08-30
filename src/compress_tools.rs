@@ -174,13 +174,25 @@ pub(crate) struct HandbrakeCaps {
 
 impl HandbrakeCaps {
     pub(crate) fn any_gpu(&self) -> bool {
-        self.nvenc_h264 || self.nvenc_h265 || self.nvenc_av1
-            || self.qsv_h264 || self.qsv_h265 || self.qsv_av1
-            || self.vce_h264 || self.vce_h265 || self.vce_av1
+        self.nvenc_h264
+            || self.nvenc_h265
+            || self.nvenc_av1
+            || self.qsv_h264
+            || self.qsv_h265
+            || self.qsv_av1
+            || self.vce_h264
+            || self.vce_h265
+            || self.vce_av1
     }
-    fn any_nvenc(&self) -> bool { self.nvenc_h264 || self.nvenc_h265 || self.nvenc_av1 }
-    fn any_qsv(&self) -> bool { self.qsv_h264 || self.qsv_h265 || self.qsv_av1 }
-    fn any_vce(&self) -> bool { self.vce_h264 || self.vce_h265 || self.vce_av1 }
+    fn any_nvenc(&self) -> bool {
+        self.nvenc_h264 || self.nvenc_h265 || self.nvenc_av1
+    }
+    fn any_qsv(&self) -> bool {
+        self.qsv_h264 || self.qsv_h265 || self.qsv_av1
+    }
+    fn any_vce(&self) -> bool {
+        self.vce_h264 || self.vce_h265 || self.vce_av1
+    }
 }
 
 /// Effective hardware-encoder availability, combining HandBrake's (unreliable)
@@ -276,11 +288,25 @@ fn probe_gpu_hardware_uncached() -> GpuHardware {
                     continue;
                 }
                 let lower = name.to_ascii_lowercase();
-                if lower.contains("nvidia") || lower.contains("geforce") || lower.contains("quadro") || lower.contains("rtx") || lower.contains("gtx") {
+                if lower.contains("nvidia")
+                    || lower.contains("geforce")
+                    || lower.contains("quadro")
+                    || lower.contains("rtx")
+                    || lower.contains("gtx")
+                {
                     hw.nvidia = true;
-                } else if lower.contains("amd") || lower.contains("radeon") || lower.contains("ati ") || lower.contains("vega") {
+                } else if lower.contains("amd")
+                    || lower.contains("radeon")
+                    || lower.contains("ati ")
+                    || lower.contains("vega")
+                {
                     hw.amd = true;
-                } else if lower.contains("intel") || lower.contains("iris") || lower.contains("uhd graphics") || lower.contains("hd graphics") || lower.contains("arc") {
+                } else if lower.contains("intel")
+                    || lower.contains("iris")
+                    || lower.contains("uhd graphics")
+                    || lower.contains("hd graphics")
+                    || lower.contains("arc")
+                {
                     hw.intel = true;
                 }
                 hw.names.push(name.to_string());
@@ -324,7 +350,13 @@ pub(crate) fn detect_handbrake_caps_ex(path: &Path) -> (HandbrakeCaps, bool) {
 pub(crate) fn detect_handbrake_caps_and_raw(path: &Path) -> (HandbrakeCaps, bool, String) {
     let text = match run_handbrake_help(path) {
         Some(t) => t,
-        None => return (HandbrakeCaps::default(), false, "<failed to run HandBrakeCLI -h>".to_string()),
+        None => {
+            return (
+                HandbrakeCaps::default(),
+                false,
+                "<failed to run HandBrakeCLI -h>".to_string(),
+            );
+        }
     };
     // parse_ok: the command produced some help text to scan. An empty capture
     // (e.g. output went somewhere we couldn't read) is "unknown", not "absent".
@@ -370,8 +402,7 @@ fn run_handbrake_help(path: &Path) -> Option<String> {
 /// logging/diagnostics.
 fn summarize_encoder_lines(text: &str) -> String {
     let tokens = [
-        "x264", "x265", "nvenc", "qsv", "vce", "mpeg", "av1", "vp8", "vp9", "theora",
-        "encoder",
+        "x264", "x265", "nvenc", "qsv", "vce", "mpeg", "av1", "vp8", "vp9", "theora", "encoder",
     ];
     let mut kept: Vec<String> = Vec::new();
     for line in text.lines() {
@@ -484,8 +515,12 @@ pub(crate) fn detect_handbrake() -> ToolInfo {
             diag.push_str(&format!(
                 "{}=[nvenc:{}/{} qsv:{}/{} vce:{}/{}]",
                 cand.display(),
-                caps.nvenc_h264, caps.nvenc_h265, caps.qsv_h264, caps.qsv_h265,
-                caps.vce_h264, caps.vce_h265
+                caps.nvenc_h264,
+                caps.nvenc_h265,
+                caps.qsv_h264,
+                caps.qsv_h265,
+                caps.vce_h264,
+                caps.vce_h265
             ));
         }
         let is_gpu = caps.any_gpu();
@@ -506,7 +541,11 @@ pub(crate) fn detect_handbrake() -> ToolInfo {
         ));
     }
     let version = capture_version(&path, &["--version"]);
-    ToolInfo { found: true, path: Some(path), version }
+    ToolInfo {
+        found: true,
+        path: Some(path),
+        version,
+    }
 }
 
 /// Detect the image encoder. Prefers `ffmpeg`, falls back to ImageMagick
@@ -524,9 +563,15 @@ pub(crate) fn detect_ffmpeg() -> ToolInfo {
         ffmpeg_common.push(pf.join("ffmpeg").join("bin").join("ffmpeg.exe"));
         ffmpeg_common.push(pf.join("ffmpeg").join("ffmpeg.exe"));
     }
-    if let Some(path) = locate("ffmpeg.exe", &ffmpeg_common).or_else(|| locate("ffmpeg", &ffmpeg_common)) {
+    if let Some(path) =
+        locate("ffmpeg.exe", &ffmpeg_common).or_else(|| locate("ffmpeg", &ffmpeg_common))
+    {
         let version = capture_version(&path, &["-version"]);
-        ToolInfo { found: true, path: Some(path), version }
+        ToolInfo {
+            found: true,
+            path: Some(path),
+            version,
+        }
     } else {
         ToolInfo::default()
     }
@@ -544,10 +589,16 @@ pub(crate) fn detect_image() -> (ToolInfo, Option<ImageKind>) {
         // reliable hit, but try the parent too.
         magick_common.push(pf.join("ImageMagick").join("magick.exe"));
     }
-    if let Some(path) = locate("magick.exe", &magick_common).or_else(|| locate("magick", &magick_common)) {
+    if let Some(path) =
+        locate("magick.exe", &magick_common).or_else(|| locate("magick", &magick_common))
+    {
         let version = capture_version(&path, &["--version"]);
         return (
-            ToolInfo { found: true, path: Some(path), version },
+            ToolInfo {
+                found: true,
+                path: Some(path),
+                version,
+            },
             Some(ImageKind::ImageMagick),
         );
     }
@@ -595,7 +646,10 @@ pub(crate) fn tools_json() -> String {
     }
     let json = tools_json_uncached();
     if let Ok(mut guard) = tools_cache().lock() {
-        *guard = Some(ToolsCache { json: json.clone(), at: Instant::now() });
+        *guard = Some(ToolsCache {
+            json: json.clone(),
+            at: Instant::now(),
+        });
     }
     json
 }
@@ -611,7 +665,11 @@ fn tools_json_uncached() -> String {
         .path
         .as_ref()
         .map(|p| detect_handbrake_caps_and_raw(p))
-        .unwrap_or((HandbrakeCaps::default(), false, "<HandBrakeCLI not found>".to_string()));
+        .unwrap_or((
+            HandbrakeCaps::default(),
+            false,
+            "<HandBrakeCLI not found>".to_string(),
+        ));
     let vendors = GpuVendors::from_caps(&caps);
     let hw = probe_gpu_hardware();
     let eff = EffectiveCaps::compute(&caps, hw);
@@ -817,7 +875,14 @@ fn run_encode_probe(hb: &Path, src: &Path, encoder_token: &str, is_gpu: bool) ->
     let enc_preset = if is_gpu { "quality" } else { "veryfast" };
     let mut cmd = Command::new(hb);
     cmd.arg("-i").arg(src).arg("-o").arg(&out);
-    cmd.args(["-e", encoder_token, "-q", "30", "--encoder-preset", enc_preset]);
+    cmd.args([
+        "-e",
+        encoder_token,
+        "-q",
+        "30",
+        "--encoder-preset",
+        enc_preset,
+    ]);
     if let Some(dir) = hb.parent() {
         if dir.is_dir() {
             cmd.current_dir(dir);

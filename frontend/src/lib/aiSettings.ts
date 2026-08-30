@@ -6,6 +6,8 @@
 // makes the HTTPS request. A localStorage fallback keeps plain-browser dev working.
 
 import { DEFAULT_LLM_OPTIONS, type LlmOptions, type LlmProvider } from "./llm";
+import { invoke } from "@tauri-apps/api/core";
+import { isTauriV2 } from "../api/v2";
 
 // One configured Model Context Protocol server. `transport` selects how Electron
 // main reaches it: a spawned process speaking newline-delimited JSON-RPC over
@@ -84,6 +86,13 @@ interface SecretStore {
 }
 
 function secretStore(): SecretStore | null {
+  if (isTauriV2()) {
+    return {
+      get: (key) => invoke<string | null>("secret_get", { key }),
+      set: (key, value) => invoke<void>("secret_set", { key, value }),
+      delete: (key) => invoke<void>("secret_delete", { key }),
+    };
+  }
   return (window as unknown as { electronAPI?: { secrets?: SecretStore } })
     .electronAPI?.secrets ?? null;
 }

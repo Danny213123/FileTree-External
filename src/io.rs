@@ -58,14 +58,21 @@ pub(crate) fn open_path(path: &str) -> io::Result<()> {
         #[link(name = "Shell32")]
         unsafe extern "system" {
             fn ShellExecuteW(
-                hwnd: isize, op: *const u16, file: *const u16,
-                params: *const u16, dir: *const u16, show: i32,
+                hwnd: isize,
+                op: *const u16,
+                file: *const u16,
+                params: *const u16,
+                dir: *const u16,
+                show: i32,
             ) -> isize;
         }
         unsafe {
             ShellExecuteW(
-                0, verb_w.as_ptr(), path_w.as_ptr(),
-                std::ptr::null(), std::ptr::null(),
+                0,
+                verb_w.as_ptr(),
+                path_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
                 1, // SW_SHOWNORMAL
             );
         }
@@ -92,7 +99,6 @@ pub(crate) fn display_name(path: &Path) -> String {
 pub(crate) fn path_to_string(path: &Path) -> String {
     path.display().to_string()
 }
-
 
 pub(crate) fn metadata_modified_ms(metadata: &Metadata) -> u64 {
     metadata
@@ -189,7 +195,10 @@ pub(crate) fn acquire_scan_threads(requested: usize) -> ScanThreadPermit {
     let gate = scan_gate();
     let mut available = gate.available.lock_recover();
     while *available < want {
-        available = gate.ready.wait(available).unwrap_or_else(|e| e.into_inner());
+        available = gate
+            .ready
+            .wait(available)
+            .unwrap_or_else(|e| e.into_inner());
     }
     *available -= want;
     ScanThreadPermit { count: want }

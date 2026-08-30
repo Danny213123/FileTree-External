@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::cli::{APP_NAME, APP_VERSION};
 use crate::io::{default_thread_count, epoch_ms_to_utc, path_to_string};
-use crate::model::{node_abs_path, AppState, ScanResult};
+use crate::model::{AppState, ScanResult, node_abs_path};
 
 /// Max data rows (one per node) emitted by the streaming CSV / XML exports before
 /// truncating, with a clearly-marked trailing indicator. Bounds the output and
@@ -14,7 +14,10 @@ pub(crate) const EXPORT_ROW_CAP: usize = 1_000_000;
 
 /// Write scan result JSON directly to any `Write` impl (e.g. a TCP stream).
 /// Avoids materialising a 300-400 MB intermediate String for large scans.
-pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -> std::io::Result<()> {
+pub(crate) fn write_scan_result_json<W: Write>(
+    w: &mut W,
+    result: &ScanResult,
+) -> std::io::Result<()> {
     // Reuse analytics computed once at scan time (no per-response recompute).
     // These are small, capped collections, so cloning them is negligible.
     let top_files = result.summary.top_files.clone();
@@ -31,9 +34,12 @@ pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -
     }
 
     e!("{{");
-    e!("\"app\":"); emit_json_str(&mut buf, APP_NAME);
-    e!(",\"version\":"); emit_json_str(&mut buf, APP_VERSION);
-    e!(",\"rootPath\":"); emit_json_str(&mut buf, &result.root_path);
+    e!("\"app\":");
+    emit_json_str(&mut buf, APP_NAME);
+    e!(",\"version\":");
+    emit_json_str(&mut buf, APP_VERSION);
+    e!(",\"rootPath\":");
+    emit_json_str(&mut buf, &result.root_path);
     e!(",\"scannedAt\":{}", result.scanned_at_ms);
     e!(",\"elapsedMs\":{}", result.elapsed_ms);
     e!(",\"threadCount\":{}", result.thread_count);
@@ -42,17 +48,27 @@ pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -
 
     e!(",\"nodes\":[");
     for (index, node) in result.nodes.iter().enumerate() {
-        if index > 0 { e!(","); }
+        if index > 0 {
+            e!(",");
+        }
         e!("{{\"id\":{}", node.id);
         match node.parent {
-            Some(p) => { e!(",\"parent\":{p}"); }
-            None    => { e!(",\"parent\":null"); }
+            Some(p) => {
+                e!(",\"parent\":{p}");
+            }
+            None => {
+                e!(",\"parent\":null");
+            }
         }
-        e!(",\"name\":"); emit_json_str(&mut buf, &node.name);
+        e!(",\"name\":");
+        emit_json_str(&mut buf, &node.name);
         e!(",\"dir\":{}", if node.is_dir { "true" } else { "false" });
         e!(",\"link\":{}", if node.is_link { "true" } else { "false" });
         e!(",\"hidden\":{}", if node.hidden { "true" } else { "false" });
-        e!(",\"readonly\":{}", if node.readonly { "true" } else { "false" });
+        e!(
+            ",\"readonly\":{}",
+            if node.readonly { "true" } else { "false" }
+        );
         e!(",\"size\":{}", node.size);
         e!(",\"allocated\":{}", node.allocated);
         e!(",\"files\":{}", node.files);
@@ -62,8 +78,10 @@ pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -
         e!(",\"accessed\":{}", node.accessed_ms);
         e!(",\"depth\":{}", node.depth);
         e!(",\"errors\":{}", node.errors);
-        e!(",\"extension\":"); emit_json_str(&mut buf, &node.extension);
-        e!(",\"owner\":"); emit_json_str(&mut buf, &node.owner);
+        e!(",\"extension\":");
+        emit_json_str(&mut buf, &node.extension);
+        e!(",\"owner\":");
+        emit_json_str(&mut buf, &node.owner);
         e!(",\"attributes\":{}", node.attributes);
         e!("}}");
 
@@ -77,30 +95,50 @@ pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -
     w.write_all(&buf)?;
     buf.clear();
 
-    e!(",\"topFiles\":"); emit_id_array_w(&mut buf, &top_files);
-    e!(",\"largestDirs\":"); emit_id_array_w(&mut buf, &largest_dirs);
+    e!(",\"topFiles\":");
+    emit_id_array_w(&mut buf, &top_files);
+    e!(",\"largestDirs\":");
+    emit_id_array_w(&mut buf, &largest_dirs);
 
     e!(",\"extensionStats\":[");
     for (i, stat) in extension_stats.iter().enumerate() {
-        if i > 0 { e!(","); }
-        e!("{{\"ext\":"); emit_json_str(&mut buf, &stat.ext);
-        e!(",\"bytes\":{},\"allocated\":{},\"files\":{}}}", stat.bytes, stat.allocated, stat.files);
+        if i > 0 {
+            e!(",");
+        }
+        e!("{{\"ext\":");
+        emit_json_str(&mut buf, &stat.ext);
+        e!(
+            ",\"bytes\":{},\"allocated\":{},\"files\":{}}}",
+            stat.bytes,
+            stat.allocated,
+            stat.files
+        );
     }
     e!("]");
 
     e!(",\"ageStats\":[");
     for (i, stat) in age_stats.iter().enumerate() {
-        if i > 0 { e!(","); }
-        e!("{{\"label\":"); emit_json_str(&mut buf, stat.label);
+        if i > 0 {
+            e!(",");
+        }
+        e!("{{\"label\":");
+        emit_json_str(&mut buf, stat.label);
         e!(",\"bytes\":{},\"files\":{}}}", stat.bytes, stat.files);
     }
     e!("]");
 
     e!(",\"duplicateCandidates\":[");
     for (i, group) in duplicate_candidates.iter().enumerate() {
-        if i > 0 { e!(","); }
-        e!("{{\"name\":"); emit_json_str(&mut buf, &group.name);
-        e!(",\"size\":{},\"waste\":{},\"ids\":", group.size, group.waste);
+        if i > 0 {
+            e!(",");
+        }
+        e!("{{\"name\":");
+        emit_json_str(&mut buf, &group.name);
+        e!(
+            ",\"size\":{},\"waste\":{},\"ids\":",
+            group.size,
+            group.waste
+        );
         emit_id_array_w(&mut buf, &group.ids);
         e!("}}");
     }
@@ -108,9 +146,13 @@ pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -
 
     e!(",\"scanErrors\":[");
     for (i, error) in result.errors.iter().take(500).enumerate() {
-        if i > 0 { e!(","); }
-        e!("{{\"path\":"); emit_json_str(&mut buf, &error.path);
-        e!(",\"message\":"); emit_json_str(&mut buf, &error.message);
+        if i > 0 {
+            e!(",");
+        }
+        e!("{{\"path\":");
+        emit_json_str(&mut buf, &error.path);
+        e!(",\"message\":");
+        emit_json_str(&mut buf, &error.message);
         e!("}}");
     }
     e!("]}}");
@@ -124,12 +166,15 @@ pub(crate) fn write_scan_result_json<W: Write>(w: &mut W, result: &ScanResult) -
 ///   {"type":"meta","rootPath":"...","scannedAt":N,...all analytics...}
 ///   {"type":"node","id":N,"parent":N|null,...}   ← one per node
 ///   {"type":"done"}
-pub(crate) fn write_scan_result_ndjson<W: Write>(w: &mut W, result: &ScanResult) -> std::io::Result<()> {
-    let top_files        = result.summary.top_files.clone();
-    let largest_dirs     = result.summary.largest_dirs.clone();
-    let ext_stats        = result.summary.extension_stats.clone();
-    let age_st           = result.summary.age_stats.clone();
-    let dup_cands        = result.summary.duplicate_candidates.clone();
+pub(crate) fn write_scan_result_ndjson<W: Write>(
+    w: &mut W,
+    result: &ScanResult,
+) -> std::io::Result<()> {
+    let top_files = result.summary.top_files.clone();
+    let largest_dirs = result.summary.largest_dirs.clone();
+    let ext_stats = result.summary.extension_stats.clone();
+    let age_st = result.summary.age_stats.clone();
+    let dup_cands = result.summary.duplicate_candidates.clone();
 
     let mut buf = Vec::with_capacity(65536);
 
@@ -139,39 +184,62 @@ pub(crate) fn write_scan_result_ndjson<W: Write>(w: &mut W, result: &ScanResult)
 
     // ── meta line ──────────────────────────────────────────────────────────
     e!("{{\"type\":\"meta\"");
-    e!(",\"app\":"); emit_json_str(&mut buf, APP_NAME);
-    e!(",\"version\":"); emit_json_str(&mut buf, APP_VERSION);
-    e!(",\"rootPath\":"); emit_json_str(&mut buf, &result.root_path);
+    e!(",\"app\":");
+    emit_json_str(&mut buf, APP_NAME);
+    e!(",\"version\":");
+    emit_json_str(&mut buf, APP_VERSION);
+    e!(",\"rootPath\":");
+    emit_json_str(&mut buf, &result.root_path);
     e!(",\"scannedAt\":{}", result.scanned_at_ms);
     e!(",\"elapsedMs\":{}", result.elapsed_ms);
     e!(",\"threadCount\":{}", result.thread_count);
     e!(",\"nodeCount\":{}", result.nodes.len());
     e!(",\"errorCount\":{}", result.errors.len());
 
-    e!(",\"topFiles\":"); emit_id_array_w(&mut buf, &top_files);
-    e!(",\"largestDirs\":"); emit_id_array_w(&mut buf, &largest_dirs);
+    e!(",\"topFiles\":");
+    emit_id_array_w(&mut buf, &top_files);
+    e!(",\"largestDirs\":");
+    emit_id_array_w(&mut buf, &largest_dirs);
 
     e!(",\"extensionStats\":[");
     for (i, stat) in ext_stats.iter().enumerate() {
-        if i > 0 { e!(","); }
-        e!("{{\"ext\":"); emit_json_str(&mut buf, &stat.ext);
-        e!(",\"bytes\":{},\"allocated\":{},\"files\":{}}}", stat.bytes, stat.allocated, stat.files);
+        if i > 0 {
+            e!(",");
+        }
+        e!("{{\"ext\":");
+        emit_json_str(&mut buf, &stat.ext);
+        e!(
+            ",\"bytes\":{},\"allocated\":{},\"files\":{}}}",
+            stat.bytes,
+            stat.allocated,
+            stat.files
+        );
     }
     e!("]");
 
     e!(",\"ageStats\":[");
     for (i, stat) in age_st.iter().enumerate() {
-        if i > 0 { e!(","); }
-        e!("{{\"label\":"); emit_json_str(&mut buf, stat.label);
+        if i > 0 {
+            e!(",");
+        }
+        e!("{{\"label\":");
+        emit_json_str(&mut buf, stat.label);
         e!(",\"bytes\":{},\"files\":{}}}", stat.bytes, stat.files);
     }
     e!("]");
 
     e!(",\"duplicateCandidates\":[");
     for (i, group) in dup_cands.iter().enumerate() {
-        if i > 0 { e!(","); }
-        e!("{{\"name\":"); emit_json_str(&mut buf, &group.name);
-        e!(",\"size\":{},\"waste\":{},\"ids\":", group.size, group.waste);
+        if i > 0 {
+            e!(",");
+        }
+        e!("{{\"name\":");
+        emit_json_str(&mut buf, &group.name);
+        e!(
+            ",\"size\":{},\"waste\":{},\"ids\":",
+            group.size,
+            group.waste
+        );
         emit_id_array_w(&mut buf, &group.ids);
         e!("}}");
     }
@@ -179,9 +247,13 @@ pub(crate) fn write_scan_result_ndjson<W: Write>(w: &mut W, result: &ScanResult)
 
     e!(",\"scanErrors\":[");
     for (i, error) in result.errors.iter().take(500).enumerate() {
-        if i > 0 { e!(","); }
-        e!("{{\"path\":"); emit_json_str(&mut buf, &error.path);
-        e!(",\"message\":"); emit_json_str(&mut buf, &error.message);
+        if i > 0 {
+            e!(",");
+        }
+        e!("{{\"path\":");
+        emit_json_str(&mut buf, &error.path);
+        e!(",\"message\":");
+        emit_json_str(&mut buf, &error.message);
         e!("}}");
     }
     e!("]}}");
@@ -194,14 +266,22 @@ pub(crate) fn write_scan_result_ndjson<W: Write>(w: &mut W, result: &ScanResult)
         e!("{{\"type\":\"node\"");
         e!(",\"id\":{}", node.id);
         match node.parent {
-            Some(p) => { e!(",\"parent\":{p}"); }
-            None    => { e!(",\"parent\":null"); }
+            Some(p) => {
+                e!(",\"parent\":{p}");
+            }
+            None => {
+                e!(",\"parent\":null");
+            }
         }
-        e!(",\"name\":"); emit_json_str(&mut buf, &node.name);
+        e!(",\"name\":");
+        emit_json_str(&mut buf, &node.name);
         e!(",\"dir\":{}", if node.is_dir { "true" } else { "false" });
         e!(",\"link\":{}", if node.is_link { "true" } else { "false" });
         e!(",\"hidden\":{}", if node.hidden { "true" } else { "false" });
-        e!(",\"readonly\":{}", if node.readonly { "true" } else { "false" });
+        e!(
+            ",\"readonly\":{}",
+            if node.readonly { "true" } else { "false" }
+        );
         e!(",\"size\":{}", node.size);
         e!(",\"allocated\":{}", node.allocated);
         e!(",\"files\":{}", node.files);
@@ -211,8 +291,10 @@ pub(crate) fn write_scan_result_ndjson<W: Write>(w: &mut W, result: &ScanResult)
         e!(",\"accessed\":{}", node.accessed_ms);
         e!(",\"depth\":{}", node.depth);
         e!(",\"errors\":{}", node.errors);
-        e!(",\"extension\":"); emit_json_str(&mut buf, &node.extension);
-        e!(",\"owner\":"); emit_json_str(&mut buf, &node.owner);
+        e!(",\"extension\":");
+        emit_json_str(&mut buf, &node.extension);
+        e!(",\"owner\":");
+        emit_json_str(&mut buf, &node.owner);
         e!(",\"attributes\":{}", node.attributes);
         e!("}}");
         buf.push(b'\n');
@@ -247,15 +329,24 @@ pub(crate) fn push_node_ndjson_line_with_path(
     e!("{{\"type\":\"node\"");
     e!(",\"id\":{}", node.id);
     match node.parent {
-        Some(p) => { e!(",\"parent\":{p}"); }
-        None => { e!(",\"parent\":null"); }
+        Some(p) => {
+            e!(",\"parent\":{p}");
+        }
+        None => {
+            e!(",\"parent\":null");
+        }
     }
-    e!(",\"name\":"); emit_json_str(buf, &node.name);
-    e!(",\"path\":"); emit_json_str(buf, &node_abs_path(nodes, id));
+    e!(",\"name\":");
+    emit_json_str(buf, &node.name);
+    e!(",\"path\":");
+    emit_json_str(buf, &node_abs_path(nodes, id));
     e!(",\"dir\":{}", if node.is_dir { "true" } else { "false" });
     e!(",\"link\":{}", if node.is_link { "true" } else { "false" });
     e!(",\"hidden\":{}", if node.hidden { "true" } else { "false" });
-    e!(",\"readonly\":{}", if node.readonly { "true" } else { "false" });
+    e!(
+        ",\"readonly\":{}",
+        if node.readonly { "true" } else { "false" }
+    );
     e!(",\"size\":{}", node.size);
     e!(",\"allocated\":{}", node.allocated);
     e!(",\"files\":{}", node.files);
@@ -265,8 +356,10 @@ pub(crate) fn push_node_ndjson_line_with_path(
     e!(",\"accessed\":{}", node.accessed_ms);
     e!(",\"depth\":{}", node.depth);
     e!(",\"errors\":{}", node.errors);
-    e!(",\"extension\":"); emit_json_str(buf, &node.extension);
-    e!(",\"owner\":"); emit_json_str(buf, &node.owner);
+    e!(",\"extension\":");
+    emit_json_str(buf, &node.extension);
+    e!(",\"owner\":");
+    emit_json_str(buf, &node.owner);
     e!(",\"attributes\":{}", node.attributes);
     e!("}}");
     buf.push(b'\n');
@@ -286,15 +379,24 @@ pub(crate) fn push_node_json_object_with_path(
     }
     e!("{{\"id\":{}", node.id);
     match node.parent {
-        Some(p) => { e!(",\"parent\":{p}"); }
-        None => { e!(",\"parent\":null"); }
+        Some(p) => {
+            e!(",\"parent\":{p}");
+        }
+        None => {
+            e!(",\"parent\":null");
+        }
     }
-    e!(",\"name\":"); emit_json_str(buf, &node.name);
-    e!(",\"path\":"); emit_json_str(buf, &node_abs_path(nodes, id));
+    e!(",\"name\":");
+    emit_json_str(buf, &node.name);
+    e!(",\"path\":");
+    emit_json_str(buf, &node_abs_path(nodes, id));
     e!(",\"dir\":{}", if node.is_dir { "true" } else { "false" });
     e!(",\"link\":{}", if node.is_link { "true" } else { "false" });
     e!(",\"hidden\":{}", if node.hidden { "true" } else { "false" });
-    e!(",\"readonly\":{}", if node.readonly { "true" } else { "false" });
+    e!(
+        ",\"readonly\":{}",
+        if node.readonly { "true" } else { "false" }
+    );
     e!(",\"size\":{}", node.size);
     e!(",\"allocated\":{}", node.allocated);
     e!(",\"files\":{}", node.files);
@@ -304,8 +406,10 @@ pub(crate) fn push_node_json_object_with_path(
     e!(",\"accessed\":{}", node.accessed_ms);
     e!(",\"depth\":{}", node.depth);
     e!(",\"errors\":{}", node.errors);
-    e!(",\"extension\":"); emit_json_str(buf, &node.extension);
-    e!(",\"owner\":"); emit_json_str(buf, &node.owner);
+    e!(",\"extension\":");
+    emit_json_str(buf, &node.extension);
+    e!(",\"owner\":");
+    emit_json_str(buf, &node.owner);
     e!(",\"attributes\":{}", node.attributes);
     e!(",\"children\":[]");
     e!("}}");
@@ -343,7 +447,7 @@ fn emit_json_str(buf: &mut Vec<u8>, value: &str) {
     buf.push(b'"');
     for ch in value.chars() {
         match ch {
-            '"'  => buf.extend_from_slice(b"\\\""),
+            '"' => buf.extend_from_slice(b"\\\""),
             '\\' => buf.extend_from_slice(b"\\\\"),
             '\n' => buf.extend_from_slice(b"\\n"),
             '\r' => buf.extend_from_slice(b"\\r"),
@@ -363,7 +467,9 @@ fn emit_json_str(buf: &mut Vec<u8>, value: &str) {
 fn emit_id_array_w(buf: &mut Vec<u8>, ids: &[usize]) {
     buf.push(b'[');
     for (i, id) in ids.iter().enumerate() {
-        if i > 0 { buf.push(b','); }
+        if i > 0 {
+            buf.push(b',');
+        }
         let _ = write!(buf, "{id}");
     }
     buf.push(b']');
@@ -515,7 +621,9 @@ fn largest_by_size(result: &ScanResult, limit: usize) -> Vec<usize> {
     // Partition the `limit` largest to the front in O(n), then sort only those
     // (O(limit log limit)) instead of fully sorting every node index (O(n log n)).
     if idx.len() > limit {
-        idx.select_nth_unstable_by(limit, |&a, &b| result.nodes[b].size.cmp(&result.nodes[a].size));
+        idx.select_nth_unstable_by(limit, |&a, &b| {
+            result.nodes[b].size.cmp(&result.nodes[a].size)
+        });
         idx.truncate(limit);
     }
     idx.sort_unstable_by(|&a, &b| result.nodes[b].size.cmp(&result.nodes[a].size));
@@ -605,7 +713,14 @@ pub(crate) fn scan_result_to_html(result: &ScanResult) -> String {
         h.push_str("<h2>By type</h2><table><thead><tr><th>Extension</th><th class=\"num\">Size</th><th class=\"num\">Files</th></tr></thead><tbody>");
         for stat in &result.summary.extension_stats {
             h.push_str("<tr><td>");
-            push_html_escaped(&mut h, if stat.ext.is_empty() { "(none)" } else { &stat.ext });
+            push_html_escaped(
+                &mut h,
+                if stat.ext.is_empty() {
+                    "(none)"
+                } else {
+                    &stat.ext
+                },
+            );
             h.push_str("</td><td class=\"num\">");
             h.push_str(&human_bytes(stat.bytes));
             h.push_str("</td><td class=\"num\">");
@@ -748,13 +863,19 @@ pub(crate) fn write_scan_result_xml<W: Write>(
     for stat in &result.summary.extension_stats {
         x.push_str("<ext name=\"");
         push_xml_escaped(&mut x, &stat.ext);
-        x.push_str(&format!("\" bytes=\"{}\" allocated=\"{}\" files=\"{}\"/>", stat.bytes, stat.allocated, stat.files));
+        x.push_str(&format!(
+            "\" bytes=\"{}\" allocated=\"{}\" files=\"{}\"/>",
+            stat.bytes, stat.allocated, stat.files
+        ));
     }
     x.push_str("</byType><byAge>");
     for stat in &result.summary.age_stats {
         x.push_str("<bucket label=\"");
         push_xml_escaped(&mut x, stat.label);
-        x.push_str(&format!("\" bytes=\"{}\" files=\"{}\"/>", stat.bytes, stat.files));
+        x.push_str(&format!(
+            "\" bytes=\"{}\" files=\"{}\"/>",
+            stat.bytes, stat.files
+        ));
     }
     x.push_str("</byAge></summary>");
 
@@ -782,7 +903,11 @@ pub(crate) fn write_scan_result_xml<W: Write>(
         x.push_str(&format!(
             "\" type=\"{}\" size=\"{}\" allocated=\"{}\" files=\"{}\" folders=\"{}\" depth=\"{}\"",
             if node.is_dir { "dir" } else { "file" },
-            node.size, node.allocated, node.files, node.folders, node.depth
+            node.size,
+            node.allocated,
+            node.files,
+            node.folders,
+            node.depth
         ));
         x.push_str(&format!(
             " hidden=\"{}\" readonly=\"{}\" link=\"{}\" modifiedMs=\"{}\"",
@@ -833,15 +958,29 @@ pub(crate) fn scan_result_to_xlsx(result: &ScanResult) -> Vec<u8> {
     const XLSX_ROW_CAP: usize = 100_000;
 
     let headers = [
-        "Path", "Name", "Type", "Size", "Allocated", "Files", "Folders",
-        "PercentOfParent", "ModifiedUtc", "Hidden", "Readonly", "Link", "Owner", "Extension",
+        "Path",
+        "Name",
+        "Type",
+        "Size",
+        "Allocated",
+        "Files",
+        "Folders",
+        "PercentOfParent",
+        "ModifiedUtc",
+        "Hidden",
+        "Readonly",
+        "Link",
+        "Owner",
+        "Extension",
     ];
     let ids = largest_by_size(result, XLSX_ROW_CAP);
     // Stream rows straight into the worksheet XML rather than collecting a
     // `Vec<Vec<Cell>>` of every row first (avoids a redundant full-buffer copy).
     let mut sheet = SheetWriter::new(&headers);
     for id in ids {
-        let Some(node) = result.nodes.get(id) else { continue };
+        let Some(node) = result.nodes.get(id) else {
+            continue;
+        };
         let parent_size = node
             .parent
             .and_then(|p| result.nodes.get(p))
@@ -855,7 +994,11 @@ pub(crate) fn scan_result_to_xlsx(result: &ScanResult) -> Vec<u8> {
         sheet.push_row(&[
             Cell::Text(node_abs_path(&result.nodes, id)),
             Cell::Text(node.name.clone()),
-            Cell::Text(if node.is_dir { "Directory".into() } else { "File".into() }),
+            Cell::Text(if node.is_dir {
+                "Directory".into()
+            } else {
+                "File".into()
+            }),
             Cell::Int(node.size),
             Cell::Int(node.allocated),
             Cell::Int(node.files),
@@ -1149,13 +1292,19 @@ mod tests {
         // like every other NDJSON line, or the client drops it and the progress
         // counter freezes at 0. Lock the wire shape so the regression can't return.
         let line = scan_progress_ndjson_line(42, 1500);
-        assert!(line.ends_with('\n'), "each NDJSON record is newline-terminated");
+        assert!(
+            line.ends_with('\n'),
+            "each NDJSON record is newline-terminated"
+        );
         let trimmed = line.trim_end();
         assert!(
             trimmed.contains("\"type\":\"scanning\""),
             "progress line must carry the type discriminator, got: {trimmed}"
         );
-        assert!(!trimmed.contains("\"scanning\":true"), "must not use the old shape");
+        assert!(
+            !trimmed.contains("\"scanning\":true"),
+            "must not use the old shape"
+        );
         assert_eq!(
             trimmed,
             "{\"type\":\"scanning\",\"nodeCount\":42,\"elapsedMs\":1500}"

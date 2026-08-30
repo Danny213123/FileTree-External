@@ -18,6 +18,7 @@ import {
   fetchSubtreeFiles,
 } from "./api/client";
 import type { AppSettings } from "./api/client";
+import { isTauriV2 } from "./api/v2";
 import type { DriveEntry, SpecialFolder, SortKey, Unit, ScanResult, TagEntry, SmartFolder, NodeRecord } from "./api/types";
 import { isActiveRule } from "./hooks/useFilterRules";
 import { EMPTY_FILTERS, type SearchFilters } from "./lib/search";
@@ -113,10 +114,9 @@ interface TabMeta {
 // Small palette of color labels for tabs (#49). Empty string clears the color.
 const TAB_COLORS = ["#e05c4c", "#ea9d36", "#e0c04c", "#56c45a", "#4ca6f0", "#a78bfa", "#ec6cb9"];
 
-// Synchronous, non-debounced crash backup of the open-tab set (#49). The server
-// settings save is debounced (700ms), so on an abnormal exit the last change
-// could be lost; this localStorage mirror is written on every tab change and
-// used as a fallback when the server returns no openTabs.
+// Synchronous, non-debounced crash backup of the open-tab set (#49) for legacy
+// browser/Electron clients. Tauri v2 keeps tabs in SQLite and must not let stale
+// renderer-local state override an empty or migrated database.
 const TAB_BACKUP_KEY = "filetree_open_tabs_backup";
 function writeTabBackup(paths: string[], meta: TabMeta[]): void {
   try { localStorage.setItem(TAB_BACKUP_KEY, JSON.stringify({ openTabs: paths, tabMeta: meta })); } catch { /* ignore */ }
@@ -527,12 +527,11 @@ export default function App() {
      activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth,
      previewOpen, detailsOpen, inspectorWidth, lowSpaceAlerts, lowSpaceThreshold]);
 
-  // #49 crash-safe restore: mirror the open-tab set to localStorage on every
-  // tab change (synchronous, unlike the 700ms-debounced server save), so an
-  // abnormal exit can still restore the last-known tabs with their meta. `tick`
-  // is included so freshly-resolved scan paths are captured too.
+  // #49 legacy crash-safe restore. Tauri v2 persists this state in SQLite and
+  // deliberately avoids a second renderer-local source of truth. `tick` is
+  // included so freshly-resolved scan paths are captured for legacy clients.
   useEffect(() => {
-    if (!settingsLoaded) return;
+    if (!settingsLoaded || isTauriV2()) return;
     writeTabBackup(
       tabs.map((t) => t.ref.current?.getScanPath() ?? t.initialPath),
       tabs.map((t) => ({ label: t.customLabel, color: t.color, pinned: t.pinned })),
@@ -708,13 +707,13 @@ export default function App() {
       setBookmarkList(savedBookmarks);
 
       // #49: pair each saved path with its meta (label/color/pinned) by index,
-      // dropping empty-path tabs together so the two stay aligned. When the
-      // server has no openTabs (e.g. an abnormal exit before the debounced save
-      // flushed), fall back to the synchronous localStorage crash backup.
+      // dropping empty-path tabs together so the two stay aligned. Legacy
+      // clients may fall back to localStorage; Tauri v2 uses SQLite as the sole
+      // source of truth for restored tabs.
       let pairs = (settings.openTabs ?? [])
         .map((p, i) => ({ p, m: settings.tabMeta?.[i] as TabMeta | undefined }))
         .filter((x) => Boolean(x.p));
-      if (pairs.length === 0) {
+      if (pairs.length === 0 && !isTauriV2()) {
         const backup = readTabBackup();
         if (backup) {
           pairs = backup.openTabs

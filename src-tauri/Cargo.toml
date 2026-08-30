@@ -1,0 +1,24 @@
+[package]
+name = "filetree-desktop"
+version = "2.0.0"
+description = "FileTree v2 low-memory Windows desktop shell"
+authors = ["Danny213123"]
+edition = "2024"
+publish = false
+
+[lib]
+name = "filetree_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "FileTree"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+filetree-core = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }

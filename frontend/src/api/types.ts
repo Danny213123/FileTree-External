@@ -75,6 +75,10 @@ export interface ScanResult {
   ageStats: AgeStat[];
   duplicateCandidates: DuplicateCandidate[];
   scanErrors: ScanError[];
+  /** V2 disk-backed scan identity. Present in Tauri; absent for the legacy
+   * browser/server transport. Child/search requests use this instead of asking
+   * the renderer to retain the complete tree. */
+  scanId?: string;
 }
 
 export interface DriveEntry {
