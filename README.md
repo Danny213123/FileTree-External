@@ -135,7 +135,7 @@ npm run build
 ```
 
 The desktop executable is at `.\target\release\FileTree.exe`; the CLI is at
-`.\target\release\filetree.exe`.
+`.\target\release\filetree-cli.exe`.
 
 ## Run
 
@@ -149,11 +149,11 @@ Optional CLI modes:
 
 ```powershell
 # Headless scan — write JSON or CSV report
-.\target\release\filetree.exe scan D:\Data --format json --out scan.json
-.\target\release\filetree.exe scan D:\Data --format csv --out scan.csv
+.\target\release\filetree-cli.exe scan D:\Data --format json --out scan.json
+.\target\release\filetree-cli.exe scan D:\Data --format csv --out scan.csv
 
 # Serve the web UI only (no native window)
-.\target\release\filetree.exe serve --port 7878
+.\target\release\filetree-cli.exe serve --port 7878
 ```
 
 ## Development

@@ -12,7 +12,7 @@ $frontendDir = Join-Path $repoRoot "frontend"
 $portableRoot = Join-Path $repoRoot "dist-portable"
 $portableDir = Join-Path $portableRoot "FileTree"
 $desktopExe = Join-Path $repoRoot "target\release\FileTree.exe"
-$cliExe = Join-Path $repoRoot "target\release\filetree.exe"
+$cliExe = Join-Path $repoRoot "target\release\filetree-cli.exe"
 
 function Invoke-Checked {
   param([string]$Label, [string]$Command, [string[]]$Arguments, [string]$WorkingDirectory)
