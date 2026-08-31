@@ -1143,13 +1143,11 @@ function TreeTableInner({
                   ) : (
                     <span className="twisty" />
                   )}
-                  {(node.dir || isBundle) && (
-                    <FileIcon
-                      ext={node.extension ?? ""}
-                      isDir={node.dir}
-                      isBundle={isBundle}
-                    />
-                  )}
+                  <FileIcon
+                    ext={node.extension ?? ""}
+                    isDir={node.dir}
+                    isBundle={isBundle}
+                  />
                   {node.id === renamingId ? (
                     <RenameInput
                       initialName={node.name}
