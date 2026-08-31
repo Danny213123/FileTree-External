@@ -407,6 +407,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       rootPath: data.rootPath,
       scannedAt: data.scannedAt,
       scanId: data.scanId,
+      loadDirectory: isTauriV2() ? fetchV2DirectorySnapshot : undefined,
       onStale: () => onStaleRef.current(),
     };
   }, [data?.lazy, data?.rootPath, data?.scannedAt, data?.scanId]);
@@ -489,6 +490,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const suppressWatchRef = useRef(false);
   // Skip stacking watch patches: a new batch is dropped/retried while one runs.
   const patchInFlightRef = useRef(false);
+  const smartRefreshInFlightRef = useRef(false);
+  const refreshToastIdRef = useRef<number | null>(null);
   // Latest path→node map, read inside the async watch flush for gating.
   const nodeByPathRef = useRef<Map<string, NodeRecord>>(new Map());
   const pendingMutationRefreshRef = useRef(false);
@@ -2001,33 +2004,46 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const doSmartRefresh = useCallback(async () => {
     const t = treeRef.current;
     const root = lastCompletedPathRef.current;
-    if (!root || status === "scanning") return;
+    if (!root || status === "scanning" || smartRefreshInFlightRef.current) return;
 
-    const dirty = Array.from(dirtyDirectoriesRef.current.values());
-    const overflowed = dirtyDirectoryOverflowRef.current;
-    if (dirty.length > 0 || overflowed) {
-      const patched = await refreshDirectories(dirty);
-      const unresolved = dirtyDirectoriesRef.current.size;
-      if (unresolved > 0 || overflowed) {
-        const pending = `${unresolved}${overflowed ? "+" : ""}`;
-        toast.warn(`Updated ${patched} changed folder${patched === 1 ? "" : "s"}; ${pending} unloaded branch${pending === "1" ? "" : "es"} will refresh when opened.`);
-      } else {
-        toast.success(`Updated ${patched} changed folder${patched === 1 ? "" : "s"}.`);
+    const replaceRefreshToast = (id: number) => {
+      if (refreshToastIdRef.current != null) toast.dismiss(refreshToastIdRef.current);
+      refreshToastIdRef.current = id;
+    };
+
+    smartRefreshInFlightRef.current = true;
+    try {
+      const dirty = Array.from(dirtyDirectoriesRef.current.values());
+      const overflowed = dirtyDirectoryOverflowRef.current;
+      if (dirty.length > 0 || overflowed) {
+        const patched = await refreshDirectories(dirty);
+        const unresolved = dirtyDirectoriesRef.current.size;
+        if (unresolved > 0 || overflowed) {
+          const pending = `${unresolved}${overflowed ? "+" : ""}`;
+          const prefix = patched > 0
+            ? `Updated ${patched} changed folder${patched === 1 ? "" : "s"}; `
+            : "";
+          replaceRefreshToast(toast.warn(`${prefix}${pending} unloaded branch${pending === "1" ? "" : "es"} will refresh when opened.`));
+        } else {
+          replaceRefreshToast(toast.success(`Updated ${patched} changed folder${patched === 1 ? "" : "s"}.`));
+        }
+        return;
       }
-      return;
-    }
 
-    // Currently-expanded directories that are real, loaded nodes (skip the root's
-    // synthetic bundle ids and unscanned stubs).
-    const openDirs: string[] = [];
-    for (const node of t.nodeById.values()) {
-      if (!node.dir || node.id < 0 || !node.path) continue;
-      if (node.id === 0 || t.expanded.has(node.id)) openDirs.push(node.path);
+      // Currently-expanded directories that are real, loaded nodes (skip the
+      // root's synthetic bundle ids). Live watcher rows are valid refresh roots.
+      const openDirs: string[] = [];
+      for (const node of t.nodeById.values()) {
+        if (!node.dir || node.id < 0 || !node.path) continue;
+        if (node.id === 0 || t.expanded.has(node.id)) openDirs.push(node.path);
+      }
+      if (openDirs.length === 0) return;
+      const limited = openDirs.slice(0, SMART_REFRESH_MAX_DIRS);
+      const patched = await refreshDirectories(limited);
+      replaceRefreshToast(toast.success(`Smart refresh updated ${patched} visible folder${patched === 1 ? "" : "s"}.`));
+    } finally {
+      smartRefreshInFlightRef.current = false;
     }
-    if (openDirs.length === 0) return;
-    const limited = openDirs.slice(0, SMART_REFRESH_MAX_DIRS);
-    const patched = await refreshDirectories(limited);
-    toast.success(`Smart refresh updated ${patched} visible folder${patched === 1 ? "" : "s"}.`);
   }, [status, refreshDirectories]);
 
   // ── Agent API facade (used by the right-side ChatPanel) ──────────────────
@@ -2598,6 +2614,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   rows={showRows}
                   flat={showFlat}
                   lazy={!!data?.lazy}
+                  loadedDirs={tree.loadedDirs}
                   nodeById={tree.nodeById}
                   expanded={tree.expanded}
                   selectedId={tree.selectedId}

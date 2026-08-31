@@ -106,9 +106,24 @@ export interface LazyOptions {
   rootPath: string;
   scannedAt: number;
   scanId?: string;
+  /** Load one live directory level when a watcher-created row is not present in
+   *  the immutable scan database yet. This keeps refresh incremental while
+   *  allowing newly-created or moved folders to expand immediately. */
+  loadDirectory?: (path: string) => Promise<NodeRecord[]>;
   /** Called when the backend reports the cached scan changed (409) — the host
    *  should refetch the scan. */
   onStale?: () => void;
+}
+
+// SQLite scan ids are ordinary sequential integers. Watcher-created entries are
+// assigned from this reserved, exactly-representable range so lazy expansion can
+// identify them without maintaining an unbounded side map or colliding with a
+// future page fetched from the scan database.
+const LIVE_NODE_ID_START = 9_000_000_000_000_000;
+const LIVE_NODE_ID_FLOOR = 8_000_000_000_000_000;
+
+function normalizedNodePath(path: string): string {
+  return path.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
 }
 
 export function compareNodes(
@@ -412,6 +427,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
   const loadingDirsRef = useRef<Set<number>>(new Set());
   const lazyRef = useRef<LazyOptions | undefined>(lazy);
   lazyRef.current = lazy;
+  const patchDirectoryRef = useRef<(changedPath: string, newNodes: NodeRecord[]) => void>(() => {});
   const [expanded, setExpanded] = useState<Set<number>>(new Set([0]));
   const expandedRef = useRef(expanded);
   expandedRef.current = expanded;
@@ -526,11 +542,43 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
     // The scan-result effect sets the root and requests its children in separate
     // renders. Do not start a request until the target directory is committed;
     // the root preload effect will retry as soon as it appears.
-    if (!nodesRef.current.some((node) => node.id === dirId && node.dir)) return;
+    const directory = nodesRef.current.find((node) => node.id === dirId && node.dir);
+    if (!directory) return;
     if (loadedDirsRef.current.has(dirId) || loadingDirsRef.current.has(dirId)) return;
     loadingDirsRef.current.add(dirId);
     const requestRoot = lz.rootPath;
     const requestScannedAt = lz.scannedAt;
+
+    // A shallow watcher refresh can discover a directory after the immutable
+    // SQLite scan was built. Its reserved id cannot be paged from that database,
+    // so read exactly one live filesystem level and graft it into the tree. Any
+    // nested directories stay lazy and follow this same path when opened.
+    if (dirId >= LIVE_NODE_ID_FLOOR && directory.path && lz.loadDirectory) {
+      const requestPath = directory.path;
+      void lz.loadDirectory(requestPath)
+        .then((snapshot) => {
+          const current = lazyRef.current;
+          if (!current?.enabled
+            || current.rootPath !== requestRoot
+            || current.scannedAt !== requestScannedAt) return;
+          if (snapshot.length > 0) patchDirectoryRef.current(requestPath, snapshot);
+          setLoadedDirs((prev) => {
+            if (prev.has(dirId)) return prev;
+            const next = new Set(prev);
+            next.add(dirId);
+            loadedDirsRef.current = next;
+            return next;
+          });
+        })
+        .catch((err: unknown) => {
+          console.warn("live ensureChildren failed for dir", requestPath, err);
+        })
+        .finally(() => {
+          loadingDirsRef.current.delete(dirId);
+        });
+      return;
+    }
+
     void fetchChildren({ rootPath: lz.rootPath, scanId: lz.scanId, dirId, scannedAt: lz.scannedAt })
       .then((fetched) => {
         const current = lazyRef.current;
@@ -592,6 +640,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
           if (prev.has(dirId)) return prev;
           const next = new Set(prev);
           next.add(dirId);
+          loadedDirsRef.current = next;
           return next;
         });
       })
@@ -771,8 +820,8 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       // authoritative. So we keep existing subfolders' subtrees untouched and
       // re-aggregate changedPath from its real children.
       const oldByPath = new Map<string, NodeRecord>();
-      for (const n of prevNodes) if (n.path) oldByPath.set(n.path, n);
-      const targetNode = oldByPath.get(changedPath);
+      for (const n of prevNodes) if (n.path) oldByPath.set(normalizedNodePath(n.path), n);
+      const targetNode = oldByPath.get(normalizedNodePath(changedPath));
       if (!targetNode) return prevNodes; // not in tree, ignore
 
       const miniById = new Map<number, NodeRecord>();
@@ -780,8 +829,15 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       const miniRoot = miniById.get(0);
       if (!miniRoot) return prevNodes;
 
-      let maxId = 0;
-      for (const n of prevNodes) if (n.id > maxId) maxId = n.id;
+      const usedIds = new Set(prevNodes.map((node) => node.id));
+      let nextLiveId = LIVE_NODE_ID_START;
+      const allocateLiveId = (): number => {
+        while (usedIds.has(nextLiveId) && nextLiveId >= LIVE_NODE_ID_FLOOR) nextLiveId--;
+        if (nextLiveId < LIVE_NODE_ID_FLOOR) throw new Error("Live node id range exhausted");
+        const id = nextLiveId--;
+        usedIds.add(id);
+        return id;
+      };
 
       // Immediate subfolders we preserve from the old tree (keep descendants +
       // aggregate sizes); files and brand-new folders spliced in with fresh ids.
@@ -792,16 +848,16 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       for (const childId of miniRoot.children) {
         const child = miniById.get(childId);
         if (!child) continue;
-        const old = child.path ? oldByPath.get(child.path) : undefined;
+        const old = child.path ? oldByPath.get(normalizedNodePath(child.path)) : undefined;
         if (child.dir && old && old.dir) {
           // Existing subfolder: keep its old subtree (id, size, descendants).
-          preservedDirPaths.push(old.path.toLowerCase());
+          preservedDirPaths.push(normalizedNodePath(old.path));
           rootChildIds.push(old.id);
         } else {
           // New/changed file, or a brand-new folder: take the fresh node. A new
-          // folder's real contents stay unknown (0) until the next full scan, so
-          // drop the shallow depth-limit error it would otherwise carry.
-          const newId = ++maxId;
+          // folder remains an unknown lazy stub until first expansion, so drop
+          // the shallow depth-limit error it would otherwise carry.
+          const newId = allocateLiveId();
           addedNodes.push({
             ...child,
             id: newId,
@@ -828,7 +884,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       // Keep every old node except changedPath itself and the old descendants
       // that are NOT under a preserved subfolder (old file children + entries
       // that disappeared). Preserved subfolders + descendants are retained as-is.
-      const changedPathNorm = changedPath.toLowerCase();
+      const changedPathNorm = normalizedNodePath(changedPath);
       // O(1) membership instead of O(preservedDirPaths) per node: a path is
       // "under preserved" iff itself or one of its ancestor dirs is preserved.
       const preservedSet = new Set(preservedDirPaths);
@@ -836,7 +892,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
         if (preservedSet.has(p)) return true;
         let cur = p;
         for (;;) {
-          const i = Math.max(cur.lastIndexOf("\\"), cur.lastIndexOf("/"));
+          const i = cur.lastIndexOf("\\");
           if (i <= 0) return false;
           cur = cur.slice(0, i);
           if (preservedSet.has(cur)) return true;
@@ -844,8 +900,8 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       };
       const kept = prevNodes.filter((n) => {
         if (n.id === targetNode.id) return false; // replaced by newRoot
-        const p = n.path.toLowerCase();
-        const underChanged = p.startsWith(changedPathNorm + "\\") || p.startsWith(changedPathNorm + "/");
+        const p = normalizedNodePath(n.path);
+        const underChanged = p.startsWith(changedPathNorm + "\\");
         if (!underChanged) return true;
         return underPreserved(p);
       });
@@ -881,6 +937,8 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       return merged;
     });
   }, []);
+
+  patchDirectoryRef.current = patchDirectory;
 
   return {
     expanded,

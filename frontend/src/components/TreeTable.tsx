@@ -71,6 +71,10 @@ interface TreeTableProps {
    *  twisty is driven by a directory's folder/file counts rather than its loaded
    *  children array. No effect in full mode (counts and loaded children agree). */
   lazy?: boolean;
+  /** Lazy directory ids whose immediate children have already been requested.
+   *  An unloaded zero-count directory may be a watcher-created stub and must
+   *  still expose an expand control; a loaded empty directory should not. */
+  loadedDirs?: ReadonlySet<number>;
   nodeById: Map<number, NodeRecord>;
   expanded: Set<number>;
   selectedId: number;
@@ -231,6 +235,7 @@ function TreeTableInner({
   rows,
   flat,
   lazy,
+  loadedDirs,
   nodeById,
   expanded,
   selectedId,
@@ -948,12 +953,15 @@ function TreeTableInner({
             const barWidth  = rootVal > 0 ? (val / rootVal) * 100 : 0;
             const parentNode = node.parent != null ? nodeById.get(node.parent) : null;
             const parentSize = parentNode ? parentNode.size : node.size;
-            // In lazy mode an unexpanded directory has no children loaded yet, so
-            // base its expandability on its folder/file counts instead. Bundles
-            // (negative id) and files still rely on the loaded children array.
+            // A watcher-created lazy directory has unknown counts until opened.
+            // Keep its twisty visible while unloaded; once loaded, genuinely
+            // empty folders lose the control. Bundles and files use children.
             const hasKids   = !flat && (
               (lazy && node.dir && node.id >= 0)
-                ? (node.folders > 0 || node.files > 0)
+                ? (!loadedDirs?.has(node.id)
+                  || node.children.length > 0
+                  || node.folders > 0
+                  || node.files > 0)
                 : node.children.length > 0
             );
             const isOpen    = expanded.has(node.id);
