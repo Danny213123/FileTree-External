@@ -45,7 +45,12 @@ import { Breadcrumb } from "./Breadcrumb";
 import { Icon } from "./Icon";
 import type { ScanStatus, ProgressStore } from "../hooks/useScan";
 import type { ScanResult, Metric, Unit } from "../api/types";
-import { releaseV2ScanPages } from "../api/v2";
+import { isTauriV2, releaseV2ScanPages } from "../api/v2";
+import {
+  mutationAffectsRoot,
+  publishFilesystemMutation,
+  subscribeFilesystemMutations,
+} from "../lib/fsMutations";
 
 export interface WorkspaceTabHandle {
   getStatus: () => ScanStatus;
@@ -471,6 +476,12 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const patchInFlightRef = useRef(false);
   // Latest path→node map, read inside the async watch flush for gating.
   const nodeByPathRef = useRef<Map<string, NodeRecord>>(new Map());
+  const pendingMutationRefreshRef = useRef(false);
+  const mutationRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const statusRef = useRef(status);
+  statusRef.current = status;
 
   const doScan = useCallback((path?: string, t?: number, forceFresh?: boolean) => {
     const p = path ?? scanPath;
@@ -509,6 +520,49 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scanPath, threads, includeHidden, followLinks, collectOwners, exclude, startScan, startRefresh, tree]);
+
+  const doScanRef = useRef(doScan);
+  doScanRef.current = doScan;
+
+  const schedulePendingMutationRefresh = useCallback(() => {
+    if (!pendingMutationRefreshRef.current || !activeRef.current || statusRef.current === "scanning") return;
+    if (mutationRefreshTimerRef.current) clearTimeout(mutationRefreshTimerRef.current);
+    mutationRefreshTimerRef.current = setTimeout(() => {
+      mutationRefreshTimerRef.current = null;
+      if (!pendingMutationRefreshRef.current || !activeRef.current || statusRef.current === "scanning") return;
+      pendingMutationRefreshRef.current = false;
+      invalidateAllScanCache();
+      doScanRef.current(undefined, undefined, true);
+    }, 120);
+  }, []);
+
+  // Tauri v2 has no loopback HTTP server, so app-initiated mutations are
+  // broadcast directly between mounted workspace tabs. Visible affected tabs
+  // refresh promptly; inactive tabs retain only a pending bit and refresh when
+  // selected, preserving the v2 bounded-memory design.
+  useEffect(() => subscribeFilesystemMutations((mutation) => {
+    if (mutation.sourceTabId === tabId) return;
+    const rootPath = dataRef.current?.rootPath || lastCompletedPathRef.current || scanPath;
+    if (!rootPath || !mutationAffectsRoot(rootPath, mutation.paths)) return;
+    pendingMutationRefreshRef.current = true;
+    setResultsStale(true);
+    schedulePendingMutationRefresh();
+  }), [scanPath, schedulePendingMutationRefresh, tabId]);
+
+  useEffect(() => {
+    schedulePendingMutationRefresh();
+  }, [active, status, schedulePendingMutationRefresh]);
+
+  useEffect(() => () => {
+    if (mutationRefreshTimerRef.current) clearTimeout(mutationRefreshTimerRef.current);
+  }, []);
+
+  const refreshAfterMutation = useCallback((changedPaths: string[]) => {
+    suppressWatchRef.current = false;
+    publishFilesystemMutation(changedPaths, tabId);
+    invalidateAllScanCache();
+    doScan(undefined, undefined, true);
+  }, [doScan, tabId]);
 
   // LAZY: when the backend reports the cached scan we're paging against changed
   // (409 during ensureChildren), force a fresh rescan of the current root.
@@ -623,6 +677,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     if (fsEventsRef.current) { fsEventsRef.current.close(); fsEventsRef.current = null; }
     if (watchDebounceRef.current) { clearTimeout(watchDebounceRef.current); watchDebounceRef.current = null; }
     pendingChangesRef.current.clear();
+
+    // The SSE endpoint belongs to the legacy HTTP shell. Tauri mutations use
+    // the bounded in-process notification bus above, so do not open a dead URL.
+    if (isTauriV2()) return;
 
     const url = `/api/fs-events?path=${encodeURIComponent(rootPath)}`;
     const es = new EventSource(url);
@@ -1438,8 +1496,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           } else if (res.moved === 0 && res.skipped > 0) {
             setMoveNotice("Nothing to paste here.");
           }
-          invalidateAllScanCache();
-          doScan(undefined, undefined, true);
+          if (res.moved > 0) refreshAfterMutation([...sources, destination]);
+          else suppressWatchRef.current = false;
           return {
             ok: res.failed === 0,
             error: res.failed > 0 ? `${res.failed} item${res.failed === 1 ? "" : "s"} failed` : undefined,
@@ -1452,7 +1510,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         }
       },
     );
-  }, [doScan]);
+  }, [refreshAfterMutation]);
 
   const handleInternalMove = useCallback(async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string }> => {
     if (sources.length === 0 || !destination) return { ok: true };
@@ -1536,8 +1594,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               toast.success(`Moved ${itemsLabel(realSources.length)} to \u201C${basenameFromPath(destination)}\u201D.`, { action: undoAction });
             }
           }
-          invalidateAllScanCache();
-          doScan(undefined, undefined, true);
+          if (didMove) refreshAfterMutation([...realSources, destination]);
+          else suppressWatchRef.current = false;
           return outcome;
         } catch (error) {
           suppressWatchRef.current = false;
@@ -1546,7 +1604,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         }
       },
     );
-  }, [doScan, runMoveWithConflicts, undoAction]);
+  }, [refreshAfterMutation, runMoveWithConflicts, undoAction]);
 
   // Paste CF_HDROP files into the focused folder. A Cut pastes as a MOVE through
   // the existing guarded move flow (handleInternalMove: no-op/descendant guards,
@@ -1803,9 +1861,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // or another app), the source is gone from disk; drop our cached scan and
   // rescan so a moved-out folder doesn't keep showing in an expanded parent.
   const handleAfterExternalMove = useCallback(() => {
-    invalidateAllScanCache();
-    doScan(undefined, undefined, true);
-  }, [doScan]);
+    refreshAfterMutation([dataRef.current?.rootPath || scanPath]);
+  }, [refreshAfterMutation, scanPath]);
 
   // #14 Smart refresh (pragmatic incremental). Rather than a full deep rescan,
   // re-walk only the directories the user currently has EXPANDED — each a cheap

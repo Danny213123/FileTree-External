@@ -292,6 +292,10 @@ function TreeTableInner({
   // (the OS copies on its own thread). The rescan is deferred to the later
   // "nativeMoveSettled" event so it reflects disk state AFTER the move finishes.
   const pendingExternalMoveRescanRef = useRef<boolean>(false);
+  // A native drag can produce both a browser drop event and a native completion
+  // callback. Keep a short operation guard so one physical gesture can never
+  // enqueue the same move twice, even if a platform emits both paths.
+  const recentInternalMovesRef = useRef<Map<string, number>>(new Map());
   // Latest values of the optional owner callbacks, read inside the IPC listener
   // effect without forcing it to re-subscribe when their identities change.
   const onOpenFolderInTabRef = useRef(onOpenFolderInTab);
@@ -650,15 +654,39 @@ function TreeTableInner({
   }, []);
 
   const runInternalMove = useCallback(async (sourcePaths: string[], destinationFolder: string) => {
+    const now = Date.now();
+    const key = `${destinationFolder.toLowerCase()}\n${sourcePaths.map((path) => path.toLowerCase()).sort().join("\n")}`;
+    const guardedUntil = recentInternalMovesRef.current.get(key) ?? 0;
+    if (guardedUntil > now) {
+      resetDragState();
+      return;
+    }
+    // Infinity covers the in-flight request; a successful move retains a short
+    // cooldown for a native completion callback that arrives just afterward.
+    recentInternalMovesRef.current.set(key, Number.POSITIVE_INFINITY);
+    let succeeded = false;
     try {
       const result = await onMoveItems?.(sourcePaths, destinationFolder);
       if (result && !result.ok) {
         reportInternalMoveError(result.error ?? "unknown error");
+      } else {
+        succeeded = true;
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       reportInternalMoveError(message);
     } finally {
+      if (succeeded) {
+        const expiresAt = Date.now() + 2000;
+        recentInternalMovesRef.current.set(key, expiresAt);
+        window.setTimeout(() => {
+          if (recentInternalMovesRef.current.get(key) === expiresAt) {
+            recentInternalMovesRef.current.delete(key);
+          }
+        }, 2100);
+      } else {
+        recentInternalMovesRef.current.delete(key);
+      }
       resetDragState();
     }
   }, [onMoveItems, reportInternalMoveError, resetDragState]);
@@ -1047,6 +1075,14 @@ function TreeTableInner({
 
                   e.preventDefault();
                   e.stopPropagation();
+
+                  // Native drag owns this gesture. Chromium/WebView2 can still
+                  // emit an HTML drop before the native command resolves; the
+                  // native completion callback below will hit-test and move it.
+                  if (isFileTreeDrag && nativeDragOriginRef.current) {
+                    setDropTargetId(null);
+                    return;
+                  }
 
                   let sources: string[] = [];
                   if (isFileTreeDrag) {
