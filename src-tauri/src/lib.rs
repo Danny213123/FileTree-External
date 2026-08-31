@@ -7,10 +7,219 @@ use filetree_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
 use tauri::window::{ProgressBarState, ProgressBarStatus};
 use tauri::{AppHandle, Manager, State};
+
+struct FsWatchRegistry {
+    next_id: AtomicU64,
+    watchers: Mutex<HashMap<u64, notify::RecommendedWatcher>>,
+}
+
+impl Default for FsWatchRegistry {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            watchers: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[tauri::command]
+fn fs_watch_start(
+    state: State<'_, Arc<V2Store>>,
+    registry: State<'_, FsWatchRegistry>,
+    root_path: String,
+    on_change: Channel<String>,
+) -> Result<u64, String> {
+    use notify::{RecursiveMode, Watcher};
+
+    require_authorized_path(&state, &root_path)?;
+    if !Path::new(&root_path).is_dir() {
+        return Err(format!("Watch root is not a folder: {root_path}"));
+    }
+
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+        let Ok(event) = result else { return };
+        let mut changed_dirs = HashSet::new();
+        for path in event.paths {
+            if let Some(parent) = path.parent() {
+                changed_dirs.insert(parent.to_string_lossy().into_owned());
+            }
+        }
+        for directory in changed_dirs {
+            let _ = on_change.send(directory);
+        }
+    })
+    .map_err(|error| format!("Could not create folder watcher: {error}"))?;
+    watcher
+        .watch(Path::new(&root_path), RecursiveMode::Recursive)
+        .map_err(|error| format!("Could not watch {root_path}: {error}"))?;
+
+    let id = registry.next_id.fetch_add(1, Ordering::Relaxed);
+    registry
+        .watchers
+        .lock()
+        .map_err(|_| "Folder watcher registry is unavailable".to_string())?
+        .insert(id, watcher);
+    Ok(id)
+}
+
+#[tauri::command]
+fn fs_watch_stop(registry: State<'_, FsWatchRegistry>, watch_id: u64) -> Result<(), String> {
+    registry
+        .watchers
+        .lock()
+        .map_err(|_| "Folder watcher registry is unavailable".to_string())?
+        .remove(&watch_id);
+    Ok(())
+}
+
+const DIRECTORY_SNAPSHOT_LIMIT: usize = 50_000;
+
+fn time_ms(value: Result<SystemTime, std::io::Error>) -> u64 {
+    value
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn directory_snapshot_rows(path: PathBuf) -> Result<Vec<Value>, String> {
+    let entries = fs::read_dir(&path)
+        .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    let mut children = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= DIRECTORY_SNAPSHOT_LIMIT {
+            return Err(format!(
+                "Folder has more than {DIRECTORY_SNAPSHOT_LIMIT} immediate entries; refresh it manually"
+            ));
+        }
+        let entry = entry.map_err(|error| format!("Could not read folder entry: {error}"))?;
+        let entry_path = entry.path();
+        let link_metadata = fs::symlink_metadata(&entry_path)
+            .map_err(|error| format!("Could not inspect {}: {error}", entry_path.display()))?;
+        let is_link = link_metadata.file_type().is_symlink();
+        let metadata = if is_link {
+            fs::metadata(&entry_path).unwrap_or(link_metadata)
+        } else {
+            link_metadata
+        };
+        let is_dir = metadata.is_dir();
+        let size = if is_dir { 0 } else { metadata.len() };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let extension = if is_dir {
+            String::new()
+        } else {
+            entry_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        };
+        children.push(serde_json::json!({
+            "id": index + 1,
+            "parent": 0,
+            "name": name,
+            "path": entry_path.to_string_lossy(),
+            "dir": is_dir,
+            "link": is_link,
+            "hidden": false,
+            "readonly": metadata.permissions().readonly(),
+            "size": size,
+            "allocated": size,
+            "files": 0,
+            "folders": 0,
+            "modified": time_ms(metadata.modified()),
+            "created": time_ms(metadata.created()),
+            "accessed": time_ms(metadata.accessed()),
+            "depth": 1,
+            "errors": 0,
+            "extension": extension,
+            "children": [],
+            "owner": "",
+            "attributes": 0
+        }));
+    }
+
+    let root_metadata = fs::metadata(&path)
+        .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    let root_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_else(|| path.to_str().unwrap_or(""));
+    let child_ids = (1..=children.len()).collect::<Vec<_>>();
+    let root = serde_json::json!({
+        "id": 0,
+        "parent": null,
+        "name": root_name,
+        "path": path.to_string_lossy(),
+        "dir": true,
+        "link": false,
+        "hidden": false,
+        "readonly": root_metadata.permissions().readonly(),
+        "size": 0,
+        "allocated": 0,
+        "files": 0,
+        "folders": 0,
+        "modified": time_ms(root_metadata.modified()),
+        "created": time_ms(root_metadata.created()),
+        "accessed": time_ms(root_metadata.accessed()),
+        "depth": 0,
+        "errors": 0,
+        "extension": "",
+        "children": child_ids,
+        "owner": "",
+        "attributes": 0
+    });
+    let mut rows = Vec::with_capacity(children.len() + 1);
+    rows.push(root);
+    rows.extend(children);
+    Ok(rows)
+}
+
+#[tauri::command]
+async fn directory_snapshot(
+    state: State<'_, Arc<V2Store>>,
+    path: String,
+) -> Result<Vec<Value>, String> {
+    require_authorized_path(&state, &path)?;
+    tauri::async_runtime::spawn_blocking(move || directory_snapshot_rows(PathBuf::from(path)))
+        .await
+        .map_err(|error| format!("Folder snapshot worker failed: {error}"))?
+}
+
+#[cfg(test)]
+mod desktop_tests {
+    use super::directory_snapshot_rows;
+    use std::fs;
+
+    #[test]
+    fn directory_snapshot_drops_removed_children() {
+        let root = std::env::temp_dir().join(format!(
+            "filetree_desktop_snapshot_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("destination")).expect("create test folder");
+        let first = directory_snapshot_rows(root.clone()).expect("first snapshot");
+        assert!(first.iter().any(|row| row["name"] == "destination"));
+
+        fs::remove_dir(root.join("destination")).expect("remove test folder");
+        let second = directory_snapshot_rows(root.clone()).expect("second snapshot");
+        assert!(!second.iter().any(|row| row["name"] == "destination"));
+        fs::remove_dir(root).expect("remove test root");
+    }
+}
 
 #[tauri::command]
 fn scan_start(
@@ -411,6 +620,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .manage(store)
         .manage(runtime)
+        .manage(FsWatchRegistry::default())
         .invoke_handler(tauri::generate_handler![
             app_version,
             app_config,
@@ -424,6 +634,9 @@ pub fn run() {
             reveal_path,
             move_items,
             native_drag,
+            fs_watch_start,
+            fs_watch_stop,
+            directory_snapshot,
             file_icon,
             file_thumbnail,
             secret_get,

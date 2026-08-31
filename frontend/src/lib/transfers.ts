@@ -53,6 +53,15 @@ let paused = false;
 let processing = false;
 const workers = new Map<number, () => Promise<TransferResult>>();
 const resolvers = new Map<number, (r: TransferResult) => void>();
+const dedupedTransfers = new Map<string, { promise: Promise<TransferResult>; expiresAt: number }>();
+
+export function transferDedupeKey(kind: TransferKind, paths: string[], destination: string): string {
+  const normalizedPaths = paths
+    .map((path) => path.replace(/\//g, "\\").replace(/\\+$/g, "").toLowerCase())
+    .sort();
+  const normalizedDestination = destination.replace(/\//g, "\\").replace(/\\+$/g, "").toLowerCase();
+  return `${kind}\n${normalizedDestination}\n${normalizedPaths.join("\n")}`;
+}
 
 function emit() {
   // Replace the array reference so useSyncExternalStore sees a new snapshot.
@@ -116,11 +125,27 @@ export function enqueueTransfer(
   label: string,
   count: number,
   worker: () => Promise<TransferResult>,
+  dedupeKey?: string,
 ): Promise<TransferResult> {
+  if (dedupeKey) {
+    const existing = dedupedTransfers.get(dedupeKey);
+    if (existing && existing.expiresAt > Date.now()) return existing.promise;
+    if (existing) dedupedTransfers.delete(dedupeKey);
+  }
   const id = nextId++;
   items.push({ id, kind, label, count, status: "queued", startedAt: Date.now() });
   workers.set(id, worker);
   const promise = new Promise<TransferResult>((resolve) => resolvers.set(id, resolve));
+  if (dedupeKey) {
+    const entry = { promise, expiresAt: Number.POSITIVE_INFINITY };
+    dedupedTransfers.set(dedupeKey, entry);
+    void promise.then(() => {
+      entry.expiresAt = Date.now() + 3000;
+      window.setTimeout(() => {
+        if (dedupedTransfers.get(dedupeKey) === entry) dedupedTransfers.delete(dedupeKey);
+      }, 3100);
+    });
+  }
   emit();
   void processQueue();
   return promise;

@@ -648,6 +648,10 @@ function TreeTableInner({
 
   const reportInternalMoveError = useCallback((message: string) => {
     console.error("[TreeTable] internal move failed", message);
+    // Stale rows and duplicate OS callbacks are recoverable filesystem races.
+    // The transfer panel already records them and WorkspaceTab refreshes the
+    // affected roots, so do not block the whole app with a browser alert.
+    if (/^(Source no longer exists|Destination is not a folder):/i.test(message)) return;
     window.setTimeout(() => {
       window.alert(`Move failed: ${message}`);
     }, 0);
@@ -1032,8 +1036,13 @@ function TreeTableInner({
                       dragWindow.__FILETREE_NATIVE_DRAG_ACTIVE__ = true;
                       void startNativeDrag(draggedPaths)
                         .then((info) => {
-                          dragWindow.__FILETREE_NATIVE_DRAG_ACTIVE__ = false;
                           finishTauriNativeDrag(info, draggedPaths);
+                          // WebView2 may deliver its HTML drop just after the
+                          // native command resolves. Keep global ownership alive
+                          // briefly so a destination pane cannot submit it again.
+                          window.setTimeout(() => {
+                            dragWindow.__FILETREE_NATIVE_DRAG_ACTIVE__ = false;
+                          }, 500);
                         })
                         .catch((error: unknown) => {
                           dragWindow.__FILETREE_NATIVE_DRAG_ACTIVE__ = false;
@@ -1079,7 +1088,10 @@ function TreeTableInner({
                   // Native drag owns this gesture. Chromium/WebView2 can still
                   // emit an HTML drop before the native command resolves; the
                   // native completion callback below will hit-test and move it.
-                  if (isFileTreeDrag && nativeDragOriginRef.current) {
+                  const nativeDragActive = !!(window as unknown as {
+                    __FILETREE_NATIVE_DRAG_ACTIVE__?: boolean;
+                  }).__FILETREE_NATIVE_DRAG_ACTIVE__;
+                  if (isFileTreeDrag && (nativeDragOriginRef.current || nativeDragActive)) {
                     setDropTargetId(null);
                     return;
                   }

@@ -19,7 +19,7 @@ import type { FilterRule } from "../hooks/useFilterRules";
 import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow, type AgentApi } from "../lib/agent";
 import { confirmRisky, isCrossDrive } from "../lib/confirmRisky";
 import { pushUndo, parentDir } from "../lib/undo";
-import { beginTransfer, finishTransfer, enqueueTransfer } from "../lib/transfers";
+import { beginTransfer, finishTransfer, enqueueTransfer, transferDedupeKey } from "../lib/transfers";
 import { searchNodesAdvanced, filtersActive, toServerSearchParams, type SearchFilters } from "../lib/search";
 import { exportResults } from "../lib/exportRows";
 import { loadFolderPref, saveFolderPref, normFolderKey } from "../lib/folderPrefs";
@@ -45,7 +45,13 @@ import { Breadcrumb } from "./Breadcrumb";
 import { Icon } from "./Icon";
 import type { ScanStatus, ProgressStore } from "../hooks/useScan";
 import type { ScanResult, Metric, Unit } from "../api/types";
-import { isTauriV2, releaseV2ScanPages } from "../api/v2";
+import {
+  isTauriV2,
+  fetchV2DirectorySnapshot,
+  releaseV2ScanPages,
+  startV2FilesystemWatch,
+  stopV2FilesystemWatch,
+} from "../api/v2";
 import {
   mutationAffectsRoot,
   publishFilesystemMutation,
@@ -469,6 +475,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const diffTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fsEventsRef = useRef<EventSource | null>(null);
+  const v2WatchIdRef = useRef<number | null>(null);
+  const watchGenerationRef = useRef(0);
   const watchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingChangesRef = useRef<Set<string>>(new Set());
   const suppressWatchRef = useRef(false);
@@ -590,7 +598,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     // entries that an inactive pane could not display.
     if (active && initialPath && !hasStartedRef.current) {
       hasStartedRef.current = true;
-      doScan(initialPath);
+      doScan(initialPath, undefined, true);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, initialPath]);
@@ -674,17 +682,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   }, [active, tree.visibleRows, tree.expanded, tree.selectedId, tree.nodeById, selectedIds, scanPath, onWorkbenchChange]);
 
   const startWatch = useCallback((rootPath: string) => {
+    const generation = ++watchGenerationRef.current;
     if (fsEventsRef.current) { fsEventsRef.current.close(); fsEventsRef.current = null; }
+    if (v2WatchIdRef.current != null) {
+      void stopV2FilesystemWatch(v2WatchIdRef.current);
+      v2WatchIdRef.current = null;
+    }
     if (watchDebounceRef.current) { clearTimeout(watchDebounceRef.current); watchDebounceRef.current = null; }
     pendingChangesRef.current.clear();
-
-    // The SSE endpoint belongs to the legacy HTTP shell. Tauri mutations use
-    // the bounded in-process notification bus above, so do not open a dead URL.
-    if (isTauriV2()) return;
-
-    const url = `/api/fs-events?path=${encodeURIComponent(rootPath)}`;
-    const es = new EventSource(url);
-    fsEventsRef.current = es;
 
     // Coalesced + gated flush. A big drive (e.g. C:\) churns logs/registry/temp
     // nonstop; patching every change would rebuild the whole node array each
@@ -740,19 +745,24 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           if (suppressWatchRef.current) break;
           invalidateScanCache(dir);
           try {
-            // Streamed (NDJSON) shallow rescan: parsed line-by-line so a
-            // background watch patch never buffers a whole JSON blob in memory.
-            const result = await fetchScanStream({
-              path: dir,
-              threads,
-              includeHidden,
-              followLinks,
-              collectOwners,
-              excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
-              maxDepth: 1,
-              nocache: true,
-            });
-            if (result?.nodes?.length) treeRef.current.patchDirectory(dir, result.nodes);
+            if (isTauriV2()) {
+              const nodes = await fetchV2DirectorySnapshot(dir);
+              if (nodes.length) treeRef.current.patchDirectory(dir, nodes);
+            } else {
+              // Streamed (NDJSON) shallow rescan: parsed line-by-line so a
+              // background watch patch never buffers a whole JSON blob in memory.
+              const result = await fetchScanStream({
+                path: dir,
+                threads,
+                includeHidden,
+                followLinks,
+                collectOwners,
+                excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
+                maxDepth: 1,
+                nocache: true,
+              });
+              if (result?.nodes?.length) treeRef.current.patchDirectory(dir, result.nodes);
+            }
           } catch { /* ignore network errors */ }
         }
       } finally {
@@ -760,18 +770,45 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       }
     }
 
-    es.onmessage = (evt) => {
-      let changedDir: string;
-      try { changedDir = JSON.parse(evt.data) as string; }
-      catch { return; }
+    const queueChangedDirectory = (changedDir: string) => {
       pendingChangesRef.current.add(changedDir);
       // Leading-edge: schedule once, don't reset on every event during a storm.
       if (!watchDebounceRef.current) {
         watchDebounceRef.current = setTimeout(flushWatch, WATCH_DEBOUNCE_MS);
       }
     };
+
+    if (isTauriV2()) {
+      void startV2FilesystemWatch(rootPath, queueChangedDirectory)
+        .then((watchId) => {
+          if (generation !== watchGenerationRef.current || !activeRef.current) {
+            void stopV2FilesystemWatch(watchId);
+            return;
+          }
+          v2WatchIdRef.current = watchId;
+        })
+        .catch((error: unknown) => {
+          console.warn("Could not start the native filesystem watcher", error);
+          setResultsStale(true);
+        });
+      return;
+    }
+
+    const url = `/api/fs-events?path=${encodeURIComponent(rootPath)}`;
+    const es = new EventSource(url);
+    fsEventsRef.current = es;
+    es.onmessage = (evt) => {
+      try { queueChangedDirectory(JSON.parse(evt.data) as string); }
+      catch { /* ignore malformed legacy watcher messages */ }
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [threads, includeHidden, followLinks, collectOwners, exclude]);
+
+  useEffect(() => () => {
+    watchGenerationRef.current++;
+    fsEventsRef.current?.close();
+    if (v2WatchIdRef.current != null) void stopV2FilesystemWatch(v2WatchIdRef.current);
+  }, []);
 
   useEffect(() => {
     if (status === "done" && data) {
@@ -802,8 +839,13 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       });
     }
     if (status === "scanning") {
+      watchGenerationRef.current++;
       fsEventsRef.current?.close();
       fsEventsRef.current = null;
+      if (v2WatchIdRef.current != null) {
+        void stopV2FilesystemWatch(v2WatchIdRef.current);
+        v2WatchIdRef.current = null;
+      }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
@@ -867,8 +909,13 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
 
   useEffect(() => {
     if (!active) {
+      watchGenerationRef.current++;
       fsEventsRef.current?.close();
       fsEventsRef.current = null;
+      if (v2WatchIdRef.current != null) {
+        void stopV2FilesystemWatch(v2WatchIdRef.current);
+        v2WatchIdRef.current = null;
+      }
       if (watchDebounceRef.current) { clearTimeout(watchDebounceRef.current); watchDebounceRef.current = null; }
       if (data?.lazy) {
         if (data.scanId) releaseV2ScanPages(data.scanId);
@@ -1509,6 +1556,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           return { ok: false, error: message };
         }
       },
+      transferDedupeKey("copy", sources, destination),
     );
   }, [refreshAfterMutation]);
 
@@ -1594,7 +1642,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               toast.success(`Moved ${itemsLabel(realSources.length)} to \u201C${basenameFromPath(destination)}\u201D.`, { action: undoAction });
             }
           }
-          if (didMove) refreshAfterMutation([...realSources, destination]);
+          if (didMove || !outcome.ok) refreshAfterMutation([...realSources, destination]);
           else suppressWatchRef.current = false;
           return outcome;
         } catch (error) {
@@ -1603,6 +1651,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           return { ok: false, error: message };
         }
       },
+      transferDedupeKey("move", realSources, destination),
     );
   }, [refreshAfterMutation, runMoveWithConflicts, undoAction]);
 

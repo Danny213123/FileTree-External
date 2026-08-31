@@ -77,6 +77,23 @@ export async function startNativeDrag(paths: string[]): Promise<NativeDragRespon
   return invoke<NativeDragResponse>("native_drag", { paths });
 }
 
+export async function startV2FilesystemWatch(
+  rootPath: string,
+  onChange: (directory: string) => void,
+): Promise<number> {
+  const channel = new Channel<string>();
+  channel.onmessage = onChange;
+  return invoke<number>("fs_watch_start", { rootPath, onChange: channel });
+}
+
+export async function stopV2FilesystemWatch(watchId: number): Promise<void> {
+  await invoke("fs_watch_stop", { watchId });
+}
+
+export async function fetchV2DirectorySnapshot(path: string): Promise<NodeRecord[]> {
+  return invoke<NodeRecord[]>("directory_snapshot", { path });
+}
+
 export function toNodeRecord(item: V2NodeItem): NodeRecord {
   return {
     id: item.id,
