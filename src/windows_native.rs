@@ -434,6 +434,27 @@ fn acquire_thumbnail_permit() -> ThumbnailPermit {
 }
 
 #[cfg(windows)]
+const SHELL_ICON_SENTINEL: [u8; 4] = [3, 2, 1, 0];
+
+#[cfg(windows)]
+fn normalize_shell_icon_bgra(bgra: &mut [u8]) -> bool {
+    let mut visible = false;
+    for pixel in bgra.chunks_exact_mut(4) {
+        if pixel == SHELL_ICON_SENTINEL {
+            pixel.fill(0);
+            continue;
+        }
+        if pixel[3] == 0 {
+            // Legacy HICONs use an AND mask and often leave the alpha channel
+            // unset even though DrawIconEx produced valid color pixels.
+            pixel[3] = 255;
+        }
+        visible |= pixel[3] != 0;
+    }
+    visible
+}
+
+#[cfg(windows)]
 #[allow(non_snake_case, non_camel_case_types)]
 fn render_shell_icon_png(extension: &str) -> Option<Vec<u8>> {
     use std::ffi::c_void;
@@ -574,7 +595,17 @@ fn render_shell_icon_png(extension: &str) -> Option<Vec<u8>> {
             DestroyIcon(info.hIcon);
             return None;
         }
+        if bits.is_null() {
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            DestroyIcon(info.hIcon);
+            return None;
+        }
         SelectObject(dc, bitmap);
+        let pixels = std::slice::from_raw_parts_mut(bits.cast::<u8>(), (SIZE * SIZE * 4) as usize);
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&SHELL_ICON_SENTINEL);
+        }
         let drawn = DrawIconEx(dc, 0, 0, info.hIcon, SIZE, SIZE, 0, 0, DI_NORMAL);
         let mut bgra = vec![0u8; (SIZE * SIZE * 4) as usize];
         let mut read_info = bitmap_info;
@@ -590,9 +621,7 @@ fn render_shell_icon_png(extension: &str) -> Option<Vec<u8>> {
         DeleteObject(bitmap);
         DeleteDC(dc);
         DestroyIcon(info.hIcon);
-        let visible = bgra
-            .chunks_exact(4)
-            .any(|pixel| pixel[0] | pixel[1] | pixel[2] | pixel[3] != 0);
+        let visible = normalize_shell_icon_bgra(&mut bgra);
         if rows == 0 || drawn == 0 || !visible {
             return None;
         }
@@ -955,7 +984,46 @@ mod tests {
 
     #[test]
     fn shell_images_are_png_and_use_icon_fallback() {
-        for extension in ["mp4", "zip", "rar"] {
+        for extension in [
+            // Images
+            "jpg",
+            "jpeg",
+            "png",
+            "gif",
+            "webp",
+            "bmp",
+            "tiff",
+            "svg",
+            // Video and audio
+            "mp4",
+            "mkv",
+            "mov",
+            "avi",
+            "webm",
+            "mp3",
+            "wav",
+            "flac",
+            // Archives, documents, and applications
+            "zip",
+            "rar",
+            "7z",
+            "tar",
+            "gz",
+            "txt",
+            "pdf",
+            "docx",
+            "xlsx",
+            "exe",
+            "dll",
+            "msi",
+            "iso",
+            "torrent",
+            // Partial, uncommon, and unregistered file types must still receive
+            // Windows' generic file icon.
+            "part",
+            "vmw",
+            "unknown_filetree_extension",
+        ] {
             let icon = shell_icon_png(extension).expect("Windows file type icon");
             assert_eq!(&icon[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
         }
@@ -968,6 +1036,23 @@ mod tests {
         )
         .expect("Windows thumbnail or icon fallback");
         assert_eq!(&image[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+    }
+
+    #[test]
+    fn legacy_shell_icon_pixels_recover_alpha_without_filling_the_background() {
+        let mut pixels = [
+            SHELL_ICON_SENTINEL,
+            [0, 0, 0, 0],
+            [20, 40, 60, 0],
+            [80, 100, 120, 128],
+        ]
+        .concat();
+
+        assert!(normalize_shell_icon_bgra(&mut pixels));
+        assert_eq!(&pixels[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&pixels[4..8], &[0, 0, 0, 255]);
+        assert_eq!(&pixels[8..12], &[20, 40, 60, 255]);
+        assert_eq!(&pixels[12..16], &[80, 100, 120, 128]);
     }
 
     #[test]

@@ -406,7 +406,13 @@ fn native_drag(
 
 #[tauri::command]
 async fn file_icon(extension: String) -> Result<Option<String>, String> {
-    if extension.len() > 32 || !extension.chars().all(|value| value.is_ascii_alphanumeric()) {
+    if extension.is_empty()
+        || extension.len() > 64
+        || extension.chars().any(|value| {
+            value.is_control()
+                || matches!(value, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
+    {
         return Err("Invalid file extension".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || filetree_core::shell_icon_data_url(&extension))

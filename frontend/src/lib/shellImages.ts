@@ -22,6 +22,12 @@ class ImagePromiseCache {
     const entry: CacheEntry = { promise: Promise.resolve(null), bytes: 0 };
     entry.promise = load().then((value) => {
       if (this.entries.get(key) !== entry) return value;
+      if (!value) {
+        // A shell worker or association lookup can fail transiently. Do not
+        // turn that one miss into a permanent blank icon for the app session.
+        this.entries.delete(key);
+        return null;
+      }
       entry.bytes = value ? value.length * 2 : 0;
       this.bytes += entry.bytes;
       this.trim();
