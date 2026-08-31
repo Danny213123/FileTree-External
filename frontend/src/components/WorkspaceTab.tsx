@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle, useSyncExternalStore, memo } from "react";
 import { useScan, fetchScanStream } from "../hooks/useScan";
 import { useTreeState, type ChipKey, type LazyOptions } from "../hooks/useTreeState";
-import { invalidate as invalidateScanCache, invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
+import { invalidate as invalidateScanCache } from "../lib/scanCache";
 import {
   revealPath, openPath, createFolder,
   copyPath, renameItem, moveItems, deletePath, copyFiles,
@@ -262,13 +262,14 @@ const QUICK_FILTER_CHIPS: { key: ChipKey; label: string }[] = [
   { key: "old1y", label: ">1 year old" },
 ];
 
-// Filesystem-watch tuning. Patching is O(n) over the whole node array, so on big
-// scans we throttle hard and only patch folders the user actually has open.
+// Filesystem-watch tuning. Snapshot reads run in bounded batches so a large
+// mutation updates changed branches without turning into a drive-wide rescan.
 // Native watcher events are already collapsed into short batches before they
 // cross IPC. This small UI-side window merges adjacent batches without making
 // visible changes wait close to a second.
 const WATCH_DEBOUNCE_MS = 60;
 const WATCH_MAX_BATCH = 6;
+const DIRTY_DIRECTORY_MAX = 512;
 
 // #11 diff-on-rescan: how long the added/changed row tint lingers before fading,
 // and the largest tree we'll snapshot per-path sizes for (keeps the diff cheap
@@ -277,11 +278,9 @@ const DIFF_HIGHLIGHT_MS = 4000;
 const DIFF_MAX_NODES = 200_000;
 
 // #14 smart refresh: re-walk at most this many currently-expanded directories
-// (each a cheap maxDepth=1 shallow rescan + patch). Beyond this it's cheaper to
-// just do a normal full rescan.
+// for an undirected manual refresh. Watcher-driven dirty paths are drained in
+// bounded batches and are not truncated to this limit.
 const SMART_REFRESH_MAX_DIRS = 50;
-const WATCH_LARGE_TREE = 50_000;
-
 // Phase 0 safety net: a scan with more nodes than this surfaces a non-blocking
 // "very large scan" banner warning that performance may degrade while loading
 // continues. Purely advisory — loading is never truncated. Kept below the lazy
@@ -482,6 +481,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const watchGenerationRef = useRef(0);
   const watchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingChangesRef = useRef<Set<string>>(new Set());
+  // Watcher and in-app mutation paths remain here until their shallow snapshot
+  // has been grafted into the loaded tree. Unknown lazy branches stay dirty and
+  // are retried when the user expands them; they never force a full drive scan.
+  const dirtyDirectoriesRef = useRef<Map<string, string>>(new Map());
+  const dirtyDirectoryOverflowRef = useRef(false);
   const suppressWatchRef = useRef(false);
   // Skip stacking watch patches: a new batch is dropped/retried while one runs.
   const patchInFlightRef = useRef(false);
@@ -509,6 +513,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     const isRefresh = p.trim() === lastCompletedPathRef.current;
     // The user explicitly (re)scanned, so any "results stale" badge no longer
     // applies; clear it now (it re-arms if the watcher sees new off-screen churn).
+    dirtyDirectoriesRef.current.clear();
+    dirtyDirectoryOverflowRef.current = false;
     setResultsStale(false);
     if (isRefresh) {
       lastScanWasRefreshRef.current = true;
@@ -532,8 +538,116 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scanPath, threads, includeHidden, followLinks, collectOwners, exclude, startScan, startRefresh, tree]);
 
-  const doScanRef = useRef(doScan);
-  doScanRef.current = doScan;
+  const markDirtyDirectories = useCallback((directories: Iterable<string>): string[] => {
+    const marked: string[] = [];
+    for (const directory of directories) {
+      const path = directory.trim();
+      if (!path) continue;
+      const key = normFolderKey(path);
+      if (!dirtyDirectoriesRef.current.has(key)) {
+        if (dirtyDirectoriesRef.current.size >= DIRTY_DIRECTORY_MAX) {
+          dirtyDirectoryOverflowRef.current = true;
+          continue;
+        }
+        dirtyDirectoriesRef.current.set(key, path);
+      }
+      marked.push(path);
+    }
+    if (dirtyDirectoriesRef.current.size > 0 || dirtyDirectoryOverflowRef.current) setResultsStale(true);
+    return marked;
+  }, []);
+
+  const markMutationPathsDirty = useCallback((paths: string[]): string[] => {
+    const loadedByKey = new Map<string, NodeRecord>();
+    for (const node of nodeByPathRef.current.values()) {
+      if (node.path) loadedByKey.set(normFolderKey(node.path), node);
+    }
+    const directories: string[] = [];
+    for (const path of paths) {
+      const node = loadedByKey.get(normFolderKey(path));
+      if (node?.dir) directories.push(node.path);
+      const parent = parentDirOf(path);
+      if (parent) directories.push(parent);
+    }
+    return markDirtyDirectories(directories);
+  }, [markDirtyDirectories]);
+
+  const refreshDirectories = useCallback(async (directories: Iterable<string>): Promise<number> => {
+    if (statusRef.current === "scanning" || patchInFlightRef.current) return 0;
+
+    const loadedByKey = new Map<string, NodeRecord>();
+    for (const node of nodeByPathRef.current.values()) {
+      if (node.dir && node.path) loadedByKey.set(normFolderKey(node.path), node);
+    }
+    const requested = new Map<string, string>();
+    for (const directory of directories) {
+      const key = normFolderKey(directory);
+      const loaded = loadedByKey.get(key);
+      if (loaded) requested.set(key, loaded.path);
+    }
+    if (requested.size === 0) {
+      setResultsStale(dirtyDirectoriesRef.current.size > 0 || dirtyDirectoryOverflowRef.current);
+      return 0;
+    }
+
+    patchInFlightRef.current = true;
+    let patched = 0;
+    const entries = Array.from(requested.entries());
+    const refreshedDirectories = new Set<string>();
+    const failedSnapshots: Array<{ key: string; dir: string }> = [];
+    try {
+      for (let offset = 0; offset < entries.length; offset += WATCH_MAX_BATCH) {
+        const batch = entries.slice(offset, offset + WATCH_MAX_BATCH);
+        const refreshed = await Promise.all(batch.map(async ([key, dir]) => {
+          invalidateScanCache(dir);
+          try {
+            if (isTauriV2()) {
+              const nodes = await fetchV2DirectorySnapshot(dir);
+              return nodes.length ? { key, dir, nodes } : null;
+            }
+            const result = await fetchScanStream({
+              path: dir,
+              threads,
+              includeHidden,
+              followLinks,
+              collectOwners,
+              excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
+              maxDepth: 1,
+              nocache: true,
+            });
+            return result?.nodes?.length ? { key, dir, nodes: result.nodes } : null;
+          } catch {
+            return null;
+          }
+        }));
+        for (const snapshot of refreshed) {
+          if (!snapshot) continue;
+          treeRef.current.patchDirectory(snapshot.dir, snapshot.nodes);
+          dirtyDirectoriesRef.current.delete(snapshot.key);
+          refreshedDirectories.add(snapshot.key);
+          patched++;
+        }
+        for (let batchIndex = 0; batchIndex < batch.length; batchIndex++) {
+          if (!refreshed[batchIndex]) {
+            const [key, dir] = batch[batchIndex];
+            failedSnapshots.push({ key, dir });
+          }
+        }
+      }
+      // A removed or renamed directory cannot be snapshotted after its event.
+      // Once its parent snapshot succeeds, that listing is authoritative and
+      // the vanished child must not leave the tab permanently marked stale.
+      for (const failed of failedSnapshots) {
+        if (refreshedDirectories.has(normFolderKey(parentDir(failed.dir)))) {
+          dirtyDirectoriesRef.current.delete(failed.key);
+        }
+      }
+    } finally {
+      patchInFlightRef.current = false;
+      setResultsStale(dirtyDirectoriesRef.current.size > 0 || dirtyDirectoryOverflowRef.current);
+    }
+    return patched;
+  }, [threads, includeHidden, followLinks, collectOwners, exclude]);
 
   const schedulePendingMutationRefresh = useCallback(() => {
     if (!pendingMutationRefreshRef.current || !activeRef.current || statusRef.current === "scanning") return;
@@ -541,11 +655,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     mutationRefreshTimerRef.current = setTimeout(() => {
       mutationRefreshTimerRef.current = null;
       if (!pendingMutationRefreshRef.current || !activeRef.current || statusRef.current === "scanning") return;
+      if (patchInFlightRef.current) {
+        schedulePendingMutationRefresh();
+        return;
+      }
       pendingMutationRefreshRef.current = false;
-      invalidateAllScanCache();
-      doScanRef.current(undefined, undefined, true);
+      void refreshDirectories(dirtyDirectoriesRef.current.values());
     }, 120);
-  }, []);
+  }, [refreshDirectories]);
 
   // Tauri v2 has no loopback HTTP server, so app-initiated mutations are
   // broadcast directly between mounted workspace tabs. Visible affected tabs
@@ -555,10 +672,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     if (mutation.sourceTabId === tabId) return;
     const rootPath = dataRef.current?.rootPath || lastCompletedPathRef.current || scanPath;
     if (!rootPath || !mutationAffectsRoot(rootPath, mutation.paths)) return;
+    markMutationPathsDirty(mutation.paths);
     pendingMutationRefreshRef.current = true;
-    setResultsStale(true);
     schedulePendingMutationRefresh();
-  }), [scanPath, schedulePendingMutationRefresh, tabId]);
+  }), [markMutationPathsDirty, scanPath, schedulePendingMutationRefresh, tabId]);
 
   useEffect(() => {
     schedulePendingMutationRefresh();
@@ -571,15 +688,16 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const refreshAfterMutation = useCallback((changedPaths: string[]) => {
     suppressWatchRef.current = false;
     publishFilesystemMutation(changedPaths, tabId);
-    invalidateAllScanCache();
-    doScan(undefined, undefined, true);
-  }, [doScan, tabId]);
+    markMutationPathsDirty(changedPaths);
+    pendingMutationRefreshRef.current = true;
+    schedulePendingMutationRefresh();
+  }, [markMutationPathsDirty, schedulePendingMutationRefresh, tabId]);
 
-  // LAZY: when the backend reports the cached scan we're paging against changed
-  // (409 during ensureChildren), force a fresh rescan of the current root.
+  // LAZY: when a cached page is stale, queue a shallow root reconciliation.
+  // The user's explicit Scan action remains the only path to a deep rebuild.
   onStaleRef.current = () => {
     const p = lastCompletedPathRef.current || scanPath;
-    if (p && p.trim()) doScan(p, undefined, true);
+    if (p && p.trim()) markDirtyDirectories([p]);
   };
 
   // Toggling owner collection only changes data on the next walk, so re-scan the
@@ -707,80 +825,28 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       }
       if (suppressWatchRef.current) { pendingChangesRef.current.clear(); return; }
 
-      const t = treeRef.current;
-      const byPath = nodeByPathRef.current;
-      const bigTree = t.nodeById.size > WATCH_LARGE_TREE;
+      const byPath = new Map<string, NodeRecord>();
+      for (const node of nodeByPathRef.current.values()) {
+        if (node.dir && node.path) byPath.set(normFolderKey(node.path), node);
+      }
 
-      // Gate: keep only changed dirs that are loaded AND currently expanded, so
-      // background churn in unopened folders is ignored (reflected on next scan).
-      // #10: a change in a loaded-but-collapsed (off-screen) subtree isn't
-      // auto-patched, so the displayed results may be stale — flag it.
+      // Patch every changed directory that is already represented in the lazy
+      // tree, including collapsed rows. Unloaded branches remain in the dirty
+      // queue and are retried when they become visible.
       const dirs: string[] = [];
-      let offscreenChanged = false;
       for (const d of pendingChangesRef.current) {
-        const node = byPath.get(d);
-        if (!node) continue; // dir isn't in our tree → nothing visible to update
-        const isOpen = node.id === 0
-          || (t.expandedAll ? !bigTree : t.expanded.has(node.id));
-        if (isOpen) dirs.push(d);
-        else offscreenChanged = true;
+        const node = byPath.get(normFolderKey(d));
+        if (node) dirs.push(node.path);
       }
       pendingChangesRef.current.clear();
-      if (offscreenChanged) setResultsStale(true);
+      setResultsStale(dirtyDirectoriesRef.current.size > 0 || dirtyDirectoryOverflowRef.current);
       if (dirs.length === 0) return;
 
-      // Coalesce nested dirs and cap the batch so one flush can't stall the UI.
-      dirs.sort((a, b) => a.length - b.length);
-      const toScan: string[] = [];
-      for (const d of dirs) {
-        if (!toScan.some(q => d === q || d.startsWith(q + "\\") || d.startsWith(q + "/")))
-          toScan.push(d);
-        if (toScan.length >= WATCH_MAX_BATCH) break;
-      }
-      // #10: more distinct open dirs changed than we patched this flush — the
-      // remainder won't be reflected until the next flush/refresh, so flag stale.
-      if (dirs.length > toScan.length) setResultsStale(true);
-
-      patchInFlightRef.current = true;
-      try {
-        const refreshed = await Promise.all(toScan.map(async (dir) => {
-          invalidateScanCache(dir);
-          try {
-            if (isTauriV2()) {
-              const nodes = await fetchV2DirectorySnapshot(dir);
-              return nodes.length ? { dir, nodes } : null;
-            } else {
-              // Streamed (NDJSON) shallow rescan: parsed line-by-line so a
-              // background watch patch never buffers a whole JSON blob in memory.
-              const result = await fetchScanStream({
-                path: dir,
-                threads,
-                includeHidden,
-                followLinks,
-                collectOwners,
-                excludePatterns: exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [],
-                maxDepth: 1,
-                nocache: true,
-              });
-              return result?.nodes?.length ? { dir, nodes: result.nodes } : null;
-            }
-          } catch {
-            return null;
-          }
-        }));
-        // React batches these functional updates into one commit, while the
-        // filesystem reads above run concurrently instead of serially.
-        if (!suppressWatchRef.current) {
-          for (const snapshot of refreshed) {
-            if (snapshot) treeRef.current.patchDirectory(snapshot.dir, snapshot.nodes);
-          }
-        }
-      } finally {
-        patchInFlightRef.current = false;
-      }
+      await refreshDirectories(dirs);
     }
 
     const queueChangedDirectories = (changedDirs: string[]) => {
+      markDirtyDirectories(changedDirs);
       for (const changedDir of changedDirs) pendingChangesRef.current.add(changedDir);
       // Leading-edge: schedule once, don't reset on every event during a storm.
       if (!watchDebounceRef.current) {
@@ -812,7 +878,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       catch { /* ignore malformed legacy watcher messages */ }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [threads, includeHidden, followLinks, collectOwners, exclude]);
+  }, [markDirtyDirectories, refreshDirectories]);
 
   useEffect(() => () => {
     watchGenerationRef.current++;
@@ -949,6 +1015,21 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       if (node?.dir) tree.ensureChildren(id);
     }
   }, [active, data?.lazy, tree.expanded, tree.nodeById, tree.ensureChildren]);
+
+  // Opening a previously-unloaded lazy branch makes any retained watcher path
+  // patchable. Retry only those newly-known dirty directories; no deep scan.
+  useEffect(() => {
+    if (!active || status !== "done" || dirtyDirectoriesRef.current.size === 0) return;
+    const loadedKeys = new Set<string>();
+    for (const node of tree.nodeById.values()) {
+      if (node.dir && node.path) loadedKeys.add(normFolderKey(node.path));
+    }
+    const ready = Array.from(dirtyDirectoriesRef.current.entries())
+      .filter(([key]) => loadedKeys.has(key))
+      .slice(0, WATCH_MAX_BATCH)
+      .map(([, path]) => path);
+    if (ready.length > 0) void refreshDirectories(ready);
+  }, [active, status, tree.nodeById, refreshDirectories]);
 
   // Record a user navigation in the history stack. Drops any forward entries
   // (classic browser semantics) and skips no-op pushes when re-navigating to
@@ -1233,11 +1314,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       // Phase 6 undo: removing the folder on Ctrl+Z is safe only while it stays
       // empty (the executor checks before deleting), so this never loses files.
       pushUndo({ kind: "mkdir", path: full });
-      doScan();
+      refreshAfterMutation([full]);
     } catch (e) {
       toast.error(`Could not create folder: ${e instanceof Error ? e.message : e}`);
     }
-  }, [tree, scanPath, doScan]);
+  }, [tree, scanPath, refreshAfterMutation]);
 
   const handleTreemapOpen = useCallback((id: number) => {
     const node = treeRef.current.nodeById.get(id);
@@ -1363,9 +1444,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     // Phase 6: record the reverse (rename back to the original name) for Ctrl+Z.
     pushUndo({ kind: "rename", parent: parentDir(node.path), from: node.name, to: newName });
     toast.success(`Renamed to \u201C${newName}\u201D.`, { action: undoAction });
-    invalidateAllScanCache();
-    doScan(undefined, undefined, true);
-  }, [tree.nodeById, doScan, undoAction]);
+    refreshAfterMutation([parentDir(node.path)]);
+  }, [tree.nodeById, refreshAfterMutation, undoAction]);
 
   const runDeletePaths = useCallback(async (paths?: string[], permanent = false) => {
     const targetPaths = paths && paths.length > 0 ? dedupeNestedPaths(paths, nodeByPath) : selectedPaths;
@@ -1404,7 +1484,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     // permanent delete is not — push a marker so Ctrl+Z says so plainly.
     if (recycled.length > 0) pushUndo({ kind: "recycle", paths: recycled });
     if (purged > 0) pushUndo({ kind: "permanentDelete", count: purged });
-    doScan();
+    refreshAfterMutation(targetPaths);
     // A recycle is reversible — offer Undo. (A permanent delete is not, so it
     // gets no Undo affordance.)
     if (recycled.length > 0 && failures.length === 0) {
@@ -1418,7 +1498,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         `Could not ${verb} ${failures.length} of ${targetPaths.length} item${targetPaths.length === 1 ? "" : "s"}:\n\n${shown}${more}`,
       );
     }
-  }, [nodeByPath, selectedPaths, doScan, undoAction]);
+  }, [nodeByPath, selectedPaths, refreshAfterMutation, undoAction]);
 
   const runDelete = useCallback(() => { void runDeletePaths(); }, [runDeletePaths]);
 
@@ -1748,13 +1828,12 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     try {
       await createFolder(full);
       pushUndo({ kind: "mkdir", path: full });
-      invalidateAllScanCache();
-      doScan(undefined, undefined, true);
+      refreshAfterMutation([full]);
       return { ok: true, path: full };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
-  }, [doScan]);
+  }, [refreshAfterMutation]);
 
   // ── F5: archive (zip) + checksum on the current selection ────────────────
   // The table's right-click opens the native Explorer menu, so these actions
@@ -1790,8 +1869,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       finishTransfer(xferId, res.ok, res.error);
       if (res.ok) {
         toast.success(`Compressed ${itemsLabel(paths.length)} to \u201C${fileName}\u201D.`);
-        invalidateAllScanCache();
-        doScan(undefined, undefined, true);
+        refreshAfterMutation([dest]);
       } else {
         toast.error(`Compress failed: ${res.error ?? "unknown error"}`);
       }
@@ -1800,7 +1878,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       finishTransfer(xferId, false, msg);
       toast.error(`Compress failed: ${msg}`);
     }
-  }, [selectedPaths, doScan]);
+  }, [selectedPaths, refreshAfterMutation]);
 
   const runExtract = useCallback(async () => {
     const node = selectedNode;
@@ -1816,8 +1894,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       finishTransfer(xferId, res.ok, res.error);
       if (res.ok) {
         toast.success(`Extracted \u201C${node.name}\u201D here.`);
-        invalidateAllScanCache();
-        doScan(undefined, undefined, true);
+        refreshAfterMutation([dest]);
       } else {
         toast.error(`Extract failed: ${res.error ?? "unknown error"}`);
       }
@@ -1826,7 +1903,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       finishTransfer(xferId, false, msg);
       toast.error(`Extract failed: ${msg}`);
     }
-  }, [selectedNode, doScan]);
+  }, [selectedNode, refreshAfterMutation]);
 
   // #43: batch attribute + timestamp editor on the current selection. Opens a
   // dialog; the apply handler routes through the audited, root-gated backend
@@ -1850,12 +1927,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       const r = await setTimes(paths, payload.times);
       if (!r.ok && r.error) errors.push(r.error);
     }
-    invalidateAllScanCache();
-    doScan(undefined, undefined, true);
+    refreshAfterMutation(paths);
     if (errors.length > 0) return { ok: false, error: errors.join("; ") };
     toast.success(`Updated ${itemsLabel(paths.length)}.`);
     return { ok: true };
-  }, [selectedPaths, doScan]);
+  }, [selectedPaths, refreshAfterMutation]);
 
   // #44: "Send to" actions on the selection. Compress reuses runCompress; Mail
   // opens the default mail client via a mailto: URL (attachments aren't possible
@@ -1897,10 +1973,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // Run a substituted Send-to command, then rescan (it may create/modify files).
   const sendToRunCommand = useCallback(async (command: string) => {
     const res = await runCommand(command, scanPath);
-    invalidateAllScanCache();
-    doScan(undefined, undefined, true);
+    refreshAfterMutation([scanPath]);
     return res;
-  }, [scanPath, doScan]);
+  }, [scanPath, refreshAfterMutation]);
 
   const runChecksum = useCallback(async () => {
     const node = selectedNode;
@@ -1914,31 +1989,33 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     toast.success(`SHA-256 of \u201C${node.name}\u201D copied:\n${res.hash}`);
   }, [selectedNode]);
 
-  // After a native drag moved item(s) OUT of this tree (a true move to Explorer
-  // or another app), the source is gone from disk; drop our cached scan and
-  // rescan so a moved-out folder doesn't keep showing in an expanded parent.
+  // After a native drag moved item(s) OUT of this tree, reconcile the loaded
+  // source listing so a moved-out folder disappears without a deep rescan.
   const handleAfterExternalMove = useCallback(() => {
     refreshAfterMutation([dataRef.current?.rootPath || scanPath]);
   }, [refreshAfterMutation, scanPath]);
 
-  // #14 Smart refresh (pragmatic incremental). Rather than a full deep rescan,
-  // re-walk only the directories the user currently has EXPANDED — each a cheap
-  // maxDepth=1 shallow rescan that `patchDirectory` splices in while PRESERVING
-  // the (unchanged) collapsed subtrees beneath them. So unscanned/collapsed
-  // subtrees keep their cached sizes (reused, not re-walked) and only the
-  // visible parts are refreshed.
-  //
-  // FLAGGED simplification: true incremental scanning (reuse-by-mtime across the
-  // whole tree) would need deep changes to the Rust walker / cache, so it's
-  // deferred. The old mtime-poll endpoint (/api/watch) was replaced by the SSE
-  // fs-events watcher, so this reuses the same shallow-rescan+patch machinery the
-  // watcher already uses. Changes inside collapsed folders aren't picked up here
-  // (use Refresh for a full deep rescan); if too many folders are open it falls
-  // back to a full rescan.
+  // #14 Incremental refresh. Dirty watcher branches are preferred; otherwise
+  // refresh loaded open directories. Each request is maxDepth=1 and preserves
+  // cached subtrees, so clicking Refresh never starts a drive-wide scan.
   const doSmartRefresh = useCallback(async () => {
     const t = treeRef.current;
     const root = lastCompletedPathRef.current;
-    if (!root || status === "scanning") { doScan(undefined, undefined, true); return; }
+    if (!root || status === "scanning") return;
+
+    const dirty = Array.from(dirtyDirectoriesRef.current.values());
+    const overflowed = dirtyDirectoryOverflowRef.current;
+    if (dirty.length > 0 || overflowed) {
+      const patched = await refreshDirectories(dirty);
+      const unresolved = dirtyDirectoriesRef.current.size;
+      if (unresolved > 0 || overflowed) {
+        const pending = `${unresolved}${overflowed ? "+" : ""}`;
+        toast.warn(`Updated ${patched} changed folder${patched === 1 ? "" : "s"}; ${pending} unloaded branch${pending === "1" ? "" : "es"} will refresh when opened.`);
+      } else {
+        toast.success(`Updated ${patched} changed folder${patched === 1 ? "" : "s"}.`);
+      }
+      return;
+    }
 
     // Currently-expanded directories that are real, loaded nodes (skip the root's
     // synthetic bundle ids and unscanned stubs).
@@ -1947,49 +2024,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       if (!node.dir || node.id < 0 || !node.path) continue;
       if (node.id === 0 || t.expanded.has(node.id)) openDirs.push(node.path);
     }
-    if (openDirs.length === 0 || openDirs.length > SMART_REFRESH_MAX_DIRS) {
-      doScan(undefined, undefined, true);
-      return;
-    }
-
-    // Coalesce nested dirs: re-walking a parent already covers its visible
-    // children, so keep only the topmost of each open chain.
-    openDirs.sort((a, b) => a.length - b.length);
-    const toScan: string[] = [];
-    for (const d of openDirs) {
-      if (!toScan.some((q) => d === q || d.startsWith(q + "\\") || d.startsWith(q + "/"))) {
-        toScan.push(d);
-      }
-    }
-
-    const excludePatterns = exclude ? exclude.split(",").map((s) => s.trim()).filter(Boolean) : [];
-    suppressWatchRef.current = true;
-    patchInFlightRef.current = true;
-    let patched = 0;
-    try {
-      for (const dir of toScan) {
-        invalidateScanCache(dir);
-        try {
-          const result = await fetchScanStream({
-            path: dir,
-            threads,
-            includeHidden,
-            followLinks,
-            collectOwners,
-            excludePatterns,
-            maxDepth: 1,
-            nocache: true,
-          });
-          if (result?.nodes?.length) { treeRef.current.patchDirectory(dir, result.nodes); patched++; }
-        } catch { /* ignore per-dir network errors */ }
-      }
-    } finally {
-      patchInFlightRef.current = false;
-      suppressWatchRef.current = false;
-    }
-    setResultsStale(false);
+    if (openDirs.length === 0) return;
+    const limited = openDirs.slice(0, SMART_REFRESH_MAX_DIRS);
+    const patched = await refreshDirectories(limited);
     toast.success(`Smart refresh updated ${patched} visible folder${patched === 1 ? "" : "s"}.`);
-  }, [status, threads, includeHidden, followLinks, collectOwners, exclude, doScan]);
+  }, [status, refreshDirectories]);
 
   // ── Agent API facade (used by the right-side ChatPanel) ──────────────────
   const agentApi = useMemo<AgentApi>(() => ({
@@ -1997,7 +2036,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     getScanResult: () => data,
     getNodes: () => Array.from(tree.nodeById.values()),
     scanFolder: async (path: string) => { openLocation(path); },
-    refresh: async () => { invalidateAllScanCache(); doScan(undefined, undefined, true); },
+    refresh: async () => { await doSmartRefresh(); },
     findDuplicates: async (minSizeBytes: number, signal?: AbortSignal) => {
       const root = data?.rootPath || scanPath;
       const res = await fetchDupesV2Bounded({ paths: [root], mode: "exact", minSize: minSizeBytes }, signal);
@@ -2008,22 +2047,21 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       const r = await renameItem(path, newName);
       if (r.ok) {
         pushUndo({ kind: "rename", parent: parentDir(path), from: basenameFromPath(path), to: newName });
-        invalidateAllScanCache();
-        doScan(undefined, undefined, true);
+        refreshAfterMutation([parentDir(path)]);
       }
       return r;
     },
     createFolder: async (path: string) => {
-      try { await createFolder(path); pushUndo({ kind: "mkdir", path }); doScan(); return { ok: true }; }
+      try { await createFolder(path); pushUndo({ kind: "mkdir", path }); refreshAfterMutation([path]); return { ok: true }; }
       catch (e) { return { ok: false, error: (e as Error).message }; }
     },
     reveal: async (path: string) => { revealPath(path); },
     // Run an approved shell command, then refresh the tree (deletions, recycle,
     // etc. change the folder). cwd defaults to this tab's scanned folder.
     runCommand: async (command: string, cwd?: string, shell?: "powershell" | "cmd") => {
-      const res = await runCommand(command, cwd ?? scanPath, shell ? { shell } : undefined);
-      invalidateAllScanCache();
-      doScan(undefined, undefined, true);
+      const workingDirectory = cwd ?? scanPath;
+      const res = await runCommand(command, workingDirectory, shell ? { shell } : undefined);
+      refreshAfterMutation([workingDirectory]);
       return res;
     },
     // Read-only bounded text read (server caps at ~64 KiB; we window by line).
@@ -2031,20 +2069,18 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     // Create/overwrite a text file via an approved PowerShell write, then rescan.
     writeFile: async (path: string, content: string) => {
       const res = await runCommand(buildWriteFileCommand(path, content), parentDir(path) || scanPath);
-      invalidateAllScanCache();
-      doScan(undefined, undefined, true);
+      refreshAfterMutation([path]);
       return res;
     },
     // Exact-substring edit via an approved PowerShell replace, then rescan.
     editFile: async (path: string, oldString: string, newString: string) => {
       const res = await runCommand(buildEditFileCommand(path, oldString, newString), parentDir(path) || scanPath);
-      invalidateAllScanCache();
-      doScan(undefined, undefined, true);
+      refreshAfterMutation([path]);
       return res;
     },
     webFetch: async (url: string, opts) => webFetch(url, opts),
     webSearch: async (query: string) => webSearch(query),
-  }), [scanPath, data, tree.nodeById, openLocation, doScan, handleInternalMove]);
+  }), [scanPath, data, tree.nodeById, openLocation, doSmartRefresh, handleInternalMove, refreshAfterMutation]);
 
   useImperativeHandle(ref, () => ({
     getStatus: () => status,
@@ -2079,7 +2115,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         onScanPathInput: setScanPathState,
         onScan: () => openLocation(scanPath),
         onCancel: cancelScan,
-        onRefresh: () => doScan(undefined, undefined, true),
+        onRefresh: () => { void doSmartRefresh(); },
         onUp: handleNavigateParent,
         onNewFolder: handleNewFolder,
         onCollapseAll: () => t.expandToLevel(0),
@@ -2186,7 +2222,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       if (tree.sortDir !== dir) tree.setSortKey(key as SortKey);
     },
     showNotice: (message) => setMoveNotice(message),
-    refresh: () => { invalidateAllScanCache(); doScan(undefined, undefined, true); },
+    refresh: () => { void doSmartRefresh(); },
     smartRefresh: doSmartRefresh,
     doNavigateId: (id) => handleNavigate(id),
     getFilterRules: () => treeRef.current.filterRules,
@@ -2339,8 +2375,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             <span className="spacer" />
             <button
               className="stale-bar-refresh"
-              title="Rescan this folder to refresh the results"
-              onClick={() => doScan(undefined, undefined, true)}
+              title="Refresh only the folders that changed"
+              onClick={() => { void doSmartRefresh(); }}
             >
               <Icon name="refresh" size={12} /> Refresh
             </button>
@@ -2657,7 +2693,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         <BulkRenameDialog
           nodes={selectedNodes}
           onClose={() => setBulkRenameOpen(false)}
-          onApplied={() => { invalidateAllScanCache(); doScan(undefined, undefined, true); }}
+          onApplied={() => { refreshAfterMutation(selectedPaths); }}
           undoAction={undoAction}
         />
       )}

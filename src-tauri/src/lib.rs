@@ -57,13 +57,23 @@ fn fs_watch_start(
     // wake one short-lived batch worker.
     let pending = Arc::new(Mutex::new(HashSet::<String>::new()));
     let callback_pending = Arc::clone(&pending);
+    let callback_root = root_path.clone();
     let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-        let Ok(event) = result else { return };
         if let Ok(mut changed_dirs) = callback_pending.lock() {
-            for path in event.paths {
-                if let Some(parent) = path.parent() {
-                    changed_dirs.insert(parent.to_string_lossy().into_owned());
+            match result {
+                Ok(event) => {
+                    for path in event.paths {
+                        if let Some(parent) = path.parent() {
+                            changed_dirs.insert(parent.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+                // notify reports backend overflows/errors without reliable item
+                // paths. Re-enumerate the watched directory itself rather than
+                // silently going stale or rebuilding the complete volume.
+                Err(_) => {
+                    changed_dirs.insert(callback_root.clone());
                 }
             }
         }
@@ -100,20 +110,12 @@ const WATCH_MAX_WINDOW: Duration = Duration::from_millis(120);
 fn collapse_changed_directories(mut directories: Vec<String>) -> Vec<String> {
     directories.sort_by_key(|path| path.len());
     let mut collapsed = Vec::<String>::new();
-    let mut normalized = Vec::<String>::new();
+    let mut normalized = HashSet::<String>::new();
     for directory in directories {
         let candidate = directory.trim_end_matches(['\\', '/']).to_ascii_lowercase();
-        if candidate.is_empty()
-            || normalized.iter().any(|parent| {
-                candidate == *parent
-                    || candidate
-                        .strip_prefix(parent)
-                        .is_some_and(|suffix| suffix.starts_with('\\') || suffix.starts_with('/'))
-            })
-        {
+        if candidate.is_empty() || !normalized.insert(candidate) {
             continue;
         }
-        normalized.push(candidate);
         collapsed.push(directory);
     }
     collapsed
@@ -306,7 +308,7 @@ mod desktop_tests {
     }
 
     #[test]
-    fn watcher_batches_remove_duplicates_and_nested_directories() {
+    fn watcher_batches_remove_duplicates_but_keep_nested_directories() {
         let collapsed = collapse_changed_directories(vec![
             r"E:\Downloads\Videos\Finished".to_string(),
             r"e:\downloads".to_string(),
@@ -314,7 +316,7 @@ mod desktop_tests {
             r"E:\Other".to_string(),
             r"E:\Other".to_string(),
         ]);
-        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed.len(), 4);
         assert!(
             collapsed
                 .iter()
