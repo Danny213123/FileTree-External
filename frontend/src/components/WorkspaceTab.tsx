@@ -1160,9 +1160,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const folderDblClickExplorerRef = useRef(folderDblClickExplorer);
   folderDblClickExplorerRef.current = folderDblClickExplorer;
 
-  const handleDblClick = useCallback((id: number) => {
-    const node = treeRef.current.nodeById.get(id);
-    if (!node) return;
+  const handleDblClick = useCallback((node: NodeRecord) => {
     if (node.dir) {
       if (!folderDblClickExplorerRef.current) {
         openLocation(node.path);

@@ -112,7 +112,9 @@ interface TreeTableProps {
    *  present, matching folder rows show a subtle grew/shrank/new indicator with
    *  a size-delta tooltip. Computed upstream and capped to directories. */
   growth?: Map<number, { dir: "grew" | "shrank" | "new"; delta: number }> | null;
-  onDoubleClick: (id: number) => void;
+  /** Pass the displayed row itself because paged/lazy search results are not
+   *  guaranteed to be resident in the bounded nodeById cache. */
+  onDoubleClick: (node: NodeRecord) => void;
   onContextMenu: (id: number, x: number, y: number) => void;
   onSortChange: (key: SortKey) => void;
   onToggleBookmark: (path: string) => void;
@@ -982,7 +984,7 @@ function TreeTableInner({
                   if (isBundle) { onToggleExpand(node.id); return; }
                   onSelect(node.id, e.shiftKey ? "range" : (e.ctrlKey || e.metaKey ? "toggle" : "single"));
                 }}
-                onDoubleClick={() => { if (!isBundle) onDoubleClick(node.id); }}
+                onDoubleClick={() => { if (!isBundle) onDoubleClick(node); }}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   if (!isBundle) onContextMenu(node.id, e.clientX, e.clientY);
