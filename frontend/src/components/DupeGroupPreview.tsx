@@ -44,7 +44,7 @@ function MemberThumb({ file }: { file: DupeFileV2 }) {
   }
   return (
     <div className="dgp-thumb dgp-thumb-icon">
-      <FileIcon ext={ext} path={file.path} isDir={false} isBundle={false} />
+      <FileIcon ext={ext} isDir={false} isBundle={false} />
     </div>
   );
 }

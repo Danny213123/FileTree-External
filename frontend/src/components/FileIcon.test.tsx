@@ -15,11 +15,10 @@ describe("FileIcon", () => {
     vi.mocked(loadShellThumbnail).mockReset().mockResolvedValue(null);
   });
 
-  it("does not eagerly generate thumbnails for ordinary media rows", async () => {
+  it("uses the Windows file-type icon without generating a media thumbnail", async () => {
     render(
       <FileIcon
         ext="mp4"
-        path="D:\\Downloads\\clip.mp4"
         isDir={false}
         isBundle={false}
       />,
@@ -31,7 +30,7 @@ describe("FileIcon", () => {
 
   it("uses a neutral file glyph instead of an archive extension badge", async () => {
     const view = render(
-      <FileIcon ext="rar" path="D:\\Downloads\\archive.rar" isDir={false} isBundle={false} />,
+      <FileIcon ext="rar" isDir={false} isBundle={false} />,
     );
 
     await waitFor(() => expect(loadShellIcon).toHaveBeenCalledWith("rar"));

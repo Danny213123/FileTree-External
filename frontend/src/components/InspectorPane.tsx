@@ -186,7 +186,7 @@ function IconPreview({ node, unit }: { node: NodeRecord; unit: Unit }) {
   return (
     <div className="preview-block preview-iconly">
       <div className="preview-icon-big">
-        <FileIcon ext={ext} path={node.path} isDir={false} isBundle={false} />
+        <FileIcon ext={ext} isDir={false} isBundle={false} />
       </div>
       <FileMeta node={node} unit={unit} />
     </div>

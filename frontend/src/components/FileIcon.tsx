@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { loadShellIcon, loadShellThumbnail } from "../lib/shellImages";
+import { loadShellIcon } from "../lib/shellImages";
 
 // Module-level: tracks extensions whose shell icon fetch failed so virtualized
 // row recreation does not repeatedly ask Windows for an unavailable icon.
@@ -7,21 +7,13 @@ const ICON_FAILED = new Set<string>();
 
 interface FileIconProps {
   ext: string;
-  path?: string;
   isDir: boolean;
   isBundle: boolean;
-  /** Generate a real media thumbnail only for the primary selected row. */
-  preferThumbnail?: boolean;
   onMouseEnter?: (e: React.MouseEvent) => void;
   onMouseLeave?: (e: React.MouseEvent) => void;
 }
 
-const THUMBNAIL_EXTENSIONS = new Set([
-  "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "heic", "avif", "raw",
-  "mp4", "mkv", "mov", "avi", "wmv", "webm", "m4v", "mpeg", "mpg", "ts",
-]);
-
-export function FileIcon({ ext, path, isDir, isBundle, preferThumbnail = false, onMouseEnter, onMouseLeave }: FileIconProps) {
+export function FileIcon({ ext, isDir, isBundle, onMouseEnter, onMouseLeave }: FileIconProps) {
   const lext = ext.toLowerCase();
   // Initialize from ICON_FAILED so all instances for the same extension agree,
   // but still use useState so a fresh app load can retry after a transient failure.
@@ -39,10 +31,7 @@ export function FileIcon({ ext, path, isDir, isBundle, preferThumbnail = false, 
     }
     let disposed = false;
     setSource(null);
-    const pending = preferThumbnail && path && THUMBNAIL_EXTENSIONS.has(lext)
-      ? loadShellThumbnail(path, 32, true).then((value) => value ?? loadShellIcon(lext))
-      : loadShellIcon(lext);
-    void pending.then((value) => {
+    void loadShellIcon(lext).then((value) => {
       if (disposed) return;
       if (value) setSource(value);
       else {
@@ -51,7 +40,7 @@ export function FileIcon({ ext, path, isDir, isBundle, preferThumbnail = false, 
       }
     });
     return () => { disposed = true; };
-  }, [imgFailed, isBundle, isDir, lext, path, preferThumbnail]);
+  }, [imgFailed, isBundle, isDir, lext]);
 
   if (isBundle) {
     return <span className="kind kind-bundle">≡</span>;

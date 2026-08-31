@@ -575,7 +575,7 @@ fn render_shell_icon_png(extension: &str) -> Option<Vec<u8>> {
             return None;
         }
         SelectObject(dc, bitmap);
-        DrawIconEx(dc, 0, 0, info.hIcon, SIZE, SIZE, 0, 0, DI_NORMAL);
+        let drawn = DrawIconEx(dc, 0, 0, info.hIcon, SIZE, SIZE, 0, 0, DI_NORMAL);
         let mut bgra = vec![0u8; (SIZE * SIZE * 4) as usize];
         let mut read_info = bitmap_info;
         let rows = GetDIBits(
@@ -590,7 +590,10 @@ fn render_shell_icon_png(extension: &str) -> Option<Vec<u8>> {
         DeleteObject(bitmap);
         DeleteDC(dc);
         DestroyIcon(info.hIcon);
-        if rows == 0 {
+        let visible = bgra
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] | pixel[1] | pixel[2] | pixel[3] != 0);
+        if rows == 0 || drawn == 0 || !visible {
             return None;
         }
         Some(encode_bgra_png(SIZE, SIZE, &bgra))
