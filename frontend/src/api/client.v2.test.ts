@@ -41,7 +41,7 @@ describe("v2 server search", () => {
 
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invoke).toHaveBeenCalledWith("scan_page", expect.objectContaining({
-      query: expect.objectContaining({ limit: 500, offset: 0, search: "summer video" }),
+      query: expect.objectContaining({ limit: 500, offset: 0, search: "summer video", countTotal: false }),
     }));
     expect(result).toEqual({ matches: [], total: 1_200, capped: true });
   });

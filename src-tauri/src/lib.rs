@@ -12,14 +12,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
 use tauri::window::{ProgressBarState, ProgressBarStatus};
 use tauri::{AppHandle, Manager, State};
 
 struct FsWatchRegistry {
     next_id: AtomicU64,
-    watchers: Mutex<HashMap<u64, notify::RecommendedWatcher>>,
+    watchers: Mutex<HashMap<u64, FsWatchEntry>>,
+}
+
+struct FsWatchEntry {
+    watcher: notify::RecommendedWatcher,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl Default for FsWatchRegistry {
@@ -36,7 +42,7 @@ fn fs_watch_start(
     state: State<'_, Arc<V2Store>>,
     registry: State<'_, FsWatchRegistry>,
     root_path: String,
-    on_change: Channel<String>,
+    on_change: Channel<Vec<String>>,
 ) -> Result<u64, String> {
     use notify::{RecursiveMode, Watcher};
 
@@ -45,39 +51,118 @@ fn fs_watch_start(
         return Err(format!("Watch root is not a folder: {root_path}"));
     }
 
+    // notify may emit one callback per item during a large move/copy. Sending
+    // every callback through IPC overwhelms WebView2 long before the actual
+    // shallow refresh becomes expensive, so collect paths in a shared set and
+    // wake one short-lived batch worker.
+    let pending = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let callback_pending = Arc::clone(&pending);
+    let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
         let Ok(event) = result else { return };
-        let mut changed_dirs = HashSet::new();
-        for path in event.paths {
-            if let Some(parent) = path.parent() {
-                changed_dirs.insert(parent.to_string_lossy().into_owned());
+        if let Ok(mut changed_dirs) = callback_pending.lock() {
+            for path in event.paths {
+                if let Some(parent) = path.parent() {
+                    changed_dirs.insert(parent.to_string_lossy().into_owned());
+                }
             }
         }
-        for directory in changed_dirs {
-            let _ = on_change.send(directory);
-        }
+        let _ = wake_tx.try_send(());
     })
     .map_err(|error| format!("Could not create folder watcher: {error}"))?;
     watcher
         .watch(Path::new(&root_path), RecursiveMode::Recursive)
         .map_err(|error| format!("Could not watch {root_path}: {error}"))?;
 
+    let worker = std::thread::Builder::new()
+        .name("filetree-fs-watch".to_string())
+        .spawn(move || forward_watch_batches(wake_rx, pending, on_change))
+        .map_err(|error| format!("Could not start folder watcher worker: {error}"))?;
+
     let id = registry.next_id.fetch_add(1, Ordering::Relaxed);
     registry
         .watchers
         .lock()
         .map_err(|_| "Folder watcher registry is unavailable".to_string())?
-        .insert(id, watcher);
+        .insert(
+            id,
+            FsWatchEntry {
+                watcher,
+                worker: Some(worker),
+            },
+        );
     Ok(id)
+}
+
+const WATCH_IDLE_WINDOW: Duration = Duration::from_millis(40);
+const WATCH_MAX_WINDOW: Duration = Duration::from_millis(120);
+
+fn collapse_changed_directories(mut directories: Vec<String>) -> Vec<String> {
+    directories.sort_by_key(|path| path.len());
+    let mut collapsed = Vec::<String>::new();
+    let mut normalized = Vec::<String>::new();
+    for directory in directories {
+        let candidate = directory.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+        if candidate.is_empty()
+            || normalized.iter().any(|parent| {
+                candidate == *parent
+                    || candidate
+                        .strip_prefix(parent)
+                        .is_some_and(|suffix| suffix.starts_with('\\') || suffix.starts_with('/'))
+            })
+        {
+            continue;
+        }
+        normalized.push(candidate);
+        collapsed.push(directory);
+    }
+    collapsed
+}
+
+fn forward_watch_batches(
+    wake_rx: std::sync::mpsc::Receiver<()>,
+    pending: Arc<Mutex<HashSet<String>>>,
+    on_change: Channel<Vec<String>>,
+) {
+    while wake_rx.recv().is_ok() {
+        let started = Instant::now();
+        loop {
+            let remaining = WATCH_MAX_WINDOW.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            match wake_rx.recv_timeout(WATCH_IDLE_WINDOW.min(remaining)) {
+                Ok(()) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let directories = pending
+            .lock()
+            .map(|mut values| values.drain().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let directories = collapse_changed_directories(directories);
+        if !directories.is_empty() && on_change.send(directories).is_err() {
+            break;
+        }
+    }
 }
 
 #[tauri::command]
 fn fs_watch_stop(registry: State<'_, FsWatchRegistry>, watch_id: u64) -> Result<(), String> {
-    registry
+    let entry = registry
         .watchers
         .lock()
         .map_err(|_| "Folder watcher registry is unavailable".to_string())?
         .remove(&watch_id);
+    if let Some(mut entry) = entry {
+        // Dropping the watcher drops its wake sender, allowing the batch worker
+        // to exit cleanly instead of accumulating detached threads as tabs move.
+        drop(entry.watcher);
+        if let Some(worker) = entry.worker.take() {
+            let _ = worker.join();
+        }
+    }
     Ok(())
 }
 
@@ -197,7 +282,7 @@ async fn directory_snapshot(
 
 #[cfg(test)]
 mod desktop_tests {
-    use super::directory_snapshot_rows;
+    use super::{collapse_changed_directories, directory_snapshot_rows};
     use std::fs;
 
     #[test]
@@ -218,6 +303,28 @@ mod desktop_tests {
         let second = directory_snapshot_rows(root.clone()).expect("second snapshot");
         assert!(!second.iter().any(|row| row["name"] == "destination"));
         fs::remove_dir(root).expect("remove test root");
+    }
+
+    #[test]
+    fn watcher_batches_remove_duplicates_and_nested_directories() {
+        let collapsed = collapse_changed_directories(vec![
+            r"E:\Downloads\Videos\Finished".to_string(),
+            r"e:\downloads".to_string(),
+            r"E:\Downloads\Videos".to_string(),
+            r"E:\Other".to_string(),
+            r"E:\Other".to_string(),
+        ]);
+        assert_eq!(collapsed.len(), 2);
+        assert!(
+            collapsed
+                .iter()
+                .any(|path| path.eq_ignore_ascii_case(r"e:\downloads"))
+        );
+        assert!(
+            collapsed
+                .iter()
+                .any(|path| path.eq_ignore_ascii_case(r"e:\other"))
+        );
     }
 }
 

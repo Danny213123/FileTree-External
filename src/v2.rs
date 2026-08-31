@@ -99,6 +99,12 @@ pub struct ScanQuery {
     pub modified_before: Option<u64>,
     pub ext: String,
     pub category: String,
+    #[serde(default = "default_true")]
+    pub count_total: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ScanQuery {
@@ -120,6 +126,7 @@ impl Default for ScanQuery {
             modified_before: None,
             ext: String::new(),
             category: String::new(),
+            count_total: true,
         }
     }
 }
@@ -533,14 +540,17 @@ impl V2Store {
             }
         }
         let where_sql = clauses.join(" AND ");
-        let count_sql = format!(
-            "SELECT COUNT(*) FROM nodes n LEFT JOIN nodes p ON p.id = n.parent_id WHERE {where_sql}"
-        );
-        let total: u64 = conn
-            .query_row(&count_sql, params_from_iter(values.iter()), |row| {
-                row.get(0)
-            })
-            .map_err(|error| error.to_string())?;
+        let mut total = 0u64;
+        if query.count_total {
+            let count_sql = format!(
+                "SELECT COUNT(*) FROM nodes n LEFT JOIN nodes p ON p.id = n.parent_id WHERE {where_sql}"
+            );
+            total = conn
+                .query_row(&count_sql, params_from_iter(values.iter()), |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())?;
+        }
         let order = sort_column(&query.sort);
         let direction = if query.direction.eq_ignore_ascii_case("asc") {
             "ASC"
@@ -559,18 +569,31 @@ impl V2Store {
                WHERE {where_sql} ORDER BY {order} {direction}, n.id ASC LIMIT ? OFFSET ?"#
         );
         let mut page_values = values;
-        page_values.push(Value::Integer(query.limit as i64));
+        let fetch_limit = if query.count_total {
+            query.limit
+        } else {
+            query.limit.saturating_add(1)
+        };
+        page_values.push(Value::Integer(fetch_limit as i64));
         page_values.push(Value::Integer(query.offset as i64));
         let mut stmt = conn.prepare(&page_sql).map_err(|error| error.to_string())?;
         let rows = stmt
             .query_map(params_from_iter(page_values.iter()), node_from_row)
             .map_err(|error| error.to_string())?;
-        let items = rows
+        let mut items = rows
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?;
+        let has_more = if query.count_total {
+            query.offset.saturating_add(items.len()) < total as usize
+        } else {
+            let more = items.len() > query.limit;
+            items.truncate(query.limit);
+            total = query.offset.saturating_add(items.len()) as u64 + u64::from(more);
+            more
+        };
         self.touch_scan(&query.scan_id).ok();
         Ok(NodePage {
-            has_more: query.offset.saturating_add(items.len()) < total as usize,
+            has_more,
             items,
             total,
             offset: query.offset,
@@ -2516,6 +2539,20 @@ mod tests {
             .unwrap();
         assert_eq!(tokenized.total, 1);
         assert_eq!(tokenized.items[0].name, "Summer Vacation 2024.mp4");
+
+        let preview = store
+            .query_nodes(ScanQuery {
+                scan_id: handle.scan_id.clone(),
+                parent_id: None,
+                search: "summer 2024".to_string(),
+                limit: 1,
+                count_total: false,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(preview.items.len(), 1);
+        assert!(preview.has_more);
+        assert_eq!(preview.total, 2);
 
         let scoped = store
             .query_nodes(ScanQuery {

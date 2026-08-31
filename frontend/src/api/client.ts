@@ -369,6 +369,9 @@ export async function fetchServerSearch(opts: {
       modifiedBefore: opts.modifiedBefore,
       ext: opts.ext,
       category: opts.category,
+      // Live search only needs to know whether another result page exists.
+      // Avoid a separate full COUNT(*) pass over a multi-million-row scan.
+      countTotal: false,
     });
     if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const matches = page.items.map(toNodeRecord);

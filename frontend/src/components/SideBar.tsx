@@ -661,7 +661,7 @@ function SearchView(props: SideBarProps) {
   // Input is controlled by App's lifted searchQuery; debounce a local copy so
   // the shared matcher doesn't re-walk the node map on every keystroke.
   useEffect(() => {
-    const t = setTimeout(() => setQuery(props.searchQuery.trim()), 180);
+    const t = setTimeout(() => setQuery(props.searchQuery.trim()), 80);
     return () => clearTimeout(t);
   }, [props.searchQuery]);
 

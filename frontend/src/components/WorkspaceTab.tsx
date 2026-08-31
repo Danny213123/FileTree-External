@@ -264,7 +264,10 @@ const QUICK_FILTER_CHIPS: { key: ChipKey; label: string }[] = [
 
 // Filesystem-watch tuning. Patching is O(n) over the whole node array, so on big
 // scans we throttle hard and only patch folders the user actually has open.
-const WATCH_DEBOUNCE_MS = 700;
+// Native watcher events are already collapsed into short batches before they
+// cross IPC. This small UI-side window merges adjacent batches without making
+// visible changes wait close to a second.
+const WATCH_DEBOUNCE_MS = 60;
 const WATCH_MAX_BATCH = 6;
 
 // #11 diff-on-rescan: how long the added/changed row tint lingers before fading,
@@ -693,9 +696,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
 
     // Coalesced + gated flush. A big drive (e.g. C:\) churns logs/registry/temp
     // nonstop; patching every change would rebuild the whole node array each
-    // time. So we (1) debounce on a leading timer that is NOT reset per event
-    // (it fires ~700ms after the first pending change), (2) only patch dirs the
-    // user actually has open/visible, and (3) never stack patches.
+    // time. Native events arrive pre-batched, then we gate them to open/visible
+    // directories and never stack patches.
     async function flushWatch() {
       watchDebounceRef.current = null;
       if (patchInFlightRef.current) {
@@ -741,13 +743,12 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
 
       patchInFlightRef.current = true;
       try {
-        for (const dir of toScan) {
-          if (suppressWatchRef.current) break;
+        const refreshed = await Promise.all(toScan.map(async (dir) => {
           invalidateScanCache(dir);
           try {
             if (isTauriV2()) {
               const nodes = await fetchV2DirectorySnapshot(dir);
-              if (nodes.length) treeRef.current.patchDirectory(dir, nodes);
+              return nodes.length ? { dir, nodes } : null;
             } else {
               // Streamed (NDJSON) shallow rescan: parsed line-by-line so a
               // background watch patch never buffers a whole JSON blob in memory.
@@ -761,17 +762,26 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                 maxDepth: 1,
                 nocache: true,
               });
-              if (result?.nodes?.length) treeRef.current.patchDirectory(dir, result.nodes);
+              return result?.nodes?.length ? { dir, nodes: result.nodes } : null;
             }
-          } catch { /* ignore network errors */ }
+          } catch {
+            return null;
+          }
+        }));
+        // React batches these functional updates into one commit, while the
+        // filesystem reads above run concurrently instead of serially.
+        if (!suppressWatchRef.current) {
+          for (const snapshot of refreshed) {
+            if (snapshot) treeRef.current.patchDirectory(snapshot.dir, snapshot.nodes);
+          }
         }
       } finally {
         patchInFlightRef.current = false;
       }
     }
 
-    const queueChangedDirectory = (changedDir: string) => {
-      pendingChangesRef.current.add(changedDir);
+    const queueChangedDirectories = (changedDirs: string[]) => {
+      for (const changedDir of changedDirs) pendingChangesRef.current.add(changedDir);
       // Leading-edge: schedule once, don't reset on every event during a storm.
       if (!watchDebounceRef.current) {
         watchDebounceRef.current = setTimeout(flushWatch, WATCH_DEBOUNCE_MS);
@@ -779,7 +789,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     };
 
     if (isTauriV2()) {
-      void startV2FilesystemWatch(rootPath, queueChangedDirectory)
+      void startV2FilesystemWatch(rootPath, queueChangedDirectories)
         .then((watchId) => {
           if (generation !== watchGenerationRef.current || !activeRef.current) {
             void stopV2FilesystemWatch(watchId);
@@ -798,7 +808,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     const es = new EventSource(url);
     fsEventsRef.current = es;
     es.onmessage = (evt) => {
-      try { queueChangedDirectory(JSON.parse(evt.data) as string); }
+      try { queueChangedDirectories([JSON.parse(evt.data) as string]); }
       catch { /* ignore malformed legacy watcher messages */ }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2234,24 +2244,22 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     const hasFilters = filtersActive(searchFilters);
     if (q.length < 2 && !hasFilters) { setLazySearch({ matches: [], capped: false }); return; }
     const controller = new AbortController();
-    const t = setTimeout(() => {
-      const params = toServerSearchParams(searchFilters);
-      void fetchServerSearch({
-        rootPath: data!.rootPath,
-        scanId: data!.scanId,
-        query: searchQuery,
-        limit: 500,
-        signal: controller.signal,
-        ...params,
+    const params = toServerSearchParams(searchFilters);
+    void fetchServerSearch({
+      rootPath: data!.rootPath,
+      scanId: data!.scanId,
+      query: searchQuery,
+      limit: 500,
+      signal: controller.signal,
+      ...params,
+    })
+      .then((res) => {
+        if (requestId === lazySearchRequestRef.current) {
+          setLazySearch({ matches: res.matches, capped: res.capped });
+        }
       })
-        .then((res) => {
-          if (requestId === lazySearchRequestRef.current) {
-            setLazySearch({ matches: res.matches, capped: res.capped });
-          }
-        })
-        .catch((err: unknown) => { if (!(err instanceof DOMException && err.name === "AbortError")) console.warn("server search failed", err); });
-    }, 350);
-    return () => { controller.abort(); clearTimeout(t); };
+      .catch((err: unknown) => { if (!(err instanceof DOMException && err.name === "AbortError")) console.warn("server search failed", err); });
+    return () => { controller.abort(); };
   }, [lazyMode, activeView, searchQuery, searchFilters, data]);
 
   const searchResults = useMemo(() => {

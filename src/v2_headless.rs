@@ -112,6 +112,9 @@ fn handle(
                     .and_then(|value| value.parse().ok()),
                 ext: query.get("ext").cloned().unwrap_or_default(),
                 category: query.get("category").cloned().unwrap_or_default(),
+                count_total: query
+                    .get("countTotal")
+                    .is_none_or(|value| value == "true" || value == "1"),
             };
             return match store.query_nodes(query) {
                 Ok(page) => json(stream, 200, &page),

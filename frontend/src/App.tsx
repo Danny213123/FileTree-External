@@ -308,11 +308,13 @@ export default function App() {
   // Activity-bar Search query, lifted to App so the sidebar Search input and the
   // main-area results table (rendered inside each WorkspaceTab) share one source
   // of truth. `searchQuery` updates per keystroke (controls the input);
-  // `debouncedSearchQuery` is what the heavy table matcher consumes.
+  // `debouncedSearchQuery` is what the heavy table matcher consumes. Keep this
+  // short: lazy v2 search is already bounded to one SQLite page, and adding a
+  // second debounce in the workspace made every query feel half a second late.
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   useEffect(() => {
-    const t = setTimeout(() => setDebouncedSearchQuery(searchQuery), 180);
+    const t = setTimeout(() => setDebouncedSearchQuery(searchQuery), 80);
     return () => clearTimeout(t);
   }, [searchQuery]);
   // Inline search filters + regex toggle (#31) and cross-scan toggle (#32),

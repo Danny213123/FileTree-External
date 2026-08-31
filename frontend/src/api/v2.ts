@@ -79,9 +79,9 @@ export async function startNativeDrag(paths: string[]): Promise<NativeDragRespon
 
 export async function startV2FilesystemWatch(
   rootPath: string,
-  onChange: (directory: string) => void,
+  onChange: (directories: string[]) => void,
 ): Promise<number> {
-  const channel = new Channel<string>();
+  const channel = new Channel<string[]>();
   channel.onmessage = onChange;
   return invoke<number>("fs_watch_start", { rootPath, onChange: channel });
 }
@@ -207,6 +207,7 @@ export async function scanPage(query: {
   modifiedBefore?: number;
   ext?: string;
   category?: string;
+  countTotal?: boolean;
 }): Promise<V2NodePage> {
   const normalized = {
     scanId: query.scanId,
@@ -225,6 +226,7 @@ export async function scanPage(query: {
     modifiedBefore: query.modifiedBefore ?? null,
     ext: query.ext ?? "",
     category: query.category ?? "",
+    countTotal: query.countTotal ?? true,
   };
   const key = JSON.stringify(normalized);
   const cached = pageCache.get(key);
