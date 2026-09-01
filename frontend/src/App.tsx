@@ -14,7 +14,6 @@ import {
   fetchDriveSpace,
   fetchAppVersion,
   notify,
-  saveSnapshot,
   fetchSubtreeFiles,
 } from "./api/client";
 import type { AppSettings } from "./api/client";
@@ -59,11 +58,10 @@ import { InspectorPane } from "./components/InspectorPane";
 import { ScheduleWizard } from "./components/ScheduleWizard";
 import { LazyView } from "./components/LazyView";
 import { recordSample as recordDriveSample } from "./lib/driveForecast";
-import { checkGrowthAlerts } from "./lib/autoSnapshot";
 
 // Heavy, not-always-visible views are code-split via React.lazy so they leave
 // the main bundle and load on first use (xterm rides along with TerminalPanel;
-// the AI chat, reports and duplicates panels likewise). Each render site is
+// the AI chat and duplicates panels likewise). Each render site is
 // wrapped in <LazyView> (Suspense + error boundary). Named exports are mapped to
 // the default export shape React.lazy expects.
 const ChatPanel = lazy(() => import("./components/ChatPanel").then((m) => ({ default: m.ChatPanel })));
@@ -71,11 +69,7 @@ const ChatPanel = lazy(() => import("./components/ChatPanel").then((m) => ({ def
 // bundle) for the command-palette → chat controller handle.
 import type { ChatPanelController } from "./components/ChatPanel";
 const TerminalPanel = lazy(() => import("./components/TerminalPanel").then((m) => ({ default: m.TerminalPanel })));
-const ReportsView = lazy(() => import("./components/ReportsView").then((m) => ({ default: m.ReportsView })));
 const DuplicatesResults = lazy(() => import("./components/DuplicatesResults").then((m) => ({ default: m.DuplicatesResults })));
-const CleanupView = lazy(() => import("./components/CleanupView").then((m) => ({ default: m.CleanupView })));
-const SnapshotsView = lazy(() => import("./components/SnapshotsView").then((m) => ({ default: m.SnapshotsView })));
-const GalleryView = lazy(() => import("./components/GalleryView").then((m) => ({ default: m.GalleryView })));
 const CompressView = lazy(() => import("./components/CompressView").then((m) => ({ default: m.CompressView })));
 
 const SETTINGS_DEBOUNCE_MS = 700;
@@ -83,7 +77,7 @@ const SETTINGS_DEBOUNCE_MS = 700;
 // Views that take over the whole editor area (replacing the workspace tabs),
 // each rendered from its own dedicated editor block below.
 const FULL_EDITOR_VIEWS = new Set<ViewId>([
-  "duplicates", "reports", "cleanup", "snapshots", "gallery", "compress",
+  "duplicates", "compress",
 ]);
 
 let nextTabId = 1;
@@ -276,22 +270,10 @@ export default function App() {
   const [heatTint, setHeatTint] = useState(() => {
     try { return localStorage.getItem("filetree_heat_tint") === "1"; } catch { return false; }
   });
-  // #39: show grew/shrank/new badges on Explorer folder rows vs. the latest
-  // saved snapshot of the current root. Default off to avoid clutter.
-  const [showGrowthBadges, setShowGrowthBadges] = useState(() => {
-    try { return localStorage.getItem("filetree_growth_badges") === "1"; } catch { return false; }
-  });
   const handleToggleFolderDblClick = useCallback(() => {
     setFolderDblClickExplorer((v) => {
       const next = !v;
       try { localStorage.setItem("filetree_folder_dblclick_explorer", next ? "1" : "0"); } catch { /* ignore */ }
-      return next;
-    });
-  }, []);
-  const handleToggleGrowthBadges = useCallback(() => {
-    setShowGrowthBadges((v) => {
-      const next = !v;
-      try { localStorage.setItem("filetree_growth_badges", next ? "1" : "0"); } catch { /* ignore */ }
       return next;
     });
   }, []);
@@ -384,7 +366,7 @@ export default function App() {
   // Shared workbench store (mirrors useScan's ProgressStore): the focused pane
   // publishes its sidebar + status snapshot here on every tree / selection /
   // scan change, and only the subscribing leaves (side bar, status bar,
-  // inspector, reports) re-render. App itself no longer re-renders on
+  // inspector and compression) re-render. App itself no longer re-renders on
   // expand / collapse / filter / select — just on scan + layout changes.
   const workbenchStoreRef = useRef<WorkbenchStore>();
   if (!workbenchStoreRef.current) workbenchStoreRef.current = createWorkbenchStore(EMPTY_WORKBENCH_SNAPSHOT);
@@ -681,7 +663,7 @@ export default function App() {
       }
       if (settings.decimals !== undefined) setDecimals(settings.decimals);
       // Layout
-      if (settings.activeView && ["explorer", "search", "treemap", "reports", "duplicates", "cleanup", "snapshots", "gallery", "compress", "bookmarks", "errors"].includes(settings.activeView)) {
+      if (settings.activeView && ["explorer", "search", "treemap", "duplicates", "compress", "bookmarks", "errors"].includes(settings.activeView)) {
         setActiveView(settings.activeView as ViewId);
       }
       if (settings.sidebarOpen !== undefined) setSidebarOpen(settings.sidebarOpen);
@@ -916,12 +898,6 @@ export default function App() {
     const timer = window.setInterval(() => void check(), 60_000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [lowSpaceAlerts, lowSpaceThreshold]);
-
-  // #40: on app start, evaluate any saved growth-alert thresholds against the
-  // accumulated snapshot history and raise a native notification for breaches
-  // (de-duped per triggering snapshot). See checkGrowthAlerts for the runtime
-  // boundary FLAG (this runs in-app, not inside the headless scheduled task).
-  useEffect(() => { void checkGrowthAlerts(); }, []);
 
   // Cycle the low-space threshold through a few sensible presets (View menu).
   const cycleLowSpaceThreshold = useCallback(() => {
@@ -1462,11 +1438,6 @@ export default function App() {
     setSidebarOpen(true);
   }, []);
 
-  // Reports → "open in Explorer": the WorkbenchReports wrapper performs the
-  // actual tree navigation off the focused pane's snapshot; App just flips back
-  // to the Explorer view afterward. Stable so the wrapper's props don't churn.
-  const handleReportsNavigate = useCallback(() => setActiveView("explorer"), []);
-
   // Drag the divider on the right edge of the shared Explorer side bar. The
   // side bar is a single left panel (hoisted out of the editor groups), so this
   // lives in App alongside sidebarWidth.
@@ -1582,7 +1553,7 @@ export default function App() {
   const focusedTabId = focusedGroup?.activeTabId ?? "";
 
   const activeRef = getActiveRef();
-  // The shared Explorer side bar, status bar, inspector and reports view are
+  // The shared Explorer side bar, status bar, inspector and compression view are
   // driven by the focused pane's WORKBENCH STORE (subscribed inside the
   // Workbench* wrappers below) rather than read here — so they re-render on
   // tree/selection changes without re-rendering App. App still reads the few
@@ -1667,7 +1638,6 @@ export default function App() {
         { separator: true },
         { label: "Double-click opens folder in Explorer", checked: folderDblClickExplorer, onClick: handleToggleFolderDblClick },
         { label: "Size heat-tint rows", checked: heatTint, onClick: handleToggleHeatTint },
-        { label: "Snapshot change badges", checked: showGrowthBadges, onClick: handleToggleGrowthBadges },
         { separator: true },
         { label: "Dark Theme", checked: darkMode, onClick: handleToggleDark },
         { label: "Appearance…", onClick: () => setAppearanceOpen(true) },
@@ -1710,7 +1680,7 @@ export default function App() {
     tmShowLabels, tmShowHierarchy, tmShowLegend, navState.canBack, navState.canForward,
     statusData, tabs.length, focusedGroupId, focusedTabId,
     lowSpaceAlerts, lowSpaceThreshold, cycleLowSpaceThreshold,
-    folderDblClickExplorer, heatTint, showGrowthBadges, handleToggleFolderDblClick, handleToggleHeatTint, handleToggleGrowthBadges,
+    folderDblClickExplorer, heatTint, handleToggleFolderDblClick, handleToggleHeatTint,
     handleOpenInNewTab, handleCloseTab, handleSaveSession, handleLoadSession,
     handleToggleTerminal, handleToggleChat, handleToggleDark, handleToggleSidebar,
     handleTogglePanel, handleTogglePreview, handleToggleDetails, handleToggleTmLabels,
@@ -1789,11 +1759,7 @@ export default function App() {
       { id: "explorer", label: "Explorer" },
       { id: "search", label: "Search" },
       { id: "treemap", label: "Treemap" },
-      { id: "reports", label: "Reports" },
       { id: "duplicates", label: "Duplicates" },
-      { id: "cleanup", label: "Cleanup" },
-      { id: "snapshots", label: "Snapshots" },
-      { id: "gallery", label: "Gallery" },
       { id: "compress", label: "Compress" },
       { id: "bookmarks", label: "Bookmarks" },
       { id: "errors", label: "Problems" },
@@ -1818,16 +1784,6 @@ export default function App() {
       { id: "hidden", title: "Toggle Hidden Files", keywords: "dotfiles include", run: () => setIncludeHidden((v) => !v) },
       { id: "terminal", title: "Open Terminal", hint: "Ctrl+`", keywords: "shell console", run: () => handleToggleTerminal() },
       { id: "undo", title: "Undo Last Action", hint: "Ctrl+Z", keywords: "revert", run: () => { void handleUndo(); } },
-      {
-        id: "snapshot", title: "Save Snapshot", keywords: "capture baseline",
-        run: () => {
-          const p = getActiveRef()?.getScanPath();
-          if (!p) { toast.info("Scan a folder first, then save a snapshot."); return; }
-          saveSnapshot(p)
-            .then(() => toast.success("Snapshot saved."))
-            .catch((e) => toast.error(`Snapshot failed: ${e instanceof Error ? e.message : String(e)}`));
-        },
-      },
       { id: "save-smart-folder", title: "Save Smart Folder\u2026", keywords: "search filter", run: () => { void handleSaveSmartFolder(); } },
       { id: "search-select-all", title: "Search: Select All Results", hint: "Search", keywords: "filter results selection select-all", run: () => { getActiveRef()?.doSelectSearchResults(); } },
       { id: "search-export-csv", title: "Search: Export Results (CSV)", hint: "Search", keywords: "filter results download export csv", run: () => { getActiveRef()?.doExportSearchResults("csv"); } },
@@ -2021,7 +1977,6 @@ export default function App() {
                         onDecimalsChange={setDecimals}
                         folderDblClickExplorer={folderDblClickExplorer}
                         heatTint={heatTint}
-                        showGrowthBadges={showGrowthBadges}
                         onClose3D={handleClose3D}
                         onToggleBookmark={handleToggleBookmark}
                         onCompress={handleCompressPaths}
@@ -2047,38 +2002,6 @@ export default function App() {
           <div className="dupes-editor">
             <LazyView>
               <DuplicatesResults ctrl={dupes} />
-            </LazyView>
-          </div>
-        )}
-
-        {activeView === "reports" && (
-          <div className="reports-editor">
-            <LazyView>
-              <WorkbenchReports store={workbenchStore} onAfterNavigate={handleReportsNavigate} />
-            </LazyView>
-          </div>
-        )}
-
-        {activeView === "cleanup" && (
-          <div className="cleanup-editor">
-            <LazyView>
-              <WorkbenchCleanup store={workbenchStore} />
-            </LazyView>
-          </div>
-        )}
-
-        {activeView === "snapshots" && (
-          <div className="snapshots-editor">
-            <LazyView>
-              <WorkbenchSnapshots store={workbenchStore} onAfterNavigate={handleReportsNavigate} />
-            </LazyView>
-          </div>
-        )}
-
-        {activeView === "gallery" && (
-          <div className="gallery-editor">
-            <LazyView>
-              <WorkbenchGallery store={workbenchStore} />
             </LazyView>
           </div>
         )}
@@ -2353,69 +2276,6 @@ function WorkbenchInspector({
       onExclude={onExclude}
     />
   );
-}
-
-// Shown in place of full-tree views (Reports, Gallery) when the active scan is
-// in LAZY mode: the renderer holds only the folders expanded so far, so a
-// whole-tree aggregation would be incomplete. Steers the user to a smaller scope.
-function LazyViewNotice({ feature }: { feature: string }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", padding: 32, textAlign: "center", color: "var(--text-muted, #888)" }}>
-      <div style={{ maxWidth: 460 }}>
-        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8, color: "var(--text)" }}>{feature} is unavailable for very large scans</div>
-        <div style={{ fontSize: 13, lineHeight: 1.5 }}>
-          This folder has too many items to load entirely, so it's browsed on demand and
-          {" "}{feature.toLowerCase()} can't aggregate the whole tree. Scan a smaller
-          subfolder to use {feature.toLowerCase()}.
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function WorkbenchReports({ store, onAfterNavigate }: { store: WorkbenchStore; onAfterNavigate: () => void }) {
-  const { sidebar: m } = useWorkbench(store);
-  // LAZY mode: reports aggregate the WHOLE tree, but the renderer only holds the
-  // folders expanded so far — the numbers would be wrong/incomplete. Gate with a
-  // notice steering the user to scan a smaller subfolder for full reports.
-  if (m.data?.lazy) return <LazyViewNotice feature="Reports" />;
-  return (
-    <ReportsView
-      data={m.data}
-      nodeById={m.nodeById}
-      onNavigate={(id) => { m.onNavigate(id); onAfterNavigate(); }}
-    />
-  );
-}
-
-// Disk Cleanup (roadmap #1): scans the focused pane's current scan root for
-// reclaimable space. Reads only scanPath from the workbench snapshot.
-function WorkbenchCleanup({ store }: { store: WorkbenchStore }) {
-  const { sidebar: m } = useWorkbench(store);
-  return <CleanupView scanPath={m.scanPath} />;
-}
-
-// Scan Snapshots + diff (roadmap #2): compares snapshots/the live scan. Reveal
-// jumps to the tree and flips back to the Explorer (like Reports).
-function WorkbenchSnapshots({ store, onAfterNavigate }: { store: WorkbenchStore; onAfterNavigate: () => void }) {
-  const { sidebar: m } = useWorkbench(store);
-  return (
-    <SnapshotsView
-      data={m.data}
-      nodeById={m.nodeById}
-      onNavigate={(id) => { m.onNavigate(id); onAfterNavigate(); }}
-    />
-  );
-}
-
-// Media gallery (roadmap #8): thumbnail grid over the focused pane's scan tree.
-// Selecting a cell reveals it in the tree but keeps the gallery open.
-function WorkbenchGallery({ store }: { store: WorkbenchStore }) {
-  const { sidebar: m } = useWorkbench(store);
-  // LAZY mode: the gallery scans the whole tree for media; only expanded folders
-  // are loaded here, so gate with a notice (scan a subfolder for the full grid).
-  if (m.data?.lazy) return <LazyViewNotice feature="Gallery" />;
-  return <GalleryView nodeById={m.nodeById} onNavigate={m.onNavigate} />;
 }
 
 // Compression page: derives compressible files from the focused pane's scan

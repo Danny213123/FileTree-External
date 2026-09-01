@@ -20,6 +20,9 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::dupes::{HashInput, hash_candidate_groups, next_hash_cache_seq};
+use crate::model::HashCacheEntry;
+
 pub const TREE_PAGE_DEFAULT: usize = 500;
 pub const TREE_PAGE_MAX: usize = 500;
 pub const COMPRESSION_PAGE_MAX: usize = 250;
@@ -279,6 +282,72 @@ pub struct MemoryStats {
     pub scan_index_bytes: u64,
     pub active_scans: usize,
     pub retained_scan_handles: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateSource {
+    pub scan_id: String,
+    pub target_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DuplicateScanRequest {
+    pub sources: Vec<DuplicateSource>,
+    pub min_size: u64,
+    pub max_size: Option<u64>,
+    pub extensions: Vec<String>,
+    pub include_hidden: bool,
+    pub threads: usize,
+}
+
+impl Default for DuplicateScanRequest {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            min_size: 1,
+            max_size: None,
+            extensions: Vec::new(),
+            include_hidden: true,
+            threads: 4,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateProgress {
+    pub phase: String,
+    pub scanned: u64,
+    pub hashing: u64,
+    pub hashed: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateFile {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub modified: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateGroup {
+    pub files: Vec<DuplicateFile>,
+    pub waste: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateScanResult {
+    pub groups: Vec<DuplicateGroup>,
+    pub errors: Vec<String>,
+    pub scanned: u64,
+    pub hashing: u64,
+    pub cancelled: bool,
 }
 
 #[derive(Debug)]
@@ -598,6 +667,356 @@ impl V2Store {
             total,
             offset: query.offset,
             limit: query.limit,
+        })
+    }
+
+    /// Find byte-identical files from one or more completed v2 scan indexes.
+    /// Candidate metadata is staged in a temporary SQLite database so the
+    /// renderer and Rust heap never retain every file path from a large drive.
+    /// Hashing then runs one same-size bucket at a time and persists full hashes
+    /// in state.db for later scans.
+    pub fn find_exact_duplicates<F>(
+        &self,
+        mut request: DuplicateScanRequest,
+        cancel: Arc<AtomicBool>,
+        progress: F,
+    ) -> Result<DuplicateScanResult, String>
+    where
+        F: Fn(DuplicateProgress),
+    {
+        if request.sources.is_empty() || request.sources.len() > 16 {
+            return Err("Select between 1 and 16 duplicate scan targets".to_string());
+        }
+        request.min_size = request.min_size.max(1);
+        request.threads = request.threads.clamp(1, 16);
+        request.extensions = request
+            .extensions
+            .into_iter()
+            .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|value| !value.is_empty() && value.len() <= 64)
+            .collect();
+        request.extensions.sort();
+        request.extensions.dedup();
+
+        let work_path = self.scans_dir.join(format!(
+            ".duplicate-work-{}-{}.db",
+            std::process::id(),
+            NEXT_SCAN_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _cleanup = TemporaryDatabase::new(work_path.clone());
+        let mut work = open_scan_connection(&work_path).map_err(|error| error.to_string())?;
+        work.execute_batch(
+            "CREATE TABLE candidates(\
+               path TEXT PRIMARY KEY COLLATE NOCASE,name TEXT NOT NULL,\
+               size INTEGER NOT NULL,modified_ms INTEGER NOT NULL\
+             );",
+        )
+        .map_err(|error| error.to_string())?;
+
+        let mut scanned = 0u64;
+        progress(DuplicateProgress {
+            phase: "indexing".to_string(),
+            scanned,
+            hashing: 0,
+            hashed: 0,
+        });
+
+        for source in &request.sources {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(DuplicateScanResult {
+                    groups: Vec::new(),
+                    errors: Vec::new(),
+                    scanned,
+                    hashing: 0,
+                    cancelled: true,
+                });
+            }
+            let handle = self
+                .catalog_handle(&source.scan_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("Scan index no longer exists: {}", source.scan_id))?;
+            if handle.status != "done" && handle.status != "stale" {
+                return Err(format!("Scan index is not ready: {}", source.scan_id));
+            }
+            if !path_is_within_text(&source.target_path, &handle.root_path) {
+                return Err(format!(
+                    "Duplicate target is outside its scan root: {}",
+                    source.target_path
+                ));
+            }
+            let scan_path = PathBuf::from(&handle.database_path);
+            if !scan_path.is_file() {
+                return Err(format!(
+                    "Scan database no longer exists: {}",
+                    source.scan_id
+                ));
+            }
+            let scan = open_scan_connection(&scan_path).map_err(|error| error.to_string())?;
+            let path_expr = "CASE WHEN p.dir_path IS NULL OR p.dir_path='' THEN n.name WHEN substr(p.dir_path,-1,1) IN ('\\','/') THEN p.dir_path || n.name ELSE p.dir_path || '\\' || n.name END";
+            let mut clauses = vec![
+                "n.is_dir=0".to_string(),
+                "n.size>=?".to_string(),
+                "(p.dir_path=? OR p.dir_path LIKE ? ESCAPE '!')".to_string(),
+            ];
+            let target = source.target_path.trim_end_matches(['\\', '/']).to_string();
+            let mut values = vec![
+                Value::Integer(as_sql_i64(request.min_size)),
+                Value::Text(target.clone()),
+                Value::Text(format!("{}\\%", escape_duplicate_like(&target))),
+            ];
+            if let Some(max_size) = request.max_size {
+                clauses.push("n.size<=?".to_string());
+                values.push(Value::Integer(as_sql_i64(max_size)));
+            }
+            if !request.include_hidden {
+                clauses.push("n.hidden=0".to_string());
+            }
+            if !request.extensions.is_empty() {
+                clauses.push(format!(
+                    "lower(n.extension) IN ({})",
+                    std::iter::repeat_n("?", request.extensions.len())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+                values.extend(request.extensions.iter().cloned().map(Value::Text));
+            }
+            let sql = format!(
+                "SELECT {path_expr},n.name,n.size,n.modified_ms FROM nodes n \
+                 LEFT JOIN nodes p ON p.id=n.parent_id WHERE {} ORDER BY n.id",
+                clauses.join(" AND ")
+            );
+            let mut stmt = scan.prepare(&sql).map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params_from_iter(values.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?.max(0) as u64,
+                        row.get::<_, i64>(3)?.max(0) as u64,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            let tx = work.transaction().map_err(|error| error.to_string())?;
+            {
+                let mut insert = tx
+                    .prepare_cached(
+                        "INSERT OR IGNORE INTO candidates(path,name,size,modified_ms) VALUES(?1,?2,?3,?4)",
+                    )
+                    .map_err(|error| error.to_string())?;
+                for row in rows {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let (path, name, size, modified_ms) = row.map_err(|error| error.to_string())?;
+                    scanned = scanned.saturating_add(
+                        insert
+                            .execute(params![
+                                path,
+                                name,
+                                as_sql_i64(size),
+                                as_sql_i64(modified_ms)
+                            ])
+                            .map_err(|error| error.to_string())? as u64,
+                    );
+                }
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            progress(DuplicateProgress {
+                phase: "indexing".to_string(),
+                scanned,
+                hashing: 0,
+                hashed: 0,
+            });
+        }
+
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(DuplicateScanResult {
+                groups: Vec::new(),
+                errors: Vec::new(),
+                scanned,
+                hashing: 0,
+                cancelled: true,
+            });
+        }
+        work.execute_batch("CREATE INDEX candidates_size ON candidates(size); PRAGMA optimize;")
+            .map_err(|error| error.to_string())?;
+        let hashing = work
+            .query_row(
+                "SELECT COALESCE(SUM(member_count),0) FROM (\
+                   SELECT COUNT(*) AS member_count FROM candidates GROUP BY size HAVING COUNT(*)>1\
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .max(0) as u64;
+        let sizes = {
+            let mut stmt = work
+                .prepare("SELECT size FROM candidates GROUP BY size HAVING COUNT(*)>1 ORDER BY size DESC")
+                .map_err(|error| error.to_string())?;
+            stmt.query_map([], |row| row.get::<_, i64>(0))
+                .map_err(|error| error.to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+        };
+
+        progress(DuplicateProgress {
+            phase: "hashing".to_string(),
+            scanned,
+            hashing,
+            hashed: 0,
+        });
+        let state = self.open_state().map_err(|error| error.to_string())?;
+        let mut groups = Vec::new();
+        let mut errors = Vec::new();
+        let mut hashed = 0u64;
+        for size in sizes {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let files = {
+                let mut stmt = work
+                    .prepare(
+                        "SELECT path,name,size,modified_ms FROM candidates WHERE size=?1 ORDER BY path COLLATE NOCASE",
+                    )
+                    .map_err(|error| error.to_string())?;
+                stmt.query_map(params![size], |row| {
+                    Ok(DuplicateFile {
+                        path: row.get(0)?,
+                        name: row.get(1)?,
+                        size: row.get::<_, i64>(2)?.max(0) as u64,
+                        modified: (row.get::<_, i64>(3)?.max(0) as u64) / 1000,
+                    })
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+            };
+            let inputs = files
+                .iter()
+                .map(|file| HashInput {
+                    path: PathBuf::from(&file.path),
+                    size: file.size,
+                    mtime: file.modified,
+                })
+                .collect::<Vec<_>>();
+            let mut cached = HashMap::new();
+            {
+                let mut lookup = state
+                    .prepare_cached(
+                        "SELECT hash FROM duplicate_hashes WHERE path=?1 COLLATE NOCASE AND size=?2 AND modified=?3",
+                    )
+                    .map_err(|error| error.to_string())?;
+                for input in &inputs {
+                    let value = lookup
+                        .query_row(
+                            params![
+                                input.path.to_string_lossy(),
+                                as_sql_i64(input.size),
+                                as_sql_i64(input.mtime)
+                            ],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(|error| error.to_string())?;
+                    if let Some(hash) = value.and_then(|value| value.parse::<u64>().ok()) {
+                        cached.insert(
+                            input.path.clone(),
+                            HashCacheEntry {
+                                size: input.size,
+                                mtime: input.mtime,
+                                hash,
+                                seq: next_hash_cache_seq(),
+                            },
+                        );
+                    }
+                }
+            }
+            let cache = Mutex::new(cached);
+            let (bucket_groups, bucket_errors) = hash_candidate_groups(
+                &inputs,
+                true,
+                &cache,
+                None,
+                None,
+                Some(&cancel),
+                request.threads,
+            );
+            errors.extend(
+                bucket_errors
+                    .into_iter()
+                    .take(200usize.saturating_sub(errors.len())),
+            );
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let cached = cache
+                .into_inner()
+                .map_err(|_| "Duplicate hash cache is unavailable")?;
+            {
+                let tx = state
+                    .unchecked_transaction()
+                    .map_err(|error| error.to_string())?;
+                {
+                    let mut upsert = tx
+                        .prepare_cached(
+                            "INSERT INTO duplicate_hashes(path,size,modified,hash,updated_at) VALUES(?1,?2,?3,?4,?5)\
+                             ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,updated_at=excluded.updated_at",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    for (path, entry) in cached {
+                        upsert
+                            .execute(params![
+                                path.to_string_lossy(),
+                                as_sql_i64(entry.size),
+                                as_sql_i64(entry.mtime),
+                                entry.hash.to_string(),
+                                now_ms() as i64,
+                            ])
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+                tx.commit().map_err(|error| error.to_string())?;
+            }
+            for (_, indices) in bucket_groups {
+                let group_files = indices
+                    .into_iter()
+                    .filter_map(|index| files.get(index).cloned())
+                    .collect::<Vec<_>>();
+                if group_files.len() >= 2 {
+                    let waste = group_files[0]
+                        .size
+                        .saturating_mul((group_files.len() - 1) as u64);
+                    groups.push(DuplicateGroup {
+                        files: group_files,
+                        waste,
+                    });
+                }
+            }
+            hashed = hashed.saturating_add(files.len() as u64);
+            progress(DuplicateProgress {
+                phase: "hashing".to_string(),
+                scanned,
+                hashing,
+                hashed: hashed.min(hashing),
+            });
+        }
+        let cancelled = cancel.load(Ordering::Relaxed);
+        if !cancelled {
+            groups.sort_by(|left, right| right.waste.cmp(&left.waste));
+            progress(DuplicateProgress {
+                phase: "done".to_string(),
+                scanned,
+                hashing,
+                hashed: hashing,
+            });
+        }
+        Ok(DuplicateScanResult {
+            groups: if cancelled { Vec::new() } else { groups },
+            errors,
+            scanned,
+            hashing,
+            cancelled,
         })
     }
 
@@ -1041,9 +1460,13 @@ impl V2Store {
                status TEXT NOT NULL, node_count INTEGER NOT NULL DEFAULT 0,\
                created_at INTEGER NOT NULL, last_used INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0\
              );\
-             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);\
-             CREATE TABLE IF NOT EXISTS secrets(key TEXT PRIMARY KEY,value BLOB NOT NULL,updated_at INTEGER NOT NULL);\
-             CREATE TABLE IF NOT EXISTS compression_jobs(\
+              CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);\
+              CREATE TABLE IF NOT EXISTS secrets(key TEXT PRIMARY KEY,value BLOB NOT NULL,updated_at INTEGER NOT NULL);\
+              CREATE TABLE IF NOT EXISTS duplicate_hashes(\
+                path TEXT PRIMARY KEY COLLATE NOCASE,size INTEGER NOT NULL,modified INTEGER NOT NULL,\
+                hash TEXT NOT NULL,updated_at INTEGER NOT NULL\
+              );\
+              CREATE TABLE IF NOT EXISTS compression_jobs(\
                id TEXT PRIMARY KEY,status TEXT NOT NULL,total INTEGER NOT NULL DEFAULT 0,\
                processed INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 0,\
                saved_bytes INTEGER NOT NULL DEFAULT 0,settings_json TEXT NOT NULL DEFAULT '{}',\
@@ -2028,6 +2451,45 @@ fn open_scan_connection(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+struct TemporaryDatabase {
+    path: PathBuf,
+}
+
+impl TemporaryDatabase {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TemporaryDatabase {
+    fn drop(&mut self) {
+        remove_database_family(&self.path);
+    }
+}
+
+fn normalized_path_text(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn path_is_within_text(candidate: &str, root: &str) -> bool {
+    let candidate = normalized_path_text(candidate);
+    let root = normalized_path_text(root);
+    candidate == root
+        || candidate
+            .strip_prefix(&root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn escape_duplicate_like(value: &str) -> String {
+    value
+        .replace('!', "!!")
+        .replace('%', "!%")
+        .replace('_', "!_")
+}
+
 fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodePageItem> {
     Ok(NodePageItem {
         id: row.get(0)?,
@@ -2678,6 +3140,67 @@ mod tests {
             .expect("nested aggregate");
         assert_eq!(nested.size, 20);
         assert_eq!(nested.files, 1);
+    }
+
+    #[test]
+    fn duplicate_scan_uses_persisted_index_and_confirms_file_bytes() {
+        let store = temp_store("duplicates");
+        let source = store.data_root().join("fixture");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("first.bin"), b"identical duplicate bytes").unwrap();
+        fs::write(
+            source.join("nested").join("second.bin"),
+            b"identical duplicate bytes",
+        )
+        .unwrap();
+        fs::write(source.join("different.bin"), b"different content bytes!!").unwrap();
+        let handle = store
+            .start_scan(
+                ScanRequest {
+                    root: source.to_string_lossy().into_owned(),
+                    threads: 2,
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
+        for _ in 0..200 {
+            let status = store.scan_status(&handle.scan_id).unwrap();
+            if status.status != "scanning" {
+                assert_eq!(status.status, "done");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = store
+            .find_exact_duplicates(
+                DuplicateScanRequest {
+                    sources: vec![DuplicateSource {
+                        scan_id: handle.scan_id,
+                        target_path: source.to_string_lossy().into_owned(),
+                    }],
+                    min_size: 1,
+                    threads: 2,
+                    ..Default::default()
+                },
+                Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+
+        assert!(!result.cancelled);
+        assert_eq!(result.groups.len(), 1);
+        let names = result.groups[0]
+            .files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(names, HashSet::from(["first.bin", "second.bin"]));
+        assert_eq!(
+            result.groups[0].waste,
+            b"identical duplicate bytes".len() as u64
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use filetree_core::v2::{
-    BOOKMARKS_JSON_MAX_BYTES, MemoryStats, NodePage, NodePageItem, SETTINGS_JSON_MAX_BYTES,
-    ScanHandle, ScanProgress, ScanQuery, ScanRequest, V2Store,
+    BOOKMARKS_JSON_MAX_BYTES, DuplicateProgress, DuplicateScanRequest, DuplicateScanResult,
+    MemoryStats, NodePage, NodePageItem, SETTINGS_JSON_MAX_BYTES, ScanHandle, ScanProgress,
+    ScanQuery, ScanRequest, V2Store,
 };
 use filetree_core::{
     CompressionFilesRequest, CompressionStartRequest, CompressionStartResult, DesktopRuntime,
@@ -10,7 +11,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,6 +29,11 @@ struct FsWatchRegistry {
 struct FsWatchEntry {
     watcher: notify::RecommendedWatcher,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct DuplicateScanRegistry {
+    cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Default for FsWatchRegistry {
@@ -586,6 +592,55 @@ async fn scan_page(state: State<'_, Arc<V2Store>>, query: ScanQuery) -> Result<N
 }
 
 #[tauri::command]
+async fn duplicates_scan(
+    state: State<'_, Arc<V2Store>>,
+    registry: State<'_, DuplicateScanRegistry>,
+    request: DuplicateScanRequest,
+    on_progress: Channel<DuplicateProgress>,
+) -> Result<DuplicateScanResult, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut active = registry
+            .cancel
+            .lock()
+            .map_err(|_| "Duplicate scan registry is unavailable".to_string())?;
+        if let Some(previous) = active.replace(Arc::clone(&cancel)) {
+            previous.store(true, Ordering::Relaxed);
+        }
+    }
+    let store = Arc::clone(state.inner());
+    let worker_cancel = Arc::clone(&cancel);
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        store.find_exact_duplicates(request, worker_cancel, move |event| {
+            let _ = on_progress.send(event);
+        })
+    })
+    .await
+    .map_err(|error| format!("Duplicate scan worker failed: {error}"))?;
+    if let Ok(mut active) = registry.cancel.lock() {
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &cancel))
+        {
+            active.take();
+        }
+    }
+    outcome
+}
+
+#[tauri::command]
+fn duplicates_cancel(registry: State<'_, DuplicateScanRegistry>) -> bool {
+    let Ok(active) = registry.cancel.lock() else {
+        return false;
+    };
+    let Some(cancel) = active.as_ref() else {
+        return false;
+    };
+    cancel.store(true, Ordering::Relaxed);
+    true
+}
+
+#[tauri::command]
 fn scan_pin(state: State<'_, Arc<V2Store>>, scan_id: String, pinned: bool) -> Result<(), String> {
     state.set_scan_pinned(&scan_id, pinned)
 }
@@ -954,6 +1009,7 @@ pub fn run() {
         .manage(store)
         .manage(runtime)
         .manage(FsWatchRegistry::default())
+        .manage(DuplicateScanRegistry::default())
         .manage(Arc::new(terminal::TerminalRegistry::default()))
         .invoke_handler(tauri::generate_handler![
             app_version,
@@ -987,6 +1043,8 @@ pub fn run() {
             scan_status,
             scan_find,
             scan_page,
+            duplicates_scan,
+            duplicates_cancel,
             scan_pin,
             memory_stats,
             compression_tools,

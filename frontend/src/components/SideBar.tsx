@@ -26,11 +26,7 @@ const VIEW_TITLES: Record<ViewId, string> = {
   explorer: "Explorer",
   search: "Search",
   treemap: "Treemap",
-  reports: "Reports",
   duplicates: "Duplicates",
-  cleanup: "Cleanup",
-  snapshots: "Snapshots",
-  gallery: "Gallery",
   compress: "Compress",
   bookmarks: "Bookmarks",
   errors: "Problems",
@@ -850,13 +846,10 @@ function SearchView(props: SideBarProps) {
 
 export function SideBar(props: SideBarProps) {
   const { view } = props;
-  // Reports/Treemap (and the Cleanup/Snapshots/Gallery editor views) reuse the
-  // Explorer body so the scan controls, drive list (with capacity bars) and
-  // folder tree stay available while their main panel shows in the editor area.
+  // Treemap and compression reuse Explorer controls while their main panel is
+  // shown in the editor area.
   const showExplorerBody =
-    view === "explorer" || view === "treemap" || view === "reports" ||
-    view === "cleanup" || view === "snapshots" || view === "gallery" ||
-    view === "compress";
+    view === "explorer" || view === "treemap" || view === "compress";
   const showFolderActions = showExplorerBody;
 
   return (

@@ -10,7 +10,6 @@ import {
   clipboardWriteFiles, clipboardReadFiles, copyItemsNative, hasNativeCopy,
   compress, extract, checksum, copyText,
   setAttributes, setTimes,
-  fetchSnapshots, fetchSnapshotData,
   fetchServerSearch, fetchSubtreeFiles,
 } from "../api/client";
 import type { ScanOptions, ExportFormat } from "../api/client";
@@ -33,7 +32,6 @@ import { BulkRenameDialog } from "./BulkRenameDialog";
 import { TagPopover } from "./TagPopover";
 import { ConfigureColumnsMenu } from "./ConfigureColumnsMenu";
 import { Treemap } from "./Treemap";
-import { maybeAutoSnapshot, checkGrowthAlerts, rootKey } from "../lib/autoSnapshot";
 import type { ViewId } from "./ActivityBar";
 import { ConflictDialog, type ConflictChoice } from "./ConflictDialog";
 import { MoveToDialog } from "./MoveToDialog";
@@ -340,9 +338,6 @@ interface WorkspaceTabProps {
   folderDblClickExplorer: boolean;
   /** #9: tint table rows by size relative to the largest visible row. */
   heatTint: boolean;
-  /** #39: annotate Explorer folder rows with grew/shrank/new badges vs. the
-   *  latest saved snapshot of the current root. Default off (set in App). */
-  showGrowthBadges: boolean;
   onClose3D: () => void;
   onToggleBookmark: (path: string) => void;
   // Quick-load file(s) into the Compress page. Receives concrete file paths
@@ -374,7 +369,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     treemapDetail,
     tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
-    folderDblClickExplorer, heatTint, showGrowthBadges,
+    folderDblClickExplorer, heatTint,
     onClose3D, onToggleBookmark, onCompress, onScanPath, onStateChange, onWorkbenchChange, onOpenTerminal,
     onOpenFolderInTab, onUndo,
   }: WorkspaceTabProps,
@@ -465,9 +460,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // #11: transient per-node-id highlight (added / size-changed) applied right
   // after a same-root refresh completes; fades after DIFF_HIGHLIGHT_MS.
   const [diffHighlight, setDiffHighlight] = useState<Map<number, "added" | "changed"> | null>(null);
-  // #39: directory node id → grew/shrank/new badge vs. the latest saved snapshot
-  // of the current root. Computed when `showGrowthBadges` is on (default off).
-  const [growthMap, setGrowthMap] = useState<Map<number, { dir: "grew" | "shrank" | "new"; delta: number }> | null>(null);
   // #11: prior scan's path→size snapshot, captured just before a refresh starts.
   const prevSizeByPathRef = useRef<Map<string, number> | null>(null);
   const diffTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -975,12 +967,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       // Seed history with the very first completed root (initial/restored scan).
       // Subsequent navigations push via openLocation; this only fires once.
       setNavHistory((prev) => (prev.index === -1 ? { stack: [data.rootPath], index: 0 } : prev));
-      // #36/#40: throttled auto-snapshot of the completed root so a growth
-      // history accumulates without user action, then evaluate growth alerts
-      // against the refreshed history. Never throws; throttle caps frequency.
-      void maybeAutoSnapshot(data.rootPath).then((list) => {
-        if (list) void checkGrowthAlerts(list);
-      });
     }
     if (status === "scanning") {
       watchGenerationRef.current++;
@@ -993,49 +979,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
-
-  // #39: compute "what changed since last snapshot" folder badges when enabled.
-  // Loads the latest saved snapshot for the current root and diffs its
-  // directory size map against the live tree (directories only, so it stays
-  // cheap on large trees). Cleared when the toggle is off or no snapshot exists.
-  useEffect(() => {
-    if (!showGrowthBadges || !data) { setGrowthMap(null); return; }
-    let cancelled = false;
-    const root = data.rootPath;
-    void (async () => {
-      try {
-        const key = rootKey(root);
-        const list = await fetchSnapshots();
-        const latest = list
-          .filter((s) => rootKey(s.path) === key)
-          .sort((a, b) => b.createdAt - a.createdAt)[0];
-        if (!latest) { if (!cancelled) setGrowthMap(null); return; }
-        const snap = await fetchSnapshotData(latest.id);
-        if (cancelled || !snap) { if (!cancelled) setGrowthMap(null); return; }
-        const prevByPath = new Map<string, number>();
-        for (const [k, v] of Object.entries(snap.dirs)) prevByPath.set(k.toLowerCase(), v);
-        const map = new Map<number, { dir: "grew" | "shrank" | "new"; delta: number }>();
-        let budget = 50000; // cap work on very large trees
-        for (const node of treeRef.current.nodeById.values()) {
-          if (budget-- <= 0) break;
-          if (!node.dir || !node.path || node.id < 0) continue;
-          const prev = prevByPath.get(node.path.toLowerCase());
-          if (prev === undefined) {
-            map.set(node.id, { dir: "new", delta: node.size });
-          } else if (node.size !== prev) {
-            const delta = node.size - prev;
-            map.set(node.id, { dir: delta >= 0 ? "grew" : "shrank", delta });
-          }
-        }
-        if (!cancelled) setGrowthMap(map);
-      } catch {
-        if (!cancelled) setGrowthMap(null);
-      }
-    })();
-    return () => { cancelled = true; };
-  // treeRef.current is read at run time; recompute on data identity + toggle.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showGrowthBadges, data]);
 
   // #5: persist this folder's sort + column widths whenever the user changes
   // them. Skipped while a restore is being applied (above) and before any scan
@@ -2680,7 +2623,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   selectionSummary={selectionSummary}
                   heatTint={heatTint}
                   diffHighlight={diffHighlight}
-                  growth={growthMap}
                   onDoubleClick={handleDblClick}
                   onContextMenu={handleContextMenu}
                   onCopySelected={runCopyFiles}

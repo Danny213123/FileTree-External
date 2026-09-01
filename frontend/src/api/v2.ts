@@ -61,6 +61,47 @@ export interface V2MemoryStats {
   retainedScanHandles: number;
 }
 
+export interface V2DuplicateSource {
+  scanId: string;
+  targetPath: string;
+}
+
+export interface V2DuplicateProgress {
+  phase: "indexing" | "hashing" | "done" | string;
+  scanned: number;
+  hashing: number;
+  hashed: number;
+}
+
+export interface V2DuplicateFile {
+  path: string;
+  name: string;
+  size: number;
+  modified: number;
+}
+
+export interface V2DuplicateGroup {
+  files: V2DuplicateFile[];
+  waste: number;
+}
+
+export interface V2DuplicateResult {
+  groups: V2DuplicateGroup[];
+  errors: string[];
+  scanned: number;
+  hashing: number;
+  cancelled: boolean;
+}
+
+export interface V2DuplicateRequest {
+  sources: V2DuplicateSource[];
+  minSize: number;
+  maxSize?: number | null;
+  extensions: string[];
+  includeHidden: boolean;
+  threads: number;
+}
+
 export interface NativeDragResponse {
   outcome: "internal" | "external-move" | "external-copy" | "cancel";
   clientX: number | null;
@@ -250,6 +291,29 @@ export async function scanPage(query: {
 
 export async function v2MemoryStats(): Promise<V2MemoryStats> {
   return invoke<V2MemoryStats>("memory_stats");
+}
+
+export async function runV2DuplicateScan(
+  request: V2DuplicateRequest,
+  onProgress: (value: V2DuplicateProgress) => void,
+  signal?: AbortSignal,
+): Promise<V2DuplicateResult> {
+  const channel = new Channel<V2DuplicateProgress>();
+  channel.onmessage = onProgress;
+  const abort = () => { void invoke("duplicates_cancel"); };
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    return await invoke<V2DuplicateResult>("duplicates_scan", {
+      request,
+      onProgress: channel,
+    });
+  } finally {
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+export async function cancelV2DuplicateScan(): Promise<void> {
+  await invoke("duplicates_cancel");
 }
 
 export function releaseV2ScanPages(scanId: string): void {

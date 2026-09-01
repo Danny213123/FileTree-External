@@ -18,6 +18,12 @@ import {
   type DupeHashFile,
 } from "../api/client";
 import { readNdjsonStream } from "./useScan";
+import {
+  cancelV2DuplicateScan,
+  isTauriV2,
+  runV2DuplicateScan,
+  runV2Scan,
+} from "../api/v2";
 import { getCached, invalidate, setCached } from "../lib/scanCache";
 import { confirmDialog } from "../lib/dialogs";
 import { toast } from "../lib/toast";
@@ -28,6 +34,7 @@ import {
   candidatesFromScan,
   dedupeCandidates,
   groupSignature,
+  isUnder,
   normalizeForKey,
   passesFilters,
   pruneGroups,
@@ -212,7 +219,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
 
   // Poll the server hash progress while hashing so the UI shows real counts.
   useEffect(() => {
-    if (phase !== "hashing") return;
+    if (phase !== "hashing" || isTauriV2()) return;
     const id = setInterval(async () => {
       const p = await fetchDupesProgress();
       setProgress((prev) => ({ scanned: prev.scanned, hashing: p.filesHashing, hashed: p.filesHashed }));
@@ -283,6 +290,89 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
       for (const t of targets) {
         const cached = getCached(t);
         if (cached) pool.push(cached);
+      }
+
+      if (isTauriV2()) {
+        if (!criteria.content.enabled) {
+          throw new Error("FileTree v2 currently requires Content matching for duplicate scans.");
+        }
+        const sources: { scanId: string; targetPath: string }[] = [];
+        for (const target of targets) {
+          let source: ScanResult | undefined;
+          let sourceLength = -1;
+          for (const candidate of pool) {
+            if (!candidate.scanId || !isUnder(target, candidate.rootPath)) continue;
+            if (candidate.rootPath.length > sourceLength) {
+              source = candidate;
+              sourceLength = candidate.rootPath.length;
+            }
+          }
+          if (!source) {
+            try {
+              source = await runV2Scan(
+                { path: target, includeHidden, threads },
+                (event) => setProgress((prev) => ({ ...prev, scanned: event.nodeCount })),
+                signal,
+              );
+              pool.push(source);
+            } catch (error) {
+              if (error instanceof Error && error.name === "AbortError") return;
+              aggErrors.push(`${target}: ${error instanceof Error ? error.message : String(error)}`);
+              continue;
+            }
+          }
+          if (source.scanId) sources.push({ scanId: source.scanId, targetPath: target });
+        }
+        if (sources.length === 0) {
+          throw new Error(aggErrors[0] || "No duplicate scan targets could be indexed.");
+        }
+
+        setPhase("hashing");
+        const duplicateResult = await runV2DuplicateScan(
+          {
+            sources,
+            minSize: filters.minSize,
+            maxSize: filters.maxSize ?? null,
+            extensions: filters.extensions,
+            includeHidden: filters.includeHidden,
+            threads,
+          },
+          (event) => {
+            setPhase(event.phase === "indexing" ? "aggregating" : "hashing");
+            setProgress({ scanned: event.scanned, hashing: event.hashing, hashed: event.hashed });
+          },
+          signal,
+        );
+        if (duplicateResult.cancelled || signal.aborted) return;
+        aggErrors.push(...duplicateResult.errors.slice(0, 50));
+
+        const byPath = new Map<string, CandidateMeta>();
+        const hashGroups = duplicateResult.groups.map((group) => ({
+          paths: group.files.map((file) => {
+            const slash = Math.max(file.path.lastIndexOf("\\"), file.path.lastIndexOf("/"));
+            const dot = file.name.lastIndexOf(".");
+            byPath.set(normalizeForKey(file.path), {
+              path: file.path,
+              name: file.name,
+              folder: slash >= 0 ? file.path.slice(0, slash) : file.path,
+              size: file.size,
+              modifiedMs: file.modified * 1000,
+              mtimeSec: file.modified,
+              ext: dot >= 0 ? file.name.slice(dot + 1).toLowerCase() : "",
+              hidden: false,
+            });
+            return file.path;
+          }),
+        }));
+        setPhase("grouping");
+        let result = buildContentGroups(hashGroups, byPath, criteria, repriCriterion);
+        result = result.filter((group) => !ignoredRef.current.has(groupSignature(group)));
+        result = sortGroupsByWaste(result);
+        setGroups(result);
+        setErrors(aggErrors);
+        setScanState("done");
+        setPhase("done");
+        return;
       }
 
       let candidates: CandidateMeta[] = [];
@@ -369,7 +459,8 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
   const stopScan = useCallback(() => {
     abortRef.current?.abort();
     abortRef.current = null;
-    void cancelDupesScan();
+    if (isTauriV2()) void cancelV2DuplicateScan();
+    else void cancelDupesScan();
     setScanState("canceled");
     setPhase("idle");
   }, []);
