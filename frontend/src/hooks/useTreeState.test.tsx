@@ -1,8 +1,15 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { NodeRecord } from "../api/types";
 import { useTreeState, type LazyOptions } from "./useTreeState";
+
+const { fetchChildrenMock } = vi.hoisted(() => ({ fetchChildrenMock: vi.fn() }));
+
+vi.mock("../api/client", () => ({
+  fetchChildren: fetchChildrenMock,
+  ScanStaleError: class ScanStaleError extends Error {},
+}));
 
 function node(overrides: Partial<NodeRecord>): NodeRecord {
   return {
@@ -30,6 +37,8 @@ function node(overrides: Partial<NodeRecord>): NodeRecord {
 }
 
 describe("useTreeState watcher patches", () => {
+  beforeEach(() => fetchChildrenMock.mockReset());
+
   it("loads a newly discovered lazy directory from the live filesystem", async () => {
     const loadDirectory = vi.fn(async (path: string) => [
       node({ id: 0, path, name: "New folder", children: [1] }),
@@ -269,5 +278,61 @@ describe("useTreeState watcher patches", () => {
       expect(loadDirectory).toHaveBeenCalledTimes(2);
       expect(Array.from(result.current.nodeById.values()).some((item) => item.name === "clip.mp4")).toBe(true);
     });
+  });
+
+  it("does not duplicate a watcher row when SQLite returns the same path under another id", async () => {
+    const liveId = 9_000_000_000_000_000;
+    fetchChildrenMock.mockResolvedValueOnce([
+      node({
+        id: 42,
+        parent: 7,
+        name: "Melu Morinaga",
+        path: "E:\\Downloads\\Melu Morinaga",
+        depth: 2,
+        size: 4_200,
+        files: 27,
+        folders: 2,
+      }),
+    ]);
+    const lazy: LazyOptions = {
+      enabled: true,
+      rootPath: "E:\\",
+      scannedAt: 1,
+      scanId: "scan-1",
+    };
+    const { result } = renderHook(() => useTreeState(lazy));
+    act(() => result.current.setNodes([
+      node({ children: [7] }),
+      node({
+        id: 7,
+        parent: 0,
+        name: "Downloads",
+        path: "E:\\Downloads",
+        depth: 1,
+        children: [liveId],
+        size: 1_900,
+        files: 24,
+        folders: 3,
+      }),
+      node({
+        id: liveId,
+        parent: 7,
+        name: "Melu Morinaga",
+        path: "e:\\downloads\\Melu Morinaga\\",
+        depth: 2,
+        size: 1_900,
+        files: 24,
+        folders: 2,
+      }),
+    ]));
+
+    act(() => result.current.ensureChildren(7));
+    await waitFor(() => expect(result.current.loadedDirs.has(7)).toBe(true));
+
+    const matches = Array.from(result.current.nodeById.values())
+      .filter((item) => item.path.replace(/[\\/]+$/, "").toLowerCase() === "e:\\downloads\\melu morinaga");
+    expect(matches).toHaveLength(1);
+    expect(matches[0].id).toBe(liveId);
+    expect(result.current.nodeById.get(7)?.children).toEqual([liveId]);
   });
 });

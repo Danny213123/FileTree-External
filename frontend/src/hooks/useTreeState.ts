@@ -646,15 +646,52 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
           for (const n of retained) byId.set(n.id, n);
           const dir = byId.get(dirId);
           if (!dir) return retained;
-          const existing = new Set(dir.children);
-          const childIds = [...dir.children];
+          // Watcher-created rows use reserved live ids. The same path can later
+          // arrive from SQLite under its stable database id, so id-only merging
+          // produces two visible rows. Treat a normalized Windows path as the
+          // child identity and also repair duplicate references already present.
+          const retainedPathIds = new Map<string, number>();
+          for (const node of retained) {
+            if (!node.path) continue;
+            const key = normalizedNodePath(node.path);
+            if (!retainedPathIds.has(key)) retainedPathIds.set(key, node.id);
+          }
+          const existingIds = new Set<number>();
+          const existingChildPaths = new Map<string, number>();
+          const childIds: number[] = [];
+          for (const childId of dir.children) {
+            const child = byId.get(childId);
+            const key = child?.path ? normalizedNodePath(child.path) : "";
+            if (key && existingChildPaths.has(key)) continue;
+            childIds.push(childId);
+            existingIds.add(childId);
+            if (key) existingChildPaths.set(key, childId);
+          }
           const added: NodeRecord[] = [];
           for (const n of boundedFetched) {
             if (byId.has(n.id)) continue; // already present (re-entrancy guard)
+            const pathKey = n.path ? normalizedNodePath(n.path) : "";
+            const matchingPathId = pathKey
+              ? (existingChildPaths.get(pathKey) ?? retainedPathIds.get(pathKey))
+              : undefined;
+            if (matchingPathId !== undefined) {
+              if (!existingIds.has(matchingPathId)) {
+                childIds.push(matchingPathId);
+                existingIds.add(matchingPathId);
+                existingChildPaths.set(pathKey, matchingPathId);
+              }
+              continue;
+            }
             added.push({ ...n, children: n.children ?? [] });
-            if (!existing.has(n.id)) { childIds.push(n.id); existing.add(n.id); }
+            if (!existingIds.has(n.id)) {
+              childIds.push(n.id);
+              existingIds.add(n.id);
+              if (pathKey) existingChildPaths.set(pathKey, n.id);
+            }
           }
-          if (added.length === 0 && childIds.length === dir.children.length) return retained;
+          const childrenChanged = childIds.length !== dir.children.length
+            || childIds.some((id, index) => id !== dir.children[index]);
+          if (added.length === 0 && !childrenChanged) return retained;
           const next = retained.map((x) => (x.id === dirId ? { ...x, children: childIds } : x));
           next.push(...added);
           return next;
