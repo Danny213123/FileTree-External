@@ -458,11 +458,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   }, [filterInput]);
   useEffect(() => { setFilterInput(tree.filter); }, [tree.filter]);
 
-  // #10: set when the fs-events watcher detects changes in parts of the tree
-  // that aren't auto-patched (collapsed/off-screen subtrees, or a burst that
-  // exceeded the patch batch cap), so the results may no longer match disk.
-  // Cleared whenever the user refreshes/rescans.
-  const [resultsStale, setResultsStale] = useState(false);
   // Phase 0: dismissal flag for the non-blocking "very large scan" banner. Reset
   // whenever a fresh scan result arrives (see the data effect) so each big scan
   // re-warns once.
@@ -504,20 +499,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const statusRef = useRef(status);
   statusRef.current = status;
 
-  // Deferred watcher entries for lazy, unopened branches are retained so they
-  // can be reconciled on expansion, but they do not make the rows currently on
-  // screen stale. This keeps the warning scoped to data the user can see.
-  const hasLoadedDirtyDirectories = useCallback((): boolean => {
-    const loadedKeys = new Set<string>();
-    for (const node of nodeByPathRef.current.values()) {
-      if (node.dir && node.path) loadedKeys.add(normFolderKey(node.path));
-    }
-    for (const key of dirtyDirectoriesRef.current.keys()) {
-      if (loadedKeys.has(key)) return true;
-    }
-    return false;
-  }, []);
-
   const doScan = useCallback((path?: string, t?: number, forceFresh?: boolean) => {
     const p = path ?? scanPath;
     if (!p.trim()) return;
@@ -531,12 +512,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       nocache: forceFresh || undefined,
     };
     const isRefresh = p.trim() === lastCompletedPathRef.current;
-    // The user explicitly (re)scanned, so any "results stale" badge no longer
-    // applies; clear it now (it re-arms if the watcher sees new off-screen churn).
+    // The user explicitly (re)scanned, so discard pending watcher work that the
+    // fresh scan already includes.
     dirtyDirectoriesRef.current.clear();
     aggregateDirectoriesRef.current.clear();
     dirtyDirectoryOverflowRef.current = false;
-    setResultsStale(false);
     if (isRefresh) {
       lastScanWasRefreshRef.current = true;
       // #11: snapshot the current tree's per-path sizes so we can diff-highlight
@@ -574,9 +554,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       }
       marked.push(path);
     }
-    if (hasLoadedDirtyDirectories() || dirtyDirectoryOverflowRef.current) setResultsStale(true);
     return marked;
-  }, [hasLoadedDirtyDirectories]);
+  }, []);
 
   const markMutationPathsDirty = useCallback((paths: string[]): string[] => {
     const loadedByKey = new Map<string, NodeRecord>();
@@ -626,7 +605,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       }
     }
     if (requested.size === 0) {
-      setResultsStale(hasLoadedDirtyDirectories() || dirtyDirectoryOverflowRef.current);
       return 0;
     }
 
@@ -722,10 +700,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       }
     } finally {
       patchInFlightRef.current = false;
-      setResultsStale(hasLoadedDirtyDirectories() || dirtyDirectoryOverflowRef.current);
     }
     return patched;
-  }, [threads, includeHidden, followLinks, collectOwners, exclude, hasLoadedDirtyDirectories, markDirtyDirectories]);
+  }, [threads, includeHidden, followLinks, collectOwners, exclude, markDirtyDirectories]);
 
   const schedulePendingMutationRefresh = useCallback(() => {
     if (!pendingMutationRefreshRef.current || !activeRef.current || statusRef.current === "scanning") return;
@@ -917,7 +894,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         if (node) dirs.push(node.path);
       }
       pendingChangesRef.current.clear();
-      setResultsStale(hasLoadedDirtyDirectories() || dirtyDirectoryOverflowRef.current);
       if (dirs.length === 0) return;
 
       await refreshDirectories(dirs);
@@ -958,7 +934,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         })
         .catch((error: unknown) => {
           console.warn("Could not start the native filesystem watcher", error);
-          setResultsStale(true);
         });
       return;
     }
@@ -971,7 +946,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       catch { /* ignore malformed legacy watcher messages */ }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [markDirtyDirectories, refreshDirectories, hasLoadedDirtyDirectories]);
+  }, [markDirtyDirectories, refreshDirectories]);
 
   useEffect(() => () => {
     watchGenerationRef.current++;
@@ -2109,10 +2084,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         const patched = await refreshDirectories(dirty);
         const unresolved = dirtyDirectoriesRef.current.size;
         // The explicit refresh acknowledges an overflow after reconciling all
-        // loaded branches. Unknown lazy branches stay queued, but no longer
-        // hold the visible-results warning open.
+        // loaded branches. Unknown lazy branches remain queued until opened.
         dirtyDirectoryOverflowRef.current = false;
-        setResultsStale(hasLoadedDirtyDirectories());
         if (unresolved > 0 || overflowed) {
           const pending = `${unresolved}${overflowed ? "+" : ""}`;
           const prefix = patched > 0
@@ -2139,7 +2112,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     } finally {
       smartRefreshInFlightRef.current = false;
     }
-  }, [status, refreshDirectories, hasLoadedDirtyDirectories]);
+  }, [status, refreshDirectories]);
 
   // ── Agent API facade (used by the right-side ChatPanel) ──────────────────
   const agentApi = useMemo<AgentApi>(() => ({
@@ -2479,27 +2452,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           onForward={goForward}
           onUp={handleNavigateParent}
         />
-        {resultsStale && status !== "scanning" && (
-          <div className="stale-bar" role="status">
-            <Icon name="warning" size={12} />
-            <span>Results may be stale — the watched folder changed.</span>
-            <span className="spacer" />
-            <button
-              className="stale-bar-refresh"
-              title="Refresh only the folders that changed"
-              onClick={() => { void doSmartRefresh(); }}
-            >
-              <Icon name="refresh" size={12} /> Refresh
-            </button>
-            <button
-              className="stale-bar-dismiss"
-              title="Dismiss"
-              onClick={() => setResultsStale(false)}
-            >
-              <Icon name="x" size={12} />
-            </button>
-          </div>
-        )}
         {data && data.nodeCount > VERY_LARGE_SCAN_NODES && !largeScanDismissed && status !== "scanning" && (
           <div className="stale-bar" role="status">
             <Icon name="warning" size={12} />
