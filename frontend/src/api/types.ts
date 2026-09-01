@@ -24,6 +24,9 @@ export interface NodeRecord {
   /** Raw Windows file-attribute bitmask (FILE_ATTRIBUTE_*); 0/undefined when
    *  unavailable. Decode flags with the masks in `lib/attributes.ts`. */
   attributes?: number;
+  /** True when directory aggregate fields came from the scan index or a live
+   *  recursive summary. False means this is an unresolved live placeholder. */
+  aggregateKnown?: boolean;
 }
 
 export interface ExtensionStat {

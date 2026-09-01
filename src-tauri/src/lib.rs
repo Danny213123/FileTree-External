@@ -1,6 +1,6 @@
 use filetree_core::v2::{
-    BOOKMARKS_JSON_MAX_BYTES, MemoryStats, NodePage, SETTINGS_JSON_MAX_BYTES, ScanHandle,
-    ScanProgress, ScanQuery, ScanRequest, V2Store,
+    BOOKMARKS_JSON_MAX_BYTES, MemoryStats, NodePage, NodePageItem, SETTINGS_JSON_MAX_BYTES,
+    ScanHandle, ScanProgress, ScanQuery, ScanRequest, V2Store,
 };
 use filetree_core::{
     CompressionFilesRequest, CompressionStartRequest, CompressionStartResult, DesktopRuntime,
@@ -279,6 +279,7 @@ fn summarize_directory(path: &Path) -> DirectoryAggregate {
 fn directory_snapshot_rows(
     path: PathBuf,
     recursive_aggregates: bool,
+    cached_children: &HashMap<String, NodePageItem>,
 ) -> Result<Vec<Value>, String> {
     let entries = fs::read_dir(&path)
         .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
@@ -300,8 +301,24 @@ fn directory_snapshot_rows(
             link_metadata
         };
         let is_dir = metadata.is_dir();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let cached = if is_dir && !recursive_aggregates {
+            cached_children.get(&name.to_ascii_lowercase())
+        } else {
+            None
+        };
+        let aggregate_known = !is_dir || recursive_aggregates || cached.is_some();
         let aggregate = if is_dir && recursive_aggregates {
             summarize_directory(&entry_path)
+        } else if let Some(cached) = cached {
+            DirectoryAggregate {
+                size: cached.size,
+                allocated: cached.allocated,
+                files: cached.files,
+                folders: cached.folders,
+                errors: cached.errors,
+                modified: cached.modified_ms,
+            }
         } else {
             DirectoryAggregate::default()
         };
@@ -316,7 +333,6 @@ fn directory_snapshot_rows(
             metadata.len()
         };
         let attributes = metadata_attributes(&metadata);
-        let name = entry.file_name().to_string_lossy().into_owned();
         let extension = if is_dir {
             String::new()
         } else {
@@ -347,7 +363,8 @@ fn directory_snapshot_rows(
             "extension": extension,
             "children": [],
             "owner": "",
-            "attributes": attributes
+            "attributes": attributes,
+            "aggregateKnown": aggregate_known
         }));
     }
 
@@ -380,7 +397,8 @@ fn directory_snapshot_rows(
         "extension": "",
         "children": child_ids,
         "owner": "",
-        "attributes": root_attributes
+        "attributes": root_attributes,
+        "aggregateKnown": true
     });
     let mut rows = Vec::with_capacity(children.len() + 1);
     rows.push(root);
@@ -393,10 +411,27 @@ async fn directory_snapshot(
     state: State<'_, Arc<V2Store>>,
     path: String,
     recursive_aggregates: Option<bool>,
+    scan_id: Option<String>,
+    directory_id: Option<i64>,
 ) -> Result<Vec<Value>, String> {
     require_authorized_path(&state, &path)?;
+    let store = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        directory_snapshot_rows(PathBuf::from(path), recursive_aggregates.unwrap_or(false))
+        let recursive_aggregates = recursive_aggregates.unwrap_or(false);
+        let cached_children = if !recursive_aggregates {
+            match (scan_id.as_deref(), directory_id) {
+                (Some(scan_id), Some(directory_id)) => store
+                    .query_snapshot_children(scan_id, directory_id, DIRECTORY_SNAPSHOT_LIMIT)?
+                    .into_iter()
+                    .filter(|item| item.is_dir)
+                    .map(|item| (item.name.to_ascii_lowercase(), item))
+                    .collect(),
+                _ => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
+        };
+        directory_snapshot_rows(PathBuf::from(path), recursive_aggregates, &cached_children)
     })
     .await
     .map_err(|error| format!("Folder snapshot worker failed: {error}"))?
@@ -407,7 +442,7 @@ mod desktop_tests {
     use super::{
         collapse_changed_directories, directory_snapshot_rows, watch_directories_for_paths,
     };
-    use std::fs;
+    use std::{collections::HashMap, fs};
 
     #[test]
     fn directory_snapshot_drops_removed_children() {
@@ -420,11 +455,13 @@ mod desktop_tests {
                 .as_nanos()
         ));
         fs::create_dir_all(root.join("destination")).expect("create test folder");
-        let first = directory_snapshot_rows(root.clone(), false).expect("first snapshot");
+        let first =
+            directory_snapshot_rows(root.clone(), false, &HashMap::new()).expect("first snapshot");
         assert!(first.iter().any(|row| row["name"] == "destination"));
 
         fs::remove_dir(root.join("destination")).expect("remove test folder");
-        let second = directory_snapshot_rows(root.clone(), false).expect("second snapshot");
+        let second =
+            directory_snapshot_rows(root.clone(), false, &HashMap::new()).expect("second snapshot");
         assert!(!second.iter().any(|row| row["name"] == "destination"));
         fs::remove_dir(root).expect("remove test root");
     }
@@ -447,7 +484,8 @@ mod desktop_tests {
         )
         .expect("write nested file");
 
-        let rows = directory_snapshot_rows(root.clone(), true).expect("aggregate snapshot");
+        let rows = directory_snapshot_rows(root.clone(), true, &HashMap::new())
+            .expect("aggregate snapshot");
         let moved = rows
             .iter()
             .find(|row| row["name"] == "moved")

@@ -601,6 +601,43 @@ impl V2Store {
         })
     }
 
+    /// Return one directory's cached children in a single bounded query. Live
+    /// filesystem snapshots use this to retain aggregate totals for branches
+    /// that are not materialized in the renderer.
+    pub fn query_snapshot_children(
+        &self,
+        scan_id: &str,
+        parent_id: i64,
+        limit: usize,
+    ) -> Result<Vec<NodePageItem>, String> {
+        if !safe_scan_id(scan_id) {
+            return Err("Invalid scan id".to_string());
+        }
+        let db_path = self.scans_dir.join(format!("{scan_id}.db"));
+        let conn = open_scan_connection(&db_path).map_err(|error| error.to_string())?;
+        let sql = r#"SELECT n.id,n.parent_id,n.name,
+               CASE WHEN n.is_dir=1 THEN n.dir_path
+                    WHEN p.dir_path IS NULL OR p.dir_path='' THEN n.name
+                    WHEN substr(p.dir_path,-1,1) IN ('\','/') THEN p.dir_path || n.name
+                    ELSE p.dir_path || '\' || n.name END,
+               n.is_dir,n.is_link,n.hidden,n.readonly,n.size,n.allocated,n.files,n.folders,
+               n.modified_ms,n.created_ms,n.accessed_ms,n.depth,n.errors,n.extension,n.owner,n.attributes
+               FROM nodes n LEFT JOIN nodes p ON p.id=n.parent_id
+               WHERE n.parent_id=?1 ORDER BY n.id ASC LIMIT ?2"#;
+        let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![parent_id, limit.clamp(1, 50_000) as i64],
+                node_from_row,
+            )
+            .map_err(|error| error.to_string())?;
+        let items = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        self.touch_scan(scan_id).ok();
+        Ok(items)
+    }
+
     pub fn set_scan_pinned(&self, scan_id: &str, pinned: bool) -> Result<(), String> {
         let conn = self.open_state().map_err(|error| error.to_string())?;
         conn.execute(
@@ -2622,7 +2659,7 @@ mod tests {
         assert_eq!(root.items[0].size, 30);
         let children = store
             .query_nodes(ScanQuery {
-                scan_id: handle.scan_id,
+                scan_id: handle.scan_id.clone(),
                 parent_id: Some(0),
                 limit: 5000,
                 ..Default::default()
@@ -2630,6 +2667,17 @@ mod tests {
             .unwrap();
         assert_eq!(children.total, 2);
         assert_eq!(children.limit, TREE_PAGE_MAX);
+
+        let snapshot_children = store
+            .query_snapshot_children(&handle.scan_id, 0, 50_000)
+            .unwrap();
+        assert_eq!(snapshot_children.len(), 2);
+        let nested = snapshot_children
+            .iter()
+            .find(|item| item.name == "nested")
+            .expect("nested aggregate");
+        assert_eq!(nested.size, 20);
+        assert_eq!(nested.files, 1);
     }
 
     #[test]

@@ -157,4 +157,46 @@ describe("useTreeState watcher patches", () => {
       expect(result.current.nodeById.get(0)?.modified).toBe(newModified);
     });
   });
+
+  it("repairs an unresolved live folder from a cached aggregate", async () => {
+    const lazy: LazyOptions = {
+      enabled: true,
+      rootPath: "E:\\",
+      scannedAt: 1,
+      scanId: "scan-1",
+    };
+    const { result } = renderHook(() => useTreeState(lazy));
+    act(() => result.current.setNodes([
+      node({ children: [7] }),
+      node({
+        id: 7,
+        parent: 0,
+        name: "Downloads",
+        path: "E:\\Downloads",
+        depth: 1,
+      }),
+    ]));
+
+    act(() => result.current.patchDirectory("E:\\", [
+      node({ children: [1] }),
+      node({
+        id: 1,
+        parent: 0,
+        name: "Downloads",
+        path: "E:\\Downloads",
+        depth: 1,
+        size: 5_000,
+        allocated: 8_192,
+        files: 12,
+        folders: 3,
+        aggregateKnown: true,
+      }),
+    ]));
+
+    await waitFor(() => {
+      expect(result.current.nodeById.get(7)?.size).toBe(5_000);
+      expect(result.current.nodeById.get(7)?.files).toBe(12);
+      expect(result.current.nodeById.get(0)?.size).toBe(5_000);
+    });
+  });
 });

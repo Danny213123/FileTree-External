@@ -93,8 +93,15 @@ export async function stopV2FilesystemWatch(watchId: number): Promise<void> {
 export async function fetchV2DirectorySnapshot(
   path: string,
   recursiveAggregates = false,
+  scanId?: string,
+  directoryId?: number,
 ): Promise<NodeRecord[]> {
-  return invoke<NodeRecord[]>("directory_snapshot", { path, recursiveAggregates });
+  return invoke<NodeRecord[]>("directory_snapshot", {
+    path,
+    recursiveAggregates,
+    scanId: scanId ?? null,
+    directoryId: directoryId ?? null,
+  });
 }
 
 export function toNodeRecord(item: V2NodeItem): NodeRecord {
@@ -120,6 +127,7 @@ export function toNodeRecord(item: V2NodeItem): NodeRecord {
     children: [],
     owner: item.owner,
     attributes: item.attributes,
+    aggregateKnown: true,
   };
 }
 

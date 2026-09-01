@@ -846,6 +846,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       // Immediate subfolders we preserve from the old tree (keep descendants +
       // aggregate sizes); files and brand-new folders spliced in with fresh ids.
       const preservedDirPaths: string[] = [];
+      const refreshedPreservedDirs = new Map<string, NodeRecord>();
       const addedNodes: NodeRecord[] = [];
       const rootChildIds: number[] = [];
 
@@ -856,6 +857,9 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
         if (child.dir && old && old.dir) {
           // Existing subfolder: keep its old subtree (id, size, descendants).
           preservedDirPaths.push(normalizedNodePath(old.path));
+          if (child.aggregateKnown === true) {
+            refreshedPreservedDirs.set(normalizedNodePath(old.path), child);
+          }
           rootChildIds.push(old.id);
         } else {
           // New/changed file, or a brand-new folder: take the fresh node. A new
@@ -908,6 +912,19 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
         const underChanged = p.startsWith(changedPathNorm + "\\");
         if (!underChanged) return true;
         return underPreserved(p);
+      }).map((n) => {
+        const refreshed = refreshedPreservedDirs.get(normalizedNodePath(n.path));
+        if (!refreshed) return n;
+        return {
+          ...n,
+          size: refreshed.size,
+          allocated: refreshed.allocated,
+          files: refreshed.files,
+          folders: refreshed.folders,
+          errors: refreshed.errors,
+          modified: Math.max(n.modified, refreshed.modified),
+          aggregateKnown: true,
+        };
       });
 
       const merged = [...kept, newRoot, ...addedNodes];

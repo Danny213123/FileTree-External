@@ -600,7 +600,12 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     for (const node of nodeByPathRef.current.values()) {
       if (node.dir && node.path) loadedByKey.set(normFolderKey(node.path), node);
     }
-    const requested = new Map<string, { path: string; recursiveAggregates: boolean }>();
+    const requested = new Map<string, {
+      path: string;
+      recursiveAggregates: boolean;
+      scanId?: string;
+      directoryId?: number;
+    }>();
     for (const directory of directories) {
       const key = normFolderKey(directory);
       const loaded = loadedByKey.get(key);
@@ -615,6 +620,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               && loaded.size === 0
               && loaded.files === 0
               && loaded.folders === 0),
+          scanId: dataRef.current?.scanId,
+          directoryId: isLiveNodeId(loaded.id) ? undefined : loaded.id,
         });
       }
     }
@@ -635,7 +642,12 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           invalidateScanCache(request.path);
           try {
             if (isTauriV2()) {
-              const nodes = await fetchV2DirectorySnapshot(request.path, request.recursiveAggregates);
+              const nodes = await fetchV2DirectorySnapshot(
+                request.path,
+                request.recursiveAggregates,
+                request.scanId,
+                request.directoryId,
+              );
               return nodes.length ? {
                 key,
                 dir: request.path,
@@ -680,7 +692,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                 && existing.size === 0
                 && existing.files === 0
                 && existing.folders === 0;
-              if (!existing || unresolvedLiveDirectory) {
+              if (child.aggregateKnown !== true && (!existing || unresolvedLiveDirectory)) {
                 aggregateDirectoriesRef.current.add(childKey);
                 aggregateFollowups.push(child.path);
               }
