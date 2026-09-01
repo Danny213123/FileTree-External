@@ -292,7 +292,14 @@ function buildDirCache(
 // so without a bound a huge tree could materialise hundreds of thousands of rows
 // — the very freeze the bundle system avoids in the normal (unfiltered) view.
 const FILTER_ROW_CAP = 5000;
-const MAX_RETAINED_LAZY_NODES = 16 * 500;
+// Keep the ordinary page cache at sixteen 500-row pages, then reserve the same
+// bounded amount for rows beneath folders the user actively expands. Without
+// this reserve, one wide directory (for example Downloads with ~8,000 direct
+// children) fills the cache and every later expansion is silently admitted as
+// zero rows.
+const MAX_CACHED_LAZY_NODES = 16 * 500;
+const MAX_ACTIVE_LAZY_NODES = 16 * 500;
+const MAX_RETAINED_LAZY_NODES = MAX_CACHED_LAZY_NODES + MAX_ACTIVE_LAZY_NODES;
 
 function collectVisibleRows(
   nodeById: Map<number, NodeRecord>,
@@ -548,7 +555,19 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
     // the root preload effect will retry as soon as it appears.
     const directory = nodesRef.current.find((node) => node.id === dirId && node.dir);
     if (!directory) return;
-    if (loadedDirsRef.current.has(dirId) || loadingDirsRef.current.has(dirId)) return;
+    if (loadingDirsRef.current.has(dirId)) return;
+    if (loadedDirsRef.current.has(dirId)) {
+      // A previous fetch may have completed while the bounded node store had no
+      // room left, or a watcher patch may have preserved the directory id while
+      // replacing its unloaded stub. A non-empty aggregate with no retained
+      // child ids is not actually loaded; clear the stale guard and retry.
+      const expectsChildren = directory.files > 0 || directory.folders > 0;
+      if (directory.children.length > 0 || !expectsChildren) return;
+      const nextLoaded = new Set(loadedDirsRef.current);
+      nextLoaded.delete(dirId);
+      loadedDirsRef.current = nextLoaded;
+      setLoadedDirs(nextLoaded);
+    }
     loadingDirsRef.current.add(dirId);
     const requestRoot = lz.rootPath;
     const requestScannedAt = lz.scannedAt;

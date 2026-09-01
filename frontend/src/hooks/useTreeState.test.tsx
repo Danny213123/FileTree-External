@@ -199,4 +199,75 @@ describe("useTreeState watcher patches", () => {
       expect(result.current.nodeById.get(0)?.size).toBe(5_000);
     });
   });
+
+  it("retries a non-empty folder whose loaded child rows are missing", async () => {
+    const loadDirectory = vi.fn()
+      .mockResolvedValueOnce([
+        node({ path: "E:\\Media", name: "Media", children: [] }),
+      ])
+      .mockResolvedValueOnce([
+        node({ path: "E:\\Media", name: "Media", children: [1], files: 1, size: 1024 }),
+        node({
+          id: 1,
+          parent: 0,
+          path: "E:\\Media\\clip.mp4",
+          name: "clip.mp4",
+          dir: false,
+          files: 1,
+          size: 1024,
+          allocated: 4096,
+          depth: 1,
+          extension: "mp4",
+        }),
+      ]);
+    const lazy: LazyOptions = {
+      enabled: true,
+      rootPath: "E:\\",
+      scannedAt: 1,
+      scanId: "scan-1",
+      loadDirectory,
+    };
+    const { result } = renderHook(() => useTreeState(lazy));
+
+    act(() => result.current.setNodes([node({ children: [] })]));
+    act(() => result.current.patchDirectory("E:\\", [
+      node({ children: [1] }),
+      node({ id: 1, parent: 0, path: "E:\\Media", name: "Media", depth: 1 }),
+    ]));
+    const liveDirectory = await waitFor(() => {
+      const found = Array.from(result.current.nodeById.values())
+        .find((item) => item.path === "E:\\Media");
+      expect(found).toBeDefined();
+      return found!;
+    });
+
+    act(() => result.current.ensureChildren(liveDirectory.id));
+    await waitFor(() => expect(result.current.loadedDirs.has(liveDirectory.id)).toBe(true));
+
+    // A parent refresh restores the aggregate but has no retained child rows,
+    // matching the stale loaded-marker state that made the chevron open empty.
+    act(() => result.current.patchDirectory("E:\\", [
+      node({ children: [1] }),
+      node({
+        id: 1,
+        parent: 0,
+        path: "E:\\Media",
+        name: "Media",
+        depth: 1,
+        files: 1,
+        size: 1024,
+        aggregateKnown: true,
+      }),
+    ]));
+    await waitFor(() => {
+      expect(result.current.nodeById.get(liveDirectory.id)?.files).toBe(1);
+      expect(result.current.nodeById.get(liveDirectory.id)?.children).toEqual([]);
+    });
+
+    act(() => result.current.ensureChildren(liveDirectory.id));
+    await waitFor(() => {
+      expect(loadDirectory).toHaveBeenCalledTimes(2);
+      expect(Array.from(result.current.nodeById.values()).some((item) => item.name === "clip.mp4")).toBe(true);
+    });
+  });
 });
