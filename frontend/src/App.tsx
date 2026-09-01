@@ -57,6 +57,7 @@ import { TransfersPanel } from "./components/TransfersPanel";
 import { InspectorPane } from "./components/InspectorPane";
 import { ScheduleWizard } from "./components/ScheduleWizard";
 import { LazyView } from "./components/LazyView";
+import { CompressView } from "./components/CompressView";
 import { recordSample as recordDriveSample } from "./lib/driveForecast";
 
 // Heavy, not-always-visible views are code-split via React.lazy so they leave
@@ -70,7 +71,6 @@ const ChatPanel = lazy(() => import("./components/ChatPanel").then((m) => ({ def
 import type { ChatPanelController } from "./components/ChatPanel";
 const TerminalPanel = lazy(() => import("./components/TerminalPanel").then((m) => ({ default: m.TerminalPanel })));
 const DuplicatesResults = lazy(() => import("./components/DuplicatesResults").then((m) => ({ default: m.DuplicatesResults })));
-const CompressView = lazy(() => import("./components/CompressView").then((m) => ({ default: m.CompressView })));
 
 const SETTINGS_DEBOUNCE_MS = 700;
 
@@ -1077,8 +1077,7 @@ export default function App() {
   // Load `filePaths` into the Compress page and switch to it. Shared by the
   // native right-click "Compress…" action and the in-app quick "Compress"
   // button so both routes behave identically.
-  const openCompressWith = useCallback((filePaths: string[]) => {
-    if (filePaths.length === 0) return;
+  const openCompressWith = useCallback((filePaths: string[] = []) => {
     setCompressInitialPaths(filePaths);
     // Open the Compress activity view (mirrors handleSelectView, inlined to
     // avoid a forward reference since this is declared earlier in the file).
@@ -1434,9 +1433,13 @@ export default function App() {
     // Activity icons now live inside the side bar, so selecting a view always
     // keeps the panel open (collapsing it would hide the icons). Use Ctrl+B
     // (or the View menu) to toggle the side bar.
+    if (v === "compress") {
+      openCompressWith();
+      return;
+    }
     setActiveView(v);
     setSidebarOpen(true);
-  }, []);
+  }, [openCompressWith]);
 
   // Drag the divider on the right edge of the shared Explorer side bar. The
   // side bar is a single left panel (hoisted out of the editor groups), so this
@@ -2008,13 +2011,11 @@ export default function App() {
 
         {activeView === "compress" && (
           <div className="compress-editor">
-            <LazyView>
-              <WorkbenchCompress
-                store={workbenchStore}
-                initialSelectedPaths={compressInitialPaths}
-                onInitialApplied={() => setCompressInitialPaths([])}
-              />
-            </LazyView>
+            <WorkbenchCompress
+              store={workbenchStore}
+              initialSelectedPaths={compressInitialPaths}
+              onInitialApplied={() => setCompressInitialPaths([])}
+            />
           </div>
         )}
 

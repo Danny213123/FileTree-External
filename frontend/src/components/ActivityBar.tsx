@@ -37,8 +37,10 @@ export function ActivityBar({
         const badge = item.id === "bookmarks" ? bookmarkCount : item.id === "errors" ? errorCount : 0;
         return (
           <button
+            type="button"
             key={item.id}
             className={`activity-btn${isActive ? " active" : ""}`}
+            aria-label={item.label}
             title={item.label}
             onClick={() => onSelect(item.id)}
           >
@@ -48,7 +50,7 @@ export function ActivityBar({
         );
       })}
       <div className="spacer" />
-      <button className="activity-btn" title={darkMode ? "Light theme" : "Dark theme"} onClick={onToggleTheme}>
+      <button type="button" className="activity-btn" title={darkMode ? "Light theme" : "Dark theme"} onClick={onToggleTheme}>
         <Icon name={darkMode ? "sun" : "moon"} />
       </button>
     </div>
