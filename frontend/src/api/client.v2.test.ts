@@ -8,9 +8,9 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { fetchServerSearch, moveItems } from "./client";
+import { fetchServerSearch, fetchSubtreeFiles, moveItems } from "./client";
 
-describe("v2 server search", () => {
+describe("v2 bounded client queries", () => {
   beforeEach(() => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,
@@ -68,5 +68,39 @@ describe("v2 server search", () => {
     });
     expect(result.ok).toBe(true);
     expect(result.moved).toEqual(["D:\\Downloads\\source"]);
+  });
+
+  it("loads folder descendants through bounded Tauri pages", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce({
+        items: [
+          { path: "E:\\Media\\one.mp4", size: 10 },
+          { path: "E:\\Media\\nested\\two.jpg", size: 20 },
+        ],
+        offset: 0,
+        limit: 500,
+        hasMore: true,
+      })
+      .mockResolvedValueOnce({
+        items: [{ path: "E:\\Media\\three.zip", size: 30 }],
+        offset: 2,
+        limit: 500,
+        hasMore: false,
+      });
+
+    const result = await fetchSubtreeFiles({
+      rootPath: "E:\\",
+      scanId: "folder-compress",
+      dirId: 42,
+    });
+
+    expect(result).toHaveLength(3);
+    expect(result[1]).toEqual({ path: "E:\\Media\\nested\\two.jpg", size: 20 });
+    expect(invoke).toHaveBeenNthCalledWith(1, "scan_subtree_files", {
+      query: { scanId: "folder-compress", directoryId: 42, offset: 0, limit: 500 },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "scan_subtree_files", {
+      query: { scanId: "folder-compress", directoryId: 42, offset: 2, limit: 500 },
+    });
   });
 });

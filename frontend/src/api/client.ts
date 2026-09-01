@@ -313,16 +313,42 @@ export async function fetchChildren(opts: {
  * the cached scan (GET /api/subtree-files). Used by the Compress-from-context
  * flow in lazy mode, where the renderer doesn't hold the whole subtree.
  */
-export async function fetchSubtreeFiles(
-  rootPath: string,
-  dirId: number,
-  signal?: AbortSignal,
-): Promise<string[]> {
-  const params = new URLSearchParams({ path: rootPath, id: String(dirId) });
-  const res = await fetch(`/api/subtree-files?${params}`, { signal });
+export interface CompressionSourceFile {
+  path: string;
+  size: number;
+}
+
+export async function fetchSubtreeFiles(opts: {
+  rootPath: string;
+  scanId?: string;
+  dirId: number;
+  signal?: AbortSignal;
+}): Promise<CompressionSourceFile[]> {
+  if (isTauriV2()) {
+    if (!opts.scanId) throw new Error("The current scan has no v2 scan id");
+    const files: CompressionSourceFile[] = [];
+    let offset = 0;
+    for (;;) {
+      if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const page = await invoke<{
+        items: CompressionSourceFile[];
+        offset: number;
+        limit: number;
+        hasMore: boolean;
+      }>("scan_subtree_files", {
+        query: { scanId: opts.scanId, directoryId: opts.dirId, offset, limit: 500 },
+      });
+      files.push(...page.items);
+      offset += page.items.length;
+      if (!page.hasMore || page.items.length === 0) break;
+    }
+    return files;
+  }
+  const params = new URLSearchParams({ path: opts.rootPath, id: String(opts.dirId) });
+  const res = await fetch(`/api/subtree-files?${params}`, { signal: opts.signal });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = (await res.json()) as { paths?: string[] };
-  return data.paths ?? [];
+  return (data.paths ?? []).map((path) => ({ path, size: 0 }));
 }
 
 export interface ServerSearchResult {

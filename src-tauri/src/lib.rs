@@ -1,7 +1,7 @@
 use filetree_core::v2::{
     BOOKMARKS_JSON_MAX_BYTES, DuplicateProgress, DuplicateScanRequest, DuplicateScanResult,
     MemoryStats, NodePage, NodePageItem, SETTINGS_JSON_MAX_BYTES, ScanHandle, ScanProgress,
-    ScanQuery, ScanRequest, V2Store,
+    ScanQuery, ScanRequest, SubtreeFilePage, SubtreeFilesQuery, V2Store,
 };
 use filetree_core::{
     CompressionFilesRequest, CompressionStartRequest, CompressionStartResult, DesktopRuntime,
@@ -592,6 +592,17 @@ async fn scan_page(state: State<'_, Arc<V2Store>>, query: ScanQuery) -> Result<N
 }
 
 #[tauri::command]
+async fn scan_subtree_files(
+    state: State<'_, Arc<V2Store>>,
+    query: SubtreeFilesQuery,
+) -> Result<SubtreeFilePage, String> {
+    let store = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || store.query_subtree_files(query))
+        .await
+        .map_err(|error| format!("Subtree file query worker failed: {error}"))?
+}
+
+#[tauri::command]
 async fn duplicates_scan(
     state: State<'_, Arc<V2Store>>,
     registry: State<'_, DuplicateScanRegistry>,
@@ -1043,6 +1054,7 @@ pub fn run() {
             scan_status,
             scan_find,
             scan_page,
+            scan_subtree_files,
             duplicates_scan,
             duplicates_cancel,
             scan_pin,

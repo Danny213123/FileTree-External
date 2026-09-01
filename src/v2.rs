@@ -170,6 +170,42 @@ pub struct NodePage {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SubtreeFilesQuery {
+    pub scan_id: String,
+    pub directory_id: i64,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for SubtreeFilesQuery {
+    fn default() -> Self {
+        Self {
+            scan_id: String::new(),
+            directory_id: 0,
+            offset: 0,
+            limit: TREE_PAGE_DEFAULT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtreeFileItem {
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtreeFilePage {
+    pub items: Vec<SubtreeFileItem>,
+    pub offset: usize,
+    pub limit: usize,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompressionSummary {
     pub id: String,
@@ -667,6 +703,69 @@ impl V2Store {
             total,
             offset: query.offset,
             limit: query.limit,
+        })
+    }
+
+    /// Return one bounded page of descendant files for a directory in a v2
+    /// scan. Directory paths are persisted in SQLite, so this avoids rebuilding
+    /// an in-memory subtree just to launch a compression selection.
+    pub fn query_subtree_files(
+        &self,
+        mut query: SubtreeFilesQuery,
+    ) -> Result<SubtreeFilePage, String> {
+        if !safe_scan_id(&query.scan_id) {
+            return Err("Invalid scan id".to_string());
+        }
+        query.limit = query.limit.clamp(1, TREE_PAGE_MAX);
+        let db_path = self.scans_dir.join(format!("{}.db", query.scan_id));
+        let conn = open_scan_connection(&db_path).map_err(|error| error.to_string())?;
+        let directory_path = conn
+            .query_row(
+                "SELECT dir_path FROM nodes WHERE id=?1 AND is_dir=1",
+                params![query.directory_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("Directory is not present in scan: {}", query.directory_id))?;
+        let descendant_pattern = format!("{}\\%", escape_duplicate_like(&directory_path));
+        let fetch_limit = query.limit.saturating_add(1);
+        let sql = r#"SELECT
+               CASE WHEN p.dir_path IS NULL OR p.dir_path='' THEN n.name
+                    WHEN substr(p.dir_path,-1,1) IN ('\','/') THEN p.dir_path || n.name
+                    ELSE p.dir_path || '\' || n.name END,
+               n.size
+             FROM nodes n LEFT JOIN nodes p ON p.id=n.parent_id
+             WHERE n.is_dir=0 AND (p.dir_path=?1 OR p.dir_path LIKE ?2 ESCAPE '!')
+             ORDER BY n.id ASC LIMIT ?3 OFFSET ?4"#;
+        let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![
+                    directory_path,
+                    descendant_pattern,
+                    fetch_limit as i64,
+                    query.offset as i64
+                ],
+                |row| {
+                    Ok(SubtreeFileItem {
+                        path: row.get(0)?,
+                        size: row.get::<_, i64>(1)?.max(0) as u64,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let mut items = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        let has_more = items.len() > query.limit;
+        items.truncate(query.limit);
+        self.touch_scan(&query.scan_id).ok();
+        Ok(SubtreeFilePage {
+            items,
+            offset: query.offset,
+            limit: query.limit,
+            has_more,
         })
     }
 
@@ -3140,6 +3239,77 @@ mod tests {
             .expect("nested aggregate");
         assert_eq!(nested.size, 20);
         assert_eq!(nested.files, 1);
+    }
+
+    #[test]
+    fn subtree_file_pages_are_recursive_and_bounded() {
+        let store = temp_store("subtree-files");
+        let source = store.data_root().join("fixture");
+        let selected = source.join("selected");
+        fs::create_dir_all(selected.join("nested")).unwrap();
+        fs::write(selected.join("a.mp4"), vec![1u8; 10]).unwrap();
+        fs::write(selected.join("b.jpg"), vec![2u8; 20]).unwrap();
+        fs::write(selected.join("nested").join("c.mp4"), vec![3u8; 30]).unwrap();
+        fs::write(source.join("outside.mp4"), vec![4u8; 40]).unwrap();
+        let handle = store
+            .start_scan(
+                ScanRequest {
+                    root: source.to_string_lossy().into_owned(),
+                    threads: 2,
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
+        for _ in 0..200 {
+            let status = store.scan_status(&handle.scan_id).unwrap();
+            if status.status != "scanning" {
+                assert_eq!(status.status, "done");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let directory = store
+            .query_nodes(ScanQuery {
+                scan_id: handle.scan_id.clone(),
+                parent_id: None,
+                search: "name:selected".to_string(),
+                directories_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(directory.items.len(), 1);
+        let first = store
+            .query_subtree_files(SubtreeFilesQuery {
+                scan_id: handle.scan_id.clone(),
+                directory_id: directory.items[0].id,
+                offset: 0,
+                limit: 2,
+            })
+            .unwrap();
+        assert_eq!(first.items.len(), 2);
+        assert!(first.has_more);
+        let second = store
+            .query_subtree_files(SubtreeFilesQuery {
+                scan_id: handle.scan_id,
+                directory_id: directory.items[0].id,
+                offset: 2,
+                limit: 2,
+            })
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert!(!second.has_more);
+        assert_eq!(
+            first.items.iter().map(|item| item.size).sum::<u64>()
+                + second.items.iter().map(|item| item.size).sum::<u64>(),
+            60
+        );
+        assert!(
+            first
+                .items
+                .iter()
+                .all(|item| !item.path.ends_with("outside.mp4"))
+        );
     }
 
     #[test]

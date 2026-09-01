@@ -16,7 +16,7 @@ import {
   notify,
   fetchSubtreeFiles,
 } from "./api/client";
-import type { AppSettings } from "./api/client";
+import type { AppSettings, CompressionSourceFile } from "./api/client";
 import { isTauriV2 } from "./api/v2";
 import type { DriveEntry, SpecialFolder, SortKey, Unit, ScanResult, TagEntry, SmartFolder, NodeRecord } from "./api/types";
 import { isActiveRule } from "./hooks/useFilterRules";
@@ -335,7 +335,7 @@ export default function App() {
   // Files to pre-check when the Compress view opens from the table's right-click
   // "Compress..." action. One-shot: CompressView applies them then signals back
   // via onInitialApplied so this clears and manual edits stick across re-renders.
-  const [compressInitialPaths, setCompressInitialPaths] = useState<string[]>([]);
+  const [compressInitialFiles, setCompressInitialFiles] = useState<CompressionSourceFile[]>([]);
 
   // Integrated terminal (global bottom panel). Mounted lazily on first open and
   // kept mounted thereafter so sessions survive hiding the panel.
@@ -1077,8 +1077,8 @@ export default function App() {
   // Load `filePaths` into the Compress page and switch to it. Shared by the
   // native right-click "Compress…" action and the in-app quick "Compress"
   // button so both routes behave identically.
-  const openCompressWith = useCallback((filePaths: string[] = []) => {
-    setCompressInitialPaths(filePaths);
+  const openCompressWith = useCallback((files: CompressionSourceFile[] = []) => {
+    setCompressInitialFiles(files);
     // Open the Compress activity view (mirrors handleSelectView, inlined to
     // avoid a forward reference since this is declared earlier in the file).
     setActiveView("compress");
@@ -1108,8 +1108,8 @@ export default function App() {
     const nodeById = active?.getNodeById();
     const scan = active?.getData();
     // LAZY mode: the renderer doesn't hold whole subtrees, so a folder's
-    // descendant files must come from the backend (GET /api/subtree-files)
-    // instead of walking the partial in-memory children.
+    // descendant files must come from the paged backend query instead of
+    // walking the partial in-memory children.
     const lazy = !!scan?.lazy;
     const rootPath = scan?.rootPath ?? "";
     const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
@@ -1120,16 +1120,17 @@ export default function App() {
       }
     }
 
-    const result: string[] = [];
+    const result: CompressionSourceFile[] = [];
     const seen = new Set<string>();
-    const pushFilePath = (p: string) => {
-      if (!p || seen.has(p)) return;
-      seen.add(p);
-      result.push(p);
+    const pushFilePath = (p: string, size = 0) => {
+      const key = norm(p);
+      if (!p || seen.has(key)) return;
+      seen.add(key);
+      result.push({ path: p, size });
     };
     const pushFile = (node: NodeRecord) => {
       if (node.dir || node.id < 0 || !node.path) return;
-      pushFilePath(node.path);
+      pushFilePath(node.path, node.size);
     };
 
     const run = async () => {
@@ -1147,8 +1148,12 @@ export default function App() {
         if (lazy) {
           // Folder in lazy mode: ask the backend for every descendant file path.
           try {
-            const files = await fetchSubtreeFiles(rootPath, node.id);
-            for (const f of files) pushFilePath(f);
+            const files = await fetchSubtreeFiles({
+              rootPath,
+              scanId: scan?.scanId,
+              dirId: node.id,
+            });
+            for (const file of files) pushFilePath(file.path, file.size);
           } catch (err) {
             console.warn("subtree-files fetch failed for", node.path, err);
           }
@@ -1170,8 +1175,8 @@ export default function App() {
 
   // Quick "Compress" button (TreeTable row action): WorkspaceTab has already
   // expanded folders/selections to concrete file paths, so just load them.
-  const handleCompressPaths = useCallback((filePaths: string[]) => {
-    openCompressWith(filePaths);
+  const handleCompressPaths = useCallback((files: CompressionSourceFile[]) => {
+    openCompressWith(files);
   }, [openCompressWith]);
 
   useEffect(() => {
@@ -2013,8 +2018,8 @@ export default function App() {
           <div className="compress-editor">
             <WorkbenchCompress
               store={workbenchStore}
-              initialSelectedPaths={compressInitialPaths}
-              onInitialApplied={() => setCompressInitialPaths([])}
+              initialSelectedFiles={compressInitialFiles}
+              onInitialApplied={() => setCompressInitialFiles([])}
             />
           </div>
         )}
@@ -2284,11 +2289,11 @@ function WorkbenchInspector({
 // [COMPRESSED] outputs appear and recycled originals disappear.
 function WorkbenchCompress({
   store,
-  initialSelectedPaths,
+  initialSelectedFiles,
   onInitialApplied,
 }: {
   store: WorkbenchStore;
-  initialSelectedPaths?: string[];
+  initialSelectedFiles?: CompressionSourceFile[];
   onInitialApplied?: () => void;
 }) {
   const { sidebar: m } = useWorkbench(store);
@@ -2298,7 +2303,7 @@ function WorkbenchCompress({
       scannedRoot={m.data?.rootPath}
       nodeById={m.nodeById}
       onRescan={m.onRefresh}
-      initialSelectedPaths={initialSelectedPaths}
+      initialSelectedFiles={initialSelectedFiles}
       onInitialApplied={onInitialApplied}
     />
   );

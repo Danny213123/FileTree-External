@@ -35,6 +35,7 @@ import {
   testGpuEncoder,
   notify,
   type GpuTestResult,
+  type CompressionSourceFile,
 } from "../api/client";
 import { invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import { formatBytes } from "../utils/formatBytes";
@@ -571,9 +572,9 @@ interface CompressViewProps {
   nodeById: Map<number, NodeRecord>;
   /** Refresh the focused pane's tree (used after a run completes). */
   onRescan: () => void;
-  /** Paths to pre-check when opened from the table's "Compress..." action. */
-  initialSelectedPaths?: string[];
-  /** Called once the initial paths have been applied so the parent can clear
+  /** Files to pre-check when opened from the table's "Compress..." action. */
+  initialSelectedFiles?: CompressionSourceFile[];
+  /** Called once the initial files have been applied so the parent can clear
    *  them (keeps manual edits sticky across re-renders / view switches). */
   onInitialApplied?: () => void;
 }
@@ -714,7 +715,7 @@ export function CompressView({
   scannedRoot,
   nodeById,
   onRescan,
-  initialSelectedPaths,
+  initialSelectedFiles,
   onInitialApplied,
 }: CompressViewProps) {
   const [tab, setTab] = useState<CompressTab>("compress");
@@ -1110,23 +1111,23 @@ export function CompressView({
   }, [nodeById, scopePaths, extraFiles, inRun]);
   idleFilesRef.current = files;
 
-  // Normalized paths of dragged-in external files, used to exempt them from the
-  // start-time stale-tree guard (which only knows about `nodeById`).
+  // Normalized paths of files represented outside the currently loaded tree,
+  // used to exempt them from the start-time stale-tree guard (which only knows
+  // about `nodeById`). This includes dropped files and unloaded lazy descendants.
   const externalPathSet = useMemo(
     () => new Set(extraFiles.map((f) => normPath(f.path))),
     [extraFiles],
   );
 
   // Launch from the table ("Compress…" / row button): scope the view to just the
-  // launched selection and pre-check it. The incoming paths are already concrete
-  // files (WorkspaceTab BFS-expands folders to their descendants before sending),
-  // so we map each to its id in the FULL scan, build the scope from the ones we
-  // found, and surface a non-blocking notice for any that aren't in the scan.
-  // Applied once per request — the parent clears `initialSelectedPaths` via
+  // launched selection and pre-check it. The incoming records are already
+  // concrete files. Files absent from the renderer's bounded lazy page become
+  // synthetic extras so collapsed descendants are not silently discarded.
+  // Applied once per request — the parent clears `initialSelectedFiles` via
   // onInitialApplied, so manual edits (and the "Show all files" escape hatch)
   // stick afterward. Matches against the unscoped tree so it's idempotent.
   useEffect(() => {
-    if (!initialSelectedPaths || initialSelectedPaths.length === 0) return;
+    if (!initialSelectedFiles || initialSelectedFiles.length === 0) return;
     if (nodeById.size === 0) return; // wait until the tree is loaded
     const idByPath = new Map<string, number>();
     for (const node of nodeById.values()) {
@@ -1135,29 +1136,40 @@ export function CompressView({
     }
     const scope = new Set<string>();
     const ids: number[] = [];
-    let missing = 0;
-    for (const p of initialSelectedPaths) {
-      const n = normPath(p);
+    const newExtras: CompressFile[] = [];
+    const extraByPath = new Map(extraFiles.map((file) => [normPath(file.path), file]));
+    for (const file of initialSelectedFiles) {
+      const n = normPath(file.path);
+      if (!n || scope.has(n)) continue;
+      scope.add(n);
       const id = idByPath.get(n);
       if (id !== undefined) {
-        scope.add(n);
         ids.push(id);
       } else {
-        missing += 1;
+        const existing = extraByPath.get(n);
+        if (existing) {
+          ids.push(existing.id);
+          continue;
+        }
+        const synthetic: CompressFile = {
+          id: extraIdRef.current--,
+          path: file.path,
+          name: baseName(file.path),
+          size: file.size,
+          kind: classifyKind(extOf(baseName(file.path))),
+        };
+        extraByPath.set(n, synthetic);
+        newExtras.push(synthetic);
+        ids.push(synthetic.id);
       }
     }
-    // Only enter scoped mode when at least one selected file is in the scan;
-    // if none matched, fall back to the full list and just show the notice.
+    if (newExtras.length > 0) setExtraFiles((current) => [...current, ...newExtras]);
     setScopePaths(scope.size > 0 ? scope : null);
     if (ids.length > 0) setSelected(new Set(ids));
-    setPreselectNotice(
-      missing > 0
-        ? `${missing} selected file${missing === 1 ? "" : "s"} ${missing === 1 ? "isn't" : "aren't"} in the current scan and couldn't be included.`
-        : "",
-    );
+    setPreselectNotice("");
     setTab("compress");
     onInitialApplied?.();
-  }, [initialSelectedPaths, nodeById, onInitialApplied]);
+  }, [initialSelectedFiles, nodeById, extraFiles, onInitialApplied]);
 
   const counts = useMemo(() => {
     let video = 0, image = 0, other = 0;

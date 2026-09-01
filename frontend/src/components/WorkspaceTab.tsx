@@ -12,7 +12,7 @@ import {
   setAttributes, setTimes,
   fetchServerSearch, fetchSubtreeFiles,
 } from "../api/client";
-import type { ScanOptions, ExportFormat } from "../api/client";
+import type { ScanOptions, ExportFormat, CompressionSourceFile } from "../api/client";
 import type { NodeRecord, SortKey, TagEntry } from "../api/types";
 import type { FilterRule } from "../hooks/useFilterRules";
 import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow, type AgentApi } from "../lib/agent";
@@ -340,10 +340,10 @@ interface WorkspaceTabProps {
   heatTint: boolean;
   onClose3D: () => void;
   onToggleBookmark: (path: string) => void;
-  // Quick-load file(s) into the Compress page. Receives concrete file paths
+  // Quick-load file(s) into the Compress page. Receives concrete file metadata
   // (folders already expanded to their contained files) and switches the
   // activity view to Compress — same mechanism as the right-click "Compress…".
-  onCompress: (paths: string[]) => void;
+  onCompress: (files: CompressionSourceFile[]) => void;
   onScanPath: (path: string) => void;
   onStateChange: () => void;
   // Publish this pane's sidebar/status snapshot to the shared workbench store
@@ -1203,8 +1203,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // Quick "Compress" row action. Mirrors handleContextMenu's target rule: when
   // the clicked row is part of a multi-selection, act on the whole selection;
   // otherwise act on just that row. Folders are expanded to their contained
-  // files (BFS over nodeById children) so the Compress page receives concrete
-  // file paths — files only, deduped, order-stable.
+  // files so the Compress page receives concrete file metadata — files only,
+  // deduped, order-stable. Lazy scans use a bounded paged backend query because
+  // collapsed descendants are intentionally absent from nodeById.
   const handleCompress = useCallback((id: number) => {
     const t = treeRef.current;
     const selIds = selectedIdsRef.current;
@@ -1213,19 +1214,25 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     const lazy = !!scan?.lazy;
     const rootPath = scan?.rootPath ?? "";
 
-    const filePaths: string[] = [];
+    const filesToCompress: CompressionSourceFile[] = [];
     const seen = new Set<string>();
-    const pushFilePath = (p: string) => {
-      if (!p || seen.has(p)) return;
-      seen.add(p);
-      filePaths.push(p);
+    const normalizePath = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    const pushFilePath = (p: string, size = 0) => {
+      const key = normalizePath(p);
+      if (!p || seen.has(key)) return;
+      seen.add(key);
+      filesToCompress.push({ path: p, size });
     };
     const pushFile = (node: NodeRecord) => {
       if (node.dir || node.id < 0 || !node.path) return;
-      pushFilePath(node.path);
+      pushFilePath(node.path, node.size);
     };
 
+    const containsFolder = targetIds.some((tid) => t.nodeById.get(tid)?.dir);
+    if (containsFolder) onCompress([]);
+
     const run = async () => {
+      let loadFailed = false;
       for (const tid of targetIds) {
         const node = t.nodeById.get(tid);
         if (!node) continue;
@@ -1236,10 +1243,16 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         if (lazy) {
           // LAZY: descendant files come from the backend, not the partial tree.
           try {
-            const files = await fetchSubtreeFiles(rootPath, node.id);
-            for (const f of files) pushFilePath(f);
+            const files = await fetchSubtreeFiles({
+              rootPath,
+              scanId: scan?.scanId,
+              dirId: node.id,
+            });
+            for (const file of files) pushFilePath(file.path, file.size);
           } catch (err) {
+            loadFailed = true;
             console.warn("subtree-files fetch failed for", node.path, err);
+            toast.error(`Couldn't load files from ${node.name}: ${err instanceof Error ? err.message : String(err)}`);
           }
           continue;
         }
@@ -1252,7 +1265,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           for (const childId of cur.children) queue.push(childId);
         }
       }
-      if (filePaths.length > 0) onCompress(filePaths);
+      if (filesToCompress.length > 0) onCompress(filesToCompress);
+      else if (containsFolder && !loadFailed) toast.info("This folder has no files to compress.");
     };
     void run();
   }, [onCompress]);
