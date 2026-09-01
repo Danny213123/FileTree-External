@@ -501,6 +501,20 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const statusRef = useRef(status);
   statusRef.current = status;
 
+  // Deferred watcher entries for lazy, unopened branches are retained so they
+  // can be reconciled on expansion, but they do not make the rows currently on
+  // screen stale. This keeps the warning scoped to data the user can see.
+  const hasLoadedDirtyDirectories = useCallback((): boolean => {
+    const loadedKeys = new Set<string>();
+    for (const node of nodeByPathRef.current.values()) {
+      if (node.dir && node.path) loadedKeys.add(normFolderKey(node.path));
+    }
+    for (const key of dirtyDirectoriesRef.current.keys()) {
+      if (loadedKeys.has(key)) return true;
+    }
+    return false;
+  }, []);
+
   const doScan = useCallback((path?: string, t?: number, forceFresh?: boolean) => {
     const p = path ?? scanPath;
     if (!p.trim()) return;
@@ -556,9 +570,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       }
       marked.push(path);
     }
-    if (dirtyDirectoriesRef.current.size > 0 || dirtyDirectoryOverflowRef.current) setResultsStale(true);
+    if (hasLoadedDirtyDirectories() || dirtyDirectoryOverflowRef.current) setResultsStale(true);
     return marked;
-  }, []);
+  }, [hasLoadedDirtyDirectories]);
 
   const markMutationPathsDirty = useCallback((paths: string[]): string[] => {
     const loadedByKey = new Map<string, NodeRecord>();
@@ -589,7 +603,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       if (loaded) requested.set(key, loaded.path);
     }
     if (requested.size === 0) {
-      setResultsStale(dirtyDirectoriesRef.current.size > 0 || dirtyDirectoryOverflowRef.current);
+      setResultsStale(hasLoadedDirtyDirectories() || dirtyDirectoryOverflowRef.current);
       return 0;
     }
 
@@ -647,10 +661,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       }
     } finally {
       patchInFlightRef.current = false;
-      setResultsStale(dirtyDirectoriesRef.current.size > 0 || dirtyDirectoryOverflowRef.current);
+      setResultsStale(hasLoadedDirtyDirectories() || dirtyDirectoryOverflowRef.current);
     }
     return patched;
-  }, [threads, includeHidden, followLinks, collectOwners, exclude]);
+  }, [threads, includeHidden, followLinks, collectOwners, exclude, hasLoadedDirtyDirectories]);
 
   const schedulePendingMutationRefresh = useCallback(() => {
     if (!pendingMutationRefreshRef.current || !activeRef.current || statusRef.current === "scanning") return;
@@ -842,7 +856,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         if (node) dirs.push(node.path);
       }
       pendingChangesRef.current.clear();
-      setResultsStale(dirtyDirectoriesRef.current.size > 0 || dirtyDirectoryOverflowRef.current);
+      setResultsStale(hasLoadedDirtyDirectories() || dirtyDirectoryOverflowRef.current);
       if (dirs.length === 0) return;
 
       await refreshDirectories(dirs);
@@ -881,7 +895,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       catch { /* ignore malformed legacy watcher messages */ }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [markDirtyDirectories, refreshDirectories]);
+  }, [markDirtyDirectories, refreshDirectories, hasLoadedDirtyDirectories]);
 
   useEffect(() => () => {
     watchGenerationRef.current++;
@@ -2018,6 +2032,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       if (dirty.length > 0 || overflowed) {
         const patched = await refreshDirectories(dirty);
         const unresolved = dirtyDirectoriesRef.current.size;
+        // The explicit refresh acknowledges an overflow after reconciling all
+        // loaded branches. Unknown lazy branches stay queued, but no longer
+        // hold the visible-results warning open.
+        dirtyDirectoryOverflowRef.current = false;
+        setResultsStale(hasLoadedDirtyDirectories());
         if (unresolved > 0 || overflowed) {
           const pending = `${unresolved}${overflowed ? "+" : ""}`;
           const prefix = patched > 0
@@ -2044,7 +2063,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     } finally {
       smartRefreshInFlightRef.current = false;
     }
-  }, [status, refreshDirectories]);
+  }, [status, refreshDirectories, hasLoadedDirtyDirectories]);
 
   // ── Agent API facade (used by the right-side ChatPanel) ──────────────────
   const agentApi = useMemo<AgentApi>(() => ({

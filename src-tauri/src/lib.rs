@@ -18,6 +18,8 @@ use tauri::ipc::Channel;
 use tauri::window::{ProgressBarState, ProgressBarStatus};
 use tauri::{AppHandle, Manager, State};
 
+mod terminal;
+
 struct FsWatchRegistry {
     next_id: AtomicU64,
     watchers: Mutex<HashMap<u64, FsWatchEntry>>,
@@ -736,6 +738,7 @@ pub fn run() {
         .manage(store)
         .manage(runtime)
         .manage(FsWatchRegistry::default())
+        .manage(Arc::new(terminal::TerminalRegistry::default()))
         .invoke_handler(tauri::generate_handler![
             app_version,
             app_config,
@@ -754,6 +757,11 @@ pub fn run() {
             directory_snapshot,
             file_icon,
             file_thumbnail,
+            terminal::terminal_profiles,
+            terminal::terminal_spawn,
+            terminal::terminal_write,
+            terminal::terminal_resize,
+            terminal::terminal_kill,
             secret_get,
             secret_set,
             secret_delete,
@@ -775,9 +783,12 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("build FileTree v2");
-    app.run(|_, event| {
+    app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
             filetree_core::set_keep_awake(false);
+            app_handle
+                .state::<Arc<terminal::TerminalRegistry>>()
+                .kill_all();
         }
     });
 }

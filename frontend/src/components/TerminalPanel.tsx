@@ -2,22 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import { getTerminalAPI, type TerminalProfile } from "../api/terminal";
 import { Icon } from "./Icon";
-
-// ── Electron bridge (terminal slice) ──────────────────────────────────────────
-interface TerminalAPI {
-  profiles: () => Promise<{ id: string; label: string }[]>;
-  spawn: (profileId: string, cwd: string, cols: number, rows: number) => Promise<{ id: number; title: string }>;
-  write: (id: number, data: string) => void;
-  resize: (id: number, cols: number, rows: number) => void;
-  kill: (id: number) => void;
-  onData: (cb: (id: number, data: Uint8Array) => void) => () => void;
-  onExit: (cb: (id: number, code: number) => void) => () => void;
-}
-
-function getTerminalAPI(): TerminalAPI | null {
-  return (window as unknown as { electronAPI?: { terminal?: TerminalAPI } }).electronAPI?.terminal ?? null;
-}
 
 // ── Clipboard helpers ─────────────────────────────────────────────────────────
 // Prefer the async web Clipboard API (available in the Electron renderer). If the
@@ -78,8 +64,6 @@ interface Session {
   cwd: string;
   title: string;
 }
-
-interface TerminalProfile { id: string; label: string; }
 
 interface TerminalPanelProps {
   open: boolean;
