@@ -914,13 +914,15 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       const byId = new Map<number, NodeRecord>();
       for (const n of merged) byId.set(n.id, n);
 
-      // Re-aggregate size/counts from changedPath up to the root. We start AT
+      // Re-aggregate size/counts and newest modified time from changedPath up
+      // to the root. We start AT
       // changedPath (not its parent): the shallow scan undercounts it because the
       // subfolder stubs reported 0. A file node carries files=1; a dir carries
       // its subtree totals — so summing children is correct and convention-safe.
       let cur: NodeRecord | null | undefined = byId.get(targetNode.id);
       while (cur) {
         let size = 0, allocated = 0, files = 0, folders = 0, errors = 0;
+        let modified = cur.modified;
         for (const cid of cur.children) {
           const child = byId.get(cid);
           if (!child) continue;
@@ -928,6 +930,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
           files += child.files;
           folders += child.folders + (child.dir ? 1 : 0);
           errors += child.errors;
+          modified = Math.max(modified, child.modified);
         }
         // update in-place (safe since we own these objects from the spread)
         (cur as NodeRecord).size = size;
@@ -935,6 +938,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
         (cur as NodeRecord).files = files;
         (cur as NodeRecord).folders = folders;
         (cur as NodeRecord).errors = errors;
+        (cur as NodeRecord).modified = modified;
         cur = cur.parent != null ? byId.get(cur.parent) : null;
       }
 

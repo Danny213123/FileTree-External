@@ -129,7 +129,9 @@ describe("useTreeState watcher patches", () => {
       scanId: "scan-1",
     };
     const { result } = renderHook(() => useTreeState(lazy));
-    act(() => result.current.setNodes([node({ children: [] })]));
+    const oldModified = new Date("2025-01-24T12:00:00Z").getTime();
+    const newModified = new Date("2026-08-31T12:00:00Z").getTime();
+    act(() => result.current.setNodes([node({ children: [], modified: oldModified })]));
 
     act(() => result.current.patchDirectory("E:\\", [
       node({ children: [1] }),
@@ -144,6 +146,7 @@ describe("useTreeState watcher patches", () => {
         allocated: 8192,
         files: 2,
         folders: 1,
+        modified: newModified,
       }),
     ]));
 
@@ -151,6 +154,7 @@ describe("useTreeState watcher patches", () => {
       expect(result.current.nodeById.get(0)?.size).toBe(6144);
       expect(result.current.nodeById.get(0)?.files).toBe(2);
       expect(result.current.nodeById.get(0)?.folders).toBe(2);
+      expect(result.current.nodeById.get(0)?.modified).toBe(newModified);
     });
   });
 });
