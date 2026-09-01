@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle, useSyncExternalStore, memo } from "react";
 import { useScan, fetchScanStream } from "../hooks/useScan";
-import { useTreeState, type ChipKey, type LazyOptions } from "../hooks/useTreeState";
+import { isLiveNodeId, useTreeState, type ChipKey, type LazyOptions } from "../hooks/useTreeState";
 import { invalidate as invalidateScanCache } from "../lib/scanCache";
 import {
   revealPath, openPath, createFolder,
@@ -486,6 +486,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // has been grafted into the loaded tree. Unknown lazy branches stay dirty and
   // are retried when the user expands them; they never force a full drive scan.
   const dirtyDirectoriesRef = useRef<Map<string, string>>(new Map());
+  // Paths absent from the immutable scan index need one bounded recursive
+  // summary after their parent listing discovers them.
+  const aggregateDirectoriesRef = useRef<Set<string>>(new Set());
   const dirtyDirectoryOverflowRef = useRef(false);
   const suppressWatchRef = useRef(false);
   // Skip stacking watch patches: a new batch is dropped/retried while one runs.
@@ -531,6 +534,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     // The user explicitly (re)scanned, so any "results stale" badge no longer
     // applies; clear it now (it re-arms if the watcher sees new off-screen churn).
     dirtyDirectoriesRef.current.clear();
+    aggregateDirectoriesRef.current.clear();
     dirtyDirectoryOverflowRef.current = false;
     setResultsStale(false);
     if (isRefresh) {
@@ -596,11 +600,23 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     for (const node of nodeByPathRef.current.values()) {
       if (node.dir && node.path) loadedByKey.set(normFolderKey(node.path), node);
     }
-    const requested = new Map<string, string>();
+    const requested = new Map<string, { path: string; recursiveAggregates: boolean }>();
     for (const directory of directories) {
       const key = normFolderKey(directory);
       const loaded = loadedByKey.get(key);
-      if (loaded) requested.set(key, loaded.path);
+      if (loaded) {
+        requested.set(key, {
+          path: loaded.path,
+          // Watcher-created directories are absent from the immutable SQLite
+          // index. Fill their recursive totals once, while ordinary refreshes
+          // remain cheap one-level listings.
+          recursiveAggregates: aggregateDirectoriesRef.current.has(key)
+            || (isLiveNodeId(loaded.id)
+              && loaded.size === 0
+              && loaded.files === 0
+              && loaded.folders === 0),
+        });
+      }
     }
     if (requested.size === 0) {
       setResultsStale(hasLoadedDirtyDirectories() || dirtyDirectoryOverflowRef.current);
@@ -615,15 +631,20 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     try {
       for (let offset = 0; offset < entries.length; offset += WATCH_MAX_BATCH) {
         const batch = entries.slice(offset, offset + WATCH_MAX_BATCH);
-        const refreshed = await Promise.all(batch.map(async ([key, dir]) => {
-          invalidateScanCache(dir);
+        const refreshed = await Promise.all(batch.map(async ([key, request]) => {
+          invalidateScanCache(request.path);
           try {
             if (isTauriV2()) {
-              const nodes = await fetchV2DirectorySnapshot(dir);
-              return nodes.length ? { key, dir, nodes } : null;
+              const nodes = await fetchV2DirectorySnapshot(request.path, request.recursiveAggregates);
+              return nodes.length ? {
+                key,
+                dir: request.path,
+                nodes,
+                recursiveAggregates: request.recursiveAggregates,
+              } : null;
             }
             const result = await fetchScanStream({
-              path: dir,
+              path: request.path,
               threads,
               includeHidden,
               followLinks,
@@ -632,22 +653,50 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               maxDepth: 1,
               nocache: true,
             });
-            return result?.nodes?.length ? { key, dir, nodes: result.nodes } : null;
+            return result?.nodes?.length ? {
+              key,
+              dir: request.path,
+              nodes: result.nodes,
+              recursiveAggregates: request.recursiveAggregates,
+            } : null;
           } catch {
             return null;
           }
         }));
         for (const snapshot of refreshed) {
           if (!snapshot) continue;
+          const targetBeforePatch = loadedByKey.get(snapshot.key);
+          const listingWasLoaded = !dataRef.current?.lazy
+            || targetBeforePatch?.id === 0
+            || (targetBeforePatch != null && treeRef.current.loadedDirs.has(targetBeforePatch.id));
+          const aggregateFollowups: string[] = [];
+          if (!snapshot.recursiveAggregates && listingWasLoaded) {
+            for (const child of snapshot.nodes) {
+              if (!child.dir || child.id === 0 || !child.path) continue;
+              const childKey = normFolderKey(child.path);
+              const existing = loadedByKey.get(childKey);
+              const unresolvedLiveDirectory = existing != null
+                && isLiveNodeId(existing.id)
+                && existing.size === 0
+                && existing.files === 0
+                && existing.folders === 0;
+              if (!existing || unresolvedLiveDirectory) {
+                aggregateDirectoriesRef.current.add(childKey);
+                aggregateFollowups.push(child.path);
+              }
+            }
+          }
           treeRef.current.patchDirectory(snapshot.dir, snapshot.nodes);
           dirtyDirectoriesRef.current.delete(snapshot.key);
+          if (snapshot.recursiveAggregates) aggregateDirectoriesRef.current.delete(snapshot.key);
+          if (aggregateFollowups.length > 0) markDirtyDirectories(aggregateFollowups);
           refreshedDirectories.add(snapshot.key);
           patched++;
         }
         for (let batchIndex = 0; batchIndex < batch.length; batchIndex++) {
           if (!refreshed[batchIndex]) {
-            const [key, dir] = batch[batchIndex];
-            failedSnapshots.push({ key, dir });
+            const [key, request] = batch[batchIndex];
+            failedSnapshots.push({ key, dir: request.path });
           }
         }
       }
@@ -664,7 +713,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       setResultsStale(hasLoadedDirtyDirectories() || dirtyDirectoryOverflowRef.current);
     }
     return patched;
-  }, [threads, includeHidden, followLinks, collectOwners, exclude, hasLoadedDirtyDirectories]);
+  }, [threads, includeHidden, followLinks, collectOwners, exclude, hasLoadedDirtyDirectories, markDirtyDirectories]);
 
   const schedulePendingMutationRefresh = useCallback(() => {
     if (!pendingMutationRefreshRef.current || !activeRef.current || statusRef.current === "scanning") return;
@@ -879,6 +928,21 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             return;
           }
           v2WatchIdRef.current = watchId;
+          const reconcileLoadedBranches = () => {
+            if (generation !== watchGenerationRef.current || !activeRef.current) return;
+            const visibleDirectories = new Set<string>([rootPath]);
+            const currentTree = treeRef.current;
+            for (const node of currentTree.nodeById.values()) {
+              if (node.dir && node.path && currentTree.expanded.has(node.id)) {
+                visibleDirectories.add(node.path);
+              }
+            }
+            queueChangedDirectories(Array.from(visibleDirectories));
+          };
+          // Reconcile restored rows immediately, then once more after lazy
+          // expansion state has rehydrated from the SQLite page cache.
+          reconcileLoadedBranches();
+          window.setTimeout(reconcileLoadedBranches, 500);
         })
         .catch((error: unknown) => {
           console.warn("Could not start the native filesystem watcher", error);

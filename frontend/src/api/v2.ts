@@ -90,8 +90,11 @@ export async function stopV2FilesystemWatch(watchId: number): Promise<void> {
   await invoke("fs_watch_stop", { watchId });
 }
 
-export async function fetchV2DirectorySnapshot(path: string): Promise<NodeRecord[]> {
-  return invoke<NodeRecord[]>("directory_snapshot", { path });
+export async function fetchV2DirectorySnapshot(
+  path: string,
+  recursiveAggregates = false,
+): Promise<NodeRecord[]> {
+  return invoke<NodeRecord[]>("directory_snapshot", { path, recursiveAggregates });
 }
 
 export function toNodeRecord(item: V2NodeItem): NodeRecord {

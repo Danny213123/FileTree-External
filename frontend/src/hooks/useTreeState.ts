@@ -122,6 +122,10 @@ export interface LazyOptions {
 const LIVE_NODE_ID_START = 9_000_000_000_000_000;
 const LIVE_NODE_ID_FLOOR = 8_000_000_000_000_000;
 
+export function isLiveNodeId(id: number): boolean {
+  return id >= LIVE_NODE_ID_FLOOR && id <= LIVE_NODE_ID_START;
+}
+
 function normalizedNodePath(path: string): string {
   return path.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
 }
@@ -553,7 +557,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
     // SQLite scan was built. Its reserved id cannot be paged from that database,
     // so read exactly one live filesystem level and graft it into the tree. Any
     // nested directories stay lazy and follow this same path when opened.
-    if (dirId >= LIVE_NODE_ID_FLOOR && directory.path && lz.loadDirectory) {
+    if (isLiveNodeId(dirId) && directory.path && lz.loadDirectory) {
       const requestPath = directory.path;
       void lz.loadDirectory(requestPath)
         .then((snapshot) => {

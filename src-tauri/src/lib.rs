@@ -65,10 +65,8 @@ fn fs_watch_start(
         if let Ok(mut changed_dirs) = callback_pending.lock() {
             match result {
                 Ok(event) => {
-                    for path in event.paths {
-                        if let Some(parent) = path.parent() {
-                            changed_dirs.insert(parent.to_string_lossy().into_owned());
-                        }
+                    for directory in watch_directories_for_paths(event.paths) {
+                        changed_dirs.insert(directory);
                     }
                 }
                 // notify reports backend overflows/errors without reliable item
@@ -108,6 +106,24 @@ fn fs_watch_start(
 
 const WATCH_IDLE_WINDOW: Duration = Duration::from_millis(40);
 const WATCH_MAX_WINDOW: Duration = Duration::from_millis(120);
+
+fn watch_directories_for_paths(paths: Vec<PathBuf>) -> Vec<String> {
+    let mut directories = Vec::with_capacity(paths.len() * 2);
+    for path in paths {
+        // A create/rename into the watched tree must refresh both the parent's
+        // entry list and the new directory's recursive aggregate. Keeping the
+        // directory itself in the batch lets the lazy renderer fill its size
+        // after the parent has grafted the new row.
+        let is_directory = path.is_dir();
+        if let Some(parent) = path.parent() {
+            directories.push(parent.to_string_lossy().into_owned());
+        }
+        if is_directory {
+            directories.push(path.to_string_lossy().into_owned());
+        }
+    }
+    directories
+}
 
 fn collapse_changed_directories(mut directories: Vec<String>) -> Vec<String> {
     directories.sort_by_key(|path| path.len());
@@ -172,6 +188,31 @@ fn fs_watch_stop(registry: State<'_, FsWatchRegistry>, watch_id: u64) -> Result<
 
 const DIRECTORY_SNAPSHOT_LIMIT: usize = 50_000;
 
+#[derive(Default)]
+struct DirectoryAggregate {
+    size: u64,
+    allocated: u64,
+    files: u64,
+    folders: u64,
+    errors: u64,
+    modified: u64,
+}
+
+#[cfg(windows)]
+fn metadata_attributes(metadata: &fs::Metadata) -> u32 {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes()
+}
+
+#[cfg(not(windows))]
+fn metadata_attributes(_metadata: &fs::Metadata) -> u32 {
+    0
+}
+
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata_attributes(metadata) & 0x400 != 0
+}
+
 fn time_ms(value: Result<SystemTime, std::io::Error>) -> u64 {
     value
         .ok()
@@ -180,7 +221,65 @@ fn time_ms(value: Result<SystemTime, std::io::Error>) -> u64 {
         .unwrap_or(0)
 }
 
-fn directory_snapshot_rows(path: PathBuf) -> Result<Vec<Value>, String> {
+// Recursively summarize one newly-created/moved branch without retaining its
+// complete node tree. Memory is bounded by the directory traversal frontier,
+// and existing branches continue to use the cheap one-level snapshot.
+fn summarize_directory(path: &Path) -> DirectoryAggregate {
+    let mut aggregate = DirectoryAggregate::default();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => {
+                aggregate.errors = aggregate.errors.saturating_add(1);
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    aggregate.errors = aggregate.errors.saturating_add(1);
+                    continue;
+                }
+            };
+            let entry_path = entry.path();
+            let link_metadata = match fs::symlink_metadata(&entry_path) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    aggregate.errors = aggregate.errors.saturating_add(1);
+                    continue;
+                }
+            };
+            let is_link = link_metadata.file_type().is_symlink();
+            let is_reparse = is_reparse_point(&link_metadata);
+            let metadata = if is_link {
+                fs::metadata(&entry_path).unwrap_or(link_metadata)
+            } else {
+                link_metadata
+            };
+            aggregate.modified = aggregate.modified.max(time_ms(metadata.modified()));
+            if metadata.is_dir() {
+                aggregate.folders = aggregate.folders.saturating_add(1);
+                if !is_link && !is_reparse {
+                    pending.push(entry_path);
+                }
+            } else {
+                aggregate.files = aggregate.files.saturating_add(1);
+                aggregate.size = aggregate.size.saturating_add(metadata.len());
+                // The live refresh path does not need an allocation-size system
+                // call per file. Logical bytes are a stable bounded fallback.
+                aggregate.allocated = aggregate.allocated.saturating_add(metadata.len());
+            }
+        }
+    }
+    aggregate
+}
+
+fn directory_snapshot_rows(
+    path: PathBuf,
+    recursive_aggregates: bool,
+) -> Result<Vec<Value>, String> {
     let entries = fs::read_dir(&path)
         .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
     let mut children = Vec::new();
@@ -201,7 +300,22 @@ fn directory_snapshot_rows(path: PathBuf) -> Result<Vec<Value>, String> {
             link_metadata
         };
         let is_dir = metadata.is_dir();
-        let size = if is_dir { 0 } else { metadata.len() };
+        let aggregate = if is_dir && recursive_aggregates {
+            summarize_directory(&entry_path)
+        } else {
+            DirectoryAggregate::default()
+        };
+        let size = if is_dir {
+            aggregate.size
+        } else {
+            metadata.len()
+        };
+        let allocated = if is_dir {
+            aggregate.allocated
+        } else {
+            metadata.len()
+        };
+        let attributes = metadata_attributes(&metadata);
         let name = entry.file_name().to_string_lossy().into_owned();
         let extension = if is_dir {
             String::new()
@@ -219,26 +333,27 @@ fn directory_snapshot_rows(path: PathBuf) -> Result<Vec<Value>, String> {
             "path": entry_path.to_string_lossy(),
             "dir": is_dir,
             "link": is_link,
-            "hidden": false,
+            "hidden": attributes & 0x2 != 0,
             "readonly": metadata.permissions().readonly(),
             "size": size,
-            "allocated": size,
-            "files": 0,
-            "folders": 0,
-            "modified": time_ms(metadata.modified()),
+            "allocated": allocated,
+            "files": if is_dir { aggregate.files } else { 1 },
+            "folders": if is_dir { aggregate.folders } else { 0 },
+            "modified": time_ms(metadata.modified()).max(aggregate.modified),
             "created": time_ms(metadata.created()),
             "accessed": time_ms(metadata.accessed()),
             "depth": 1,
-            "errors": 0,
+            "errors": if is_dir { aggregate.errors } else { 0 },
             "extension": extension,
             "children": [],
             "owner": "",
-            "attributes": 0
+            "attributes": attributes
         }));
     }
 
     let root_metadata = fs::metadata(&path)
         .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    let root_attributes = metadata_attributes(&root_metadata);
     let root_name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -251,7 +366,7 @@ fn directory_snapshot_rows(path: PathBuf) -> Result<Vec<Value>, String> {
         "path": path.to_string_lossy(),
         "dir": true,
         "link": false,
-        "hidden": false,
+        "hidden": root_attributes & 0x2 != 0,
         "readonly": root_metadata.permissions().readonly(),
         "size": 0,
         "allocated": 0,
@@ -265,7 +380,7 @@ fn directory_snapshot_rows(path: PathBuf) -> Result<Vec<Value>, String> {
         "extension": "",
         "children": child_ids,
         "owner": "",
-        "attributes": 0
+        "attributes": root_attributes
     });
     let mut rows = Vec::with_capacity(children.len() + 1);
     rows.push(root);
@@ -277,16 +392,21 @@ fn directory_snapshot_rows(path: PathBuf) -> Result<Vec<Value>, String> {
 async fn directory_snapshot(
     state: State<'_, Arc<V2Store>>,
     path: String,
+    recursive_aggregates: Option<bool>,
 ) -> Result<Vec<Value>, String> {
     require_authorized_path(&state, &path)?;
-    tauri::async_runtime::spawn_blocking(move || directory_snapshot_rows(PathBuf::from(path)))
-        .await
-        .map_err(|error| format!("Folder snapshot worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        directory_snapshot_rows(PathBuf::from(path), recursive_aggregates.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("Folder snapshot worker failed: {error}"))?
 }
 
 #[cfg(test)]
 mod desktop_tests {
-    use super::{collapse_changed_directories, directory_snapshot_rows};
+    use super::{
+        collapse_changed_directories, directory_snapshot_rows, watch_directories_for_paths,
+    };
     use std::fs;
 
     #[test]
@@ -300,13 +420,43 @@ mod desktop_tests {
                 .as_nanos()
         ));
         fs::create_dir_all(root.join("destination")).expect("create test folder");
-        let first = directory_snapshot_rows(root.clone()).expect("first snapshot");
+        let first = directory_snapshot_rows(root.clone(), false).expect("first snapshot");
         assert!(first.iter().any(|row| row["name"] == "destination"));
 
         fs::remove_dir(root.join("destination")).expect("remove test folder");
-        let second = directory_snapshot_rows(root.clone()).expect("second snapshot");
+        let second = directory_snapshot_rows(root.clone(), false).expect("second snapshot");
         assert!(!second.iter().any(|row| row["name"] == "destination"));
         fs::remove_dir(root).expect("remove test root");
+    }
+
+    #[test]
+    fn directory_snapshot_can_aggregate_a_new_branch() {
+        let root = std::env::temp_dir().join(format!(
+            "filetree_desktop_aggregate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("moved").join("nested")).expect("create nested folder");
+        fs::write(root.join("moved").join("clip.bin"), [1_u8, 2, 3, 4]).expect("write direct file");
+        fs::write(
+            root.join("moved").join("nested").join("image.bin"),
+            [5_u8, 6],
+        )
+        .expect("write nested file");
+
+        let rows = directory_snapshot_rows(root.clone(), true).expect("aggregate snapshot");
+        let moved = rows
+            .iter()
+            .find(|row| row["name"] == "moved")
+            .expect("moved row");
+        assert_eq!(moved["size"], 6);
+        assert_eq!(moved["files"], 2);
+        assert_eq!(moved["folders"], 1);
+
+        fs::remove_dir_all(root).expect("remove aggregate test root");
     }
 
     #[test]
@@ -329,6 +479,34 @@ mod desktop_tests {
                 .iter()
                 .any(|path| path.eq_ignore_ascii_case(r"e:\other"))
         );
+    }
+
+    #[test]
+    fn watcher_reports_new_directory_and_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "filetree_desktop_watch_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let created = root.join("moved-folder");
+        fs::create_dir_all(&created).expect("create watched folder");
+
+        let directories = watch_directories_for_paths(vec![created.clone()]);
+        assert!(
+            directories
+                .iter()
+                .any(|path| path == root.to_string_lossy().as_ref())
+        );
+        assert!(
+            directories
+                .iter()
+                .any(|path| path == created.to_string_lossy().as_ref())
+        );
+
+        fs::remove_dir_all(root).expect("remove watcher test root");
     }
 }
 

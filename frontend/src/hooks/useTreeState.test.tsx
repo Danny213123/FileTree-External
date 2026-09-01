@@ -120,4 +120,37 @@ describe("useTreeState watcher patches", () => {
       expect(result.current.nodeById.get(8)?.name).toBe("kept.mp4");
     });
   });
+
+  it("propagates watcher-created folder aggregates to the visible root", async () => {
+    const lazy: LazyOptions = {
+      enabled: true,
+      rootPath: "E:\\",
+      scannedAt: 1,
+      scanId: "scan-1",
+    };
+    const { result } = renderHook(() => useTreeState(lazy));
+    act(() => result.current.setNodes([node({ children: [] })]));
+
+    act(() => result.current.patchDirectory("E:\\", [
+      node({ children: [1] }),
+      node({
+        id: 1,
+        parent: 0,
+        path: "E:\\Moved folder",
+        name: "Moved folder",
+        dir: true,
+        depth: 1,
+        size: 6144,
+        allocated: 8192,
+        files: 2,
+        folders: 1,
+      }),
+    ]));
+
+    await waitFor(() => {
+      expect(result.current.nodeById.get(0)?.size).toBe(6144);
+      expect(result.current.nodeById.get(0)?.files).toBe(2);
+      expect(result.current.nodeById.get(0)?.folders).toBe(2);
+    });
+  });
 });
