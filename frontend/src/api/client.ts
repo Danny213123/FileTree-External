@@ -336,7 +336,7 @@ export async function fetchSubtreeFiles(opts: {
         limit: number;
         hasMore: boolean;
       }>("scan_subtree_files", {
-        query: { scanId: opts.scanId, directoryId: opts.dirId, offset, limit: 500 },
+        query: { scanId: opts.scanId, directoryId: opts.dirId, offset, limit: 5_000 },
       });
       files.push(...page.items);
       offset += page.items.length;
@@ -349,6 +349,19 @@ export async function fetchSubtreeFiles(opts: {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = (await res.json()) as { paths?: string[] };
   return (data.paths ?? []).map((path) => ({ path, size: 0 }));
+}
+
+/** Return the largest descendant file for a folder hover without loading its
+ * complete subtree into the renderer. */
+export async function fetchFolderPreview(opts: {
+  scanId: string;
+  dirId: number;
+}): Promise<CompressionSourceFile | null> {
+  if (!isTauriV2()) return null;
+  return invoke<CompressionSourceFile | null>("scan_folder_preview", {
+    scanId: opts.scanId,
+    directoryId: opts.dirId,
+  });
 }
 
 export interface ServerSearchResult {

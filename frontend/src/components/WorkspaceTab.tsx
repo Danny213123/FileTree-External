@@ -1211,7 +1211,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     const selIds = selectedIdsRef.current;
     const targetIds = selIds.has(id) && selIds.size > 1 ? [...selIds] : [id];
     const scan = dataRef.current;
-    const lazy = !!scan?.lazy;
+    // A v2 scan id is authoritative: even a scan that is not marked lazy may
+    // have a bounded renderer cache after incremental refreshes. Always resolve
+    // folders from SQLite when the persisted scan is available.
+    const hasPersistedScan = !!scan?.scanId;
     const rootPath = scan?.rootPath ?? "";
 
     const filesToCompress: CompressionSourceFile[] = [];
@@ -1229,7 +1232,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     };
 
     const containsFolder = targetIds.some((tid) => t.nodeById.get(tid)?.dir);
-    if (containsFolder) onCompress([]);
+    if (containsFolder) toast.info("Loading every file in the selected folder for compression...");
 
     const run = async () => {
       let loadFailed = false;
@@ -1240,8 +1243,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           pushFile(node);
           continue;
         }
-        if (lazy) {
-          // LAZY: descendant files come from the backend, not the partial tree.
+        if (hasPersistedScan) {
+          // V2: descendant files always come from the backend, not the bounded
+          // renderer tree. This is required for drive roots and refreshed tabs.
           try {
             const files = await fetchSubtreeFiles({
               rootPath,
@@ -2616,6 +2620,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               <div className="editor-main">
                 <TreeTable
                   rows={showRows}
+                  scanId={data?.scanId}
                   flat={showFlat}
                   lazy={!!data?.lazy}
                   loadedDirs={tree.loadedDirs}

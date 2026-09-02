@@ -1110,7 +1110,7 @@ export default function App() {
     // LAZY mode: the renderer doesn't hold whole subtrees, so a folder's
     // descendant files must come from the paged backend query instead of
     // walking the partial in-memory children.
-    const lazy = !!scan?.lazy;
+    const hasPersistedScan = !!scan?.scanId;
     const rootPath = scan?.rootPath ?? "";
     const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
     const pathToNode = new Map<string, NodeRecord>();
@@ -1145,8 +1145,9 @@ export default function App() {
           pushFile(node);
           continue;
         }
-        if (lazy) {
-          // Folder in lazy mode: ask the backend for every descendant file path.
+        if (hasPersistedScan) {
+          // A v2 renderer only guarantees a bounded node cache. Resolve every
+          // folder through the persisted scan even if `lazy` is absent/false.
           try {
             const files = await fetchSubtreeFiles({
               rootPath,

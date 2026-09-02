@@ -25,6 +25,7 @@ use crate::model::HashCacheEntry;
 
 pub const TREE_PAGE_DEFAULT: usize = 500;
 pub const TREE_PAGE_MAX: usize = 500;
+pub const SUBTREE_FILE_PAGE_MAX: usize = 5_000;
 pub const COMPRESSION_PAGE_MAX: usize = 250;
 pub const SCAN_CHANNEL_CAPACITY: usize = 8_192;
 pub const SCAN_TRANSACTION_ROWS: usize = 10_000;
@@ -716,7 +717,7 @@ impl V2Store {
         if !safe_scan_id(&query.scan_id) {
             return Err("Invalid scan id".to_string());
         }
-        query.limit = query.limit.clamp(1, TREE_PAGE_MAX);
+        query.limit = query.limit.clamp(1, SUBTREE_FILE_PAGE_MAX);
         let db_path = self.scans_dir.join(format!("{}.db", query.scan_id));
         let conn = open_scan_connection(&db_path).map_err(|error| error.to_string())?;
         let directory_path = conn
@@ -767,6 +768,53 @@ impl V2Store {
             limit: query.limit,
             has_more,
         })
+    }
+
+    /// Return the largest file anywhere below a directory. Folder hover uses
+    /// this single-row query instead of walking the renderer's partial lazy
+    /// tree or transferring the complete subtree over IPC.
+    pub fn query_largest_subtree_file(
+        &self,
+        scan_id: &str,
+        directory_id: i64,
+    ) -> Result<Option<SubtreeFileItem>, String> {
+        if !safe_scan_id(scan_id) {
+            return Err("Invalid scan id".to_string());
+        }
+        let db_path = self.scans_dir.join(format!("{scan_id}.db"));
+        let conn = open_scan_connection(&db_path).map_err(|error| error.to_string())?;
+        let directory_path = conn
+            .query_row(
+                "SELECT dir_path FROM nodes WHERE id=?1 AND is_dir=1",
+                params![directory_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("Directory is not present in scan: {directory_id}"))?;
+        let descendant_pattern = format!("{}\\%", escape_duplicate_like(&directory_path));
+        let item = conn
+            .query_row(
+                r#"SELECT
+                     CASE WHEN p.dir_path IS NULL OR p.dir_path='' THEN n.name
+                          WHEN substr(p.dir_path,-1,1) IN ('\','/') THEN p.dir_path || n.name
+                          ELSE p.dir_path || '\' || n.name END,
+                     n.size
+                   FROM nodes n LEFT JOIN nodes p ON p.id=n.parent_id
+                   WHERE n.is_dir=0 AND (p.dir_path=?1 OR p.dir_path LIKE ?2 ESCAPE '!')
+                   ORDER BY n.size DESC,n.id ASC LIMIT 1"#,
+                params![directory_path, descendant_pattern],
+                |row| {
+                    Ok(SubtreeFileItem {
+                        path: row.get(0)?,
+                        size: row.get::<_, i64>(1)?.max(0) as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        self.touch_scan(scan_id).ok();
+        Ok(item)
     }
 
     /// Find byte-identical files from one or more completed v2 scan indexes.
@@ -3291,7 +3339,7 @@ mod tests {
         assert!(first.has_more);
         let second = store
             .query_subtree_files(SubtreeFilesQuery {
-                scan_id: handle.scan_id,
+                scan_id: handle.scan_id.clone(),
                 directory_id: directory.items[0].id,
                 offset: 2,
                 limit: 2,
@@ -3310,6 +3358,22 @@ mod tests {
                 .iter()
                 .all(|item| !item.path.ends_with("outside.mp4"))
         );
+        let widened = store
+            .query_subtree_files(SubtreeFilesQuery {
+                scan_id: handle.scan_id.clone(),
+                directory_id: directory.items[0].id,
+                offset: 0,
+                limit: usize::MAX,
+            })
+            .unwrap();
+        assert_eq!(widened.limit, SUBTREE_FILE_PAGE_MAX);
+        assert_eq!(widened.items.len(), 3);
+        let preview = store
+            .query_largest_subtree_file(&handle.scan_id, directory.items[0].id)
+            .unwrap()
+            .expect("largest subtree file");
+        assert!(preview.path.ends_with("c.mp4"));
+        assert_eq!(preview.size, 30);
     }
 
     #[test]

@@ -603,6 +603,20 @@ async fn scan_subtree_files(
 }
 
 #[tauri::command]
+async fn scan_folder_preview(
+    state: State<'_, Arc<V2Store>>,
+    scan_id: String,
+    directory_id: i64,
+) -> Result<Option<filetree_core::v2::SubtreeFileItem>, String> {
+    let store = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        store.query_largest_subtree_file(&scan_id, directory_id)
+    })
+    .await
+    .map_err(|error| format!("Folder preview query worker failed: {error}"))?
+}
+
+#[tauri::command]
 async fn duplicates_scan(
     state: State<'_, Arc<V2Store>>,
     registry: State<'_, DuplicateScanRegistry>,
@@ -1055,6 +1069,7 @@ pub fn run() {
             scan_find,
             scan_page,
             scan_subtree_files,
+            scan_folder_preview,
             duplicates_scan,
             duplicates_cancel,
             scan_pin,

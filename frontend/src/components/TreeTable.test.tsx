@@ -21,6 +21,10 @@ vi.mock("../lib/shellImages", () => ({
   loadShellThumbnail: vi.fn(() => Promise.resolve("data:image/png;base64,folder")),
 }));
 
+vi.mock("../api/client", () => ({
+  fetchFolderPreview: vi.fn(() => Promise.resolve({ path: "E:\\Media\\clip.mp4", size: 1024 })),
+}));
+
 vi.mock("./NodeTooltip", () => ({
   NodeTooltip: ({ node, thumbPath }: { node: NodeRecord; thumbPath?: string }) => (
     <div data-testid="node-tooltip" data-node-path={node.path} data-thumb-path={thumbPath ?? ""} />
@@ -28,6 +32,7 @@ vi.mock("./NodeTooltip", () => ({
 }));
 
 import type { NodeRecord } from "../api/types";
+import { fetchFolderPreview } from "../api/client";
 import { loadShellThumbnail } from "../lib/shellImages";
 import { TreeTable } from "./TreeTable";
 
@@ -148,14 +153,16 @@ describe("TreeTable lazy expansion", () => {
     expect(loadedView.container.querySelector("button.twisty")).toBeNull();
   });
 
-  it("uses the hovered folder's own Windows thumbnail instead of a loaded descendant", async () => {
+  it("uses the largest persisted descendant for a folder hover", async () => {
+    vi.mocked(fetchFolderPreview).mockClear();
     vi.mocked(loadShellThumbnail).mockClear();
     const directory = { ...unknownDirectory, children: [file.id], files: 1 };
     const view = render(
       <TreeTable
         rows={[directory]}
+        scanId="folder-hover"
         lazy
-        nodeById={new Map([[directory.id, directory], [file.id, file]])}
+        nodeById={new Map([[directory.id, directory]])}
         expanded={new Set()}
         selectedId={0}
         selectedIds={new Set()}
@@ -179,8 +186,9 @@ describe("TreeTable lazy expansion", () => {
 
     fireEvent.mouseEnter(view.container.querySelector(".name-cell")!);
     const tooltip = await within(view.container).findByTestId("node-tooltip");
-    expect(loadShellThumbnail).toHaveBeenCalledWith(directory.path);
+    expect(fetchFolderPreview).toHaveBeenCalledWith({ scanId: "folder-hover", dirId: directory.id });
+    expect(loadShellThumbnail).toHaveBeenCalledWith(file.path);
     expect(tooltip).toHaveAttribute("data-node-path", directory.path);
-    expect(tooltip).toHaveAttribute("data-thumb-path", directory.path);
+    expect(tooltip).toHaveAttribute("data-thumb-path", file.path);
   });
 });

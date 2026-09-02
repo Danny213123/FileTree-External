@@ -8,9 +8,10 @@ import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
 import { eqPath, isNoOpMove } from "../lib/agent";
 import { attributeLetters, attributeList } from "../lib/attributes";
-import { isImage, isVideo } from "../lib/thumbs";
+import { isImage, isVideo, pickLargestFolderFile } from "../lib/thumbs";
 import { isTauriV2, startNativeDrag, type NativeDragResponse } from "../api/v2";
 import { loadShellThumbnail } from "../lib/shellImages";
+import { fetchFolderPreview } from "../api/client";
 
 const ROW_HEIGHT = 23;
 // Smallest a column may be dragged to, so a header never collapses to nothing.
@@ -62,6 +63,9 @@ type MoveItemsResult = { ok: boolean; error?: string };
 
 interface TreeTableProps {
   rows: NodeRecord[];
+  /** Persisted v2 scan backing this table. Folder hover uses it to find the
+   * largest file even when that file is not loaded in the renderer. */
+  scanId?: string;
   /** Render rows as a FLAT list (used for search results): every row sits at
    *  depth 0 with no expand twisty. All other behavior — sort, hover, context
    *  menu, selection, drag, bookmark, rename — is identical to the tree. */
@@ -233,6 +237,7 @@ function RenameInput({
 
 function TreeTableInner({
   rows,
+  scanId,
   flat,
   lazy,
   loadedDirs,
@@ -521,35 +526,63 @@ function TreeTableInner({
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hoverRequestRef = useRef(0);
+  const folderPreviewCacheRef = useRef(new Map<string, string>());
   const [tooltip, setTooltip] = useState<{ node: NodeRecord; x: number; y: number; thumbPath?: string } | null>(null);
+
+  useEffect(() => {
+    folderPreviewCacheRef.current.clear();
+  }, [scanId]);
 
   const handleKindEnter = useCallback((node: NodeRecord, e: React.MouseEvent) => {
     if (node.id < 0) return; // skip bundles
     const x = e.clientX;
     const y = e.clientY;
-    // Ask Windows for the hovered item's own thumbnail. For folders this avoids
-    // guessing from the renderer's partial lazy subtree, which could be empty or
-    // contain only a media file loaded for a different branch. Windows falls
-    // back to the correct folder icon when it has no folder thumbnail.
-    let thumbPath: string | undefined;
-    if (node.dir && node.path) {
-      thumbPath = node.path;
-    } else if (node.path && (isImage(node.extension ?? "") || isVideo(node.extension ?? ""))) {
-      thumbPath = node.path;
-    }
-    // Warm the image so its bytes are ready (decoded) by the time the card opens.
-    if (thumbPath) {
-      void loadShellThumbnail(thumbPath).then((source) => {
-        if (!source) return;
-        const img = new Image();
-        img.src = source;
-      });
-    }
+    const requestId = ++hoverRequestRef.current;
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
-    hoverTimerRef.current = setTimeout(() => setTooltip({ node, x, y, thumbPath }), 150);
-  }, []);
+    hoverTimerRef.current = setTimeout(() => {
+      const show = async () => {
+        let thumbPath: string | undefined;
+        if (node.dir && node.path) {
+          const cacheKey = `${scanId ?? "legacy"}:${node.id}:${node.path}:${node.modified}:${node.size}:${node.files}`;
+          thumbPath = folderPreviewCacheRef.current.get(cacheKey);
+          if (!thumbPath) {
+            if (scanId) {
+              try {
+                thumbPath = (await fetchFolderPreview({ scanId, dirId: node.id }))?.path;
+              } catch (error) {
+                console.warn("Folder preview query failed", node.path, error);
+              }
+            } else {
+              thumbPath = pickLargestFolderFile(node.id, nodeById) ?? undefined;
+            }
+            // Empty folders still get their own Windows folder icon.
+            thumbPath ??= node.path;
+            folderPreviewCacheRef.current.set(cacheKey, thumbPath);
+            if (folderPreviewCacheRef.current.size > 256) {
+              const oldest = folderPreviewCacheRef.current.keys().next().value;
+              if (oldest) folderPreviewCacheRef.current.delete(oldest);
+            }
+          }
+        } else if (node.path && (isImage(node.extension ?? "") || isVideo(node.extension ?? ""))) {
+          thumbPath = node.path;
+        }
+        if (requestId !== hoverRequestRef.current) return;
+        if (thumbPath) {
+          void loadShellThumbnail(thumbPath).then((source) => {
+            if (!source) return;
+            const img = new Image();
+            img.src = source;
+          });
+        }
+        setTooltip({ node, x, y, thumbPath });
+      };
+      void show();
+    }, 150);
+  }, [nodeById, scanId]);
 
   const handleKindLeave = useCallback(() => {
+    hoverRequestRef.current++;
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
     setTooltip(null);
   }, []);

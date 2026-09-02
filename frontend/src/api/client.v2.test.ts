@@ -8,7 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { fetchServerSearch, fetchSubtreeFiles, moveItems } from "./client";
+import { fetchFolderPreview, fetchServerSearch, fetchSubtreeFiles, moveItems } from "./client";
 
 describe("v2 bounded client queries", () => {
   beforeEach(() => {
@@ -97,10 +97,23 @@ describe("v2 bounded client queries", () => {
     expect(result).toHaveLength(3);
     expect(result[1]).toEqual({ path: "E:\\Media\\nested\\two.jpg", size: 20 });
     expect(invoke).toHaveBeenNthCalledWith(1, "scan_subtree_files", {
-      query: { scanId: "folder-compress", directoryId: 42, offset: 0, limit: 500 },
+      query: { scanId: "folder-compress", directoryId: 42, offset: 0, limit: 5_000 },
     });
     expect(invoke).toHaveBeenNthCalledWith(2, "scan_subtree_files", {
-      query: { scanId: "folder-compress", directoryId: 42, offset: 2, limit: 500 },
+      query: { scanId: "folder-compress", directoryId: 42, offset: 2, limit: 5_000 },
+    });
+  });
+
+  it("loads one largest descendant for a folder hover", async () => {
+    vi.mocked(invoke).mockResolvedValue({ path: "E:\\Media\\largest.mkv", size: 9_000 });
+
+    await expect(fetchFolderPreview({ scanId: "folder-hover", dirId: 77 })).resolves.toEqual({
+      path: "E:\\Media\\largest.mkv",
+      size: 9_000,
+    });
+    expect(invoke).toHaveBeenCalledWith("scan_folder_preview", {
+      scanId: "folder-hover",
+      directoryId: 77,
     });
   });
 });

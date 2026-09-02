@@ -68,3 +68,29 @@ export function pickFolderThumb(
   cache?.set(folderId, pick);
   return pick;
 }
+
+/** Pick the largest loaded descendant file of any type. This is the legacy/full
+ * scan fallback for folder hover; v2 scans use the equivalent SQLite query so
+ * unloaded descendants are considered too. */
+export function pickLargestFolderFile(
+  folderId: number,
+  nodeById: Map<number, NodeRecord>,
+): string | null {
+  const root = nodeById.get(folderId);
+  if (!root) return null;
+
+  let best: NodeRecord | null = null;
+  let visited = 0;
+  const stack = [...root.children];
+  while (stack.length) {
+    const node = nodeById.get(stack.pop()!);
+    if (!node || node.id < 0) continue;
+    if (++visited > MAX_VISITED) break;
+    if (node.dir) {
+      for (const childId of node.children) stack.push(childId);
+    } else if (node.path && (!best || node.size > best.size)) {
+      best = node;
+    }
+  }
+  return best?.path ?? null;
+}
