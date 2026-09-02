@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@tanstack/react-virtual", () => ({
@@ -17,7 +17,18 @@ vi.mock("./FileIcon", () => ({
   FileIcon: () => <span data-testid="file-icon" />,
 }));
 
+vi.mock("../lib/shellImages", () => ({
+  loadShellThumbnail: vi.fn(() => Promise.resolve("data:image/png;base64,folder")),
+}));
+
+vi.mock("./NodeTooltip", () => ({
+  NodeTooltip: ({ node, thumbPath }: { node: NodeRecord; thumbPath?: string }) => (
+    <div data-testid="node-tooltip" data-node-path={node.path} data-thumb-path={thumbPath ?? ""} />
+  ),
+}));
+
 import type { NodeRecord } from "../api/types";
+import { loadShellThumbnail } from "../lib/shellImages";
 import { TreeTable } from "./TreeTable";
 
 const file: NodeRecord = {
@@ -135,5 +146,41 @@ describe("TreeTable lazy expansion", () => {
     view.unmount();
     const loadedView = renderDirectory(new Set([unknownDirectory.id]));
     expect(loadedView.container.querySelector("button.twisty")).toBeNull();
+  });
+
+  it("uses the hovered folder's own Windows thumbnail instead of a loaded descendant", async () => {
+    vi.mocked(loadShellThumbnail).mockClear();
+    const directory = { ...unknownDirectory, children: [file.id], files: 1 };
+    const view = render(
+      <TreeTable
+        rows={[directory]}
+        lazy
+        nodeById={new Map([[directory.id, directory], [file.id, file]])}
+        expanded={new Set()}
+        selectedId={0}
+        selectedIds={new Set()}
+        sortKey="name"
+        sortDir={1}
+        metric="size"
+        unit="auto"
+        decimals={1}
+        visibleColumns={new Set(["name"])}
+        columnWidths={{}}
+        onColumnResize={vi.fn()}
+        bookmarks={new Set()}
+        onToggleExpand={vi.fn()}
+        onSelect={vi.fn()}
+        onDoubleClick={vi.fn()}
+        onContextMenu={vi.fn()}
+        onSortChange={vi.fn()}
+        onToggleBookmark={vi.fn()}
+      />,
+    );
+
+    fireEvent.mouseEnter(view.container.querySelector(".name-cell")!);
+    const tooltip = await within(view.container).findByTestId("node-tooltip");
+    expect(loadShellThumbnail).toHaveBeenCalledWith(directory.path);
+    expect(tooltip).toHaveAttribute("data-node-path", directory.path);
+    expect(tooltip).toHaveAttribute("data-thumb-path", directory.path);
   });
 });

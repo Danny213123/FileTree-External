@@ -8,7 +8,7 @@ import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
 import { eqPath, isNoOpMove } from "../lib/agent";
 import { attributeLetters, attributeList } from "../lib/attributes";
-import { pickFolderThumb, isImage, isVideo } from "../lib/thumbs";
+import { isImage, isVideo } from "../lib/thumbs";
 import { isTauriV2, startNativeDrag, type NativeDragResponse } from "../api/v2";
 import { loadShellThumbnail } from "../lib/shellImages";
 
@@ -522,21 +522,18 @@ function TreeTableInner({
   const scrollRef = useRef<HTMLDivElement>(null);
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [tooltip, setTooltip] = useState<{ node: NodeRecord; x: number; y: number; thumbPath?: string } | null>(null);
-  // Memoized folder→representative-thumbnail cache so repeated hovers over the
-  // same folder don't re-walk its subtree. Cleared whenever the node map changes
-  // (new scan / merge / patch) so a stale path is never served.
-  const folderThumbCacheRef = useRef(new Map<number, string | null>());
-  useEffect(() => { folderThumbCacheRef.current.clear(); }, [nodeById]);
 
   const handleKindEnter = useCallback((node: NodeRecord, e: React.MouseEvent) => {
     if (node.id < 0) return; // skip bundles
     const x = e.clientX;
     const y = e.clientY;
-    // Resolve the thumbnail this row will show: a folder uses the largest
-    // bookmarked/any media beneath it; a media file uses its own path.
+    // Ask Windows for the hovered item's own thumbnail. For folders this avoids
+    // guessing from the renderer's partial lazy subtree, which could be empty or
+    // contain only a media file loaded for a different branch. Windows falls
+    // back to the correct folder icon when it has no folder thumbnail.
     let thumbPath: string | undefined;
-    if (node.dir) {
-      thumbPath = pickFolderThumb(node.id, nodeById, bookmarks, folderThumbCacheRef.current) ?? undefined;
+    if (node.dir && node.path) {
+      thumbPath = node.path;
     } else if (node.path && (isImage(node.extension ?? "") || isVideo(node.extension ?? ""))) {
       thumbPath = node.path;
     }
@@ -550,7 +547,7 @@ function TreeTableInner({
     }
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
     hoverTimerRef.current = setTimeout(() => setTooltip({ node, x, y, thumbPath }), 150);
-  }, [nodeById, bookmarks]);
+  }, []);
 
   const handleKindLeave = useCallback(() => {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
@@ -1233,6 +1230,7 @@ function TreeTableInner({
       </div>
       {tooltip && (
         <NodeTooltip
+          key={`${tooltip.node.id}:${tooltip.node.path}:${tooltip.thumbPath ?? ""}`}
           node={tooltip.node}
           unit={unit}
           anchorX={tooltip.x}

@@ -29,6 +29,11 @@ export function NodeTooltip({ node, unit, anchorX, anchorY, thumbPath }: Props) 
   const [thumbError, setThumbError] = useState(false);
 
   useEffect(() => {
+    setThumbLoaded(false);
+    setThumbError(false);
+  }, [effectiveThumb, node.path]);
+
+  useEffect(() => {
     const el = ref.current;
     if (!el) return;
     const vw = window.innerWidth;
@@ -52,6 +57,7 @@ export function NodeTooltip({ node, unit, anchorX, anchorY, thumbPath }: Props) 
       {effectiveThumb && !thumbError && (
         <div className="node-tooltip-thumb">
           <ShellThumbnail
+            key={effectiveThumb}
             path={effectiveThumb}
             alt=""
             onLoad={() => setThumbLoaded(true)}

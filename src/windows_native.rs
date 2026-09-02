@@ -726,7 +726,7 @@ fn render_shell_thumbnail_png(path: &str, size: i32, icon_fallback: bool) -> Opt
         fn DeleteObject(object: isize) -> i32;
     }
 
-    if !Path::new(path).is_file() {
+    if !Path::new(path).exists() {
         return None;
     }
     let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
@@ -1036,6 +1036,21 @@ mod tests {
         )
         .expect("Windows thumbnail or icon fallback");
         assert_eq!(&image[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+        let folder = std::env::temp_dir().join(format!(
+            "filetree-folder-thumbnail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&folder).expect("create thumbnail test folder");
+        let folder_image =
+            shell_thumbnail_png(folder.to_str().expect("UTF-8 test folder path"), 32, true)
+                .expect("Windows folder thumbnail or icon fallback");
+        assert_eq!(&folder_image[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+        std::fs::remove_dir_all(folder).expect("remove thumbnail test folder");
     }
 
     #[test]
