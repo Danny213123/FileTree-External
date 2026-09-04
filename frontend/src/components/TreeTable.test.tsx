@@ -92,6 +92,42 @@ describe("TreeTable double click", () => {
     expect(onDoubleClick).toHaveBeenCalledOnce();
     expect(onDoubleClick).toHaveBeenCalledWith(file);
   });
+
+  it("opens a context menu from the displayed search row when it is absent from nodeById", () => {
+    const onContextMenu = vi.fn();
+    const view = render(
+      <TreeTable
+        rows={[file]}
+        flat
+        lazy
+        nodeById={new Map()}
+        expanded={new Set()}
+        selectedId={0}
+        selectedIds={new Set()}
+        sortKey="name"
+        sortDir={1}
+        metric="size"
+        unit="auto"
+        decimals={1}
+        visibleColumns={new Set(["name"])}
+        columnWidths={{}}
+        onColumnResize={vi.fn()}
+        bookmarks={new Set()}
+        onToggleExpand={vi.fn()}
+        onSelect={vi.fn()}
+        onDoubleClick={vi.fn()}
+        onContextMenu={onContextMenu}
+        onSortChange={vi.fn()}
+        onToggleBookmark={vi.fn()}
+      />,
+    );
+
+    fireEvent.contextMenu(within(view.container).getByText("clip.mp4"), {
+      clientX: 123,
+      clientY: 234,
+    });
+    expect(onContextMenu).toHaveBeenCalledWith(file, 123, 234);
+  });
 });
 
 describe("TreeTable lazy expansion", () => {

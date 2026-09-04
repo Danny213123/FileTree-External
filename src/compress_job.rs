@@ -1158,6 +1158,21 @@ fn ratio(orig: u64, new_bytes: u64) -> f64 {
 
 // ── Worker thread ──────────────────────────────────────────────────────────
 
+/// Compression is throughput work, not latency-sensitive UI work. On Windows,
+/// keep its CPU priority below the WebView/message-pump threads so a pair of
+/// Deflate workers cannot make the application appear hung on smaller systems.
+#[cfg(windows)]
+fn lower_current_compression_thread_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+
+    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+}
+
+#[cfg(not(windows))]
+fn lower_current_compression_thread_priority() {}
+
 /// Spawn the dedicated worker thread for `job`. Returns immediately; the encode
 /// runs entirely off the HTTP connection thread.
 ///
@@ -1877,6 +1892,7 @@ fn run_job(state: Arc<CompressionRuntimeState>, job: Arc<CompressJob>) {
         let img = img.clone();
         let ff = ff.clone();
         handles.push(std::thread::spawn(move || {
+            lower_current_compression_thread_priority();
             loop {
                 if job.cancel.load(Ordering::SeqCst) {
                     break;
@@ -3251,6 +3267,13 @@ fn process_file(
         }
     }
 
+    // Stop can arrive immediately after verification. Never tag an output or
+    // dispose of the original once cancellation has been requested.
+    if job.cancel.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_file(&out);
+        return FileOutcome::Cancelled;
+    }
+
     *job.files[index].stage.lock_recover() = "finalizing".to_string();
     job.files[index]
         .updated_at
@@ -3411,6 +3434,7 @@ fn run_verify_capture(job: &Arc<CompressJob>, index: usize, mut cmd: Command) ->
             };
         }
     };
+    lower_encoder_process_priority(&child);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     job.children.lock_recover().insert(index, child);
@@ -3506,8 +3530,9 @@ fn verify_output(
         FileKind::Image => verify_image(job, index, out, orig, ff, img, img_kind),
         // Audio also routes here (classified Other) and so flows through the same
         // archive CRC check as every other zipped file — coherent and complete.
-        FileKind::Other => match crate::archive::verify_archive(out) {
-            Ok(()) => Verify::Ok,
+        FileKind::Other => match crate::archive::verify_archive_cancellable(out, &job.cancel) {
+            Ok(true) => Verify::Ok,
+            Ok(false) => Verify::Cancelled,
             Err(e) => Verify::Failed(format!("zip CRC/structure check failed: {e}")),
         },
     }
@@ -4190,9 +4215,9 @@ fn run_magick_image(
     run_child(job, index, cmd)
 }
 
-/// Lossless zip pipeline for non-media files (built-in, no external tool). Runs
-/// inline (no child), so cancellation is observed between files rather than
-/// mid-zip. `level` is the Deflate level (0 stores). Acquires the zip lane.
+/// Lossless zip pipeline for non-media files (built-in, no external tool).
+/// Cancellation is checked between 64 KiB chunks so Stop does not have to wait
+/// for a large archive to finish. `level` is the Deflate level (0 stores).
 fn run_zip(
     job: &Arc<CompressJob>,
     index: usize,
@@ -4212,8 +4237,13 @@ fn run_zip(
         input.display(),
         out.display()
     );
-    match crate::archive::compress_with_level(&[input.to_string_lossy().into_owned()], out, level) {
-        Ok(()) => {
+    match crate::archive::compress_with_level_cancellable(
+        &[input.to_string_lossy().into_owned()],
+        out,
+        level,
+        &job.cancel,
+    ) {
+        Ok(true) => {
             f.pct.store(100, Ordering::Relaxed);
             job.emit(ev_progress(job, index, 100));
             EncodeResult::Done {
@@ -4226,6 +4256,7 @@ fn run_zip(
                 fps: None,
             }
         }
+        Ok(false) => EncodeResult::Cancelled,
         Err(e) => EncodeResult::Spawn { error: e, command },
     }
 }
@@ -4304,6 +4335,7 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
             };
         }
     };
+    lower_encoder_process_priority(&child);
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -4431,6 +4463,19 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
         fps,
     }
 }
+
+#[cfg(windows)]
+fn lower_encoder_process_priority(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, SetPriorityClass};
+
+    let handle = HANDLE(child.as_raw_handle());
+    let _ = unsafe { SetPriorityClass(handle, BELOW_NORMAL_PRIORITY_CLASS) };
+}
+
+#[cfg(not(windows))]
+fn lower_encoder_process_priority(_child: &Child) {}
 
 /// Maximum number of non-progress stderr lines kept in the failure tail.
 const STDERR_TAIL_LINES: usize = 50;

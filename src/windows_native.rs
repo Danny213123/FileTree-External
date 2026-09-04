@@ -3,7 +3,7 @@ use std::collections::HashMap;
 #[cfg(windows)]
 use std::path::Path;
 #[cfg(windows)]
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 #[derive(Debug)]
 pub(crate) struct NativeDragResult {
@@ -166,6 +166,12 @@ pub(crate) struct NativeMoveResult {
     pub(crate) failed: usize,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct ClipboardFilesResult {
+    pub(crate) paths: Vec<String>,
+    pub(crate) prefer_move: bool,
+}
+
 /// Move files/folders through the same `IFileOperation` engine Explorer uses.
 /// Because `FOF_SILENT` is deliberately absent, Windows supplies its normal
 /// progress, collision, cancellation, and elevation UI for non-trivial moves.
@@ -175,6 +181,26 @@ pub(crate) fn native_move_files(
     destination: String,
     owner_handle: isize,
 ) -> Result<NativeMoveResult, String> {
+    native_transfer_files(paths, destination, owner_handle, true)
+}
+
+/// Copy files/folders through Explorer's `IFileOperation` engine.
+#[cfg(windows)]
+pub(crate) fn native_copy_files(
+    paths: Vec<String>,
+    destination: String,
+    owner_handle: isize,
+) -> Result<NativeMoveResult, String> {
+    native_transfer_files(paths, destination, owner_handle, false)
+}
+
+#[cfg(windows)]
+fn native_transfer_files(
+    paths: Vec<String>,
+    destination: String,
+    owner_handle: isize,
+    move_items: bool,
+) -> Result<NativeMoveResult, String> {
     use std::ffi::c_void;
     use std::iter::once;
     use std::os::windows::ffi::OsStrExt;
@@ -182,11 +208,13 @@ pub(crate) fn native_move_files(
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
     use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
     use windows::Win32::UI::Shell::{
-        FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FOF_WANTNUKEWARNING,
-        FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE, FOFX_SHOWELEVATIONPROMPT, FileOperation,
-        IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
+        COPYENGINE_E_CANCELLED, COPYENGINE_E_USER_CANCELLED, COPYENGINE_S_ALREADY_DONE,
+        COPYENGINE_S_USER_IGNORED, FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR,
+        FOF_WANTNUKEWARNING, FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE, FOFX_SHOWELEVATIONPROMPT,
+        FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl,
+        IShellItem, SHCreateItemFromParsingName,
     };
-    use windows::core::PCWSTR;
+    use windows::core::{HRESULT, PCWSTR, implement};
 
     struct OleGuard(bool);
     impl Drop for OleGuard {
@@ -194,6 +222,172 @@ pub(crate) fn native_move_files(
             if self.0 {
                 unsafe { OleUninitialize() };
             }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ItemTransferOutcome {
+        Completed,
+        Skipped,
+        Failed,
+    }
+
+    #[implement(IFileOperationProgressSink)]
+    struct TransferProgressSink {
+        outcome: Arc<Mutex<Option<ItemTransferOutcome>>>,
+    }
+
+    impl TransferProgressSink {
+        fn record(&self, status: HRESULT) {
+            let outcome = if status == COPYENGINE_S_USER_IGNORED
+                || status == COPYENGINE_S_ALREADY_DONE
+                || status == COPYENGINE_E_USER_CANCELLED
+                || status == COPYENGINE_E_CANCELLED
+            {
+                ItemTransferOutcome::Skipped
+            } else if status.is_ok() {
+                ItemTransferOutcome::Completed
+            } else {
+                ItemTransferOutcome::Failed
+            };
+            if let Ok(mut current) = self.outcome.lock() {
+                // A folder operation can report descendants through the same
+                // item sink. Its top-level Post* callback is last, so retaining
+                // the latest status yields the requested item's true outcome.
+                *current = Some(outcome);
+            }
+        }
+    }
+
+    impl IFileOperationProgressSink_Impl for TransferProgressSink_Impl {
+        fn StartOperations(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn FinishOperations(&self, _result: HRESULT) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn PreRenameItem(
+            &self,
+            _flags: u32,
+            _item: Option<&IShellItem>,
+            _new_name: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn PostRenameItem(
+            &self,
+            _flags: u32,
+            _item: Option<&IShellItem>,
+            _new_name: &PCWSTR,
+            _result: HRESULT,
+            _new_item: Option<&IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn PreMoveItem(
+            &self,
+            _flags: u32,
+            _item: Option<&IShellItem>,
+            _destination: Option<&IShellItem>,
+            _new_name: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn PostMoveItem(
+            &self,
+            _flags: u32,
+            _item: Option<&IShellItem>,
+            _destination: Option<&IShellItem>,
+            _new_name: &PCWSTR,
+            result: HRESULT,
+            _new_item: Option<&IShellItem>,
+        ) -> windows::core::Result<()> {
+            self.record(result);
+            Ok(())
+        }
+
+        fn PreCopyItem(
+            &self,
+            _flags: u32,
+            _item: Option<&IShellItem>,
+            _destination: Option<&IShellItem>,
+            _new_name: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn PostCopyItem(
+            &self,
+            _flags: u32,
+            _item: Option<&IShellItem>,
+            _destination: Option<&IShellItem>,
+            _new_name: &PCWSTR,
+            result: HRESULT,
+            _new_item: Option<&IShellItem>,
+        ) -> windows::core::Result<()> {
+            self.record(result);
+            Ok(())
+        }
+
+        fn PreDeleteItem(
+            &self,
+            _flags: u32,
+            _item: Option<&IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn PostDeleteItem(
+            &self,
+            _flags: u32,
+            _item: Option<&IShellItem>,
+            _result: HRESULT,
+            _new_item: Option<&IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn PreNewItem(
+            &self,
+            _flags: u32,
+            _destination: Option<&IShellItem>,
+            _new_name: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn PostNewItem(
+            &self,
+            _flags: u32,
+            _destination: Option<&IShellItem>,
+            _new_name: &PCWSTR,
+            _template_name: &PCWSTR,
+            _file_attributes: u32,
+            _result: HRESULT,
+            _new_item: Option<&IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn UpdateProgress(&self, _total: u32, _completed: u32) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn ResetTimer(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn PauseTimer(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn ResumeTimer(&self) -> windows::core::Result<()> {
+            Ok(())
         }
     }
 
@@ -236,11 +430,13 @@ pub(crate) fn native_move_files(
     let _ole = OleGuard(unsafe { OleInitialize(None) }.is_ok());
     let destination_item = shell_item(destination_path)
         .map_err(|error| format!("Windows could not open the destination: {error}"))?;
+    let operation_name = if move_items { "move" } else { "copy" };
     let operation: IFileOperation =
         unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }
-            .map_err(|error| format!("Windows could not start the move operation: {error}"))?;
-    unsafe { operation.SetOwnerWindow(owner) }
-        .map_err(|error| format!("Windows could not attach the move dialog: {error}"))?;
+            .map_err(|error| format!("Windows could not start the {operation_name}: {error}"))?;
+    unsafe { operation.SetOwnerWindow(owner) }.map_err(|error| {
+        format!("Windows could not attach the {operation_name} dialog: {error}")
+    })?;
     let flags = FILEOPERATION_FLAGS(
         FOF_ALLOWUNDO.0
             | FOF_NOCONFIRMMKDIR.0
@@ -250,7 +446,7 @@ pub(crate) fn native_move_files(
             | FOFX_SHOWELEVATIONPROMPT.0,
     );
     unsafe { operation.SetOperationFlags(flags) }
-        .map_err(|error| format!("Windows could not configure the move operation: {error}"))?;
+        .map_err(|error| format!("Windows could not configure the {operation_name}: {error}"))?;
 
     let mut result = NativeMoveResult::default();
     let mut queued = Vec::new();
@@ -280,20 +476,40 @@ pub(crate) fn native_move_files(
                 continue;
             }
         };
-        if unsafe {
-            operation.MoveItem(
-                &source_item,
-                &destination_item,
-                PCWSTR::null(),
-                None::<&IFileOperationProgressSink>,
-            )
+        let target_existed = target.exists();
+        let item_outcome = Arc::new(Mutex::new(None));
+        let progress_sink: IFileOperationProgressSink = TransferProgressSink {
+            outcome: Arc::clone(&item_outcome),
         }
-        .is_err()
-        {
+        .into();
+        let queued_item = unsafe {
+            if move_items {
+                operation.MoveItem(
+                    &source_item,
+                    &destination_item,
+                    PCWSTR::null(),
+                    Some(&progress_sink),
+                )
+            } else {
+                operation.CopyItem(
+                    &source_item,
+                    &destination_item,
+                    PCWSTR::null(),
+                    Some(&progress_sink),
+                )
+            }
+        };
+        if queued_item.is_err() {
             result.failed += 1;
             continue;
         }
-        queued.push(path_text);
+        queued.push((
+            path_text,
+            target,
+            target_existed,
+            item_outcome,
+            progress_sink,
+        ));
     }
 
     if queued.is_empty() {
@@ -303,12 +519,38 @@ pub(crate) fn native_move_files(
     result.aborted = unsafe { operation.GetAnyOperationsAborted() }
         .map(|value| value.as_bool())
         .unwrap_or(false);
-    for source in queued {
-        if std::fs::symlink_metadata(&source).is_err() {
+    for (source, target, target_existed, item_outcome, _progress_sink) in queued {
+        let sink_outcome = item_outcome.lock().ok().and_then(|outcome| *outcome);
+        match sink_outcome {
+            Some(ItemTransferOutcome::Completed) => {
+                result.moved += 1;
+                continue;
+            }
+            Some(ItemTransferOutcome::Skipped) => {
+                result.skipped += 1;
+                continue;
+            }
+            Some(ItemTransferOutcome::Failed) => {
+                result.failed += 1;
+                continue;
+            }
+            None => {}
+        }
+        // A progress sink should always report queued items. Retain conservative
+        // filesystem fallbacks for older shell extensions that omit callbacks.
+        if move_items {
+            if std::fs::symlink_metadata(&source).is_err() {
+                result.moved += 1;
+            } else if result.aborted || perform_error.is_none() {
+                // A source left in place after a successful operation is
+                // normally a collision the user chose to skip.
+                result.skipped += 1;
+            } else {
+                result.failed += 1;
+            }
+        } else if !target_existed && target.exists() {
             result.moved += 1;
         } else if result.aborted || perform_error.is_none() {
-            // A source left in place after a successful operation is normally a
-            // collision the user chose to skip.
             result.skipped += 1;
         } else {
             result.failed += 1;
@@ -318,7 +560,9 @@ pub(crate) fn native_move_files(
         && !result.aborted
         && result.moved == 0
     {
-        return Err(format!("Windows could not complete the move: {error}"));
+        return Err(format!(
+            "Windows could not complete the {operation_name}: {error}"
+        ));
     }
     Ok(result)
 }
@@ -330,6 +574,256 @@ pub(crate) fn native_move_files(
     _owner_handle: isize,
 ) -> Result<NativeMoveResult, String> {
     Err("Native file moves are only available on Windows".to_string())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn native_copy_files(
+    _paths: Vec<String>,
+    _destination: String,
+    _owner_handle: isize,
+) -> Result<NativeMoveResult, String> {
+    Err("Native file copies are only available on Windows".to_string())
+}
+
+#[cfg(windows)]
+pub(crate) fn clipboard_write_files(
+    paths: Vec<String>,
+    owner_handle: isize,
+    cut: bool,
+) -> Result<bool, String> {
+    use std::ffi::{OsStr, c_void};
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{BOOL, GlobalFree, HANDLE, HGLOBAL, HWND, POINT};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_MOVE};
+    use windows::Win32::UI::Shell::DROPFILES;
+    use windows::core::w;
+
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseClipboard() };
+        }
+    }
+
+    struct GlobalMemory(Option<HGLOBAL>);
+    impl GlobalMemory {
+        fn handle(&self) -> HGLOBAL {
+            self.0.expect("global clipboard memory")
+        }
+        fn release(&mut self) {
+            self.0 = None;
+        }
+    }
+    impl Drop for GlobalMemory {
+        fn drop(&mut self) {
+            if let Some(memory) = self.0 {
+                // GlobalFree's generated Result interpretation is inverted for
+                // the API's NULL-on-success contract, but the call still frees.
+                let _ = unsafe { GlobalFree(memory) };
+            }
+        }
+    }
+
+    fn allocate_bytes(bytes: &[u8]) -> Result<GlobalMemory, String> {
+        let memory = unsafe { GlobalAlloc(GHND, bytes.len()) }
+            .map_err(|error| format!("Could not allocate clipboard memory: {error}"))?;
+        let target = unsafe { GlobalLock(memory) }.cast::<u8>();
+        if target.is_null() {
+            let _ = unsafe { GlobalFree(memory) };
+            return Err("Could not lock clipboard memory".to_string());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len());
+            let _ = GlobalUnlock(memory);
+        }
+        Ok(GlobalMemory(Some(memory)))
+    }
+
+    fn open(owner: HWND) -> Result<ClipboardGuard, String> {
+        let mut last_error = String::new();
+        for _ in 0..30 {
+            match unsafe { OpenClipboard(owner) } {
+                Ok(()) => return Ok(ClipboardGuard),
+                Err(error) => {
+                    last_error = error.to_string();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        Err(format!("Windows clipboard is busy: {last_error}"))
+    }
+
+    let selected = paths
+        .into_iter()
+        .filter(|path| !path.is_empty() && Path::new(path).exists())
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Ok(false);
+    }
+
+    let mut file_list = Vec::<u16>::new();
+    for path in &selected {
+        file_list.extend(OsStr::new(path).encode_wide().chain(once(0)));
+    }
+    file_list.push(0);
+    let header_size = std::mem::size_of::<DROPFILES>();
+    let list_bytes = file_list
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| "Clipboard selection is too large".to_string())?;
+    let total_size = header_size
+        .checked_add(list_bytes)
+        .ok_or_else(|| "Clipboard selection is too large".to_string())?;
+    let mut payload = vec![0u8; total_size];
+    let drop_files = DROPFILES {
+        pFiles: header_size as u32,
+        pt: POINT { x: 0, y: 0 },
+        fNC: BOOL(0),
+        fWide: BOOL(1),
+    };
+    unsafe {
+        std::ptr::write_unaligned(payload.as_mut_ptr().cast::<DROPFILES>(), drop_files);
+        std::ptr::copy_nonoverlapping(
+            file_list.as_ptr().cast::<u8>(),
+            payload.as_mut_ptr().add(header_size),
+            list_bytes,
+        );
+    }
+
+    let mut file_memory = allocate_bytes(&payload)?;
+    let effect = if cut {
+        DROPEFFECT_MOVE.0
+    } else {
+        DROPEFFECT_COPY.0
+    };
+    let mut effect_memory = allocate_bytes(&effect.to_ne_bytes())?;
+    let owner = HWND(owner_handle as *mut c_void);
+    let _clipboard = open(owner)?;
+    unsafe { EmptyClipboard() }
+        .map_err(|error| format!("Could not clear the Windows clipboard: {error}"))?;
+    unsafe { SetClipboardData(CF_HDROP.0 as u32, HANDLE(file_memory.handle().0)) }
+        .map_err(|error| format!("Could not copy files to the Windows clipboard: {error}"))?;
+    file_memory.release();
+
+    let effect_format = unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) };
+    if effect_format == 0
+        || unsafe { SetClipboardData(effect_format, HANDLE(effect_memory.handle().0)) }.is_err()
+    {
+        // Do not leave an apparently valid Cut that lost its MOVE intent.
+        let _ = unsafe { EmptyClipboard() };
+        return Err("Could not set the clipboard file operation".to_string());
+    }
+    effect_memory.release();
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn clipboard_write_files(
+    _paths: Vec<String>,
+    _owner_handle: isize,
+    _cut: bool,
+) -> Result<bool, String> {
+    Err("File clipboard operations are only available on Windows".to_string())
+}
+
+#[cfg(windows)]
+pub(crate) fn clipboard_read_files(owner_handle: isize) -> Result<ClipboardFilesResult, String> {
+    use std::ffi::c_void;
+    use windows::Win32::Foundation::{HGLOBAL, HWND};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        RegisterClipboardFormatW,
+    };
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT_MOVE};
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    use windows::core::w;
+
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseClipboard() };
+        }
+    }
+
+    let owner = HWND(owner_handle as *mut c_void);
+    let mut last_error = String::new();
+    let _clipboard = {
+        let mut opened = false;
+        for _ in 0..30 {
+            match unsafe { OpenClipboard(owner) } {
+                Ok(()) => {
+                    opened = true;
+                    break;
+                }
+                Err(error) => {
+                    last_error = error.to_string();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        if !opened {
+            return Err(format!("Windows clipboard is busy: {last_error}"));
+        }
+        ClipboardGuard
+    };
+
+    if unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_err() {
+        return Ok(ClipboardFilesResult::default());
+    }
+    let data = unsafe { GetClipboardData(CF_HDROP.0 as u32) }
+        .map_err(|error| format!("Could not read files from the Windows clipboard: {error}"))?;
+    let drop = HDROP(data.0);
+    let count = unsafe { DragQueryFileW(drop, u32::MAX, None) };
+    if count > 1_000 {
+        return Err("Clipboard contains more than 1,000 items".to_string());
+    }
+    let mut paths = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let length = unsafe { DragQueryFileW(drop, index, None) } as usize;
+        if length == 0 || length > 32_767 {
+            continue;
+        }
+        let mut buffer = vec![0u16; length + 1];
+        let copied = unsafe { DragQueryFileW(drop, index, Some(&mut buffer)) } as usize;
+        if copied > 0 {
+            paths.push(String::from_utf16_lossy(&buffer[..copied]));
+        }
+    }
+
+    let effect_format = unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) };
+    let prefer_move =
+        if effect_format != 0 && unsafe { IsClipboardFormatAvailable(effect_format) }.is_ok() {
+            unsafe { GetClipboardData(effect_format) }
+                .ok()
+                .and_then(|handle| {
+                    let memory = HGLOBAL(handle.0);
+                    if unsafe { GlobalSize(memory) } < std::mem::size_of::<u32>() {
+                        return None;
+                    }
+                    let pointer = unsafe { GlobalLock(memory) }.cast::<u32>();
+                    if pointer.is_null() {
+                        return None;
+                    }
+                    let value = unsafe { std::ptr::read_unaligned(pointer) };
+                    let _ = unsafe { GlobalUnlock(memory) };
+                    Some(value & DROPEFFECT_MOVE.0 != 0)
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+    Ok(ClipboardFilesResult { paths, prefer_move })
+}
+
+#[cfg(not(windows))]
+pub(crate) fn clipboard_read_files(_owner_handle: isize) -> Result<ClipboardFilesResult, String> {
+    Err("File clipboard operations are only available on Windows".to_string())
 }
 
 #[cfg(windows)]

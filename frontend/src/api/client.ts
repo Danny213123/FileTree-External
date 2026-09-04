@@ -1122,11 +1122,12 @@ export interface ClipboardFiles {
 
 /** True when the native shell COPY (for paste-copy / drag-in copy) is available. */
 export function hasNativeCopy(): boolean {
-  return typeof eAPI().copyItemsNative === "function";
+  return isTauriV2() || typeof eAPI().copyItemsNative === "function";
 }
 
-/** True when native CF_HDROP clipboard read/write is available (Electron + addon). */
+/** True when native CF_HDROP clipboard read/write is available. */
 export function hasClipboardFiles(): boolean {
+  if (isTauriV2()) return true;
   const api = eAPI();
   return typeof api.clipboardReadFiles === "function" && typeof api.clipboardWriteFiles === "function";
 }
@@ -1139,6 +1140,9 @@ export async function copyItemsNative(
   paths: string[],
   destination: string,
 ): Promise<NativeMoveResult> {
+  if (isTauriV2()) {
+    return invoke<NativeMoveResult>("native_copy_items", { paths, destination });
+  }
   const api = eAPI();
   if (!api.copyItemsNative) throw new Error("native copy unavailable");
   return api.copyItemsNative(paths, destination);
@@ -1150,6 +1154,9 @@ export async function copyItemsNative(
  * native addon) or there was nothing to write.
  */
 export async function clipboardWriteFiles(paths: string[], cut: boolean): Promise<boolean> {
+  if (isTauriV2()) {
+    return invoke<boolean>("clipboard_write_files", { paths, cut });
+  }
   const api = eAPI();
   if (!api.clipboardWriteFiles) {
     // Best-effort text fallback so something lands on the clipboard.
@@ -1161,6 +1168,9 @@ export async function clipboardWriteFiles(paths: string[], cut: boolean): Promis
 
 /** Read CF_HDROP paths (+ cut/copy intent) off the clipboard for paste-into-folder. */
 export async function clipboardReadFiles(): Promise<ClipboardFiles> {
+  if (isTauriV2()) {
+    return invoke<ClipboardFiles>("clipboard_read_files");
+  }
   const api = eAPI();
   if (!api.clipboardReadFiles) return { paths: [], preferMove: false };
   try {
@@ -1350,7 +1360,9 @@ export async function moveItems(
 }
 
 export async function copyFiles(paths: string[]): Promise<void> {
-  if (eAPI().copyFiles) {
+  if (isTauriV2()) {
+    await invoke<boolean>("clipboard_write_files", { paths, cut: false });
+  } else if (eAPI().copyFiles) {
     await eAPI().copyFiles!(paths);
   } else {
     await fetch("/api/copy-files", {

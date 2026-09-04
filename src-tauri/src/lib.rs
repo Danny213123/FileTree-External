@@ -37,6 +37,78 @@ struct DuplicateScanRegistry {
     cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
+const EXTERNAL_COPY_GRANT_TTL: Duration = Duration::from_secs(30);
+
+/// One-shot capabilities for paths supplied by the operating system rather
+/// than by the renderer. Tauri commands otherwise accept only paths beneath a
+/// scanned root. Clipboard reads and native file-drop events replace this set,
+/// and a copy consumes every outside-root capability it uses.
+#[derive(Default)]
+struct ExternalCopyGrants {
+    paths: Mutex<HashMap<String, Instant>>,
+}
+
+impl ExternalCopyGrants {
+    fn path_key(path: &Path) -> Option<String> {
+        if !path.is_absolute() {
+            return None;
+        }
+        Some(
+            fs::canonicalize(path)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_ascii_lowercase(),
+        )
+    }
+
+    fn replace_keys(&self, keys: impl IntoIterator<Item = String>) {
+        let expires_at = Instant::now() + EXTERNAL_COPY_GRANT_TTL;
+        if let Ok(mut granted) = self.paths.lock() {
+            granted.clear();
+            granted.extend(keys.into_iter().map(|key| (key, expires_at)));
+        }
+    }
+
+    fn grant_strings(&self, paths: &[String]) {
+        self.replace_keys(
+            paths
+                .iter()
+                .filter_map(|path| Self::path_key(Path::new(path))),
+        );
+    }
+
+    fn grant_native_drop(&self, paths: &[PathBuf]) {
+        self.replace_keys(paths.iter().filter_map(|path| Self::path_key(path)));
+    }
+
+    fn consume_strings(&self, paths: &[String]) -> bool {
+        if paths.is_empty() {
+            return true;
+        }
+        let Some(keys) = paths
+            .iter()
+            .map(|path| Self::path_key(Path::new(path)))
+            .collect::<Option<HashSet<_>>>()
+        else {
+            return false;
+        };
+        let now = Instant::now();
+        let Ok(mut granted) = self.paths.lock() else {
+            return false;
+        };
+        granted.retain(|_, expires_at| *expires_at > now);
+        if !keys.iter().all(|key| granted.contains_key(key)) {
+            return false;
+        }
+        for key in keys {
+            granted.remove(&key);
+        }
+        true
+    }
+}
+
 impl Default for FsWatchRegistry {
     fn default() -> Self {
         Self {
@@ -447,9 +519,37 @@ async fn directory_snapshot(
 #[cfg(test)]
 mod desktop_tests {
     use super::{
-        collapse_changed_directories, directory_snapshot_rows, watch_directories_for_paths,
+        ExternalCopyGrants, collapse_changed_directories, directory_snapshot_rows,
+        watch_directories_for_paths,
     };
     use std::{collections::HashMap, fs};
+
+    #[test]
+    fn external_copy_grants_are_exact_and_one_shot() {
+        let root = std::env::temp_dir().join(format!(
+            "filetree_desktop_copy_grant_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create grant test folder");
+        let granted = root.join("granted.txt");
+        let other = root.join("other.txt");
+        fs::write(&granted, b"granted").expect("create granted file");
+        fs::write(&other, b"other").expect("create other file");
+        let granted = granted.to_string_lossy().into_owned();
+        let other = other.to_string_lossy().into_owned();
+        let grants = ExternalCopyGrants::default();
+
+        grants.grant_strings(std::slice::from_ref(&granted));
+        assert!(!grants.consume_strings(std::slice::from_ref(&other)));
+        assert!(grants.consume_strings(std::slice::from_ref(&granted)));
+        assert!(!grants.consume_strings(std::slice::from_ref(&granted)));
+
+        fs::remove_dir_all(root).expect("remove grant test folder");
+    }
 
     #[test]
     fn directory_snapshot_drops_removed_children() {
@@ -834,6 +934,16 @@ fn require_authorized_paths(store: &V2Store, paths: &[String]) -> Result<(), Str
     }
 }
 
+fn require_existing_copy_sources(paths: &[String]) -> Result<(), String> {
+    if paths.iter().all(|path| {
+        path.len() <= 32_768 && Path::new(path).is_absolute() && fs::symlink_metadata(path).is_ok()
+    }) {
+        Ok(())
+    } else {
+        Err("One or more copy sources are missing or invalid".to_string())
+    }
+}
+
 #[tauri::command]
 fn open_path(state: State<'_, Arc<V2Store>>, path: String) -> Result<(), String> {
     require_authorized_path(&state, &path)?;
@@ -896,6 +1006,91 @@ fn native_move_items(
         moved: result.moved,
         skipped: result.skipped,
         failed: result.failed,
+    })
+}
+
+#[tauri::command]
+async fn native_copy_items(
+    window: tauri::WebviewWindow,
+    state: State<'_, Arc<V2Store>>,
+    grants: State<'_, ExternalCopyGrants>,
+    paths: Vec<String>,
+    destination: String,
+) -> Result<NativeMoveResponse, String> {
+    if paths.is_empty() || paths.len() > 1_000 {
+        return Err("Select between 1 and 1,000 items to copy".to_string());
+    }
+    require_authorized_path(&state, &destination)?;
+    require_existing_copy_sources(&paths)?;
+    let external_paths = paths
+        .iter()
+        .filter(|path| !state.source_path_is_authorized(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !grants.consume_strings(&external_paths) {
+        return Err(
+            "Copy sources outside scanned directories must come from the current clipboard or file drop"
+                .to_string(),
+        );
+    }
+    let owner = window.hwnd().map_err(|error| error.to_string())?;
+    let owner_handle = owner.0 as isize;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        filetree_core::copy_items_with_windows(paths, destination, owner_handle)
+    })
+    .await
+    .map_err(|error| format!("Windows copy worker failed: {error}"))??;
+    Ok(NativeMoveResponse {
+        aborted: result.aborted,
+        moved: result.moved,
+        skipped: result.skipped,
+        failed: result.failed,
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardFilesResponse {
+    paths: Vec<String>,
+    prefer_move: bool,
+}
+
+#[tauri::command]
+async fn clipboard_write_files(
+    window: tauri::WebviewWindow,
+    state: State<'_, Arc<V2Store>>,
+    paths: Vec<String>,
+    cut: bool,
+) -> Result<bool, String> {
+    if paths.is_empty() || paths.len() > 1_000 {
+        return Err("Select between 1 and 1,000 files or folders".to_string());
+    }
+    require_authorized_paths(&state, &paths)?;
+    let owner = window.hwnd().map_err(|error| error.to_string())?;
+    let owner_handle = owner.0 as isize;
+    tauri::async_runtime::spawn_blocking(move || {
+        filetree_core::write_files_to_clipboard(paths, owner_handle, cut)
+    })
+    .await
+    .map_err(|error| format!("Windows clipboard worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn clipboard_read_files(
+    window: tauri::WebviewWindow,
+    grants: State<'_, ExternalCopyGrants>,
+) -> Result<ClipboardFilesResponse, String> {
+    let owner = window.hwnd().map_err(|error| error.to_string())?;
+    let owner_handle = owner.0 as isize;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        filetree_core::read_files_from_clipboard(owner_handle)
+    })
+    .await
+    .map_err(|error| format!("Windows clipboard worker failed: {error}"))??;
+    grants.grant_strings(&result.paths);
+    Ok(ClipboardFilesResponse {
+        paths: result.paths,
+        prefer_move: result.prefer_move,
     })
 }
 
@@ -1062,8 +1257,11 @@ fn compression_presence(
 }
 
 #[tauri::command]
-fn compression_tools(runtime: State<'_, Arc<DesktopRuntime>>) -> Result<Value, String> {
-    json_value(runtime.compression_tools_json())
+async fn compression_tools(runtime: State<'_, Arc<DesktopRuntime>>) -> Result<Value, String> {
+    let runtime = Arc::clone(runtime.inner());
+    tauri::async_runtime::spawn_blocking(move || json_value(runtime.compression_tools_json()))
+        .await
+        .map_err(|error| format!("Compression tool probe failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1104,12 +1302,13 @@ struct CompressionControl {
 }
 
 #[tauri::command]
-fn compression_control(
+async fn compression_control(
     runtime: State<'_, Arc<DesktopRuntime>>,
     action: String,
     request: CompressionControl,
 ) -> Result<Value, String> {
-    match action.as_str() {
+    let runtime = Arc::clone(runtime.inner());
+    tauri::async_runtime::spawn_blocking(move || match action.as_str() {
         "cancel" => Ok(serde_json::json!({ "ok": runtime.cancel_compression(&request.id) })),
         "pause" => {
             Ok(serde_json::json!({ "ok": true, "status": runtime.pause_compression(&request.id)? }))
@@ -1147,32 +1346,47 @@ fn compression_control(
             Ok(serde_json::json!({ "ok": true }))
         }
         _ => Err(format!("Unknown compression action: {action}")),
-    }
+    })
+    .await
+    .map_err(|error| format!("Compression control worker failed: {error}"))?
 }
 
 #[tauri::command]
-fn compression_list(runtime: State<'_, Arc<DesktopRuntime>>) -> Result<Value, String> {
-    json_value(runtime.list_compressions_json())
+async fn compression_list(runtime: State<'_, Arc<DesktopRuntime>>) -> Result<Value, String> {
+    let runtime = Arc::clone(runtime.inner());
+    tauri::async_runtime::spawn_blocking(move || json_value(runtime.list_compressions_json()))
+        .await
+        .map_err(|error| format!("Compression list worker failed: {error}"))?
 }
 
 #[tauri::command]
-fn compression_files(
+async fn compression_files(
     runtime: State<'_, Arc<DesktopRuntime>>,
     id: String,
     query: CompressionFilesRequest,
 ) -> Result<Option<Value>, String> {
-    runtime
-        .compression_files_json(&id, query)
-        .map(json_value)
-        .transpose()
+    let runtime = Arc::clone(runtime.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime
+            .compression_files_json(&id, query)
+            .map(json_value)
+            .transpose()
+    })
+    .await
+    .map_err(|error| format!("Compression files worker failed: {error}"))?
 }
 
 #[tauri::command]
-fn compression_telemetry(
+async fn compression_telemetry(
     runtime: State<'_, Arc<DesktopRuntime>>,
     id: String,
 ) -> Result<Value, String> {
-    json_value(runtime.compression_telemetry_json(&id))
+    let runtime = Arc::clone(runtime.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        json_value(runtime.compression_telemetry_json(&id))
+    })
+    .await
+    .map_err(|error| format!("Compression telemetry worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1207,6 +1421,7 @@ pub fn run() {
         .manage(runtime)
         .manage(FsWatchRegistry::default())
         .manage(DuplicateScanRegistry::default())
+        .manage(ExternalCopyGrants::default())
         .manage(Arc::new(terminal::TerminalRegistry::default()))
         .invoke_handler(tauri::generate_handler![
             app_version,
@@ -1221,6 +1436,9 @@ pub fn run() {
             reveal_path,
             move_items,
             native_move_items,
+            native_copy_items,
+            clipboard_write_files,
+            clipboard_read_files,
             native_drag,
             shell_context_menu,
             fs_watch_start,
@@ -1260,6 +1478,19 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("build FileTree v2");
     app.run(|app_handle, event| {
+        match &event {
+            tauri::RunEvent::WebviewEvent {
+                event: tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }),
+                ..
+            }
+            | tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }),
+                ..
+            } => app_handle
+                .state::<ExternalCopyGrants>()
+                .grant_native_drop(paths),
+            _ => {}
+        }
         if matches!(event, tauri::RunEvent::Exit) {
             filetree_core::set_keep_awake(false);
             app_handle

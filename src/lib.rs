@@ -160,6 +160,41 @@ pub fn move_items_with_windows(
     })
 }
 
+pub fn copy_items_with_windows(
+    paths: Vec<String>,
+    destination: String,
+    owner_handle: isize,
+) -> Result<NativeMoveOutcome, String> {
+    windows_native::native_copy_files(paths, destination, owner_handle).map(|result| {
+        NativeMoveOutcome {
+            aborted: result.aborted,
+            moved: result.moved,
+            skipped: result.skipped,
+            failed: result.failed,
+        }
+    })
+}
+
+pub struct ClipboardFilesOutcome {
+    pub paths: Vec<String>,
+    pub prefer_move: bool,
+}
+
+pub fn write_files_to_clipboard(
+    paths: Vec<String>,
+    owner_handle: isize,
+    cut: bool,
+) -> Result<bool, String> {
+    windows_native::clipboard_write_files(paths, owner_handle, cut)
+}
+
+pub fn read_files_from_clipboard(owner_handle: isize) -> Result<ClipboardFilesOutcome, String> {
+    windows_native::clipboard_read_files(owner_handle).map(|result| ClipboardFilesOutcome {
+        paths: result.paths,
+        prefer_move: result.prefer_move,
+    })
+}
+
 pub fn show_shell_context_menu(
     paths: Vec<String>,
     owner_handle: isize,

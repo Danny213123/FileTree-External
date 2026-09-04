@@ -36,7 +36,6 @@ interface TitleBarProps {
   // Right cluster (AI assistant / agent)
   chatOpen: boolean;
   onToggleChat: () => void;
-  onOpenAgents: () => void;
   onNewSession: () => void;
   onCloseChat: () => void;
   getSessions: () => ChatSessionMeta[];
@@ -68,7 +67,7 @@ export function TitleBar({
   title, menus,
   sidebarOpen, onToggleSidebar, onPrevTab, onNextTab, canPrevTab, canNextTab,
   terminalOpen, onToggleTerminal,
-  chatOpen, onToggleChat, onOpenAgents, onNewSession, onCloseChat,
+  chatOpen, onToggleChat, onNewSession, onCloseChat,
   getSessions, onRestoreSession, optionsMenu,
   visibleColumns, onVisibleColumnsChange, decimals, onDecimalsChange, unit, onUnitChange,
 }: TitleBarProps) {
@@ -198,21 +197,21 @@ export function TitleBar({
       {/* Right controls: chat / agents / sessions / options / collapse */}
       <div className="titlebar-actions right">
         <button
+          type="button"
           className={`titlebar-btn${chatOpen ? " active" : ""}`}
-          title="Open chat (Ctrl+Alt+B)"
+          title={`${chatOpen ? "Hide" : "Open"} AI Assistant (Ctrl+Alt+B)`}
+          aria-pressed={chatOpen}
           onClick={onToggleChat}
         >
           <Icon name="chat" size={15} />
         </button>
-        <button className="titlebar-btn" title="Open AI Assistant" onClick={onOpenAgents}>
-          <Icon name="window-stack" size={15} />
-        </button>
-        <button className="titlebar-btn" title="New agent session" onClick={onNewSession}>
+        <button type="button" className="titlebar-btn" title="New AI Assistant session" onClick={onNewSession}>
           <Icon name="plus" size={16} />
         </button>
 
         <div className="titlebar-pop">
           <button
+            type="button"
             className={`titlebar-btn${pop === "history" ? " active" : ""}`}
             title="Session history"
             onClick={toggleHistory}
@@ -244,6 +243,7 @@ export function TitleBar({
 
         <div className="titlebar-pop">
           <button
+            type="button"
             className={`titlebar-btn${pop === "options" ? " active" : ""}`}
             title="Options"
             onClick={toggleOptions}
@@ -274,7 +274,13 @@ export function TitleBar({
           )}
         </div>
 
-        <button className="titlebar-btn" title="Collapse right panel" onClick={onCloseChat}>
+        <button
+          type="button"
+          className="titlebar-btn"
+          title={chatOpen ? "Collapse AI Assistant" : "AI Assistant is already closed"}
+          onClick={onCloseChat}
+          disabled={!chatOpen}
+        >
           <Icon name="layout-sidebar-reverse" size={15} />
         </button>
       </div>

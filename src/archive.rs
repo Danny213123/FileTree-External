@@ -104,6 +104,35 @@ fn entry_options(path: &Path, level: i64) -> SimpleFileOptions {
 /// inputs are stored (no-compress) regardless of `level`. Errors are returned as
 /// display strings for the JSON body.
 pub(crate) fn compress_with_level(paths: &[String], dest: &Path, level: i64) -> Result<(), String> {
+    compress_with_level_impl(paths, dest, level, &|| false).map(|_| ())
+}
+
+/// Cancellable compression used by background compression jobs. Returns
+/// `Ok(false)` when cancellation was observed; callers can then remove the
+/// incomplete destination without treating a user stop as an encoder error.
+pub(crate) fn compress_with_level_cancellable(
+    paths: &[String],
+    dest: &Path,
+    level: i64,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<bool, String> {
+    compress_with_level_impl(paths, dest, level, &|| {
+        cancel.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+fn compress_with_level_impl<F>(
+    paths: &[String],
+    dest: &Path,
+    level: i64,
+    cancelled: &F,
+) -> Result<bool, String>
+where
+    F: Fn() -> bool,
+{
+    if cancelled() {
+        return Ok(false);
+    }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -112,6 +141,9 @@ pub(crate) fn compress_with_level(paths: &[String], dest: &Path, level: i64) -> 
     let mut buf = vec![0u8; CHUNK];
 
     for raw in paths {
+        if cancelled() {
+            return Ok(false);
+        }
         let src = Path::new(raw);
         let Ok(md) = fs::symlink_metadata(src) else {
             return Err(format!("{raw}: source does not exist"));
@@ -121,26 +153,41 @@ pub(crate) fn compress_with_level(paths: &[String], dest: &Path, level: i64) -> 
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "entry".to_string());
         if md.is_dir() {
-            add_dir(&mut zip, src, &base, level, &mut buf)?;
+            if !add_dir(&mut zip, src, &base, level, &mut buf, cancelled)? {
+                return Ok(false);
+            }
         } else if md.is_file() {
             zip.start_file(base, entry_options(src, level))
                 .map_err(|e| e.to_string())?;
-            stream_file(&mut zip, src, &mut buf)?;
+            if !stream_file(&mut zip, src, &mut buf, cancelled)? {
+                return Ok(false);
+            }
         }
     }
+    if cancelled() {
+        return Ok(false);
+    }
     zip.finish().map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(true)
 }
 
 /// Recursively add `dir` (and its subtree) to the archive under `prefix`. Empty
 /// directories are preserved via an explicit directory entry.
-fn add_dir<W: io::Write + io::Seek>(
+fn add_dir<W, F>(
     zip: &mut ZipWriter<W>,
     dir: &Path,
     prefix: &str,
     level: i64,
     buf: &mut [u8],
-) -> Result<(), String> {
+    cancelled: &F,
+) -> Result<bool, String>
+where
+    W: io::Write + io::Seek,
+    F: Fn() -> bool,
+{
+    if cancelled() {
+        return Ok(false);
+    }
     let dir_options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Stored)
         .unix_permissions(0o644);
@@ -153,30 +200,42 @@ fn add_dir<W: io::Write + io::Seek>(
         let entry_name = format!("{prefix}/{name}");
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
-            add_dir(zip, &path, &entry_name, level, buf)?;
+            if !add_dir(zip, &path, &entry_name, level, buf, cancelled)? {
+                return Ok(false);
+            }
         } else if ft.is_file() {
             zip.start_file(entry_name, entry_options(&path, level))
                 .map_err(|e| e.to_string())?;
-            stream_file(zip, &path, buf)?;
+            if !stream_file(zip, &path, buf, cancelled)? {
+                return Ok(false);
+            }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
-fn stream_file<W: io::Write + io::Seek>(
+fn stream_file<W, F>(
     zip: &mut ZipWriter<W>,
     src: &Path,
     buf: &mut [u8],
-) -> Result<(), String> {
+    cancelled: &F,
+) -> Result<bool, String>
+where
+    W: io::Write + io::Seek,
+    F: Fn() -> bool,
+{
     let mut f = File::open(src).map_err(|e| e.to_string())?;
     loop {
+        if cancelled() {
+            return Ok(false);
+        }
         let n = f.read(buf).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
         zip.write_all(&buf[..n]).map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Extract `archive` into `dest` (created if absent). Entry names are resolved
@@ -213,6 +272,27 @@ pub(crate) fn extract(archive: &Path, dest: &Path) -> Result<(), String> {
 /// An archive with no entries is also rejected. This is the post-compression
 /// integrity gate for the zip pipeline — it never mutates the archive.
 pub(crate) fn verify_archive(archive: &Path) -> Result<(), String> {
+    verify_archive_impl(archive, &|| false).map(|_| ())
+}
+
+/// Cancellable variant of [`verify_archive`] for compression jobs. Like the
+/// compression helper, `Ok(false)` means a user stop was observed.
+pub(crate) fn verify_archive_cancellable(
+    archive: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<bool, String> {
+    verify_archive_impl(archive, &|| {
+        cancel.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+fn verify_archive_impl<F>(archive: &Path, cancelled: &F) -> Result<bool, String>
+where
+    F: Fn() -> bool,
+{
+    if cancelled() {
+        return Ok(false);
+    }
     let file = File::open(archive).map_err(|e| format!("open archive: {e}"))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("read archive: {e}"))?;
     if zip.is_empty() {
@@ -220,6 +300,9 @@ pub(crate) fn verify_archive(archive: &Path) -> Result<(), String> {
     }
     let mut buf = vec![0u8; CHUNK];
     for i in 0..zip.len() {
+        if cancelled() {
+            return Ok(false);
+        }
         let mut entry = zip.by_index(i).map_err(|e| format!("entry {i}: {e}"))?;
         if entry.is_dir() {
             continue;
@@ -228,13 +311,16 @@ pub(crate) fn verify_archive(archive: &Path) -> Result<(), String> {
         // Reading to EOF makes the zip crate verify this entry's CRC32; a
         // mismatch surfaces as an io error here.
         loop {
+            if cancelled() {
+                return Ok(false);
+            }
             let n = entry.read(&mut buf).map_err(|e| format!("{name}: {e}"))?;
             if n == 0 {
                 break;
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Stream `path` through the requested hasher and return `(normalized_algo,
@@ -290,5 +376,44 @@ mod tests {
         assert!(!needs_zip64((u32::MAX as u64) - 1));
         assert!(needs_zip64(u32::MAX as u64));
         assert!(needs_zip64(7_303_577_911));
+    }
+
+    #[test]
+    fn cancellable_zip_stops_before_creating_an_output() {
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let dest =
+            std::env::temp_dir().join(format!("filetree-cancelled-zip-{}.zip", std::process::id()));
+        let _ = fs::remove_file(&dest);
+
+        let completed =
+            compress_with_level_cancellable(&["unused-source.txt".to_string()], &dest, 6, &cancel)
+                .expect("pre-cancel is not an archive error");
+
+        assert!(!completed);
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn zip_loop_observes_cancellation_between_chunks() {
+        let root =
+            std::env::temp_dir().join(format!("filetree-cancel-midstream-{}", std::process::id()));
+        let source = root.join("source.bin");
+        let dest = root.join("output.zip");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test directory");
+        fs::write(&source, vec![0x5a; CHUNK * 4]).expect("write test source");
+
+        let checks = std::cell::Cell::new(0usize);
+        let completed =
+            compress_with_level_impl(&[source.to_string_lossy().into_owned()], &dest, 6, &|| {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next >= 5
+            })
+            .expect("cancellation is not an archive error");
+
+        assert!(!completed);
+        assert!(checks.get() >= 5);
+        let _ = fs::remove_dir_all(root);
     }
 }

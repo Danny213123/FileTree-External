@@ -294,13 +294,25 @@ export function CompressionMonitor({ focusJobId }: Props) {
       setTelemetry(null);
       return;
     }
-    const tick = async () => setTelemetry(await fetchCompressTelemetry(selectedId));
+    let stopped = false;
+    let timer: number | null = null;
+    const active = !!selectedJob && ["running", "pausing"].includes(selectedJob.status);
+    const tick = async () => {
+      const next = await fetchCompressTelemetry(selectedId);
+      if (stopped) return;
+      setTelemetry(next);
+      if (active) await loadPage(0, true);
+      if (stopped) return;
+      // Schedule only after the previous probe has finished. The native probe
+      // launches system utilities and may take longer than one interval; a
+      // setInterval here used to pile up probes and starve control commands.
+      timer = window.setTimeout(() => void tick(), active ? 2_000 : 5_000);
+    };
     void tick();
-    const timer = window.setInterval(() => {
-      void tick();
-      if (selectedJob && ["running", "pausing"].includes(selectedJob.status)) void loadPage(0, true);
-    }, 1_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
   }, [selectedId, selectedJob?.status, loadPage]);
 
   const rowVirtualizer = useVirtualizer({
@@ -321,19 +333,27 @@ export function CompressionMonitor({ focusJobId }: Props) {
     return pageCache.current.get(offset)?.[index - offset] ?? null;
   }, [cacheVersion]);
 
+  const presenceActive = layout.keepAwake
+    && jobs.some((job) => ["running", "pausing"].includes(job.status));
+  const presenceStatus = selectedJob?.status ?? "idle";
+  const presenceProgress = (selectedJob?.totalBytes ?? 0) > 0
+    ? (selectedJob?.workCompletedBytes ?? 0) / (selectedJob?.totalBytes ?? 1)
+    : 0;
+
   useEffect(() => {
-    const totalBytes = selectedJob?.totalBytes ?? 0;
-    const completedBytes = selectedJob?.workCompletedBytes ?? 0;
     void setCompressionPresence({
       enabled: layout.keepAwake,
-      active: layout.keepAwake && jobs.some((job) => ["running", "pausing"].includes(job.status)),
-      status: selectedJob?.status ?? "idle",
-      progress: totalBytes > 0 ? completedBytes / totalBytes : 0,
+      active: presenceActive,
+      status: presenceStatus,
+      progress: presenceProgress,
     });
+  }, [layout.keepAwake, presenceActive, presenceStatus, presenceProgress]);
+
+  useEffect(() => {
     return () => {
       void setCompressionPresence({ enabled: false, active: false, status: "idle", progress: 0 });
     };
-  }, [selectedJob, layout.keepAwake]);
+  }, []);
 
   const processed = selectedJob ? selectedJob.done + selectedJob.skipped + selectedJob.errors : 0;
   const bytePct = selectedJob
@@ -358,7 +378,18 @@ export function CompressionMonitor({ focusJobId }: Props) {
   const mutate = async (label: string, action: () => Promise<unknown>) => {
     setBusy(label);
     try {
-      await action();
+      const result = await action();
+      if (
+        result
+        && typeof result === "object"
+        && "ok" in result
+        && (result as { ok?: boolean }).ok === false
+      ) {
+        const message = "error" in result && typeof (result as { error?: unknown }).error === "string"
+          ? (result as { error: string }).error
+          : `${label} failed`;
+        throw new Error(message);
+      }
       await refreshJobs();
       await loadPage(0, true);
     } catch (error) {
@@ -510,8 +541,8 @@ export function CompressionMonitor({ focusJobId }: Props) {
                   void mutate("workers", () => setCompressConcurrency(selectedJob.id, value));
                 }} />
               </label>
-              {selectedJob.status === "running" && <button title="Pause after active files finish" disabled={!!busy} onClick={() => void mutate("pause", () => pauseCompressJob(selectedJob.id))}><Icon name="pause-fill" size={13} /> Pause</button>}
-              {["paused", "pausing", "queued"].includes(selectedJob.status) && <button title="Resume this run" disabled={!!busy || selectedJob.status === "pausing"} onClick={() => void mutate("resume", () => resumeCompressJob(selectedJob.id))}><Icon name="play-fill" size={13} /> Resume</button>}
+              {selectedJob.status === "running" && <button title="Pause the queue after active files finish safely" disabled={!!busy} onClick={() => void mutate("pause", () => pauseCompressJob(selectedJob.id))}><Icon name="pause-fill" size={13} /> Pause queue</button>}
+              {["paused", "pausing", "queued"].includes(selectedJob.status) && <button title={selectedJob.status === "pausing" ? "Cancel the pending pause and keep running" : "Resume this run"} disabled={!!busy} onClick={() => void mutate("resume", () => resumeCompressJob(selectedJob.id))}><Icon name="play-fill" size={13} /> {selectedJob.status === "pausing" ? "Keep running" : "Resume"}</button>}
               {["running", "pausing", "paused"].includes(selectedJob.status) && <button className="danger" title="Stop immediately and remove partial outputs" disabled={!!busy} onClick={() => {
                 if (window.confirm("Stop this run now? Active encoders will be terminated and partial outputs removed. The run remains resumable.")) {
                   void mutate("stop", () => cancelCompressJob(selectedJob.id));

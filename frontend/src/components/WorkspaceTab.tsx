@@ -4,7 +4,7 @@ import { isLiveNodeId, useTreeState, type ChipKey, type LazyOptions } from "../h
 import { invalidate as invalidateScanCache } from "../lib/scanCache";
 import {
   revealPath, openPath, createFolder,
-  copyPath, renameItem, moveItems, deletePath, copyFiles,
+  copyPath, renameItem, moveItems, deletePath,
   hasNativeMove, moveItemsNative, fetchDupesV2Bounded, runCommand,
   exportUrl, printReportAsPdf, webFetch, webSearch,
   clipboardWriteFiles, clipboardReadFiles, copyItemsNative, hasNativeCopy,
@@ -416,9 +416,102 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const selectedIdsRef = useRef(selectedIds);
   selectedIdsRef.current = selectedIds;
   const selectionAnchorIdRef = useRef<number>(0);
-  // Latest flat search/filter results, mirrored into a ref so the imperative
-  // handle (defined above the memo) can read them lazily at call time (#35).
+  // Search state lives beside selection so every row action resolves against
+  // the result set from this render, including lazy rows absent from nodeById.
   const searchResultsRef = useRef<NodeRecord[]>([]);
+  const localSearchResults = useMemo(
+    () => searchNodesAdvanced(tree.nodeById, searchQuery, searchFilters, tree.sortKey, tree.sortDir, 2000),
+    [tree.nodeById, searchQuery, searchFilters, tree.sortKey, tree.sortDir],
+  );
+  const [lazySearch, setLazySearch] = useState<{
+    key: string;
+    matches: NodeRecord[];
+    capped: boolean;
+  }>({ key: "", matches: [], capped: false });
+  const lazySearchRequestRef = useRef(0);
+  const lazyMode = !!data?.lazy;
+  const lazySearchKey = `${data?.scanId ?? ""}\u0000${searchQuery}\u0000${JSON.stringify(searchFilters)}`;
+  useEffect(() => {
+    const requestId = ++lazySearchRequestRef.current;
+    const requestKey = lazySearchKey;
+    if (!lazyMode || activeView !== "search") {
+      setLazySearch({ key: "", matches: [], capped: false });
+      return;
+    }
+    const q = searchQuery.trim();
+    const hasFilters = filtersActive(searchFilters);
+    if (q.length < 2 && !hasFilters) {
+      setLazySearch({ key: requestKey, matches: [], capped: false });
+      return;
+    }
+    const controller = new AbortController();
+    const params = toServerSearchParams(searchFilters);
+    void fetchServerSearch({
+      rootPath: data!.rootPath,
+      scanId: data!.scanId,
+      query: searchQuery,
+      limit: 500,
+      signal: controller.signal,
+      ...params,
+    })
+      .then((res) => {
+        if (requestId === lazySearchRequestRef.current) {
+          setLazySearch({
+            key: requestKey,
+            matches: res.matches,
+            capped: res.capped,
+          });
+        }
+      })
+      .catch((err: unknown) => {
+        if (!(err instanceof DOMException && err.name === "AbortError")) {
+          console.warn("server search failed", err);
+        }
+      });
+    return () => {
+      controller.abort();
+    };
+  }, [lazyMode, lazySearchKey, activeView, searchQuery, searchFilters, data]);
+
+  const searchResults = useMemo(() => {
+    if (!lazyMode) return localSearchResults;
+    if (lazySearch.key !== lazySearchKey) return [];
+    return [...lazySearch.matches].sort((a, b) => compareNodes(a, b, tree.sortKey, tree.sortDir));
+  }, [lazyMode, lazySearchKey, localSearchResults, lazySearch, tree.sortKey, tree.sortDir]);
+  searchResultsRef.current = searchResults;
+  const searching = activeView === "search"
+    && (searchQuery.trim().length >= 2 || filtersActive(searchFilters));
+
+  const taggedPaths = useMemo(() => {
+    if (!activeTagFilter) return null;
+    const want = activeTagFilter.toLowerCase();
+    const paths = new Set<string>();
+    for (const entry of tagsByPath.values()) {
+      if (entry.tags.some((tag) => tag.toLowerCase() === want)) paths.add(entry.path);
+    }
+    return paths;
+  }, [tagsByPath, activeTagFilter]);
+  const tagResults = useMemo(() => {
+    if (!taggedPaths) return [];
+    const results: NodeRecord[] = [];
+    for (const node of tree.nodeById.values()) {
+      if (node.id >= 0 && node.path && taggedPaths.has(node.path)) results.push(node);
+    }
+    results.sort((a, b) => compareNodes(a, b, tree.sortKey, tree.sortDir));
+    return results;
+  }, [taggedPaths, tree.nodeById, tree.sortKey, tree.sortDir]);
+  const tagFiltering = !!activeTagFilter && !searching;
+  const showRows = searching ? searchResults : tagFiltering ? tagResults : tree.visibleRows;
+  const showFlat = searching || tagFiltering;
+  const showRowsRef = useRef(showRows);
+  showRowsRef.current = showRows;
+  const actionNodeById = useMemo(() => {
+    if (!showFlat) return tree.nodeById;
+    return new Map(showRows.map((node) => [node.id, node]));
+  }, [showFlat, showRows, tree.nodeById]);
+  const actionNodeByIdRef = useRef(actionNodeById);
+  actionNodeByIdRef.current = actionNodeById;
+  const showTreemapView = activeView === "treemap";
   const isFirstChunkRef = useRef(true);
   const lastCompletedPathRef = useRef<string>("");
   const lastScanWasRefreshRef = useRef(false);
@@ -1097,18 +1190,19 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // unrelated parent re-renders.
   const handleSelectRow = useCallback((id: number, mode: "single" | "toggle" | "range") => {
     const t = treeRef.current;
-    const node = t.nodeById.get(id);
+    const node = actionNodeByIdRef.current.get(id);
     if (!node || node.id < 0 || !node.path) return;
 
     if (mode === "range") {
+      const rows = showRowsRef.current;
       const anchorId = selectionAnchorIdRef.current;
-      const anchorIndex = t.visibleRows.findIndex((row) => row.id === anchorId);
-      const targetIndex = t.visibleRows.findIndex((row) => row.id === id);
+      const anchorIndex = rows.findIndex((row) => row.id === anchorId);
+      const targetIndex = rows.findIndex((row) => row.id === id);
       if (anchorIndex >= 0 && targetIndex >= 0) {
         const [start, end] = anchorIndex < targetIndex
           ? [anchorIndex, targetIndex]
           : [targetIndex, anchorIndex];
-        const rangeIds = t.visibleRows
+        const rangeIds = rows
           .slice(start, end + 1)
           .filter((row) => row.id >= 0 && !!row.path)
           .map((row) => row.id);
@@ -1154,20 +1248,23 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     treeRef.current.setSelectedId(ids[ids.length - 1]);
   }, []);
 
-  const handleContextMenu = useCallback((id: number, x: number, y: number) => {
-    const t = treeRef.current;
+  const handleContextMenu = useCallback((node: NodeRecord, x: number, y: number) => {
     const selIds = selectedIdsRef.current;
+    const id = node.id;
     const alreadySelected = selIds.has(id);
     if (!alreadySelected) handleSelectRow(id, "single");
-    const node = t.nodeById.get(id);
     if (!node || node.id < 0 || !node.path) return;
     const targetIds = alreadySelected && selIds.size > 1
       ? [id, ...Array.from(selIds).filter((selectedId) => selectedId !== id)]
       : [id];
+    const currentNodes = actionNodeByIdRef.current;
     const paths = targetIds
-      .map((targetId) => t.nodeById.get(targetId))
+      .map((targetId) => (
+        targetId === id ? node : currentNodes.get(targetId)
+      ))
       .filter((target): target is NodeRecord => !!target && target.id >= 0 && !!target.path)
-      .map((target) => target.path);
+      .map((target) => target.path)
+      .filter((path, index, all) => all.indexOf(path) === index);
     void shellContextMenu(paths, x, y).catch((error: unknown) => {
       toast.error(error instanceof Error ? error.message : String(error));
     });
@@ -1179,6 +1276,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // a 500K-file folder from crossing IPC just to open the setup page.
   const handleCompress = useCallback((id: number) => {
     const t = treeRef.current;
+    const currentNodes = actionNodeByIdRef.current;
     const selIds = selectedIdsRef.current;
     const rawTargetIds = selIds.has(id) && selIds.size > 1 ? [...selIds] : [id];
     const targetSet = new Set(rawTargetIds);
@@ -1186,11 +1284,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       // Keep explicitly selected files even when their parent folder is also
       // selected: a watcher may have added them after the immutable scan index
       // was written. Rust deduplicates files that are already in the index.
-      if (!t.nodeById.get(targetId)?.dir) return true;
-      let parent = t.nodeById.get(targetId)?.parent;
+      if (!currentNodes.get(targetId)?.dir) return true;
+      let parent = currentNodes.get(targetId)?.parent;
       while (parent != null) {
         if (targetSet.has(parent)) return false;
-        parent = t.nodeById.get(parent)?.parent;
+        parent = currentNodes.get(parent)?.parent ?? t.nodeById.get(parent)?.parent;
       }
       return true;
     });
@@ -1211,7 +1309,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     };
 
     for (const tid of targetIds) {
-      const node = t.nodeById.get(tid);
+      const node = currentNodes.get(tid);
       if (!node) continue;
       if (!node.dir) {
         pushFile(node);
@@ -1288,11 +1386,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const handleExpand = useCallback((level: number) => { tree.expandToLevel(level); }, [tree]);
 
   const handleNewFolder = useCallback(async () => {
-    const selected = tree.nodeById.get(tree.selectedId);
+    const selected = actionNodeByIdRef.current.get(tree.selectedId);
     const base = selected?.dir
       ? selected.path
-      : selected?.parent != null
-        ? (tree.nodeById.get(selected.parent)?.path ?? scanPath)
+      : selected?.path
+        ? parentDir(selected.path)
         : scanPath;
     const name = await promptDialog({
       title: "New folder",
@@ -1321,25 +1419,31 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     if (node && !node.dir && node.path) openPath(node.path);
   }, []);
 
-  const selectedNode = tree.nodeById.get(tree.selectedId);
+  // Flat views deliberately scope commands to their displayed rows. This keeps
+  // a selection from an earlier search from targeting an item now hidden by a
+  // different query.
+  const selectedNode = actionNodeById.get(tree.selectedId);
   const selectedNodes = useMemo(() => {
     const nodes = Array.from(selectedIds)
-      .map((id) => tree.nodeById.get(id))
+      .map((id) => actionNodeById.get(id))
       .filter((node): node is NodeRecord => !!node && node.id >= 0 && !!node.path);
-    return nodes.length > 0 && selectedNode?.path ? nodes : selectedNode?.path ? [selectedNode] : [];
-  }, [selectedIds, selectedNode, tree.nodeById]);
+    return nodes.length > 0 ? nodes : selectedNode?.path ? [selectedNode] : [];
+  }, [actionNodeById, selectedIds, selectedNode]);
   const nodeByPath = useMemo(() => {
     const map = new Map<string, NodeRecord>();
     for (const node of tree.nodeById.values()) {
       if (node.path) map.set(node.path, node);
     }
+    for (const node of actionNodeById.values()) {
+      if (node.path) map.set(node.path, node);
+    }
     return map;
-  }, [tree.nodeById]);
+  }, [actionNodeById, tree.nodeById]);
   nodeByPathRef.current = nodeByPath;
-  const selectedPaths = useMemo(
-    () => dedupeNestedPaths(selectedNodes.map((node) => node.path), nodeByPath),
-    [nodeByPath, selectedNodes],
-  );
+  const selectedPaths = useMemo(() => {
+    const selectedByPath = new Map(selectedNodes.map((node) => [node.path, node]));
+    return dedupeNestedPaths(selectedNodes.map((node) => node.path), selectedByPath);
+  }, [selectedNodes]);
 
   // Selection summary for the status bar. Count is every selected row; total
   // size sums only top-level-selected nodes (those whose parent is NOT also
@@ -1347,23 +1451,22 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const selectionSummary = useMemo(() => {
     let count = 0;
     let bytes = 0;
-    for (const id of selectedIds) {
-      const node = tree.nodeById.get(id);
-      if (!node || node.id < 0 || !node.path) continue;
+    for (const node of selectedNodes) {
       count++;
       if (node.parent != null && selectedIds.has(node.parent)) continue;
       bytes += node.size;
     }
     return { count, bytes };
-  }, [selectedIds, tree.nodeById]);
+  }, [selectedIds, selectedNodes]);
 
   // Copy the current selection to the clipboard as a TSV table (header + one row
   // per selected node, in the active sort order) — pastes cleanly into Excel /
   // Sheets. Sourced from the same selection the status-bar summary uses.
   const runCopyAsTable = useCallback(() => {
     const t = treeRef.current;
+    const currentNodes = actionNodeByIdRef.current;
     const nodes = Array.from(selectedIdsRef.current)
-      .map((id) => t.nodeById.get(id))
+      .map((id) => currentNodes.get(id))
       .filter((n): n is NodeRecord => !!n && n.id >= 0 && !!n.path);
     if (nodes.length === 0) { toast.info("Select one or more items to copy."); return; }
     nodes.sort((a, b) => compareNodes(a, b, t.sortKey, t.sortDir));
@@ -1384,15 +1487,40 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   }, []);
 
   useEffect(() => {
-    const node = tree.nodeById.get(tree.selectedId);
-    if (!node || node.id < 0 || !node.path) return;
-    setSelectedIds((prev) => {
-      const valid = new Set(Array.from(prev).filter((id) => tree.nodeById.has(id)));
-      if (valid.has(tree.selectedId) && valid.size === prev.size) return prev;
-      selectionAnchorIdRef.current = tree.selectedId;
-      return new Set([tree.selectedId]);
-    });
-  }, [tree.selectedId, tree.nodeById]);
+    const activeNode = actionNodeById.get(tree.selectedId);
+    const valid = new Set(Array.from(selectedIds).filter((id) => actionNodeById.has(id)));
+    let next: Set<number>;
+    if (activeNode?.path && activeNode.id >= 0) {
+      next = valid.has(tree.selectedId) ? valid : new Set([tree.selectedId]);
+    } else if (valid.size > 0) {
+      next = valid;
+      const nextPrimary = valid.values().next().value as number;
+      if (tree.selectedId !== nextPrimary) tree.setSelectedId(nextPrimary);
+    } else if (showFlat) {
+      next = new Set();
+      if (tree.selectedId !== -1) tree.setSelectedId(-1);
+    } else {
+      const fallback = tree.nodeById.get(0) ?? tree.visibleRows.find((node) => node.id >= 0);
+      next = fallback ? new Set([fallback.id]) : new Set();
+      if (fallback && tree.selectedId !== fallback.id) tree.setSelectedId(fallback.id);
+    }
+    const unchanged = next.size === selectedIds.size
+      && Array.from(next).every((id) => selectedIds.has(id));
+    if (!unchanged) {
+      if (next.size > 0) {
+        selectionAnchorIdRef.current = next.values().next().value as number;
+      }
+      setSelectedIds(next);
+    }
+  }, [
+    actionNodeById,
+    selectedIds,
+    showFlat,
+    tree.nodeById,
+    tree.selectedId,
+    tree.setSelectedId,
+    tree.visibleRows,
+  ]);
 
   const runReveal   = useCallback(() => { if (selectedNode) revealPath(selectedNode.path); }, [selectedNode]);
   const runOpen     = useCallback(() => { if (selectedNode) openPath(selectedNode.path); }, [selectedNode]);
@@ -1431,7 +1559,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
 
   const commitRename = useCallback(async (id: number, rawName: string) => {
     setRenamingId(null);
-    const node = tree.nodeById.get(id);
+    const node = actionNodeByIdRef.current.get(id);
     if (!node) return;
     const newName = rawName.trim();
     if (!newName || newName === node.name) return;
@@ -1441,7 +1569,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     pushUndo({ kind: "rename", parent: parentDir(node.path), from: node.name, to: newName });
     toast.success(`Renamed to \u201C${newName}\u201D.`, { action: undoAction });
     refreshAfterMutation([parentDir(node.path)]);
-  }, [tree.nodeById, refreshAfterMutation, undoAction]);
+  }, [refreshAfterMutation, undoAction]);
 
   const runDeletePaths = useCallback(async (paths?: string[], permanent = false) => {
     const targetPaths = paths && paths.length > 0 ? dedupeNestedPaths(paths, nodeByPath) : selectedPaths;
@@ -1576,24 +1704,49 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   );
 
   const runCopyFiles = useCallback(() => {
-    if (selectedPaths.length > 0) copyFiles(selectedPaths).catch(() => {});
+    if (selectedPaths.length === 0) {
+      setMoveNotice("Select one or more files or folders to copy.");
+      return;
+    }
+    void clipboardWriteFiles(selectedPaths, false)
+      .then((written) => {
+        setMoveNotice(written
+          ? `Copied ${itemsLabel(selectedPaths.length)} to the clipboard.`
+          : "The desktop file clipboard is unavailable.");
+      })
+      .catch((error: unknown) => {
+        setMoveNotice(`Copy failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
   }, [selectedPaths]);
 
   // Cut the selection: CF_HDROP with a MOVE drop effect so Explorer dims the
   // items and a later Paste (here or in Explorer) relocates them (#9).
   const runCutFiles = useCallback(() => {
-    if (selectedPaths.length > 0) clipboardWriteFiles(selectedPaths, true).catch(() => {});
+    if (selectedPaths.length === 0) {
+      setMoveNotice("Select one or more files or folders to cut.");
+      return;
+    }
+    void clipboardWriteFiles(selectedPaths, true)
+      .then((written) => {
+        setMoveNotice(written
+          ? `Cut ${itemsLabel(selectedPaths.length)} to the clipboard.`
+          : "The desktop file clipboard is unavailable.");
+      })
+      .catch((error: unknown) => {
+        setMoveNotice(`Cut failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
   }, [selectedPaths]);
 
   // Where a Paste lands: a single selected folder, else the scanned root.
   const pasteTargetFolder = useCallback((): string | null => {
     if (!data) return null;
     if (selectedPaths.length === 1) {
-      const node = nodeByPath.get(selectedPaths[0]);
+      const node = nodeByPath.get(selectedPaths[0])
+        ?? selectedNodes.find((selected) => selected.path === selectedPaths[0]);
       if (node?.dir) return node.path;
     }
     return data.rootPath;
-  }, [data, selectedPaths, nodeByPath]);
+  }, [data, selectedPaths, nodeByPath, selectedNodes]);
 
   // Copy clipboard/dropped files INTO `destination` via the guarded native shell
   // COPY (IFileOperation): native progress/collision dialogs, recycle-on-
@@ -1746,15 +1899,19 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // const is initialised before these closures capture it.
   const runPaste = useCallback(async () => {
     if (!data) return;
-    const clip = await clipboardReadFiles();
-    if (!clip.paths.length) { setMoveNotice("Clipboard has no files to paste."); return; }
-    const dest = pasteTargetFolder();
-    if (!dest) return;
-    if (clip.preferMove) {
-      const outcome = await handleInternalMove(clip.paths, dest);
-      if (!outcome.ok) setMoveNotice(`Paste failed: ${outcome.error ?? "unknown error"}`);
-    } else {
-      await runPasteCopy(clip.paths, dest);
+    try {
+      const clip = await clipboardReadFiles();
+      if (!clip.paths.length) { setMoveNotice("Clipboard has no files to paste."); return; }
+      const dest = pasteTargetFolder();
+      if (!dest) return;
+      if (clip.preferMove) {
+        const outcome = await handleInternalMove(clip.paths, dest);
+        if (!outcome.ok) setMoveNotice(`Paste failed: ${outcome.error ?? "unknown error"}`);
+      } else {
+        await runPasteCopy(clip.paths, dest);
+      }
+    } catch (error) {
+      setMoveNotice(`Paste failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }, [data, pasteTargetFolder, handleInternalMove, runPasteCopy]);
 
@@ -2268,81 +2425,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   }, [panelHeight, onPanelHeightChange]);
-
-  const showTreemapView = activeView === "treemap";
-  // Flat, sorted name/path matches across the whole scan. Rendered in the main
-  // table (replacing the tree rows) when the Search view is active with a >= 2
-  // char query; re-sorts automatically because it reads the active sortKey/dir.
-  const localSearchResults = useMemo(
-    () => searchNodesAdvanced(tree.nodeById, searchQuery, searchFilters, tree.sortKey, tree.sortDir, 2000),
-    [tree.nodeById, searchQuery, searchFilters, tree.sortKey, tree.sortDir],
-  );
-
-  // LAZY mode: the renderer holds only loaded dirs, so name/path search runs on
-  // the backend over the cached scan (GET /api/search). Results are fetched
-  // (debounced + abortable) into state, then re-sorted client-side by the active
-  // table sort. Full mode keeps the synchronous in-memory search above.
-  const [lazySearch, setLazySearch] = useState<{ matches: NodeRecord[]; capped: boolean }>({ matches: [], capped: false });
-  const lazySearchRequestRef = useRef(0);
-  const lazyMode = !!data?.lazy;
-  useEffect(() => {
-    const requestId = ++lazySearchRequestRef.current;
-    if (!lazyMode || activeView !== "search") { setLazySearch({ matches: [], capped: false }); return; }
-    const q = searchQuery.trim();
-    const hasFilters = filtersActive(searchFilters);
-    if (q.length < 2 && !hasFilters) { setLazySearch({ matches: [], capped: false }); return; }
-    const controller = new AbortController();
-    const params = toServerSearchParams(searchFilters);
-    void fetchServerSearch({
-      rootPath: data!.rootPath,
-      scanId: data!.scanId,
-      query: searchQuery,
-      limit: 500,
-      signal: controller.signal,
-      ...params,
-    })
-      .then((res) => {
-        if (requestId === lazySearchRequestRef.current) {
-          setLazySearch({ matches: res.matches, capped: res.capped });
-        }
-      })
-      .catch((err: unknown) => { if (!(err instanceof DOMException && err.name === "AbortError")) console.warn("server search failed", err); });
-    return () => { controller.abort(); };
-  }, [lazyMode, activeView, searchQuery, searchFilters, data]);
-
-  const searchResults = useMemo(() => {
-    if (!lazyMode) return localSearchResults;
-    return [...lazySearch.matches].sort((a, b) => compareNodes(a, b, tree.sortKey, tree.sortDir));
-  }, [lazyMode, localSearchResults, lazySearch, tree.sortKey, tree.sortDir]);
-  searchResultsRef.current = searchResults;
-  // Show flat results when searching (>=2 char query) OR a pure size/type/date
-  // filter is active (lets filters alone list results with an empty query).
-  const searching = activeView === "search" && (searchQuery.trim().length >= 2 || filtersActive(searchFilters));
-
-  // Tag filter (F4): when a tag is active, flatten the table to the tagged paths
-  // (same flat-list treatment as Search). A lightweight predicate over the live
-  // node map — no mutation of the tree's own filter state.
-  const taggedPaths = useMemo(() => {
-    if (!activeTagFilter) return null;
-    const want = activeTagFilter.toLowerCase();
-    const set = new Set<string>();
-    for (const e of tagsByPath.values()) {
-      if (e.tags.some((t) => t.toLowerCase() === want)) set.add(e.path);
-    }
-    return set;
-  }, [tagsByPath, activeTagFilter]);
-  const tagResults = useMemo(() => {
-    if (!taggedPaths) return [];
-    const out: NodeRecord[] = [];
-    for (const n of tree.nodeById.values()) {
-      if (n.id >= 0 && n.path && taggedPaths.has(n.path)) out.push(n);
-    }
-    out.sort((a, b) => compareNodes(a, b, tree.sortKey, tree.sortDir));
-    return out;
-  }, [taggedPaths, tree.nodeById, tree.sortKey, tree.sortDir]);
-  const tagFiltering = !!activeTagFilter && !searching;
-  const showRows = searching ? searchResults : tagFiltering ? tagResults : tree.visibleRows;
-  const showFlat = searching || tagFiltering;
 
   const breadcrumbPath = data?.rootPath || scanPath;
   const canBack = navHistory.index > 0;

@@ -1402,7 +1402,6 @@ export default function App() {
 
   const handleClose3D = useCallback(() => setTmShow3D(false), []);
   const handleToggleChat = useCallback(() => setChatOpen((v) => !v), []);
-  const handleOpenChat = useCallback(() => setChatOpen(true), []);
   const handleCloseChat = useCallback(() => setChatOpen(false), []);
   const handleNewAgentSession = useCallback(() => {
     setChatSessionId(newChatSessionId());
@@ -1836,7 +1835,6 @@ export default function App() {
         onToggleTerminal={handleToggleTerminal}
         chatOpen={chatOpen}
         onToggleChat={handleToggleChat}
-        onOpenAgents={handleOpenChat}
         onNewSession={handleNewAgentSession}
         onCloseChat={handleCloseChat}
         getSessions={loadChatIndex}

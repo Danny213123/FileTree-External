@@ -123,7 +123,9 @@ interface TreeTableProps {
   /** Pass the displayed row itself because paged/lazy search results are not
    *  guaranteed to be resident in the bounded nodeById cache. */
   onDoubleClick: (node: NodeRecord) => void;
-  onContextMenu: (id: number, x: number, y: number) => void;
+  /** Context menus need the same guarantee as double-click: search rows may not
+   *  exist in nodeById, so the row object is the authoritative path source. */
+  onContextMenu: (node: NodeRecord, x: number, y: number) => void;
   onSortChange: (key: SortKey) => void;
   onToggleBookmark: (path: string) => void;
   /** Quick-load this row (or its active multi-selection) into Compression.
@@ -674,13 +676,17 @@ function TreeTableInner({
   }, [rows]);
 
   const rootNode = nodeById.get(0);
+  const rowById = useMemo(
+    () => new Map(rows.map((row) => [row.id, row])),
+    [rows],
+  );
   const selectedDragNodes = useMemo(
     () => dedupeNestedNodes(
       Array.from(selectedIds)
-        .map((id) => nodeById.get(id))
+        .map((id) => nodeById.get(id) ?? rowById.get(id))
         .filter((node): node is NodeRecord => !!node && node.id >= 0 && !!node.path),
     ),
-    [nodeById, selectedIds],
+    [nodeById, rowById, selectedIds],
   );
 
   const reportInternalMoveError = useCallback((message: string) => {
@@ -1025,7 +1031,7 @@ function TreeTableInner({
                 onDoubleClick={() => { if (!isBundle) onDoubleClick(node); }}
                 onContextMenu={(e) => {
                   e.preventDefault();
-                  if (!isBundle) onContextMenu(node.id, e.clientX, e.clientY);
+                  if (!isBundle) onContextMenu(node, e.clientX, e.clientY);
                 }}
                 onDragStart={(e) => {
                   if (!isDraggable) return;

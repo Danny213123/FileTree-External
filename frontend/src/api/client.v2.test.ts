@@ -9,6 +9,9 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import { invoke } from "@tauri-apps/api/core";
 import {
+  clipboardReadFiles,
+  clipboardWriteFiles,
+  copyItemsNative,
   fetchFolderPreview,
   fetchServerSearch,
   fetchSubtreeFiles,
@@ -99,6 +102,41 @@ describe("v2 bounded client queries", () => {
 
     expect(invoke).toHaveBeenCalledWith("native_move_items", {
       paths: ["D:\\Downloads\\one.bin", "D:\\Downloads\\two.bin"],
+      destination: "E:\\Archive",
+    });
+  });
+
+  it("uses the Windows file clipboard and native copy commands", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce({
+        paths: ["D:\\Downloads\\one.bin"],
+        preferMove: false,
+      })
+      .mockResolvedValueOnce({
+        aborted: false,
+        moved: 1,
+        skipped: 0,
+        failed: 0,
+      });
+
+    await expect(clipboardWriteFiles(["D:\\Downloads\\one.bin"], false)).resolves.toBe(true);
+    await expect(clipboardReadFiles()).resolves.toEqual({
+      paths: ["D:\\Downloads\\one.bin"],
+      preferMove: false,
+    });
+    await expect(copyItemsNative(
+      ["D:\\Downloads\\one.bin"],
+      "E:\\Archive",
+    )).resolves.toMatchObject({ moved: 1, failed: 0 });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "clipboard_write_files", {
+      paths: ["D:\\Downloads\\one.bin"],
+      cut: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "clipboard_read_files");
+    expect(invoke).toHaveBeenNthCalledWith(3, "native_copy_items", {
+      paths: ["D:\\Downloads\\one.bin"],
       destination: "E:\\Archive",
     });
   });
