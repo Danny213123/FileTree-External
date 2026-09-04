@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle, useSyncExternalStore, memo } from "react";
 import { useScan, fetchScanStream } from "../hooks/useScan";
-import { isLiveNodeId, useTreeState, type ChipKey, type LazyOptions } from "../hooks/useTreeState";
+import { isLiveNodeId, isNodeOpen, useTreeState, type ChipKey, type LazyOptions } from "../hooks/useTreeState";
 import { invalidate as invalidateScanCache } from "../lib/scanCache";
 import {
   revealPath, openPath, createFolder,
@@ -32,7 +32,6 @@ import { TreeTable } from "./TreeTable";
 import { BulkRenameDialog } from "./BulkRenameDialog";
 import { TagPopover } from "./TagPopover";
 import { ConfigureColumnsMenu } from "./ConfigureColumnsMenu";
-import { Treemap } from "./Treemap";
 import type { ViewId } from "./ActivityBar";
 import { ConflictDialog, type ConflictChoice } from "./ConflictDialog";
 import { MoveToDialog } from "./MoveToDialog";
@@ -171,14 +170,22 @@ export interface RibbonState {
 export interface SidebarModel {
   data: ScanResult | null;
   nodeById: Map<number, NodeRecord>;
+  metric: Metric;
   unit: Unit;
+  loadedDirs: Set<number>;
   scanPath: string;
   scanning: boolean;
   treeRows: NodeRecord[];
   expanded: Set<number>;
+  expandedAll: boolean;
+  collapsedOverrides: Set<number>;
   selectedId: number;
   selectedNode: NodeRecord | undefined;
   errorCount: number;
+  onSelectNode: (id: number) => void;
+  onEnsureChildren: (id: number) => void;
+  onMoveItems: (sourcePaths: string[], destinationFolder: string) => Promise<{ ok: boolean; error?: string }>;
+  onOpenNode: (id: number) => void;
   onNavigate: (id: number) => void;
   onScanPathInput: (p: string) => void;
   onScan: () => void;
@@ -290,7 +297,7 @@ interface WorkspaceTabProps {
   tabId: string;
   initialPath: string;
   active: boolean;
-  // Drives the in-pane treemap "view"; the shared side bar (App) tracks its own.
+  // Drives search/results behavior; the shared side bar (App) tracks its own.
   activeView: ViewId;
   // Activity-bar Search query (already debounced in App). When activeView ===
   // "search" and this has >= 2 chars, the main table renders flat search results.
@@ -301,11 +308,6 @@ interface WorkspaceTabProps {
   // Whether the per-pane controls toolbar row (under the tabs) is shown. Toggled
   // from the tab bar's toolbar button; per-editor-group, defaults to visible.
   toolbarVisible: boolean;
-  darkMode: boolean;
-  panelOpen: boolean;
-  onPanelOpenChange: (v: boolean) => void;
-  panelHeight: number;
-  onPanelHeightChange: (n: number) => void;
   // data + options
   bookmarkList: string[];
   // Tags & color labels (F4): path → entry map for the row badges + popover, the
@@ -323,13 +325,6 @@ interface WorkspaceTabProps {
   /** Toggling this re-scans the current path so owners (de)populate. */
   onCollectOwnersChange: (v: boolean) => void;
   exclude: string;
-  treemapDetail: number;
-  tmShowSingleFiles: boolean;
-  tmShow3D: boolean;
-  tmShowHierarchy: boolean;
-  tmShowLegend: boolean;
-  tmShowLabels: boolean;
-  tmDragDrop: boolean;
   decimals: number;
   visibleColumns: Set<SortKey>;
   onVisibleColumnsChange: (cols: Set<SortKey>) => void;
@@ -339,7 +334,6 @@ interface WorkspaceTabProps {
   folderDblClickExplorer: boolean;
   /** #9: tint table rows by size relative to the largest visible row. */
   heatTint: boolean;
-  onClose3D: () => void;
   onToggleBookmark: (path: string) => void;
   // Quick-load files or persisted scan folders into the Compress page.
   onCompress: (sources: CompressionSource[]) => void;
@@ -361,15 +355,12 @@ interface WorkspaceTabProps {
 
 const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(function WorkspaceTab(
   {
-    tabId, initialPath, active, activeView, searchQuery, searchFilters, toolbarVisible, darkMode,
-    panelOpen, onPanelOpenChange, panelHeight, onPanelHeightChange,
+    tabId, initialPath, active, activeView, searchQuery, searchFilters, toolbarVisible,
     bookmarkList, tagsByPath, activeTagFilter, onSetTags, onClearTagFilter,
     threads, includeHidden, followLinks, collectOwners, onCollectOwnersChange, exclude,
-    treemapDetail,
-    tmShowSingleFiles, tmShow3D, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
     folderDblClickExplorer, heatTint,
-    onClose3D, onToggleBookmark, onCompress, onScanPath, onStateChange, onWorkbenchChange, onOpenTerminal,
+    onToggleBookmark, onCompress, onScanPath, onStateChange, onWorkbenchChange, onOpenTerminal,
     onOpenFolderInTab, onUndo,
   }: WorkspaceTabProps,
   ref,
@@ -385,7 +376,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     [],
   );
   const [filterDialogOpen, setFilterDialogOpen] = useState(false);
-  const dragStartRef = useRef<{ y: number; h: number } | null>(null);
 
   const { data, status, errorMessage, progressStore, startScan, startRefresh, cancelScan } = useScan();
   // LAZY mode (very large scans): when useScan flags the result `lazy`, the
@@ -512,7 +502,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   }, [showFlat, showRows, tree.nodeById]);
   const actionNodeByIdRef = useRef(actionNodeById);
   actionNodeByIdRef.current = actionNodeById;
-  const showTreemapView = activeView === "treemap";
   const isFirstChunkRef = useRef(true);
   const lastCompletedPathRef = useRef<string>("");
   const lastScanWasRefreshRef = useRef(false);
@@ -939,7 +928,21 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // onStateChange above (which keeps the shell's scan-level state in sync too).
   useEffect(() => {
     if (active) onWorkbenchChange();
-  }, [active, tree.visibleRows, tree.expanded, tree.selectedId, tree.nodeById, selectedIds, scanPath, onWorkbenchChange]);
+  }, [
+    active,
+    tree.visibleRows,
+    tree.expanded,
+    tree.expandedAll,
+    tree.collapsedOverrides,
+    tree.selectedId,
+    tree.nodeById,
+    tree.loadedDirs,
+    tree.metric,
+    tree.unit,
+    selectedIds,
+    scanPath,
+    onWorkbenchChange,
+  ]);
 
   const startWatch = useCallback((rootPath: string) => {
     const generation = ++watchGenerationRef.current;
@@ -1005,7 +1008,16 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             const visibleDirectories = new Set<string>([rootPath]);
             const currentTree = treeRef.current;
             for (const node of currentTree.nodeById.values()) {
-              if (node.dir && node.path && currentTree.expanded.has(node.id)) {
+              if (
+                node.dir
+                && node.path
+                && isNodeOpen(
+                  node.id,
+                  currentTree.expanded,
+                  currentTree.expandedAll,
+                  currentTree.collapsedOverrides,
+                )
+              ) {
                 visibleDirectories.add(node.path);
               }
             }
@@ -1109,15 +1121,38 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
-  // Rehydrate lazily-expanded branches a level at a time after an inactive tab
-  // releases its node pages. Stable database IDs preserve selection/expansion.
+  // Rehydrate open lazy branches a level at a time after an inactive tab
+  // releases pages. Expand All also discovers newly-loaded folders recursively;
+  // the small batch keeps a large drive from launching thousands of requests at
+  // once while the node cache applies its normal retention bound.
   useEffect(() => {
     if (!active || !data?.lazy) return;
-    for (const id of tree.expanded) {
-      const node = tree.nodeById.get(id);
-      if (node?.dir) tree.ensureChildren(id);
+    let requested = 0;
+    for (const node of tree.nodeById.values()) {
+      if (
+        requested >= 12
+        || !node.dir
+        || tree.loadedDirs.has(node.id)
+        || !isNodeOpen(
+          node.id,
+          tree.expanded,
+          tree.expandedAll,
+          tree.collapsedOverrides,
+        )
+      ) continue;
+      tree.ensureChildren(node.id);
+      requested++;
     }
-  }, [active, data?.lazy, tree.expanded, tree.nodeById, tree.ensureChildren]);
+  }, [
+    active,
+    data?.lazy,
+    tree.expanded,
+    tree.expandedAll,
+    tree.collapsedOverrides,
+    tree.loadedDirs,
+    tree.nodeById,
+    tree.ensureChildren,
+  ]);
 
   // Opening a previously-unloaded lazy branch makes any retained watcher path
   // patchable. Retry only those newly-known dirty directories; no deep scan.
@@ -1351,6 +1386,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       t.ensureExpanded(node.parent);
       node = t.nodeById.get(node.parent);
     }
+    if (id >= 0 && t.nodeById.get(id)?.dir) t.ensureChildren(id);
     t.setSelectedId(id);
   }, []);
 
@@ -2310,7 +2346,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       const openDirs: string[] = [];
       for (const node of t.nodeById.values()) {
         if (!node.dir || node.id < 0 || !node.path) continue;
-        if (node.id === 0 || t.expanded.has(node.id)) openDirs.push(node.path);
+        if (
+          node.id === 0
+          || isNodeOpen(node.id, t.expanded, t.expandedAll, t.collapsedOverrides)
+        ) openDirs.push(node.path);
       }
       if (openDirs.length === 0) return;
       const limited = openDirs.slice(0, SMART_REFRESH_MAX_DIRS);
@@ -2394,14 +2433,23 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       return {
         data,
         nodeById: t.nodeById,
+        metric: t.metric,
         unit: t.unit,
+        loadedDirs: t.loadedDirs,
         scanPath,
         scanning: status === "scanning",
         treeRows: t.visibleRows,
         expanded: t.expanded,
+        expandedAll: t.expandedAll,
+        collapsedOverrides: t.collapsedOverrides,
         selectedId: t.selectedId,
         selectedNode: t.nodeById.get(t.selectedId),
         errorCount: data?.errorCount ?? 0,
+        onSelectNode: t.setSelectedId,
+        onEnsureChildren: t.ensureChildren,
+        onMoveItems: (sourcePaths, destinationFolder) =>
+          handleInternalMove(sourcePaths, destinationFolder),
+        onOpenNode: handleTreemapOpen,
         onNavigate: handleNavigate,
         onScanPathInput: setScanPathState,
         onScan: () => openLocation(scanPath),
@@ -2519,34 +2567,12 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     getFilterRules: () => treeRef.current.filterRules,
     setFilterRules: (rules) => treeRef.current.setFilterRules(rules),
   }), [status, data, progressStore, errorMessage, scanPath, tree, cancelScan, agentApi,
-       doScan, handleNavigate, handleNavigateParent, handleExpand, handleNewFolder, selectedNode,
+       doScan, handleNavigate, handleNavigateParent, handleExpand, handleNewFolder, handleTreemapOpen, selectedNode,
        openLocation, goBack, goForward, navHistory, runOpen, runReveal, onScanPath,
        runRename, runRenamePath, runDelete, runDeletePaths, runMoveTo, runCopyTo, runEditAttributes,
        runSendToMail, runSendToCommand, runCopyPath, runCopyFiles,
        runCompress, runExtract, runChecksum, selectionSummary, runCopyAsTable,
        runCutFiles, runPaste, dropExternalInto, doSmartRefresh]);
-
-  // Bottom-panel (treemap) vertical resize.
-  const handlePanelResize = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    dragStartRef.current = { y: e.clientY, h: panelHeight };
-    const onMove = (ev: MouseEvent) => {
-      if (!dragStartRef.current) return;
-      const delta = dragStartRef.current.y - ev.clientY;
-      onPanelHeightChange(Math.max(120, Math.min(900, dragStartRef.current.h + delta)));
-    };
-    const onUp = () => {
-      dragStartRef.current = null;
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.body.style.cursor = "ns-resize";
-    document.body.style.userSelect = "none";
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  }, [panelHeight, onPanelHeightChange]);
 
   const breadcrumbPath = data?.rootPath || scanPath;
   const canBack = navHistory.index > 0;
@@ -2559,8 +2585,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // Inactive tabs stay MOUNTED — so their scan/tree state, imperative ref, the
   // shared Explorer side bar, the status bar and the Duplicates cross-tab scan
   // aggregation all keep reading this pane — but render NONE of their heavy
-  // content. The virtualized TreeTable and the two Treemap canvases are
-  // unmounted, freeing their DOM + canvas backing stores and skipping any
+  // content. The virtualized TreeTable is unmounted, freeing its DOM and
+  // skipping any
   // background canvas redraws / row reconciliation while hidden (previously they
   // stayed in the DOM behind `display:none`). Every piece of important state
   // lives in this component's hooks (useScan / useTreeState / selection /
@@ -2615,67 +2641,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             </button>
           </div>
         )}
-        {showTreemapView ? (
-          <>
-            {toolbarVisible && (
-            <div className="editor-toolbar">
-              <label>
-                Size
-                <select value={tree.metric} onChange={(e) => tree.setMetric(e.target.value as Metric)}>
-                  <option value="size">Size</option>
-                  <option value="allocated">Allocated</option>
-                  <option value="files">Files</option>
-                  <option value="folders">Folders</option>
-                </select>
-              </label>
-              <label>
-                Unit
-                <select value={tree.unit} onChange={(e) => tree.setUnit(e.target.value as Unit)}>
-                  <option value="auto">Auto</option>
-                  <option value="tb">TB</option>
-                  <option value="gb">GB</option>
-                  <option value="mb">MB</option>
-                  <option value="kb">KB</option>
-                  <option value="bytes">Bytes</option>
-                </select>
-              </label>
-            </div>
-            )}
-            {data?.lazy && (
-              <div className="stale-bar" role="status">
-                <Icon name="warning" size={12} />
-                <span>
-                  This scan is very large and loads folders on demand — the treemap only
-                  reflects folders you've expanded. Narrow to a subfolder for a complete map.
-                </span>
-              </div>
-            )}
-            <div className="editor-stack">
-              <div className="editor-main">
-                <Treemap
-                  nodeById={tree.nodeById}
-                  selectedId={tree.selectedId}
-                  metric={tree.metric}
-                  unit={tree.unit}
-                  detail={treemapDetail}
-                  darkMode={darkMode}
-                  showSingleFiles={tmShowSingleFiles}
-                  show3D={tmShow3D}
-                  showHierarchy={tmShowHierarchy}
-                  showLegend={tmShowLegend}
-                  showLabels={tmShowLabels}
-                  dragDrop={tmDragDrop}
-                  onSelect={tree.setSelectedId}
-                  onNavigate={handleNavigate}
-                  onOpen={handleTreemapOpen}
-                  onClose3D={onClose3D}
-                />
-              </div>
-            </div>
-          </>
-        ) : (
-          <>
-            {toolbarVisible && (
+        {toolbarVisible && (
             <div className="editor-toolbar">
               <label>
                 Size
@@ -2708,10 +2674,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               </label>
               <button
                 onClick={() => tree.expandToLevel(Infinity)}
-                disabled={!!data?.lazy}
                 title={data?.lazy
-                  ? "Expand all is disabled for very large (lazily loaded) scans — folders load on demand as you expand them."
-                  : undefined}
+                  ? "Expand all folders and file groups, loading large scans in bounded batches."
+                  : "Expand all folders and file groups."}
               >Expand all</button>
               <button onClick={() => tree.expandToLevel(0)}>Collapse all</button>
               <span className="sep" />
@@ -2738,15 +2703,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               />
               <span className="spacer" />
               <button onClick={handleOpenTerminal} title="Open terminal here (Ctrl+`)">Terminal</button>
-              <button
-                className={panelOpen ? "active" : ""}
-                onClick={() => onPanelOpenChange(!panelOpen)}
-                title="Toggle treemap panel"
-              >Treemap</button>
             </div>
-            )}
+        )}
 
-            {toolbarVisible && (
+        {toolbarVisible && (
             <div className="editor-toolbar quick-filter-chips">
               {QUICK_FILTER_CHIPS.map((chip) => (
                 <button
@@ -2760,10 +2720,10 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                 </button>
               ))}
             </div>
-            )}
+        )}
 
-            {searching && (
-              <div className="editor-toolbar search-results-bar">
+        {searching && (
+          <div className="editor-toolbar search-results-bar">
                 <Icon name="search" size={12} />
                 <span className="search-results-count">
                   {searchResults.length}{searchResults.length >= 2000 ? "+" : ""} result{searchResults.length === 1 ? "" : "s"}
@@ -2784,12 +2744,12 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   disabled={searchResults.length === 0}
                   title="Export the result rows to JSON"
                 >Export JSON</button>
-              </div>
-            )}
+          </div>
+        )}
 
-            <div className="editor-stack">
-              <div className="editor-main">
-                <TreeTable
+        <div className="editor-stack">
+          <div className="editor-main">
+            <TreeTable
                   rows={showRows}
                   scanId={data?.scanId}
                   flat={showFlat}
@@ -2797,6 +2757,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   loadedDirs={tree.loadedDirs}
                   nodeById={tree.nodeById}
                   expanded={tree.expanded}
+                  expandedAll={tree.expandedAll}
+                  collapsedOverrides={tree.collapsedOverrides}
                   selectedId={tree.selectedId}
                   selectedIds={selectedIds}
                   sortKey={tree.sortKey}
@@ -2828,53 +2790,17 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   renamingId={renamingId}
                   onRenameCommit={commitRename}
                   onRenameCancel={cancelRename}
-                />
-                {/* In-editor scan feedback: while a scan is in flight and the
-                    tree is still empty (initial/large scans blank the grid), show
-                    a centered overlay with the live node count + Cancel over a few
-                    skeleton rows. A refresh keeps the old tree visible, so rows are
-                    present and this never shows. */}
-                {status === "scanning" && tree.visibleRows.length === 0 && (
-                  <ScanOverlay progressStore={progressStore} onCancel={cancelScan} />
-                )}
-              </div>
-
-              {panelOpen && (
-                <>
-                  <div className="resizer-y" onMouseDown={handlePanelResize} />
-                  <div className="bottom-panel" style={{ height: panelHeight, flex: `0 0 ${panelHeight}px` }}>
-                    <div className="bottom-panel-header">
-                      <span className="bottom-panel-tab active">Treemap</span>
-                      <span className="spacer" />
-                      <button className="icon" title="Close panel" onClick={() => onPanelOpenChange(false)}><Icon name="x" size={13} /></button>
-                    </div>
-                    <div className="bottom-panel-body">
-                      <Treemap
-                        nodeById={tree.nodeById}
-                        selectedId={tree.selectedId}
-                        metric={tree.metric}
-                        unit={tree.unit}
-                        detail={treemapDetail}
-                        darkMode={darkMode}
-                        showSingleFiles={tmShowSingleFiles}
-                        show3D={tmShow3D}
-                        showHierarchy={tmShowHierarchy}
-                        showLegend={tmShowLegend}
-                        showLabels={tmShowLabels}
-                        dragDrop={tmDragDrop}
-                        onSelect={tree.setSelectedId}
-                        onNavigate={handleNavigate}
-                        onMoveItems={handleInternalMove}
-                        onOpen={handleTreemapOpen}
-                        onClose3D={onClose3D}
-                      />
-                    </div>
-                  </div>
-                </>
-              )}
-            </div>
-          </>
-        )}
+            />
+            {/* In-editor scan feedback: while a scan is in flight and the
+                tree is still empty (initial/large scans blank the grid), show
+                a centered overlay with the live node count + Cancel over a few
+                skeleton rows. A refresh keeps the old tree visible, so rows are
+                present and this never shows. */}
+            {status === "scanning" && tree.visibleRows.length === 0 && (
+              <ScanOverlay progressStore={progressStore} onCancel={cancelScan} />
+            )}
+          </div>
+        </div>
       </div>
 
       {filterDialogOpen && (

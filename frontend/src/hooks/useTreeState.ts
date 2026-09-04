@@ -42,6 +42,7 @@ function buildChipRules(chips: Set<ChipKey>): FilterRule[] {
 export interface TreeState {
   expanded: Set<number>;
   expandedAll: boolean;
+  collapsedOverrides: Set<number>;
   selectedId: number;
   sortKey: SortKey;
   sortDir: 1 | -1;
@@ -301,6 +302,16 @@ const MAX_CACHED_LAZY_NODES = 16 * 500;
 const MAX_ACTIVE_LAZY_NODES = 16 * 500;
 const MAX_RETAINED_LAZY_NODES = MAX_CACHED_LAZY_NODES + MAX_ACTIVE_LAZY_NODES;
 
+/** Single source of truth for folder and synthetic file-bundle twisties. */
+export function isNodeOpen(
+  id: number,
+  expanded: ReadonlySet<number>,
+  expandedAll: boolean,
+  collapsedOverrides: ReadonlySet<number>,
+): boolean {
+  return expandedAll ? !collapsedOverrides.has(id) : expanded.has(id);
+}
+
 function collectVisibleRows(
   nodeById: Map<number, NodeRecord>,
   expanded: Set<number>,
@@ -314,14 +325,6 @@ function collectVisibleRows(
 ): NodeRecord[] {
   const root = nodeById.get(0);
   if (!root) return [];
-
-  // File bundles (negative ids) are always opt-in via `expanded`, even under
-  // Expand All — auto-opening them would materialise every file in the folder as
-  // its own row (the ~700k-row freeze). Real folders honour Expand All.
-  const isOpen = (id: number) => {
-    if (id < 0) return expanded.has(id);
-    return expandedAll ? !collapsedOverrides.has(id) : expanded.has(id);
-  };
 
   // Determine which filtering mode is active. Rules take precedence when any
   // rule is active; compiledRules already holds ONLY the active rules (their
@@ -368,7 +371,10 @@ function collectVisibleRows(
 
     // While filtering, treat real directories as open so matches inside
     // collapsed folders still surface; otherwise honor the expand/collapse state.
-    if (!(filtering && !isBundle && node.dir) && !isOpen(node.id)) continue;
+    if (
+      !(filtering && !isBundle && node.dir)
+      && !isNodeOpen(node.id, expanded, expandedAll, collapsedOverrides)
+    ) continue;
 
     if (isBundle) {
       // Expanded bundle: look up pre-sorted file list from parent dir's cache
@@ -443,7 +449,11 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
   const expandedRef = useRef(expanded);
   expandedRef.current = expanded;
   const [expandedAll, setExpandedAll] = useState(false);
+  const expandedAllRef = useRef(expandedAll);
+  expandedAllRef.current = expandedAll;
   const [collapsedOverrides, setCollapsedOverrides] = useState<Set<number>>(new Set());
+  const collapsedOverridesRef = useRef(collapsedOverrides);
+  collapsedOverridesRef.current = collapsedOverrides;
   const [selectedId, setSelectedId] = useState(0);
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
@@ -615,6 +625,19 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
           if (required > 0) {
             const protectedIds = new Set<number>([0, dirId, selectedIdRef.current, ...expandedRef.current]);
             const byId = new Map(retained.map((node) => [node.id, node]));
+            if (expandedAllRef.current) {
+              for (const node of retained) {
+                if (
+                  node.dir
+                  && isNodeOpen(
+                    node.id,
+                    expandedRef.current,
+                    true,
+                    collapsedOverridesRef.current,
+                  )
+                ) protectedIds.add(node.id);
+              }
+            }
             for (const id of [...protectedIds]) {
               let current = byId.get(id);
               while (current?.parent != null) {
@@ -626,7 +649,13 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
             let removed = 0;
             retained = retained.filter((node) => {
               if (removed >= required || protectedIds.has(node.id) || incomingIds.has(node.id)) return true;
-              if (node.parent != null && !expandedRef.current.has(node.parent)) {
+              const parentOpen = node.parent != null && isNodeOpen(
+                node.parent,
+                expandedRef.current,
+                expandedAllRef.current,
+                collapsedOverridesRef.current,
+              );
+              if (node.parent != null && !parentOpen) {
                 removedParents.add(node.parent);
                 removed++;
                 return false;
@@ -720,7 +749,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
     // LAZY: opening a real directory pulls its children if not yet loaded. Safe
     // to call unconditionally — ensureChildren no-ops in full mode / when loaded.
     if (id >= 0) ensureChildren(id);
-    if (expandedAll && id >= 0) {
+    if (expandedAll) {
       setCollapsedOverrides((prev) => {
         const next = new Set(prev);
         if (next.has(id)) next.delete(id); // re-open a manually-collapsed node
@@ -1035,6 +1064,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
   return {
     expanded,
     expandedAll,
+    collapsedOverrides,
     selectedId,
     sortKey,
     sortDir,

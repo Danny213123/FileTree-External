@@ -27,7 +27,7 @@ export const SHORTCUT_COMMANDS: ShortcutCommand[] = [
   { id: "palette.files", label: "Go to File", defaultChord: "Ctrl+P", category: "General" },
   { id: "toggle.chat", label: "Toggle AI Assistant", defaultChord: "Ctrl+Alt+B", category: "View" },
   { id: "toggle.sidebar", label: "Toggle Side Bar", defaultChord: "Ctrl+B", category: "View" },
-  { id: "toggle.panel", label: "Toggle Panel", defaultChord: "Ctrl+J", category: "View" },
+  { id: "toggle.panel", label: "Toggle Treemap", defaultChord: "Ctrl+J", category: "View" },
   { id: "tab.new", label: "New Tab", defaultChord: "Ctrl+T", category: "View" },
   { id: "toggle.terminal", label: "Toggle Terminal", defaultChord: "Ctrl+`", category: "View" },
   { id: "toggle.preview", label: "Toggle Preview Pane", defaultChord: "Alt+P", category: "View" },

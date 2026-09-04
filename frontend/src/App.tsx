@@ -32,6 +32,8 @@ import type { WorkspaceTab as WorkspaceTabMeta } from "./components/TabBar";
 import { TabBar } from "./components/TabBar";
 import { WorkspaceTab } from "./components/WorkspaceTab";
 import type { WorkspaceTabHandle, SidebarModel } from "./components/WorkspaceTab";
+import { Treemap } from "./components/Treemap";
+import { Icon } from "./components/Icon";
 import { TitleBar, type Menu, type MenuItem } from "./components/TitleBar";
 import { loadChatIndex, newChatSessionId } from "./lib/chatSessions";
 import { undoLast } from "./lib/undo";
@@ -162,14 +164,22 @@ const NOOP = () => {};
 const EMPTY_SIDEBAR_MODEL: SidebarModel = {
   data: null,
   nodeById: new Map(),
+  metric: "size",
   unit: "auto",
+  loadedDirs: new Set(),
   scanPath: "",
   scanning: false,
   treeRows: [],
   expanded: new Set(),
+  expandedAll: false,
+  collapsedOverrides: new Set(),
   selectedId: 0,
   selectedNode: undefined,
   errorCount: 0,
+  onSelectNode: NOOP,
+  onEnsureChildren: NOOP,
+  onMoveItems: async () => ({ ok: false, error: "No active scan" }),
+  onOpenNode: NOOP,
   onNavigate: NOOP,
   onScanPathInput: NOOP,
   onScan: NOOP,
@@ -326,6 +336,8 @@ export default function App() {
   const [sidebarWidth, setSidebarWidth] = useState(260);
   const [panelOpen, setPanelOpen] = useState(false);
   const [panelHeight, setPanelHeight] = useState(320);
+  const panelOpenRef = useRef(false);
+  useEffect(() => { panelOpenRef.current = panelOpen; }, [panelOpen]);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatWidth, setChatWidth] = useState(360);
   const [chatSessionId, setChatSessionId] = useState<string>(() => newChatSessionId());
@@ -333,10 +345,19 @@ export default function App() {
   // plus a nonce the palette bumps to pop the session-history view.
   const chatControllerRef = useRef<ChatPanelController | null>(null);
   const [chatHistoryReq, setChatHistoryReq] = useState(0);
-  // Right-side inspector: Preview and Details panes (independently toggleable).
+  // Right-side Explorer inspector. Preview and Details share the same rail so
+  // only one is visible at a time.
   const [previewOpen, setPreviewOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [inspectorWidth, setInspectorWidth] = useState(320);
+  useEffect(() => {
+    if (activeView !== "explorer") {
+      setPreviewOpen(false);
+      setDetailsOpen(false);
+    } else if (previewOpen && detailsOpen) {
+      setDetailsOpen(false);
+    }
+  }, [activeView, previewOpen, detailsOpen]);
   // Scheduled-scan wizard (#10) — a modal over the workbench.
   const [scheduleOpen, setScheduleOpen] = useState(false);
 
@@ -466,6 +487,7 @@ export default function App() {
   const handleToggleTerminal = useCallback(() => {
     if (terminalOpenRef.current) { setTerminalOpen(false); return; }
     const cwd = getActiveRef()?.getScanPath() || "";
+    setPanelOpen(false);
     setTerminalCwd(cwd);
     setTerminalMounted(true);
     setTerminalOpen(true);
@@ -581,9 +603,24 @@ export default function App() {
   // `optionsMenu` arrays (and the TitleBar props) keep stable callback identities
   // instead of allocating fresh closures on every render.
   const handleToggleSidebar = useCallback(() => setSidebarOpen((v) => !v), []);
-  const handleTogglePanel = useCallback(() => setPanelOpen((v) => !v), []);
-  const handleTogglePreview = useCallback(() => setPreviewOpen((v) => !v), []);
-  const handleToggleDetails = useCallback(() => setDetailsOpen((v) => !v), []);
+  const handleToggleTreemap = useCallback(() => {
+    if (panelOpenRef.current) {
+      setPanelOpen(false);
+      return;
+    }
+    setTerminalOpen(false);
+    setPanelOpen(true);
+  }, []);
+  const handleTogglePreview = useCallback(() => {
+    if (activeView !== "explorer") return;
+    setDetailsOpen(false);
+    setPreviewOpen((open) => !open);
+  }, [activeView]);
+  const handleToggleDetails = useCallback(() => {
+    if (activeView !== "explorer") return;
+    setPreviewOpen(false);
+    setDetailsOpen((open) => !open);
+  }, [activeView]);
   const handleToggleTmLabels = useCallback(() => setTmShowLabels((v) => !v), []);
   const handleToggleTmHierarchy = useCallback(() => setTmShowHierarchy((v) => !v), []);
   const handleToggleTmLegend = useCallback(() => setTmShowLegend((v) => !v), []);
@@ -675,12 +712,17 @@ export default function App() {
       }
       if (settings.decimals !== undefined) setDecimals(settings.decimals);
       // Layout
-      if (settings.activeView && ["explorer", "search", "treemap", "duplicates", "compress", "bookmarks", "errors"].includes(settings.activeView)) {
+      const legacyTreemapView = settings.activeView === "treemap";
+      if (settings.activeView && ["explorer", "search", "duplicates", "compress", "bookmarks", "errors"].includes(settings.activeView)) {
         setActiveView(settings.activeView as ViewId);
+      } else if (legacyTreemapView) {
+        setActiveView("explorer");
       }
       if (settings.sidebarOpen !== undefined) setSidebarOpen(settings.sidebarOpen);
       if (settings.sidebarWidth) setSidebarWidth(settings.sidebarWidth);
-      if (settings.panelOpen !== undefined) setPanelOpen(settings.panelOpen);
+      if (settings.panelOpen !== undefined || legacyTreemapView) {
+        setPanelOpen(legacyTreemapView || !!settings.panelOpen);
+      }
       if (settings.panelHeight) setPanelHeight(settings.panelHeight);
       if (settings.chatOpen !== undefined) setChatOpen(settings.chatOpen);
       if (settings.chatWidth) setChatWidth(settings.chatWidth);
@@ -1249,7 +1291,7 @@ export default function App() {
         case "palette.files": e.preventDefault(); setPaletteMode("files"); break;
         case "toggle.chat": e.preventDefault(); setChatOpen((v) => !v); break;
         case "toggle.sidebar": e.preventDefault(); setSidebarOpen((v) => !v); break;
-        case "toggle.panel": e.preventDefault(); setPanelOpen((v) => !v); break;
+        case "toggle.panel": e.preventDefault(); handleToggleTreemap(); break;
         case "tab.new": e.preventDefault(); handleOpenInNewTab(""); break;
         case "toggle.terminal": e.preventDefault(); handleToggleTerminal(); break;
         // Per-tab navigation history (acts on the focused pane).
@@ -1257,8 +1299,8 @@ export default function App() {
         case "nav.forward": e.preventDefault(); getActiveRef()?.doForward(); break;
         case "nav.up": e.preventDefault(); getActiveRef()?.doNavigateParent(); break;
         // Inspector pane toggles (mirror Explorer): Alt+P preview, Alt+Shift+P details.
-        case "toggle.preview": e.preventDefault(); setPreviewOpen((v) => !v); break;
-        case "toggle.details": e.preventDefault(); setDetailsOpen((v) => !v); break;
+        case "toggle.preview": e.preventDefault(); handleTogglePreview(); break;
+        case "toggle.details": e.preventDefault(); handleToggleDetails(); break;
         case "edit.undo":
           // Ctrl+Z must never hijack text-editing undo.
           if (inEditable(e.target) || inEditable(document.activeElement)) return;
@@ -1288,7 +1330,15 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleOpenInNewTab, handleToggleTerminal, handleUndo, getActiveRef]);
+  }, [
+    handleOpenInNewTab,
+    handleToggleTerminal,
+    handleToggleTreemap,
+    handleTogglePreview,
+    handleToggleDetails,
+    handleUndo,
+    getActiveRef,
+  ]);
 
   const handleScanPath = useCallback((path: string) => {
     if (path.trim()) { pushRecent(path.trim()); persist(); }
@@ -1420,6 +1470,11 @@ export default function App() {
   }, []);
 
   const handleClose3D = useCallback(() => setTmShow3D(false), []);
+  const handleOpen3D = useCallback(() => {
+    setTerminalOpen(false);
+    setPanelOpen(true);
+    setTmShow3D(true);
+  }, []);
   const handleToggleChat = useCallback(() => setChatOpen((v) => !v), []);
   const handleCloseChat = useCallback(() => setChatOpen(false), []);
   const handleNewAgentSession = useCallback(() => {
@@ -1525,6 +1580,7 @@ export default function App() {
 
   // Open a terminal at `cwd` (called by the editor-toolbar Terminal button).
   const handleOpenTerminal = useCallback((cwd: string) => {
+    setPanelOpen(false);
     setTerminalCwd(cwd || "");
     setTerminalMounted(true);
     setTerminalOpen(true);
@@ -1550,6 +1606,26 @@ export default function App() {
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   }, [terminalHeight]);
+
+  const handleTreemapResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = panelHeight;
+    const onMove = (ev: MouseEvent) => {
+      const delta = startY - ev.clientY;
+      setPanelHeight(Math.max(120, Math.min(window.innerHeight - 220, startH + delta)));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "ns-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [panelHeight]);
 
   // Editor-tab metadata (label/path/scanning) per tab, derived from the live
   // refs and looked up per group in the split layout below. Memoized on `tabs`
@@ -1583,6 +1659,7 @@ export default function App() {
   const statusData = activeRef?.getData() ?? null;
   const shellErrorCount = statusData?.errorCount ?? 0;
   const navState = activeRef?.getNavState() ?? { canBack: false, canForward: false };
+  const inspectorEligible = activeView === "explorer";
   const activeLabel = metaById.get(focusedTabId)?.label ?? "FileTree";
   const focusedTabIndex = focusedGroup ? focusedGroup.tabIds.indexOf(focusedTabId) : -1;
   const canPrevTab = focusedTabIndex > 0;
@@ -1648,12 +1725,12 @@ export default function App() {
       label: "View",
       items: [
         { label: "Toggle Side Bar", kbd: "Ctrl+B", checked: sidebarOpen, onClick: handleToggleSidebar },
-        { label: "Toggle Panel", kbd: "Ctrl+J", checked: panelOpen, onClick: handleTogglePanel },
+        { label: "Toggle Treemap", kbd: "Ctrl+J", checked: panelOpen, onClick: handleToggleTreemap },
         { label: "Toggle Terminal", kbd: "Ctrl+`", checked: terminalOpen, onClick: handleToggleTerminal },
         { label: "Toggle AI Assistant", kbd: "Ctrl+Alt+B", checked: chatOpen, onClick: handleToggleChat },
         { separator: true },
-        { label: "Preview Pane", kbd: "Alt+P", checked: previewOpen, onClick: handleTogglePreview },
-        { label: "Details Pane", kbd: "Alt+Shift+P", checked: detailsOpen, onClick: handleToggleDetails },
+        { label: "Preview Pane", kbd: "Alt+P", checked: inspectorEligible && previewOpen, disabled: !inspectorEligible, onClick: handleTogglePreview },
+        { label: "Details Pane", kbd: "Alt+Shift+P", checked: inspectorEligible && detailsOpen, disabled: !inspectorEligible, onClick: handleToggleDetails },
         { separator: true },
         { label: "Configure Columns…", opensColumns: true },
         { separator: true },
@@ -1670,6 +1747,7 @@ export default function App() {
         { label: "Treemap: Labels", checked: tmShowLabels, onClick: handleToggleTmLabels },
         { label: "Treemap: Hierarchy", checked: tmShowHierarchy, onClick: handleToggleTmHierarchy },
         { label: "Treemap: Legend", checked: tmShowLegend, onClick: handleToggleTmLegend },
+        { label: "Treemap: 3D View…", checked: tmShow3D, disabled: !statusData, onClick: handleOpen3D },
         { separator: true },
         { label: "Expand All", onClick: () => getActiveRef()?.doExpand(Infinity) },
         { label: "Collapse All", onClick: () => getActiveRef()?.doExpand(0) },
@@ -1697,15 +1775,15 @@ export default function App() {
   // getActiveRef / the extracted toggle handlers are stable; the array rebuilds
   // only when a checked/disabled input or the focused tab changes.
   [
-    sidebarOpen, panelOpen, terminalOpen, chatOpen, previewOpen, detailsOpen, darkMode,
-    tmShowLabels, tmShowHierarchy, tmShowLegend, navState.canBack, navState.canForward,
+    sidebarOpen, panelOpen, terminalOpen, chatOpen, previewOpen, detailsOpen, inspectorEligible, darkMode,
+    tmShowLabels, tmShowHierarchy, tmShowLegend, tmShow3D, navState.canBack, navState.canForward,
     statusData, tabs.length, focusedGroupId, focusedTabId,
     lowSpaceAlerts, lowSpaceThreshold, cycleLowSpaceThreshold,
     folderDblClickExplorer, heatTint, handleToggleFolderDblClick, handleToggleHeatTint,
     handleOpenInNewTab, handleCloseTab, handleSaveSession, handleLoadSession,
     handleToggleTerminal, handleToggleChat, handleToggleDark, handleToggleSidebar,
-    handleTogglePanel, handleTogglePreview, handleToggleDetails, handleToggleTmLabels,
-    handleToggleTmHierarchy, handleToggleTmLegend, handleOpenSchedule, handleAbout, getActiveRef,
+    handleToggleTreemap, handleTogglePreview, handleToggleDetails, handleToggleTmLabels,
+    handleToggleTmHierarchy, handleToggleTmLegend, handleOpen3D, handleOpenSchedule, handleAbout, getActiveRef,
   ]);
 
   // Overflow menu for the right-hand "⋯" control in the title bar.
@@ -1714,7 +1792,6 @@ export default function App() {
     { label: chatOpen ? "Hide AI Assistant" : "Open AI Assistant", onClick: handleToggleChat },
     { separator: true },
     { label: "Toggle Side Bar", kbd: "Ctrl+B", checked: sidebarOpen, onClick: handleToggleSidebar },
-    { label: "Toggle Treemap Panel", kbd: "Ctrl+J", checked: panelOpen, onClick: handleTogglePanel },
     { separator: true },
     { label: "Dark Theme", checked: darkMode, onClick: handleToggleDark },
     { separator: true },
@@ -1727,8 +1804,8 @@ export default function App() {
     { label: "About FileTree", onClick: handleAbout },
   ],
   [
-    chatOpen, sidebarOpen, panelOpen, darkMode, statusData,
-    handleNewAgentSession, handleToggleChat, handleToggleSidebar, handleTogglePanel,
+    chatOpen, sidebarOpen, darkMode, statusData,
+    handleNewAgentSession, handleToggleChat, handleToggleSidebar,
     handleToggleDark, handleAbout, getActiveRef,
   ]);
 
@@ -1779,7 +1856,6 @@ export default function App() {
     const views: { id: ViewId; label: string }[] = [
       { id: "explorer", label: "Explorer" },
       { id: "search", label: "Search" },
-      { id: "treemap", label: "Treemap" },
       { id: "duplicates", label: "Duplicates" },
       { id: "compress", label: "Compress" },
       { id: "bookmarks", label: "Bookmarks" },
@@ -1804,6 +1880,7 @@ export default function App() {
       { id: "copy-as-table", title: "Copy as table", keywords: "tsv excel sheets clipboard rows export", run: () => getActiveRef()?.doCopyAsTable() },
       { id: "hidden", title: "Toggle Hidden Files", keywords: "dotfiles include", run: () => setIncludeHidden((v) => !v) },
       { id: "terminal", title: "Open Terminal", hint: "Ctrl+`", keywords: "shell console", run: () => handleToggleTerminal() },
+      { id: "treemap", title: "Toggle Treemap", hint: "Ctrl+J", keywords: "panel disk map", run: () => handleToggleTreemap() },
       { id: "undo", title: "Undo Last Action", hint: "Ctrl+Z", keywords: "revert", run: () => { void handleUndo(); } },
       { id: "save-smart-folder", title: "Save Smart Folder\u2026", keywords: "search filter", run: () => { void handleSaveSmartFolder(); } },
       { id: "search-select-all", title: "Search: Select All Results", hint: "Search", keywords: "filter results selection select-all", run: () => { getActiveRef()?.doSelectSearchResults(); } },
@@ -1837,7 +1914,7 @@ export default function App() {
         run: () => handleSelectView(v.id),
       })),
     ];
-  }, [getActiveRef, handleToggleTerminal, handleUndo, handleSaveSmartFolder, handleToggleSidebar, handleToggleChat, handleSelectView, handleNewAgentSession, handleExcludePath]);
+  }, [getActiveRef, handleToggleTerminal, handleToggleTreemap, handleUndo, handleSaveSmartFolder, handleToggleSidebar, handleToggleChat, handleSelectView, handleNewAgentSession, handleExcludePath]);
 
   return (
     <div className="vscode">
@@ -1972,11 +2049,6 @@ export default function App() {
                         searchQuery={debouncedSearchQuery}
                         searchFilters={searchFilters}
                         toolbarVisible={!group.toolbarHidden}
-                        darkMode={darkMode}
-                        panelOpen={panelOpen}
-                        onPanelOpenChange={setPanelOpen}
-                        panelHeight={panelHeight}
-                        onPanelHeightChange={setPanelHeight}
                         bookmarkList={bookmarkList}
                         threads={threads}
                         includeHidden={includeHidden}
@@ -1984,20 +2056,12 @@ export default function App() {
                         collectOwners={collectOwners}
                         onCollectOwnersChange={setCollectOwners}
                         exclude={exclude}
-                        treemapDetail={treemapDetail}
-                        tmShowSingleFiles={tmShowSingleFiles}
-                        tmShow3D={tmShow3D}
-                        tmShowHierarchy={tmShowHierarchy}
-                        tmShowLegend={tmShowLegend}
-                        tmShowLabels={tmShowLabels}
-                        tmDragDrop={tmDragDrop}
                         decimals={decimals}
                         visibleColumns={visibleColumns}
                         onVisibleColumnsChange={setVisibleColumns}
                         onDecimalsChange={setDecimals}
                         folderDblClickExplorer={folderDblClickExplorer}
                         heatTint={heatTint}
-                        onClose3D={handleClose3D}
                         onToggleBookmark={handleToggleBookmark}
                         onCompress={handleCompressPaths}
                         onScanPath={handleScanPath}
@@ -2036,7 +2100,7 @@ export default function App() {
           </div>
         )}
 
-        {(previewOpen || detailsOpen) && (
+        {inspectorEligible && (previewOpen || detailsOpen) && (
           <>
             <div className="resizer-x" onMouseDown={handleInspectorResize} />
             <WorkbenchInspector
@@ -2075,6 +2139,30 @@ export default function App() {
           </>
         )}
       </div>
+
+        {panelOpen && (
+          <>
+            <div className="resizer-y" onMouseDown={handleTreemapResize} />
+            <WorkbenchTreemapPanel
+              store={workbenchStore}
+              height={panelHeight}
+              detail={treemapDetail}
+              darkMode={darkMode}
+              showSingleFiles={tmShowSingleFiles}
+              show3D={tmShow3D}
+              showHierarchy={tmShowHierarchy}
+              showLegend={tmShowLegend}
+              showLabels={tmShowLabels}
+              dragDrop={tmDragDrop}
+              onClose={() => {
+                setPanelOpen(false);
+                setTmShow3D(false);
+              }}
+              onOpen3D={handleOpen3D}
+              onClose3D={handleClose3D}
+            />
+          </>
+        )}
 
         {terminalMounted && (
           <>
@@ -2230,6 +2318,8 @@ function WorkbenchSideBar({
       onOpenLocation={m.onOpenLocation}
       treeRows={m.treeRows}
       expanded={m.expanded}
+      expandedAll={m.expandedAll}
+      collapsedOverrides={m.collapsedOverrides}
       selectedId={m.selectedId}
       onToggleExpand={m.onToggleExpand}
       onSelectFolder={m.onSelectFolder}
@@ -2260,6 +2350,81 @@ function WorkbenchStatusBar({ store, onUndo }: { store: WorkbenchStore; onUndo: 
       scanPath={snap.sidebar.scanPath}
       onUndo={onUndo}
     />
+  );
+}
+
+function WorkbenchTreemapPanel({
+  store,
+  height,
+  detail,
+  darkMode,
+  showSingleFiles,
+  show3D,
+  showHierarchy,
+  showLegend,
+  showLabels,
+  dragDrop,
+  onClose,
+  onOpen3D,
+  onClose3D,
+}: {
+  store: WorkbenchStore;
+  height: number;
+  detail: number;
+  darkMode: boolean;
+  showSingleFiles: boolean;
+  show3D: boolean;
+  showHierarchy: boolean;
+  showLegend: boolean;
+  showLabels: boolean;
+  dragDrop: boolean;
+  onClose: () => void;
+  onOpen3D: () => void;
+  onClose3D: () => void;
+}) {
+  const { sidebar: model } = useWorkbench(store);
+  return (
+    <section
+      className="bottom-panel treemap-panel"
+      style={{ height, flex: `0 0 ${height}px` }}
+      aria-label="Treemap panel"
+    >
+      <div className="bottom-panel-header">
+        <span className="bottom-panel-tab active">
+          <Icon name="treemap" size={13} /> Treemap
+        </span>
+        <span className="spacer" />
+        <button className="icon" title="Open 3D treemap" onClick={onOpen3D}>
+          <Icon name="bar-chart" size={13} />
+        </button>
+        <button className="icon" title="Close treemap" onClick={onClose}>
+          <Icon name="x" size={13} />
+        </button>
+      </div>
+      <div className="bottom-panel-body">
+        <Treemap
+          nodeById={model.nodeById}
+          selectedId={model.selectedId}
+          metric={model.metric}
+          unit={model.unit}
+          detail={detail}
+          darkMode={darkMode}
+          showSingleFiles={showSingleFiles}
+          show3D={show3D}
+          showHierarchy={showHierarchy}
+          showLegend={showLegend}
+          showLabels={showLabels}
+          dragDrop={dragDrop}
+          loadedDirs={model.data?.lazy ? model.loadedDirs : undefined}
+          onViewChange={model.onEnsureChildren}
+          onSelect={model.onSelectNode}
+          onNavigate={model.onNavigate}
+          onMoveItems={model.onMoveItems}
+          onOpen={model.onOpenNode}
+          onClose3D={onClose3D}
+        />
+      </div>
+    </section>
   );
 }
 

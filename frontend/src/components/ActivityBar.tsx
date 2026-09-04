@@ -3,13 +3,12 @@
 import { Icon, type IconName } from "./Icon";
 
 export type ViewId =
-  | "explorer" | "search" | "treemap" | "duplicates"
+  | "explorer" | "search" | "duplicates"
   | "compress" | "bookmarks" | "errors";
 
 const ITEMS: { id: ViewId; label: string; icon: IconName }[] = [
   { id: "explorer", label: "Explorer", icon: "explorer" },
   { id: "search", label: "Search", icon: "search" },
-  { id: "treemap", label: "Treemap", icon: "treemap" },
   { id: "duplicates", label: "Duplicates", icon: "duplicates" },
   { id: "compress", label: "Compress", icon: "file-zip" },
   { id: "bookmarks", label: "Bookmarks", icon: "bookmark" },

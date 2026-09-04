@@ -48,7 +48,7 @@ import { Icon } from "./Icon";
 
 const PAGE_SIZE = 250;
 const PAGE_CACHE_LIMIT = 12;
-const LAYOUT_KEY = "filetree.compress.monitor.v1";
+const LAYOUT_KEY = "filetree.compress.monitor.v2";
 
 type SortKey =
   | "activity" | "queue" | "name" | "size" | "progress" | "elapsed"
@@ -70,8 +70,8 @@ interface MonitorLayout {
 }
 
 const DEFAULT_LAYOUT: MonitorLayout = {
-  columns: ["name", "progress", "stage", "elapsed", "eta", "speed", "encoder", "sizes", "savings", "result"],
-  widths: { name: 320, progress: 170, stage: 90, elapsed: 76, eta: 76, speed: 90, encoder: 150, sizes: 150, savings: 82, result: 145 },
+  columns: ["name", "progress", "stage", "sizes", "result"],
+  widths: { name: 360, progress: 200, stage: 110, elapsed: 86, eta: 86, speed: 100, encoder: 160, sizes: 180, savings: 92, result: 170 },
   sort: "activity",
   direction: "asc",
   status: "",
@@ -178,7 +178,9 @@ export function CompressionMonitor({ focusJobId }: Props) {
   const [inspected, setInspected] = useState<CompressJobFile | null>(null);
   const [telemetry, setTelemetry] = useState<CompressTelemetry | null>(null);
   const [columnsOpen, setColumnsOpen] = useState(false);
+  const [metricsOpen, setMetricsOpen] = useState(true);
   const [busy, setBusy] = useState("");
+  const [workerInput, setWorkerInput] = useState(2);
   const scrollRef = useRef<HTMLDivElement>(null);
   const pageCache = useRef(new Map<number, CompressJobFile[]>());
   const pageLru = useRef<number[]>([]);
@@ -235,6 +237,10 @@ export function CompressionMonitor({ focusJobId }: Props) {
   );
 
   useEffect(() => {
+    setWorkerInput(selectedJob?.concurrency ?? 2);
+  }, [selectedJob?.id, selectedJob?.concurrency]);
+
+  useEffect(() => {
     if (!selectedJob) return;
     if (progressSampleJob.current !== selectedJob.id) {
       progressSampleJob.current = selectedJob.id;
@@ -285,7 +291,7 @@ export function CompressionMonitor({ focusJobId }: Props) {
     setPageMeta(null);
     setSelectedFiles(new Set());
     setInspected(null);
-    scrollRef.current?.scrollTo({ top: 0 });
+    scrollRef.current?.scrollTo?.({ top: 0 });
     void loadPage(0, true);
   }, [queryKey, loadPage]);
 
@@ -318,7 +324,7 @@ export function CompressionMonitor({ focusJobId }: Props) {
   const rowVirtualizer = useVirtualizer({
     count: pageMeta?.totalMatches ?? 0,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => 30,
+    estimateSize: () => 36,
     overscan: 14,
   });
   const virtualRows = rowVirtualizer.getVirtualItems();
@@ -399,6 +405,15 @@ export function CompressionMonitor({ focusJobId }: Props) {
     }
   };
 
+  const commitWorkers = () => {
+    if (!selectedJob) return;
+    const value = Math.max(1, Math.min(2, Math.floor(workerInput || 1)));
+    setWorkerInput(value);
+    if (value !== (selectedJob.concurrency ?? 2)) {
+      void mutate("workers", () => setCompressConcurrency(selectedJob.id, value));
+    }
+  };
+
   const queuedIds = jobs.filter((job) => job.status === "queued").map((job) => job.id);
   const moveQueuedRun = (id: string, delta: -1 | 1) => {
     const index = queuedIds.indexOf(id);
@@ -422,7 +437,13 @@ export function CompressionMonitor({ focusJobId }: Props) {
   const setQuickView = (view: "active" | "queued" | "completed" | "attention" | "all") => {
     setLayout((current) => ({
       ...current,
-      status: view === "active" ? "running" : view === "queued" ? "pending" : view === "completed" ? "done" : "",
+      status: view === "active"
+        ? "running"
+        : view === "queued"
+          ? "pending"
+          : view === "completed"
+            ? "done,skipped,error"
+            : "",
       attention: view === "attention",
       sort: view === "active" ? "activity" : current.sort,
       direction: view === "active" ? "asc" : current.direction,
@@ -477,7 +498,7 @@ export function CompressionMonitor({ focusJobId }: Props) {
   };
 
   return (
-    <div className="compression-monitor">
+    <div className="compression-monitor compression-monitor-v2">
       <aside className="cm-runs" aria-label="Compression runs">
         <div className="cm-runs-head">
           <strong>Runs</strong>
@@ -502,12 +523,27 @@ export function CompressionMonitor({ focusJobId }: Props) {
                       <span role="button" tabIndex={0} aria-label="Move queued run earlier" className={queueIndex <= 0 ? "disabled" : ""} onClick={(event) => {
                         event.stopPropagation();
                         moveQueuedRun(job.id, -1);
+                      }} onKeyDown={(event) => {
+                        if (event.key !== "Enter" && event.key !== " ") return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        moveQueuedRun(job.id, -1);
                       }}><Icon name="caret-up" size={10} /></span>
                       <span role="button" tabIndex={0} aria-label="Move queued run later" className={queueIndex >= queuedIds.length - 1 ? "disabled" : ""} onClick={(event) => {
                         event.stopPropagation();
                         moveQueuedRun(job.id, 1);
+                      }} onKeyDown={(event) => {
+                        if (event.key !== "Enter" && event.key !== " ") return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        moveQueuedRun(job.id, 1);
                       }}><Icon name="caret-down" size={10} /></span>
                       <span role="button" tabIndex={0} aria-label="Remove queued run" onClick={(event) => {
+                        event.stopPropagation();
+                        void mutate("remove", () => removeQueuedCompressJob(job.id));
+                      }} onKeyDown={(event) => {
+                        if (event.key !== "Enter" && event.key !== " ") return;
+                        event.preventDefault();
                         event.stopPropagation();
                         void mutate("remove", () => removeQueuedCompressJob(job.id));
                       }}><Icon name="x" size={11} /></span>
@@ -525,7 +561,7 @@ export function CompressionMonitor({ focusJobId }: Props) {
 
       <section className="cm-detail">
         {!selectedJob ? <div className="cm-empty centered">{jobsLoading ? "Loading compression runs..." : "Select a run to inspect it"}</div> : <>
-          <header className="cm-job-header">
+          <header className="cm-job-header cm-job-header-v2">
             <div className="cm-job-title">
               <span className={`cm-status-pill ${statusTone(selectedJob.status)}`}>{selectedJob.status}</span>
               <strong>{selectedJob.preset}</strong>
@@ -536,14 +572,21 @@ export function CompressionMonitor({ focusJobId }: Props) {
             <div className="cm-job-controls">
               <label className="cm-concurrency" title="Live worker limit; reductions apply after active files finish">
                 Workers
-                <input type="number" min={1} max={2} value={selectedJob.concurrency ?? 2} onChange={(event) => {
-                  const value = Math.max(1, Math.min(2, Math.floor(Number(event.target.value) || 1)));
-                  void mutate("workers", () => setCompressConcurrency(selectedJob.id, value));
-                }} />
+                <input
+                  type="number"
+                  min={1}
+                  max={2}
+                  value={workerInput}
+                  onChange={(event) => setWorkerInput(Number(event.target.value))}
+                  onBlur={commitWorkers}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
+                />
               </label>
-              {selectedJob.status === "running" && <button title="Pause the queue after active files finish safely" disabled={!!busy} onClick={() => void mutate("pause", () => pauseCompressJob(selectedJob.id))}><Icon name="pause-fill" size={13} /> Pause queue</button>}
-              {["paused", "pausing", "queued"].includes(selectedJob.status) && <button title={selectedJob.status === "pausing" ? "Cancel the pending pause and keep running" : "Resume this run"} disabled={!!busy} onClick={() => void mutate("resume", () => resumeCompressJob(selectedJob.id))}><Icon name="play-fill" size={13} /> {selectedJob.status === "pausing" ? "Keep running" : "Resume"}</button>}
-              {["running", "pausing", "paused"].includes(selectedJob.status) && <button className="danger" title="Stop immediately and remove partial outputs" disabled={!!busy} onClick={() => {
+              {selectedJob.status === "running" && <button className="compress-btn" title="Pause the queue after active files finish safely" disabled={!!busy} onClick={() => void mutate("pause", () => pauseCompressJob(selectedJob.id))}><Icon name="pause-fill" size={13} /> Pause queue</button>}
+              {["paused", "pausing", "queued"].includes(selectedJob.status) && <button className="compress-btn" title={selectedJob.status === "pausing" ? "Cancel the pending pause and keep running" : "Resume this run"} disabled={!!busy} onClick={() => void mutate("resume", () => resumeCompressJob(selectedJob.id))}><Icon name="play-fill" size={13} /> {selectedJob.status === "pausing" ? "Keep running" : "Resume"}</button>}
+              {["running", "pausing", "paused"].includes(selectedJob.status) && <button className="compress-btn danger" title="Stop immediately and remove partial outputs" disabled={!!busy} onClick={() => {
                 if (window.confirm("Stop this run now? Active encoders will be terminated and partial outputs removed. The run remains resumable.")) {
                   void mutate("stop", () => cancelCompressJob(selectedJob.id));
                 }
@@ -561,31 +604,43 @@ export function CompressionMonitor({ focusJobId }: Props) {
               <span>{selectedJob.activeCount ?? 0} active</span>
               <span>{formatBytes(selectedJob.savedBytes)} saved</span>
             </div>
+            {isLowSpace && <div className="cm-warning"><Icon name="warning" size={13} /> Destination space is low. FileTree will keep the run intact and will not delete or skip work automatically.</div>}
+          </header>
+
+          <details
+            className="cm-metrics-panel"
+            open={metricsOpen}
+            onToggle={(event) => setMetricsOpen(event.currentTarget.open)}
+          >
+            <summary className="cm-metrics-summary">
+              <span>Run metrics</span>
+              <label onClick={(event) => event.stopPropagation()}>
+                <input type="checkbox" checked={layout.keepAwake} onChange={(event) => setLayout((current) => ({ ...current, keepAwake: event.target.checked }))} />
+                Keep PC awake
+              </label>
+            </summary>
             <div className="cm-job-facts">
               <span><small>Active time</small>{fmtDuration(selectedJob.activeElapsedMs)}</span>
               <span><small>ETA</small>{overallEta == null ? "Calculating" : fmtDuration(overallEta)}</span>
               <span><small>Expected finish</small>{expectedFinish(overallEta)}</span>
               <span><small>Confidence</small>{confidence}</span>
-              <label><input type="checkbox" checked={layout.keepAwake} onChange={(event) => setLayout((current) => ({ ...current, keepAwake: event.target.checked }))} /> Keep PC awake</label>
             </div>
-            {isLowSpace && <div className="cm-warning"><Icon name="warning" size={13} /> Destination space is low. FileTree will keep the run intact and will not delete or skip work automatically.</div>}
-          </header>
-
-          <div className="cm-telemetry" aria-label="Compression telemetry">
-            <Telemetry label="GPU encode" value={telemetryText(telemetry?.gpuVideoEncodePct, "%")} />
-            <Telemetry label="Sessions" value={telemetryText(telemetry?.encoderSessions)} />
-            <Telemetry label="Aggregate" value={telemetryText(telemetry?.aggregateFps, " fps")} />
-            <Telemetry label="Pipeline CPU" value={telemetryText(telemetry?.encoderCpuPct, "%")} />
-            <Telemetry label="RAM" value={telemetry?.ramBytes == null ? "Unavailable" : formatBytes(telemetry.ramBytes)} />
-            <Telemetry label="Read" value={fmtRate(telemetry?.readBytesPerSec)} />
-            <Telemetry label="Write" value={fmtRate(telemetry?.writeBytesPerSec)} />
-            <Telemetry label="Free space" value={telemetry?.destinationFreeBytes == null ? "Unavailable" : formatBytes(telemetry.destinationFreeBytes)} warn={isLowSpace} />
-          </div>
+            <div className="cm-telemetry" aria-label="Compression telemetry">
+              <Telemetry label="GPU encode" value={telemetryText(telemetry?.gpuVideoEncodePct, "%")} />
+              <Telemetry label="Sessions" value={telemetryText(telemetry?.encoderSessions)} />
+              <Telemetry label="Aggregate" value={telemetryText(telemetry?.aggregateFps, " fps")} />
+              <Telemetry label="Pipeline CPU" value={telemetryText(telemetry?.encoderCpuPct, "%")} />
+              <Telemetry label="RAM" value={telemetry?.ramBytes == null ? "Unavailable" : formatBytes(telemetry.ramBytes)} />
+              <Telemetry label="Read" value={fmtRate(telemetry?.readBytesPerSec)} />
+              <Telemetry label="Write" value={fmtRate(telemetry?.writeBytesPerSec)} />
+              <Telemetry label="Free space" value={telemetry?.destinationFreeBytes == null ? "Unavailable" : formatBytes(telemetry.destinationFreeBytes)} warn={isLowSpace} />
+            </div>
+          </details>
 
           <div className="cm-toolbar">
             <div className="cm-search"><Icon name="search" size={13} /><input aria-label="Search files" placeholder="Search files, paths, outcomes..." value={searchInput} onChange={(event) => setSearchInput(event.target.value)} /></div>
             <div className="cm-quick-views">
-              {(["all", "active", "queued", "completed", "attention"] as const).map((view) => <button key={view} className={(view === "attention" ? layout.attention : view === "active" ? layout.status === "running" : view === "queued" ? layout.status === "pending" : view === "completed" ? layout.status === "done" : !layout.status && !layout.attention) ? "selected" : ""} onClick={() => setQuickView(view)}>{view[0].toUpperCase() + view.slice(1)}</button>)}
+              {(["all", "active", "queued", "completed", "attention"] as const).map((view) => <button key={view} className={(view === "attention" ? layout.attention : view === "active" ? layout.status === "running" : view === "queued" ? layout.status === "pending" : view === "completed" ? layout.status === "done,skipped,error" : !layout.status && !layout.attention) ? "selected" : ""} onClick={() => setQuickView(view)}>{view[0].toUpperCase() + view.slice(1)}</button>)}
             </div>
             <select title="File type" value={layout.kind} onChange={(event) => setLayout((current) => ({ ...current, kind: event.target.value }))}><option value="">All types</option><option value="video">Video</option><option value="image">Images</option><option value="other">Other</option></select>
             <select title="Original disposition" value={layout.disposition} onChange={(event) => setLayout((current) => ({ ...current, disposition: event.target.value }))}><option value="">Any disposition</option><option value="recycled">Recycled</option><option value="deleted">Deleted</option><option value="kept">Kept</option></select>

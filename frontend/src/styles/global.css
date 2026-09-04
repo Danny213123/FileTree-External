@@ -1539,6 +1539,23 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   opacity: 0.55; transition: opacity 0.12s;
 }
 .treemap-export:hover { opacity: 1; background: var(--vsc-list-hover); }
+.treemap-export:disabled { opacity: 0.3; cursor: default; background: var(--surface); }
+.treemap-empty {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  color: var(--treemap-fg);
+  font-size: 12px;
+  text-align: center;
+  pointer-events: none;
+}
+.treemap-empty .bi { opacity: 0.7; }
 .treemap-tooltip {
   position: fixed;
   pointer-events: none;
@@ -4049,6 +4066,15 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
 .compress-overall-text { font-size: 12px; color: var(--text-5); white-space: nowrap; }
 .compress-overall-text b { color: var(--text); font-variant-numeric: tabular-nums; }
 .compress-saved { color: var(--accent-2, var(--accent)); font-weight: 600; }
+.compress-active-run {
+  display: flex; align-items: center; gap: 10px; flex: 0 0 auto;
+  min-height: 44px; padding: 8px 12px; border-bottom: 1px solid var(--vsc-border);
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface)); color: var(--text-5);
+  font-size: 12px;
+}
+.compress-active-run .ct-ico { color: var(--accent); display: inline-flex; }
+.compress-active-run > span:nth-child(2) { flex: 1 1 auto; min-width: 0; }
+.compress-active-run b { color: var(--text); text-transform: capitalize; }
 
 /* Generic progress bar (overall + per-file) */
 .compress-bar {
@@ -4558,6 +4584,174 @@ html.native-context-menu-open .compress-log-vrow:hover { background: transparent
   .cm-workarea { position: relative; }
   .cm-toolbar { flex-wrap: wrap; }
 }
+
+/* Spacious compression monitor — same square, minimal visual language as the
+   Setup and History tabs, with secondary metrics collapsible on demand. */
+.compression-monitor-v2 {
+  grid-template-columns: minmax(260px, 290px) minmax(0, 1fr);
+  font-size: 12.5px;
+}
+.compression-monitor-v2 .cm-runs {
+  background: var(--panel);
+}
+.compression-monitor-v2 .cm-runs-head {
+  height: 44px; padding: 0 14px;
+}
+.compression-monitor-v2 .cm-runs-head strong {
+  font-size: 12.5px; font-weight: 600;
+}
+.compression-monitor-v2 .cm-run {
+  min-height: 88px; gap: 10px; padding: 12px 14px;
+}
+.compression-monitor-v2 .cm-status-dot {
+  width: 8px; height: 8px; margin-top: 5px;
+}
+.compression-monitor-v2 .cm-run-main { gap: 8px; }
+.compression-monitor-v2 .cm-run-main strong { font-size: 13px; font-weight: 600; }
+.compression-monitor-v2 .cm-run-main em,
+.compression-monitor-v2 .cm-run-main small { font-size: 11px; }
+.compression-monitor-v2 .cm-run-progress { height: 6px; background: var(--panel-2); }
+.compression-monitor-v2 .cm-run-queue-actions > span {
+  width: 22px; height: 22px;
+}
+
+.cm-job-header-v2 {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px 18px; padding: 14px 16px; background: var(--surface);
+}
+.cm-job-header-v2 .cm-job-title,
+.cm-job-header-v2 .cm-job-controls,
+.cm-job-header-v2 .cm-progress-summary {
+  min-height: 0; padding: 0; border: 0;
+}
+.cm-job-header-v2 .cm-job-title {
+  padding-right: 0; flex-wrap: wrap; overflow: visible; white-space: normal;
+}
+.cm-job-header-v2 .cm-job-title strong {
+  font-size: 15px; font-weight: 600;
+}
+.cm-job-header-v2 .cm-job-title > span {
+  max-width: min(300px, 30vw);
+}
+.cm-job-header-v2 .cm-status-pill {
+  flex: 0 0 auto; padding: 3px 8px; font-size: 11px;
+}
+.cm-job-header-v2 .cm-job-controls {
+  position: static; display: flex; flex-wrap: wrap; justify-content: flex-end;
+  gap: 7px; background: transparent;
+}
+.cm-job-header-v2 .cm-job-controls .compress-btn,
+.cm-job-header-v2 .cm-concurrency {
+  height: 30px; font-size: 12px;
+}
+.cm-job-header-v2 .cm-job-controls .compress-btn { padding: 0 11px; }
+.cm-job-header-v2 .cm-concurrency { padding: 0 4px 0 9px; }
+.cm-job-header-v2 .cm-concurrency input { height: 26px; width: 42px; }
+.cm-job-header-v2 .cm-progress-summary {
+  grid-column: 1 / -1; gap: 14px;
+}
+.cm-job-header-v2 .cm-overall-track {
+  height: 9px; min-width: 200px; background: var(--panel-2);
+}
+.cm-job-header-v2 .cm-progress-summary strong { font-size: 13px; }
+.cm-job-header-v2 .cm-warning {
+  grid-column: 1 / -1; margin: 0 -16px -14px; min-height: 34px; padding: 7px 16px;
+}
+
+.cm-metrics-panel {
+  flex: 0 0 auto; border-bottom: 1px solid var(--vsc-border); background: var(--panel);
+}
+.cm-metrics-summary {
+  min-height: 40px; padding: 0 16px; display: flex; align-items: center; gap: 10px;
+  box-sizing: border-box; cursor: pointer; color: var(--text); font-weight: 600;
+}
+.cm-metrics-summary > span { flex: 1 1 auto; }
+.cm-metrics-summary label {
+  display: inline-flex; align-items: center; gap: 6px; color: var(--text-5);
+  font-size: 12px; font-weight: 400; cursor: pointer;
+}
+.cm-metrics-summary input { accent-color: var(--accent); }
+.cm-metrics-panel .cm-job-facts {
+  min-height: 0; padding: 0 16px 10px; display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 8px;
+  border: 0; white-space: normal;
+}
+.cm-metrics-panel .cm-job-facts > span,
+.cm-metrics-panel .cm-telemetry > span {
+  min-width: 0; min-height: 56px; padding: 9px 11px; display: flex;
+  flex-direction: column; justify-content: center; gap: 4px; box-sizing: border-box;
+  border: 1px solid var(--vsc-border); background: var(--surface);
+  font-variant-numeric: tabular-nums;
+}
+.cm-metrics-panel .cm-job-facts small,
+.cm-metrics-panel .cm-telemetry small {
+  color: var(--text-5); font-size: 11px; text-transform: none;
+}
+.cm-metrics-panel .cm-job-facts > span { font-size: 13px; }
+.cm-metrics-panel .cm-telemetry {
+  padding: 0 16px 14px; display: grid;
+  grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 8px;
+  border: 0; background: transparent;
+}
+.cm-metrics-panel .cm-telemetry > span {
+  height: auto; border-right: 1px solid var(--vsc-border);
+}
+.cm-metrics-panel .cm-telemetry strong { font-size: 12.5px; }
+
+.compression-monitor-v2 .cm-toolbar {
+  min-height: 48px; padding: 8px 12px; gap: 8px; flex-wrap: wrap;
+}
+.compression-monitor-v2 .cm-search {
+  flex: 1 1 300px; max-width: none; height: 30px; padding: 0 9px;
+}
+.compression-monitor-v2 .cm-toolbar button,
+.compression-monitor-v2 .cm-toolbar select {
+  height: 30px; font-size: 12px;
+}
+.compression-monitor-v2 .cm-toolbar select { min-width: 110px; }
+.compression-monitor-v2 .cm-quick-views button { padding: 0 10px; }
+.compression-monitor-v2 .icon-button { width: 30px; }
+.compression-monitor-v2 .cm-selection-actions {
+  height: 40px; padding: 5px 12px; gap: 8px;
+}
+.compression-monitor-v2 .cm-selection-actions button { height: 28px; font-size: 12px; }
+
+.compression-monitor-v2 .cm-table-head { flex-basis: 32px; }
+.compression-monitor-v2 .cm-column-head { height: 32px; padding: 0 10px; font-size: 11.5px; }
+.compression-monitor-v2 .cm-table-row { height: 36px; }
+.compression-monitor-v2 .cm-cell { padding: 0 10px; }
+.compression-monitor-v2 .cm-table-footer {
+  flex-basis: 28px; height: 28px; padding: 0 10px; font-size: 11px;
+}
+.compression-monitor-v2 .cm-workarea.with-inspector {
+  grid-template-columns: minmax(0, 1fr) minmax(310px, 360px);
+}
+.compression-monitor-v2 .cm-inspector-head { height: 40px; padding: 0 11px; }
+.compression-monitor-v2 .cm-inspector-field { padding: 9px 11px; }
+.compression-monitor-v2 .cm-inspector-actions { padding: 9px 11px; }
+
+@media (max-width: 1180px) {
+  .compression-monitor-v2 { grid-template-columns: minmax(220px, 240px) minmax(0, 1fr); }
+  .cm-job-header-v2 { grid-template-columns: minmax(0, 1fr); }
+  .cm-job-header-v2 .cm-job-controls { justify-content: flex-start; }
+  .cm-job-header-v2 .cm-progress-summary { grid-column: 1; }
+  .cm-metrics-panel .cm-job-facts,
+  .cm-metrics-panel .cm-telemetry { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+}
+@media (max-width: 840px) {
+  .compression-monitor-v2 {
+    grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(120px, 190px) minmax(0, 1fr);
+  }
+  .compression-monitor-v2 .cm-runs {
+    border-right: 0; border-bottom: 1px solid var(--vsc-border);
+  }
+  .compression-monitor-v2 .cm-run-list {
+    display: grid; grid-auto-flow: column; grid-auto-columns: minmax(220px, 260px);
+    overflow-x: auto; overflow-y: hidden;
+  }
+  .compression-monitor-v2 .cm-run { border-right: 1px solid var(--vsc-border); }
+  .compression-monitor-v2 .cm-workarea.with-inspector { grid-template-columns: minmax(0, 1fr); }
+}
 @media (prefers-reduced-motion: reduce) {
   .cm-run-progress i, .cm-file-progress-fill, .cm-overall-track span { transition: none !important; }
 }
@@ -4711,7 +4905,7 @@ html.native-context-menu-open .compress-log-vrow:hover { background: transparent
   -webkit-app-region: drag;
   user-select: none;
   padding-left: 8px;
-  padding-right: 144px; /* reserve space for Windows caption buttons overlay */
+  padding-right: 8px;
   font-size: 12px;
   position: relative;
   z-index: 40;
@@ -5005,6 +5199,7 @@ html.native-context-menu-open .compress-log-vrow:hover { background: transparent
   border-bottom: 1px solid var(--vsc-border); flex: 0 0 auto;
 }
 .bottom-panel-tab {
+  display: inline-flex; align-items: center; gap: 6px;
   text-transform: uppercase; font-size: 11px; letter-spacing: 0.04em; color: var(--muted);
   padding: 7px 0 6px; border-bottom: 1px solid transparent; cursor: pointer; background: none; border-top: 0; border-left: 0; border-right: 0; height: auto;
 }
@@ -6253,8 +6448,9 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 }
 .search-save:hover { background: var(--vsc-list-hover); color: var(--accent); }
 
-/* Honor a user's reduced-motion preference: drop the added motion (the live
-   scan count + progress text still convey state without movement). */
+/* Honor reduced motion for decorative transitions. The scan spinner and
+   indeterminate bar remain animated because they are the only visual indication
+   that a long-running scan is still making progress. */
 @media (prefers-reduced-motion: reduce) {
   .filter-dialog-overlay,
   .filter-dialog,
@@ -6278,8 +6474,6 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
   .compress-bar-fill,
   .scan-overlay,
   .skeleton-bar,
-  .scan-overlay .df-scanning-spinner,
-  .scan-overlay .df-progress-bar-sweep,
   .cmdk-overlay,
   .cmdk,
   .xfer-panel,
@@ -6292,6 +6486,11 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
   .ctx-meter-fill,
   .compress-bar-fill {
     transition: none !important;
+  }
+  .scan-overlay .df-scanning-spinner { animation-duration: 1.4s; }
+  .scan-overlay .df-progress-bar-sweep {
+    animation-duration: 2.4s;
+    animation-timing-function: linear;
   }
 }
 

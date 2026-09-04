@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { NodeRecord } from "../api/types";
-import { useTreeState, type LazyOptions } from "./useTreeState";
+import { isNodeOpen, useTreeState, type LazyOptions } from "./useTreeState";
 
 const { fetchChildrenMock } = vi.hoisted(() => ({ fetchChildrenMock: vi.fn() }));
 
@@ -383,5 +383,112 @@ describe("useTreeState watcher patches", () => {
     expect(matches).toHaveLength(1);
     expect(matches[0].id).toBe(liveId);
     expect(result.current.nodeById.get(7)?.children).toEqual([liveId]);
+  });
+});
+
+describe("useTreeState expand and collapse", () => {
+  const fullTree = [
+    node({ children: [1, 4], files: 3, folders: 2, size: 60 }),
+    node({
+      id: 1,
+      parent: 0,
+      name: "Folder A",
+      path: "E:\\Folder A",
+      depth: 1,
+      children: [2, 3],
+      files: 2,
+      folders: 1,
+      size: 40,
+    }),
+    node({
+      id: 2,
+      parent: 1,
+      name: "Folder B",
+      path: "E:\\Folder A\\Folder B",
+      depth: 2,
+      children: [5],
+      files: 1,
+      size: 20,
+    }),
+    node({
+      id: 3,
+      parent: 1,
+      name: "a.txt",
+      path: "E:\\Folder A\\a.txt",
+      dir: false,
+      depth: 2,
+      files: 1,
+      size: 20,
+      extension: "txt",
+    }),
+    node({
+      id: 4,
+      parent: 0,
+      name: "root.txt",
+      path: "E:\\root.txt",
+      dir: false,
+      depth: 1,
+      files: 1,
+      size: 20,
+      extension: "txt",
+    }),
+    node({
+      id: 5,
+      parent: 2,
+      name: "nested.txt",
+      path: "E:\\Folder A\\Folder B\\nested.txt",
+      dir: false,
+      depth: 3,
+      files: 1,
+      size: 20,
+      extension: "txt",
+    }),
+  ];
+
+  it("expands every folder and every synthetic file bundle", async () => {
+    const { result } = renderHook(() => useTreeState());
+    act(() => result.current.setNodes(fullTree));
+    act(() => result.current.expandToLevel(Infinity));
+
+    await waitFor(() => {
+      const ids = new Set(result.current.visibleRows.map((item) => item.id));
+      expect(ids).toEqual(new Set([0, 1, 2, 3, 4, 5, -1, -2, -3]));
+    });
+    expect(result.current.expandedAll).toBe(true);
+  });
+
+  it("collapses the whole tree after Expand All", async () => {
+    const { result } = renderHook(() => useTreeState());
+    act(() => result.current.setNodes(fullTree));
+    act(() => result.current.expandToLevel(Infinity));
+    await waitFor(() => expect(result.current.visibleRows.length).toBeGreaterThan(1));
+
+    act(() => result.current.expandToLevel(0));
+
+    await waitFor(() => {
+      expect(result.current.visibleRows.map((item) => item.id)).toEqual([0]);
+    });
+    expect(result.current.expandedAll).toBe(false);
+    expect(result.current.expanded.size).toBe(0);
+  });
+
+  it("lets a bundle be collapsed and reopened during Expand All", async () => {
+    const { result } = renderHook(() => useTreeState());
+    act(() => result.current.setNodes(fullTree));
+    act(() => result.current.expandToLevel(Infinity));
+    await waitFor(() => expect(result.current.visibleRows.some((item) => item.id === 3)).toBe(true));
+
+    act(() => result.current.toggleExpand(-2));
+    await waitFor(() => expect(result.current.visibleRows.some((item) => item.id === 3)).toBe(false));
+    expect(result.current.visibleRows.some((item) => item.id === -2)).toBe(true);
+
+    act(() => result.current.toggleExpand(-2));
+    await waitFor(() => expect(result.current.visibleRows.some((item) => item.id === 3)).toBe(true));
+  });
+
+  it("uses the same open predicate for folders and bundles", () => {
+    expect(isNodeOpen(7, new Set(), true, new Set())).toBe(true);
+    expect(isNodeOpen(-8, new Set(), true, new Set())).toBe(true);
+    expect(isNodeOpen(-8, new Set(), true, new Set([-8]))).toBe(false);
   });
 });

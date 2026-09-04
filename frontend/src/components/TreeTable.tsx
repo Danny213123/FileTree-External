@@ -12,6 +12,7 @@ import { isImage, isVideo, pickLargestFolderFile } from "../lib/thumbs";
 import { isTauriV2, startNativeDrag, type NativeDragResponse } from "../api/v2";
 import { loadShellThumbnail } from "../lib/shellImages";
 import { fetchFolderPreview } from "../api/client";
+import { isNodeOpen } from "../hooks/useTreeState";
 
 const ROW_HEIGHT = 23;
 // Smallest a column may be dragged to, so a header never collapses to nothing.
@@ -81,6 +82,8 @@ interface TreeTableProps {
   loadedDirs?: ReadonlySet<number>;
   nodeById: Map<number, NodeRecord>;
   expanded: Set<number>;
+  expandedAll: boolean;
+  collapsedOverrides: Set<number>;
   selectedId: number;
   selectedIds: Set<number>;
   sortKey: SortKey;
@@ -245,6 +248,8 @@ function TreeTableInner({
   loadedDirs,
   nodeById,
   expanded,
+  expandedAll,
+  collapsedOverrides,
   selectedId,
   selectedIds,
   sortKey,
@@ -1000,7 +1005,7 @@ function TreeTableInner({
                   || node.files > 0)
                 : node.children.length > 0
             );
-            const isOpen    = expanded.has(node.id);
+            const isOpen = isNodeOpen(node.id, expanded, expandedAll, collapsedOverrides);
             const isDraggable = !isBundle && !!node.path && node.id !== renamingId;
             const isSelected = !isBundle && selectedIds.has(node.id);
             const isDropTarget = dropTargetId === node.id;
@@ -1180,6 +1185,7 @@ function TreeTableInner({
                   {hasKids ? (
                     <button
                       className="twisty"
+                      aria-label={`${isOpen ? "Collapse" : "Expand"} ${node.name}`}
                       onClick={(e) => { e.stopPropagation(); onToggleExpand(node.id); }}
                     >
                       <Icon name={isOpen ? "chevron-down" : "chevron-right"} size={10} />

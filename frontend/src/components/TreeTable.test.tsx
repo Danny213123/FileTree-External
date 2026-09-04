@@ -68,6 +68,8 @@ describe("TreeTable double click", () => {
         lazy
         nodeById={new Map()}
         expanded={new Set()}
+        expandedAll={false}
+        collapsedOverrides={new Set()}
         selectedId={0}
         selectedIds={new Set()}
         sortKey="name"
@@ -102,6 +104,8 @@ describe("TreeTable double click", () => {
         lazy
         nodeById={new Map()}
         expanded={new Set()}
+        expandedAll={false}
+        collapsedOverrides={new Set()}
         selectedId={0}
         selectedIds={new Set()}
         sortKey="name"
@@ -143,6 +147,8 @@ describe("TreeTable double click", () => {
         lazy
         nodeById={new Map([[stale.id, stale]])}
         expanded={new Set()}
+        expandedAll={false}
+        collapsedOverrides={new Set()}
         selectedId={file.id}
         selectedIds={new Set([file.id, stale.id])}
         sortKey="name"
@@ -193,7 +199,7 @@ describe("TreeTable lazy expansion", () => {
     children: [],
   };
 
-  function renderDirectory(loadedDirs: ReadonlySet<number>) {
+  function renderDirectory(loadedDirs: ReadonlySet<number>, expandedAll = false) {
     const onToggleExpand = vi.fn();
     const view = render(
       <TreeTable
@@ -202,6 +208,8 @@ describe("TreeTable lazy expansion", () => {
         loadedDirs={loadedDirs}
         nodeById={new Map([[unknownDirectory.id, unknownDirectory]])}
         expanded={new Set()}
+        expandedAll={expandedAll}
+        collapsedOverrides={new Set()}
         selectedId={0}
         selectedIds={new Set()}
         sortKey="name"
@@ -236,6 +244,11 @@ describe("TreeTable lazy expansion", () => {
     expect(loadedView.container.querySelector("button.twisty")).toBeNull();
   });
 
+  it("shows an open twisty while Expand All is active", () => {
+    const view = renderDirectory(new Set(), true);
+    expect(view.getByRole("button", { name: "Collapse New folder" })).toBeInTheDocument();
+  });
+
   it("uses the largest persisted descendant for a folder hover", async () => {
     vi.mocked(fetchFolderPreview).mockClear();
     vi.mocked(loadShellThumbnail).mockClear();
@@ -247,6 +260,8 @@ describe("TreeTable lazy expansion", () => {
         lazy
         nodeById={new Map([[directory.id, directory]])}
         expanded={new Set()}
+        expandedAll={false}
+        collapsedOverrides={new Set()}
         selectedId={0}
         selectedIds={new Set()}
         sortKey="name"

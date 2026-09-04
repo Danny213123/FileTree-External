@@ -739,17 +739,6 @@ function dominantKind(files: CompressFile[]): CompressKind | null {
   return best;
 }
 
-/** One frontend-queued selection (#18): captured files + a frozen snapshot of
- *  the request fields so it starts identically to when it was enqueued, even if
- *  the user changes settings while the active job runs. */
-interface QueuedBatch {
-  id: string;
-  files: CompressFile[];
-  request: Omit<CompressJobRequest, "paths">;
-  /** External (dropped, out-of-scan) paths exempt from the stale-tree guard. */
-  externalPaths: Set<string>;
-}
-
 export function CompressView({
   scanPath,
   scannedRoot,
@@ -808,11 +797,6 @@ export function CompressView({
   const [outputMode, setOutputMode] = useState<"inplace" | "folder">("inplace");
   const [outputDir, setOutputDir] = useState("");
 
-  // Frontend job queue (#18). The backend already runs jobs concurrently, but a
-  // queue lets the user line up several selections without babysitting: while a
-  // job runs in THIS view, "Compress" enqueues; each batch auto-starts when the
-  // active run reaches a terminal state.
-  const [queue, setQueue] = useState<QueuedBatch[]>([]);
   // The dominant kind last auto-applied to the preset, so #20 only re-applies a
   // remembered preset when the dominant kind actually changes (never fighting a
   // manual choice the user makes while keeping the same selection).
@@ -830,7 +814,7 @@ export function CompressView({
 
   const [runStatus, setRunStatus] = useState<RunStatus>("idle");
   const [starting, setStarting] = useState(false);
-  const [progress, setProgress] = useState<Map<number, FileProg>>(new Map());
+  const [, setProgress] = useState<Map<number, FileProg>>(new Map());
   const [jobId, setJobId] = useState<string | null>(null);
   const [runError, setRunError] = useState("");
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
@@ -1124,12 +1108,9 @@ export function CompressView({
   // (counts, groups, select-all, totals) keys off this list, so scoping here is
   // enough to make the whole view reflect just the selection.
   //
-  // Gated on `inRun`: while a job is running the view renders from `progArr`,
-  // not from these scan-derived lists, and `nodeById` can change underneath us
-  // (lazy tree loading). Re-scanning the whole selection on every progress
-  // flush is exactly the main-thread saturation that blanks large jobs, so we
-  // freeze the last idle value (held in a ref) for the duration of the run and
-  // recompute fresh once it returns to idle.
+  // Freeze the setup list while a job is active. The Monitor owns live per-file
+  // progress, while Setup remains a stable summary of the selection that began
+  // the run rather than rebuilding on every lazy-tree update.
   const idleFilesRef = useRef<CompressFile[]>([]);
   const files = useMemo(() => {
     if (inRun) return idleFilesRef.current;
@@ -1427,31 +1408,6 @@ export function CompressView({
   }, [filteredFiles, inRun]);
   idleGroupsRef.current = groups;
 
-  const progArr = useMemo(
-    () => [...progress.values()].sort((a, b) => a.index - b.index),
-    [progress],
-  );
-
-  // Overall progress: files finished / total + an aggregate percentage.
-  const total = progArr.length;
-  const processedCount = progArr.filter(
-    (f) => f.status === "done" || f.status === "skipped" || f.status === "error",
-  ).length;
-  const savedCount = progArr.filter((f) => f.status === "done").length;
-  const skippedCount = progArr.filter((f) => f.status === "skipped").length;
-  const failedCount = progArr.filter((f) => f.status === "error").length;
-  const activeCount = progArr.filter((f) => f.status === "running").length;
-  const aggregatePct = total
-    ? Math.round(
-        progArr.reduce(
-          (s, f) =>
-            s + (f.status === "done" || f.status === "skipped" || f.status === "error" ? 100 : f.pct),
-          0,
-        ) / total,
-      )
-    : 0;
-  const savedTotal = progArr.reduce((s, f) => s + f.savedBytes, 0);
-
   const isFileSelected = useCallback(
     (file: CompressFile) => file.scanBacked
       ? (scanSelectionOverrides.has(file.id) ? !scanSelectionDefault : scanSelectionDefault)
@@ -1505,33 +1461,18 @@ export function CompressView({
   // ── List rows (virtualized) ─────────────────────────────────────────────────
   const rows = useMemo<Row[]>(() => {
     const out: Row[] = [];
-    if (inRun) {
-      for (const kind of KIND_ORDER) {
-        const items = progArr.filter((f) => f.kind === kind);
-        if (!items.length) continue;
-        out.push({
-          type: "group",
-          key: `g-${kind}`,
-          label: KIND_LABEL[kind],
-          count: items.length,
-          size: items.reduce((s, f) => s + f.origBytes, 0),
-        });
-        for (const rf of items) out.push({ type: "runfile", key: `r-${rf.index}`, rf });
-      }
-    } else {
-      for (const g of groups) {
-        out.push({
-          type: "group",
-          key: `g-${g.kind}`,
-          label: KIND_LABEL[g.kind],
-          count: g.items.length,
-          size: g.items.reduce((s, f) => s + f.size, 0),
-        });
-        for (const f of g.items) out.push({ type: "file", key: `f-${f.id}`, file: f });
-      }
+    for (const g of groups) {
+      out.push({
+        type: "group",
+        key: `g-${g.kind}`,
+        label: KIND_LABEL[g.kind],
+        count: g.items.length,
+        size: g.items.reduce((s, f) => s + f.size, 0),
+      });
+      for (const f of g.items) out.push({ type: "file", key: `f-${f.id}`, file: f });
     }
     return out;
-  }, [inRun, progArr, groups]);
+  }, [groups]);
 
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -2193,27 +2134,6 @@ export function CompressView({
     buildRequestBase,
   ]);
 
-  // Kick off the queue manually when idle (the auto-runner only fires after a
-  // terminal state; this starts the first batch so the rest then chain).
-  const startQueue = useCallback(() => {
-    if (queue.length === 0) return;
-    const [next, ...rest] = queue;
-    setQueue(rest);
-    void runFiles(next.files, next.request, next.externalPaths);
-  }, [queue, runFiles]);
-
-  // Auto-start the next queued batch once the active run reaches a terminal
-  // state. Stays idle when nothing has run yet (queue only fills while a job is
-  // running) and never double-starts: the popped batch is removed before launch,
-  // and `runFiles` flips the status back to "running".
-  useEffect(() => {
-    if (queue.length === 0) return;
-    if (runStatus === "running" || runStatus === "idle") return;
-    const [next, ...rest] = queue;
-    setQueue(rest);
-    void runFiles(next.files, next.request, next.externalPaths);
-  }, [runStatus, queue, runFiles]);
-
   // ── Per-file re-compress from History (#19) ─────────────────────────────────
   // Start a fresh single-file job for `path`, using the current settings (or an
   // explicit built-in preset override). Confirms the source still exists first.
@@ -2246,7 +2166,7 @@ export function CompressView({
         const presetName = presetOverride
           ? (PRESETS.find((p) => p.id === presetOverride)?.label ?? "Custom")
           : selectedPresetName;
-        toast.success(`Re-compressing ${baseName(path)} (${presetName}) — see the In Progress tab.`);
+        toast.success(`Re-compressing ${baseName(path)} (${presetName}) — see the Monitor tab.`);
       } catch (e) {
         toast.error(`Could not start re-compress: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -2281,6 +2201,7 @@ export function CompressView({
     try {
       const newId = await retryCompressJob(jobId);
       setJobId(newId);
+      setTab("progress");
       void attachStream(newId);
     } catch (e) {
       finalizedRef.current = true;
@@ -2416,23 +2337,6 @@ export function CompressView({
           <span className="ct-ico"><Icon name="info-circle" size={14} /></span>
           <span>{preflightNotice}</span>
           <button className="compress-notice-x" onClick={() => setPreflightNotice("")} title="Dismiss">×</button>
-        </div>
-      )}
-      {queue.length > 0 && (
-        <div className="compress-notice queue">
-          <span className="ct-ico"><Icon name="clock-history" size={14} /></span>
-          <span>
-            <b>{queue.length}</b> batch{queue.length === 1 ? "" : "es"} queued
-            {" "}({queue.reduce((s, b) => s + b.files.length, 0).toLocaleString()} files)
-            {inRun ? " — the next starts when the current job finishes." : " — see the In Progress tab."}
-          </span>
-          <button
-            className="compress-notice-x"
-            onClick={() => setQueue([])}
-            title="Clear the queue"
-          >
-            ×
-          </button>
         </div>
       )}
       {showBanner && !perf.bannerDismissed && (
@@ -2632,35 +2536,24 @@ export function CompressView({
                 <Icon name="file-zip" size={13} /> Add to queue
               </button>
             )}
-            {runnableSelected.length === 0 && queue.length > 0 ? (
-              <button
-                className="compress-btn primary"
-                onClick={startQueue}
-                disabled={starting}
-                title={`Start the ${queue.length} queued batch${queue.length === 1 ? "" : "es"}`}
-              >
-                <Icon name="file-zip" size={13} /> {starting ? "Starting…" : `Start queue (${queue.length})`}
-              </button>
-            ) : (
-              <button
-                className="compress-btn primary"
-                onClick={() => void handleStart()}
-                disabled={starting || folderListingLoading || !!folderListingError || runnableCount === 0 || (outputMode === "folder" && !outputDir.trim())}
-                title={
-                  folderListingLoading
-                    ? "Wait until every file has been listed"
-                    : folderListingError
-                      ? "The complete folder listing could not be loaded"
-                      : runnableCount === 0
-                    ? "Select at least one file whose encoder is available"
-                    : outputMode === "folder" && !outputDir.trim()
-                      ? "Enter a destination folder, or switch Output back to In place"
-                      : `Compress ${runnableCount.toLocaleString()} file(s)`
-                }
-              >
-                <Icon name="file-zip" size={13} /> {starting ? "Starting…" : `Compress ${runnableCount > 0 ? `(${runnableCount.toLocaleString()})` : ""}`}
-              </button>
-            )}
+            <button
+              className="compress-btn primary"
+              onClick={() => void handleStart()}
+              disabled={starting || folderListingLoading || !!folderListingError || runnableCount === 0 || (outputMode === "folder" && !outputDir.trim())}
+              title={
+                folderListingLoading
+                  ? "Wait until every file has been listed"
+                  : folderListingError
+                    ? "The complete folder listing could not be loaded"
+                    : runnableCount === 0
+                  ? "Select at least one file whose encoder is available"
+                  : outputMode === "folder" && !outputDir.trim()
+                    ? "Enter a destination folder, or switch Output back to In place"
+                    : `Compress ${runnableCount.toLocaleString()} file(s)`
+              }
+            >
+              <Icon name="file-zip" size={13} /> {starting ? "Starting…" : `Compress ${runnableCount > 0 ? `(${runnableCount.toLocaleString()})` : ""}`}
+            </button>
           </>
         )}
         {runStatus === "running" && (
@@ -2941,18 +2834,15 @@ export function CompressView({
       )}
 
       {inRun && (
-        <div className="compress-overall">
-          <span className="compress-overall-text">
-            <b>{processedCount.toLocaleString()}</b> / {total.toLocaleString()} processed
+        <div className="compress-active-run">
+          <span className="ct-ico"><Icon name="bar-chart" size={15} /></span>
+          <span>
+            This run is <b>{runStatus}</b>. Live progress, controls, and per-file
+            results are available in Monitor.
           </span>
-          <div className="compress-bar" title={`${aggregatePct}%`}>
-            <div className="compress-bar-fill" style={{ width: `${aggregatePct}%` }} />
-          </div>
-          <span className="compress-overall-text">
-            {aggregatePct}% · {activeCount.toLocaleString()} active · {savedCount.toLocaleString()} saved ·{" "}
-            {skippedCount.toLocaleString()} skipped · {failedCount.toLocaleString()} failed ·{" "}
-            <span className="compress-saved">{formatBytes(savedTotal)}</span>
-          </span>
+          <button className="compress-btn primary" onClick={() => setTab("progress")}>
+            Open Monitor
+          </button>
         </div>
       )}
 
@@ -3486,6 +3376,14 @@ function JobFileTable({ files, loading }: { files: CompressJobFile[] | undefined
       </div>
     </div>
   );
+}
+
+/** Legacy frontend-queue row retained for the exported compatibility view. */
+interface QueuedBatch {
+  id: string;
+  files: CompressFile[];
+  request: Omit<CompressJobRequest, "paths">;
+  externalPaths: Set<string>;
 }
 
 // In Progress tab: a table of every compression job — running in this session,

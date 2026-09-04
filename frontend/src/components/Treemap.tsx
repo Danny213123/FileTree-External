@@ -334,12 +334,27 @@ interface TreemapProps {
   onMoveItems?: (sourcePaths: string[], destinationFolder: string) => Promise<{ ok: boolean; error?: string } | void> | { ok: boolean; error?: string } | void;
   onOpen?: (id: number) => void;
   onClose3D?: () => void;
+  /** Lazy scans only: directories whose immediate children are available. */
+  loadedDirs?: ReadonlySet<number>;
+  /** Requests the immediate children needed for the current treemap scope. */
+  onViewChange?: (viewId: number) => void;
+}
+
+export function resolveTreemapViewId(
+  selectedId: number,
+  nodeById: Map<number, NodeRecord>,
+): number {
+  if (selectedId < 0) return -selectedId - 1;
+  const node = nodeById.get(selectedId);
+  if (!node) return 0;
+  return node.dir ? node.id : (node.parent ?? 0);
 }
 
 export const Treemap = memo(function Treemap({
   nodeById, selectedId, metric, unit, detail, darkMode,
   showSingleFiles, show3D, showHierarchy, showLegend, showLabels, dragDrop,
   onSelect, onNavigate, onMoveItems, onOpen, onClose3D,
+  loadedDirs, onViewChange,
 }: TreemapProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -375,15 +390,15 @@ export const Treemap = memo(function Treemap({
 
   const { maxTop, maxChildren, maxDepth } = useMemo(() => detailLimits(detail), [detail]);
 
-  // Bundle nodes have negative IDs: id = -(parentId + 1), so parentId = -id - 1.
   const isBundleSelected = selectedId < 0;
-  const viewId = useMemo(() => {
-    if (selectedId < 0) return -selectedId - 1; // bundle → its parent folder id
-    const node = nodeById.get(selectedId);
-    if (!node) return 0;
-    if (node.dir) return node.id;
-    return node.parent ?? 0;
-  }, [selectedId, nodeById]);
+  const viewId = useMemo(
+    () => resolveTreemapViewId(selectedId, nodeById),
+    [selectedId, nodeById],
+  );
+
+  useEffect(() => {
+    onViewChange?.(viewId);
+  }, [onViewChange, viewId]);
 
   const topItems = useMemo(() => {
     const allKids = (nodeById.get(viewId)?.children ?? [])
@@ -398,6 +413,15 @@ export const Treemap = memo(function Treemap({
       .sort((a, b) => getValue(b, metric) - getValue(a, metric))
       .slice(0, maxTop);
   }, [viewId, isBundleSelected, nodeById, metric, maxTop, showSingleFiles]);
+  const viewNode = nodeById.get(viewId);
+  const viewLoading = !!viewNode?.dir && loadedDirs !== undefined && !loadedDirs.has(viewId);
+  const emptyMessage = !viewNode
+    ? "Open a scan to view its treemap."
+    : viewLoading
+      ? "Loading folder contents…"
+      : viewNode.children.length === 0
+        ? "This folder is empty."
+        : "No items match the current treemap options.";
 
   const flatRects = useMemo(() => {
     const topRects = layoutTreemap(topItems, containerSize.w, containerSize.h, metric);
@@ -671,6 +695,7 @@ export const Treemap = memo(function Treemap({
           className="treemap-export"
           title="Export the treemap as a PNG image"
           onClick={handleExportPng}
+          disabled={flatRects.length === 0}
         >
           <Icon name="image" size={13} /> PNG
         </button>
@@ -694,6 +719,12 @@ export const Treemap = memo(function Treemap({
             className="treemap-overlay"
           />
           <TreemapTooltip ref={tooltipApiRef} unit={unit} />
+          {topItems.length === 0 && (
+            <div className="treemap-empty" role="status">
+              <Icon name={viewLoading ? "clock-history" : "treemap"} size={22} />
+              <span>{emptyMessage}</span>
+            </div>
+          )}
         </div>
       </div>
       {showLegend && legendItems.length > 0 && (

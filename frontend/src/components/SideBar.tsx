@@ -17,7 +17,7 @@ import {
 import { getAllCached } from "../lib/scanCache";
 import { exportResults } from "../lib/exportRows";
 import { revealPath } from "../api/client";
-import { compareNodes } from "../hooks/useTreeState";
+import { compareNodes, isNodeOpen } from "../hooks/useTreeState";
 import { loadPresets, addPreset, removePreset, type ScanPreset } from "../lib/scanPresets";
 import { promptDialog } from "../lib/dialogs";
 import { toast } from "../lib/toast";
@@ -25,7 +25,6 @@ import { toast } from "../lib/toast";
 const VIEW_TITLES: Record<ViewId, string> = {
   explorer: "Explorer",
   search: "Search",
-  treemap: "Treemap",
   duplicates: "Duplicates",
   compress: "Compress",
   bookmarks: "Bookmarks",
@@ -79,6 +78,8 @@ export interface SideBarProps {
   // explorer: folder tree (reuses the active tab's tree state)
   treeRows: NodeRecord[];
   expanded: Set<number>;
+  expandedAll: boolean;
+  collapsedOverrides: Set<number>;
   selectedId: number;
   onToggleExpand: (id: number) => void;
   onSelectFolder: (id: number) => void;
@@ -480,7 +481,12 @@ function ExplorerView(props: SideBarProps) {
                 const row = folderRows[vItem.index];
                 const node = props.nodeById.get(row.id);
                 const hasChildren = !!node && node.children.some((cid) => props.nodeById.get(cid)?.dir);
-                const isOpen = props.expanded.has(row.id);
+                const isOpen = isNodeOpen(
+                  row.id,
+                  props.expanded,
+                  props.expandedAll,
+                  props.collapsedOverrides,
+                );
                 return (
                   <div
                     key={row.id}
@@ -846,10 +852,8 @@ function SearchView(props: SideBarProps) {
 
 export function SideBar(props: SideBarProps) {
   const { view } = props;
-  // Treemap and compression reuse Explorer controls while their main panel is
-  // shown in the editor area.
-  const showExplorerBody =
-    view === "explorer" || view === "treemap" || view === "compress";
+  // Compression reuses Explorer controls while its main panel is shown.
+  const showExplorerBody = view === "explorer" || view === "compress";
   const showFolderActions = showExplorerBody;
 
   return (

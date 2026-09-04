@@ -23,4 +23,20 @@ describe("ActivityBar", () => {
     expect(onSelect).toHaveBeenCalledOnce();
     expect(onSelect).toHaveBeenCalledWith("compress");
   });
+
+  it("keeps Treemap out of the primary activity navigation", () => {
+    render(
+      <ActivityBar
+        activeView="explorer"
+        sidebarOpen
+        onSelect={vi.fn()}
+        bookmarkCount={0}
+        errorCount={0}
+        darkMode
+        onToggleTheme={() => {}}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Treemap" })).not.toBeInTheDocument();
+  });
 });
