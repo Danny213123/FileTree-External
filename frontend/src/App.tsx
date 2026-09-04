@@ -13,10 +13,10 @@ import {
   saveSmartFolders,
   fetchDriveSpace,
   fetchAppVersion,
+  fetchCompressTools,
   notify,
-  fetchSubtreeFiles,
 } from "./api/client";
-import type { AppSettings, CompressionSourceFile } from "./api/client";
+import type { AppSettings, CompressionSource } from "./api/client";
 import { isTauriV2 } from "./api/v2";
 import type { DriveEntry, SpecialFolder, SortKey, Unit, ScanResult, TagEntry, SmartFolder, NodeRecord } from "./api/types";
 import { isActiveRule } from "./hooks/useFilterRules";
@@ -295,6 +295,12 @@ export default function App() {
   // second debounce in the workspace made every query feel half a second late.
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  // Tool detection can probe external binaries and GPU capabilities. Warm that
+  // cached result during app startup so folder compression can begin streaming
+  // immediately when the user opens it.
+  useEffect(() => {
+    void fetchCompressTools();
+  }, []);
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearchQuery(searchQuery), 80);
     return () => clearTimeout(t);
@@ -332,10 +338,9 @@ export default function App() {
   // Scheduled-scan wizard (#10) — a modal over the workbench.
   const [scheduleOpen, setScheduleOpen] = useState(false);
 
-  // Files to pre-check when the Compress view opens from the table's right-click
-  // "Compress..." action. One-shot: CompressView applies them then signals back
-  // via onInitialApplied so this clears and manual edits stick across re-renders.
-  const [compressInitialFiles, setCompressInitialFiles] = useState<CompressionSourceFile[]>([]);
+  // Files or persisted scan folders to preselect when Compression opens.
+  // One-shot: CompressView applies them and then clears this handoff state.
+  const [compressInitialFiles, setCompressInitialFiles] = useState<CompressionSource[]>([]);
 
   // Integrated terminal (global bottom panel). Mounted lazily on first open and
   // kept mounted thereafter so sessions survive hiding the panel.
@@ -1071,14 +1076,10 @@ export default function App() {
     };
   }, [handleOpenInNewTab]);
 
-  // Right-click "Compress..." from the table: parse the (multi-file) payload,
-  // drop anything the focused pane's tree knows to be a directory, stash the
-  // file paths, and switch to the Compress view (which pre-checks them).
-  // Load `filePaths` into the Compress page and switch to it. Shared by the
-  // native right-click "Compress…" action and the in-app quick "Compress"
-  // button so both routes behave identically.
-  const openCompressWith = useCallback((files: CompressionSourceFile[] = []) => {
-    setCompressInitialFiles(files);
+  // Load file or scan-folder sources into Compression. Shared by the native
+  // right-click action and the in-app quick button.
+  const openCompressWith = useCallback((sources: CompressionSource[] = []) => {
+    setCompressInitialFiles(sources);
     // Open the Compress activity view (mirrors handleSelectView, inlined to
     // avoid a forward reference since this is declared earlier in the file).
     setActiveView("compress");
@@ -1107,11 +1108,10 @@ export default function App() {
     const active = getActiveRef();
     const nodeById = active?.getNodeById();
     const scan = active?.getData();
-    // LAZY mode: the renderer doesn't hold whole subtrees, so a folder's
-    // descendant files must come from the paged backend query instead of
-    // walking the partial in-memory children.
-    const hasPersistedScan = !!scan?.scanId;
-    const rootPath = scan?.rootPath ?? "";
+    // Persisted folders remain compact scan/id descriptors. Their aggregate
+    // count and size were computed during scanning; Rust expands them only when
+    // a job starts, avoiding a huge renderer/IPC path list.
+    const scanId = scan?.scanId;
     const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
     const pathToNode = new Map<string, NodeRecord>();
     if (nodeById) {
@@ -1120,7 +1120,7 @@ export default function App() {
       }
     }
 
-    const result: CompressionSourceFile[] = [];
+    const result: CompressionSource[] = [];
     const seen = new Set<string>();
     const pushFilePath = (p: string, size = 0) => {
       const key = norm(p);
@@ -1133,51 +1133,45 @@ export default function App() {
       pushFilePath(node.path, node.size);
     };
 
-    const run = async () => {
-      for (const p of paths) {
-        const node = pathToNode.get(norm(p));
-        if (!node) {
-          // Path not in the current scan — keep it raw for CompressView's notice.
-          pushFilePath(p);
-          continue;
-        }
-        if (!node.dir) {
-          pushFile(node);
-          continue;
-        }
-        if (hasPersistedScan) {
-          // A v2 renderer only guarantees a bounded node cache. Resolve every
-          // folder through the persisted scan even if `lazy` is absent/false.
-          try {
-            const files = await fetchSubtreeFiles({
-              rootPath,
-              scanId: scan?.scanId,
-              dirId: node.id,
-            });
-            for (const file of files) pushFilePath(file.path, file.size);
-          } catch (err) {
-            console.warn("subtree-files fetch failed for", node.path, err);
-          }
-          continue;
-        }
-        // Full mode: walk descendants, collecting every file underneath it.
-        const queue = [node.id];
-        for (let qi = 0; qi < queue.length; qi++) {
-          const cur = nodeById?.get(queue[qi]);
-          if (!cur) continue;
-          if (!cur.dir) { pushFile(cur); continue; }
-          for (const childId of cur.children) queue.push(childId);
-        }
+    for (const p of paths) {
+      const node = pathToNode.get(norm(p));
+      if (!node) {
+        // Path not in the current scan — keep it raw for CompressView's notice.
+        pushFilePath(p);
+        continue;
       }
-      openCompressWith(result);
-    };
-    void run();
+      if (!node.dir) {
+        pushFile(node);
+        continue;
+      }
+      if (scanId && node.id >= 0 && node.path) {
+        result.push({
+          sourceType: "scan-directory",
+          scanId,
+          directoryId: node.id,
+          path: node.path,
+          name: node.name,
+          size: node.size,
+          fileCount: node.files,
+        });
+        continue;
+      }
+      // Browser/headless fallback: walk the fully materialized tree.
+      const queue = [node.id];
+      for (let qi = 0; qi < queue.length; qi++) {
+        const cur = nodeById?.get(queue[qi]);
+        if (!cur) continue;
+        if (!cur.dir) { pushFile(cur); continue; }
+        for (const childId of cur.children) queue.push(childId);
+      }
+    }
+    openCompressWith(result);
   }, [getActiveRef, openCompressWith]);
 
-  // Quick "Compress" button (TreeTable row action): WorkspaceTab has already
-  // expanded folders/selections to concrete file paths, so just load them.
-  const handleCompressPaths = useCallback((files: CompressionSourceFile[]) => {
-    openCompressWith(files);
+  // Quick "Compress" button (TreeTable row action): sources are already compact
+  // file records or persisted scan-folder descriptors.
+  const handleCompressPaths = useCallback((sources: CompressionSource[]) => {
+    openCompressWith(sources);
   }, [openCompressWith]);
 
   useEffect(() => {
@@ -2294,7 +2288,7 @@ function WorkbenchCompress({
   onInitialApplied,
 }: {
   store: WorkbenchStore;
-  initialSelectedFiles?: CompressionSourceFile[];
+  initialSelectedFiles?: CompressionSource[];
   onInitialApplied?: () => void;
 }) {
   const { sidebar: m } = useWorkbench(store);

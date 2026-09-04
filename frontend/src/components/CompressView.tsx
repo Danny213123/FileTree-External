@@ -12,11 +12,13 @@ import type {
   CompressLogRow,
   CompressEncoder,
   CompressCodec,
+  CompressionScanDirectory,
   OriginalAction,
 } from "../api/types";
 import {
   fetchCompressTools,
   installCompressTool,
+  streamCompressionCandidates,
   compressPreflight,
   startCompressJob,
   cancelCompressJob,
@@ -35,7 +37,8 @@ import {
   testGpuEncoder,
   notify,
   type GpuTestResult,
-  type CompressionSourceFile,
+  type CompressionScanDirectorySource,
+  type CompressionSource,
 } from "../api/client";
 import { invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
 import { formatBytes } from "../utils/formatBytes";
@@ -530,6 +533,7 @@ interface CompressFile {
   name: string;
   size: number;
   kind: CompressKind;
+  scanBacked?: boolean;
 }
 
 /** Live per-file progress within a job, keyed by the server's `index`. */
@@ -572,22 +576,18 @@ interface CompressViewProps {
   nodeById: Map<number, NodeRecord>;
   /** Refresh the focused pane's tree (used after a run completes). */
   onRescan: () => void;
-  /** Files to pre-check when opened from the table's "Compress..." action. */
-  initialSelectedFiles?: CompressionSourceFile[];
+  /** Files/folders to preselect when opened from the table's Compress action. */
+  initialSelectedFiles?: CompressionSource[];
   /** Called once the initial files have been applied so the parent can clear
    *  them (keeps manual edits sticky across re-renders / view switches). */
   onInitialApplied?: () => void;
 }
 
 // Pipeline classification MUST mirror the backend `classify()` in
-// src/compress_job.rs (audio folds into the HandBrake/video pipeline; svg/avif/
-// heic are zipped as "other"). The app-wide isImage/isVideo thumbnail sets
-// diverge from this, so we keep dedicated sets here: otherwise the encoder
-// availability gating would mislabel files (e.g. let an mp3 through as zip-able
-// "other" when the backend would route it to HandBrake and error).
+// src/compress_job.rs (audio and svg/avif/heic use the built-in zip pipeline).
+// The app-wide thumbnail sets diverge from this, so keep dedicated sets here.
 const COMPRESS_VIDEO_EXTS = new Set([
   "mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "mpg", "mpeg",
-  "mp3", "wav", "flac", "aac", "ogg", "m4a",
 ]);
 const COMPRESS_IMAGE_EXTS = new Set([
   "jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif", "gif",
@@ -600,6 +600,42 @@ function classifyKind(ext: string): CompressKind {
   return "other";
 }
 
+const KNOWN_NO_GAIN_OTHER_EXTS = new Set([
+  "zip", "7z", "rar", "gz", "bz2", "xz", "zst", "lz4", "cab", "tgz",
+  "jpg", "jpeg", "png", "gif", "webp", "avif", "heic",
+  "mp4", "mkv", "mov", "m4v", "webm", "m4a", "aac", "mp3", "ogg", "flac",
+  "docx", "xlsx", "pptx",
+]);
+const INCOMPLETE_DOWNLOAD_EXTS = new Set([
+  "part", "partial", "crdownload", "download", "opdownload", "aria2",
+]);
+
+function canAttemptCompression(
+  path: string,
+  size: number,
+  tools: CompressTools | null,
+  minSizeBytes: number,
+): boolean {
+  const name = baseName(path);
+  const ext = extOf(name);
+  if (
+    size <= 0
+    || (minSizeBytes > 0 && size < minSizeBytes)
+    || /\[COMPRESSED\]/i.test(name)
+    || INCOMPLETE_DOWNLOAD_EXTS.has(ext)
+  ) {
+    return false;
+  }
+  const kind = classifyKind(ext);
+  if (kind === "video") return !!tools?.handbrake.found && size >= 1024 * 1024;
+  if (kind === "image") {
+    return !!tools?.image.found
+      && size >= 32 * 1024
+      && !(ext === "webp" && size < 2 * 1024 * 1024);
+  }
+  return !KNOWN_NO_GAIN_OTHER_EXTS.has(ext);
+}
+
 function baseName(p: string): string {
   const parts = p.split(/[\\/]+/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : p;
@@ -610,6 +646,10 @@ function baseName(p: string): string {
  *  regardless of slash direction or drive-letter casing on Windows. */
 function normPath(p: string): string {
   return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+function isScanDirectorySource(source: CompressionSource): source is CompressionScanDirectorySource {
+  return "sourceType" in source && source.sourceType === "scan-directory";
 }
 
 // ── Pre-run savings estimate (#17) ───────────────────────────────────────────
@@ -732,6 +772,14 @@ export function CompressView({
   const [showPerf, setShowPerf] = useState(false);
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [scanSelectionDefault, setScanSelectionDefault] = useState(true);
+  const [scanSelectionOverrides, setScanSelectionOverrides] = useState<Set<number>>(new Set());
+  const [scanDirectorySources, setScanDirectorySources] = useState<CompressionScanDirectorySource[]>([]);
+  const [scanDirectoryFiles, setScanDirectoryFiles] = useState<CompressFile[]>([]);
+  const [folderListingScanned, setFolderListingScanned] = useState(0);
+  const [folderListingLoaded, setFolderListingLoaded] = useState(0);
+  const [folderListingLoading, setFolderListingLoading] = useState(false);
+  const [folderListingError, setFolderListingError] = useState("");
   const [installing, setInstalling] = useState<"handbrake" | "image" | null>(null);
   // Non-blocking notice when some right-click-selected paths aren't in the scan.
   const [preselectNotice, setPreselectNotice] = useState("");
@@ -778,6 +826,7 @@ export function CompressView({
   // Synchronous promise guard: React state does not commit quickly enough to
   // stop a double-click (or two mounted panes) from issuing duplicate creates.
   const startAttemptRef = useRef<Promise<boolean> | null>(null);
+  const pendingStartCancelledRef = useRef(false);
 
   const [runStatus, setRunStatus] = useState<RunStatus>("idle");
   const [starting, setStarting] = useState(false);
@@ -1084,12 +1133,25 @@ export function CompressView({
   const idleFilesRef = useRef<CompressFile[]>([]);
   const files = useMemo(() => {
     if (inRun) return idleFilesRef.current;
+    const folderScope = scanDirectorySources.length > 0;
+    if (folderScope && (!scopePaths || scopePaths.size === 0)) {
+      return scanDirectoryFiles;
+    }
     const out: CompressFile[] = [];
     const seen = new Set<string>();
+    for (const file of scanDirectoryFiles) {
+      const key = normPath(file.path);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(file);
+    }
     for (const node of nodeById.values()) {
       if (node.dir || node.id < 0 || !node.path) continue;
-      if (scopePaths && !scopePaths.has(normPath(node.path))) continue;
-      seen.add(normPath(node.path));
+      if (!canAttemptCompression(node.path, node.size, tools, perf.minSizeBytes)) continue;
+      const key = normPath(node.path);
+      if (folderScope ? !scopePaths?.has(key) : scopePaths && !scopePaths.has(key)) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
       out.push({
         id: node.id,
         path: node.path,
@@ -1101,14 +1163,24 @@ export function CompressView({
     // Merge dragged-in external files (#16), skipping any that the scan tree now
     // covers (so a dropped file that's actually inside the scan doesn't double).
     for (const ef of extraFiles) {
+      if (!canAttemptCompression(ef.path, ef.size, tools, perf.minSizeBytes)) continue;
       const key = normPath(ef.path);
       if (seen.has(key)) continue;
-      if (scopePaths && !scopePaths.has(key)) continue;
+      if (folderScope ? !scopePaths?.has(key) : scopePaths && !scopePaths.has(key)) continue;
       seen.add(key);
       out.push(ef);
     }
     return out;
-  }, [nodeById, scopePaths, extraFiles, inRun]);
+  }, [
+    nodeById,
+    scopePaths,
+    extraFiles,
+    scanDirectorySources,
+    scanDirectoryFiles,
+    tools,
+    perf.minSizeBytes,
+    inRun,
+  ]);
   idleFilesRef.current = files;
 
   // Normalized paths of files represented outside the currently loaded tree,
@@ -1119,16 +1191,47 @@ export function CompressView({
     [extraFiles],
   );
 
-  // Launch from the table ("Compress…" / row button): scope the view to just the
-  // launched selection and pre-check it. The incoming records are already
-  // concrete files. Files absent from the renderer's bounded lazy page become
-  // synthetic extras so collapsed descendants are not silently discarded.
+  // Launch from the table ("Compress…" / row button): scope the view to compact
+  // persisted folder descriptors plus any concrete files. Files absent from the
+  // renderer's bounded lazy page become synthetic extras.
   // Applied once per request — the parent clears `initialSelectedFiles` via
   // onInitialApplied, so manual edits (and the "Show all files" escape hatch)
   // stick afterward. Matches against the unscoped tree so it's idempotent.
   useEffect(() => {
     if (!initialSelectedFiles || initialSelectedFiles.length === 0) return;
     if (nodeById.size === 0) return; // wait until the tree is loaded
+    const coveredDirectories = new Set<string>();
+    const directorySources: CompressionScanDirectorySource[] = [];
+    const sortedDirectories = initialSelectedFiles
+      .filter(isScanDirectorySource)
+      .map((source) => ({ source, path: normPath(source.path) }))
+      .sort((a, b) => a.path.length - b.path.length);
+    for (const entry of sortedDirectories) {
+      let ancestor = entry.path;
+      let covered = false;
+      for (;;) {
+        if (coveredDirectories.has(`${entry.source.scanId}\0${ancestor}`)) {
+          covered = true;
+          break;
+        }
+        const slash = ancestor.lastIndexOf("/");
+        if (slash < 0) break;
+        ancestor = ancestor.slice(0, slash);
+      }
+      if (covered) continue;
+      coveredDirectories.add(`${entry.source.scanId}\0${entry.path}`);
+      directorySources.push(entry.source);
+    }
+    const incomingFiles = initialSelectedFiles
+      .filter((source): source is Exclude<CompressionSource, CompressionScanDirectorySource> => !isScanDirectorySource(source));
+    setScanDirectorySources(directorySources);
+    setScanDirectoryFiles([]);
+    setFolderListingScanned(0);
+    setFolderListingLoaded(0);
+    setFolderListingLoading(directorySources.length > 0);
+    setFolderListingError("");
+    setScanSelectionDefault(true);
+    setScanSelectionOverrides(new Set());
     const idByPath = new Map<string, number>();
     for (const node of nodeById.values()) {
       if (node.dir || node.id < 0 || !node.path) continue;
@@ -1138,7 +1241,7 @@ export function CompressView({
     const ids: number[] = [];
     const newExtras: CompressFile[] = [];
     const extraByPath = new Map(extraFiles.map((file) => [normPath(file.path), file]));
-    for (const file of initialSelectedFiles) {
+    for (const file of incomingFiles) {
       const n = normPath(file.path);
       if (!n || scope.has(n)) continue;
       scope.add(n);
@@ -1164,12 +1267,126 @@ export function CompressView({
       }
     }
     if (newExtras.length > 0) setExtraFiles((current) => [...current, ...newExtras]);
-    setScopePaths(scope.size > 0 ? scope : null);
-    if (ids.length > 0) setSelected(new Set(ids));
+    setScopePaths(scope.size > 0 || directorySources.length > 0 ? scope : null);
+    setSelected(new Set(ids));
     setPreselectNotice("");
     setTab("compress");
     onInitialApplied?.();
   }, [initialSelectedFiles, nodeById, extraFiles, onInitialApplied]);
+
+  // Check every descendant through one SQLite cursor, but send only files with
+  // an available pipeline that are not known no-gain/too-small candidates.
+  // This keeps the per-file behavior without filling WebView2 with rows that
+  // the compression job would immediately skip.
+  useEffect(() => {
+    if (scanDirectorySources.length === 0) return;
+    if (!tools) return;
+    const controller = new AbortController();
+    let disposed = false;
+    const listed: CompressFile[] = [];
+    const seenPaths = scanDirectorySources.length > 1 ? new Set<string>() : null;
+    const totals = {
+      scanned: 0,
+      eligible: 0,
+      skippedUnavailable: 0,
+      skippedNoGain: 0,
+      skippedTooSmall: 0,
+    };
+    let lastPublished = 0;
+    let nextListPublishAt = 1;
+    let observedScanned = 0;
+
+    const run = async () => {
+      setScanDirectoryFiles([]);
+      setFolderListingScanned(0);
+      setFolderListingLoaded(0);
+      setFolderListingLoading(true);
+      setFolderListingError("");
+      setPreselectNotice("");
+      try {
+        for (const source of scanDirectorySources) {
+          const stats = await streamCompressionCandidates(
+            {
+              rootPath: scannedRoot || scanPath,
+              scanId: source.scanId,
+              dirId: source.directoryId,
+              allowVideo: tools.handbrake.found,
+              allowImage: tools.image.found,
+              minSizeBytes: perf.minSizeBytes,
+              signal: controller.signal,
+            },
+            (batch, progress) => {
+              if (disposed) return;
+              for (const file of batch) {
+                const key = normPath(file.path);
+                if (!key || (seenPaths && !seenPaths.add(key))) continue;
+                const listedFile: CompressFile = {
+                  id: extraIdRef.current--,
+                  path: file.path,
+                  name: baseName(file.path),
+                  size: file.size,
+                  kind: classifyKind(extOf(baseName(file.path))),
+                  scanBacked: true,
+                };
+                listed.push(listedFile);
+              }
+              if (listed.length >= nextListPublishAt) {
+                setScanDirectoryFiles(listed.slice());
+                setFolderListingLoaded(listed.length);
+                nextListPublishAt = Math.max(listed.length + 500, nextListPublishAt * 2);
+              }
+              const scanned = totals.scanned + progress.scanned;
+              observedScanned = scanned;
+              if ((lastPublished === 0 && scanned > 0) || scanned - lastPublished >= 5_000) {
+                lastPublished = scanned;
+                setFolderListingScanned(scanned);
+                setFolderListingLoaded(listed.length);
+              }
+            },
+          );
+          totals.scanned += stats.scanned;
+          totals.eligible += stats.eligible;
+          totals.skippedUnavailable += stats.skippedUnavailable;
+          totals.skippedNoGain += stats.skippedNoGain;
+          totals.skippedTooSmall += stats.skippedTooSmall;
+        }
+        if (disposed) return;
+        setScanDirectoryFiles(listed);
+        setFolderListingScanned(totals.scanned);
+        setFolderListingLoaded(listed.length);
+        setFolderListingLoading(false);
+        const skipped = totals.skippedUnavailable + totals.skippedNoGain + totals.skippedTooSmall;
+        if (skipped > 0) {
+          const reasons = [
+            totals.skippedUnavailable > 0
+              ? `${totals.skippedUnavailable.toLocaleString()} without an installed encoder`
+              : "",
+            totals.skippedNoGain > 0
+              ? `${totals.skippedNoGain.toLocaleString()} already compressed or known not to shrink`
+              : "",
+            totals.skippedTooSmall > 0
+              ? `${totals.skippedTooSmall.toLocaleString()} too small for worthwhile compression`
+              : "",
+          ].filter(Boolean);
+          setPreselectNotice(
+            `Found ${listed.length.toLocaleString()} compressible file${listed.length === 1 ? "" : "s"}. Omitted ${reasons.join(", ")}.`,
+          );
+        }
+      } catch (error) {
+        if (disposed || controller.signal.aborted) return;
+        setScanDirectoryFiles(listed);
+        setFolderListingScanned(observedScanned);
+        setFolderListingLoaded(listed.length);
+        setFolderListingLoading(false);
+        setFolderListingError(error instanceof Error ? error.message : String(error));
+      }
+    };
+    void run();
+    return () => {
+      disposed = true;
+      controller.abort();
+    };
+  }, [scanDirectorySources, scannedRoot, scanPath, tools, perf.minSizeBytes]);
 
   const counts = useMemo(() => {
     let video = 0, image = 0, other = 0;
@@ -1235,16 +1452,34 @@ export function CompressView({
     : 0;
   const savedTotal = progArr.reduce((s, f) => s + f.savedBytes, 0);
 
+  const isFileSelected = useCallback(
+    (file: CompressFile) => file.scanBacked
+      ? (scanSelectionOverrides.has(file.id) ? !scanSelectionDefault : scanSelectionDefault)
+      : selected.has(file.id),
+    [selected, scanSelectionDefault, scanSelectionOverrides],
+  );
   const selectedFiles = useMemo(
-    () => files.filter((f) => selected.has(f.id)),
-    [files, selected],
+    () => files.filter(isFileSelected),
+    [files, isFileSelected],
   );
   selectedFilesRef.current = selectedFiles;
   const selectedBytes = selectedFiles.reduce((s, f) => s + f.size, 0);
+  const scanDirectoryFileCount = scanDirectorySources.reduce((sum, source) => sum + source.fileCount, 0);
+  const scanDirectoryBytes = scanDirectorySources.reduce((sum, source) => sum + source.size, 0);
+  const selectedCount = selectedFiles.length;
+  const selectedTotalBytes = selectedBytes;
+  const scanDirectories = useMemo<CompressionScanDirectory[]>(
+    () => scanDirectorySources.map((source) => ({
+      scanId: source.scanId,
+      directoryId: source.directoryId,
+    })),
+    [scanDirectorySources],
+  );
   const runnableSelected = useMemo(
     () => selectedFiles.filter((f) => kindAvailable(f.kind)),
     [selectedFiles, kindAvailable],
   );
+  const runnableCount = runnableSelected.length;
 
   // #17 pre-run savings estimate for the runnable selection, under the active
   // codec/quality/resolution. Heuristic only (see `estimateSavings`).
@@ -1306,29 +1541,62 @@ export function CompressView({
   });
 
   // ── Selection helpers ───────────────────────────────────────────────────────
-  const toggleFile = useCallback((id: number) => {
+  const toggleFile = useCallback((file: CompressFile) => {
+    if (file.scanBacked) {
+      setScanSelectionOverrides((current) => {
+        const next = new Set(current);
+        if (next.has(file.id)) next.delete(file.id); else next.add(file.id);
+        return next;
+      });
+      return;
+    }
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
+      if (next.has(file.id)) next.delete(file.id); else next.add(file.id);
       return next;
     });
   }, []);
 
   const toggleGroup = useCallback((items: CompressFile[]) => {
+    const allOn = items.length > 0 && items.every(isFileSelected);
+    const desired = !allOn;
     setSelected((prev) => {
       const next = new Set(prev);
-      const allOn = items.length > 0 && items.every((f) => next.has(f.id));
-      if (allOn) for (const f of items) next.delete(f.id);
-      else for (const f of items) next.add(f.id);
+      for (const file of items) {
+        if (file.scanBacked) continue;
+        if (desired) next.add(file.id); else next.delete(file.id);
+      }
       return next;
     });
-  }, []);
+    setScanSelectionOverrides((current) => {
+      const next = new Set(current);
+      for (const file of items) {
+        if (!file.scanBacked) continue;
+        if (desired === scanSelectionDefault) next.delete(file.id);
+        else next.add(file.id);
+      }
+      return next;
+    });
+  }, [isFileSelected, scanSelectionDefault]);
 
   const selectAll = useCallback(() => {
-    setSelected(new Set(filteredFiles.map((f) => f.id)));
-  }, [filteredFiles]);
+    setSelected(new Set(filteredFiles.filter((file) => !file.scanBacked).map((file) => file.id)));
+    if (typeFilter === "all") {
+      setScanSelectionDefault(true);
+      setScanSelectionOverrides(new Set());
+    } else {
+      setScanSelectionDefault(false);
+      setScanSelectionOverrides(new Set(
+        filteredFiles.filter((file) => file.scanBacked).map((file) => file.id),
+      ));
+    }
+  }, [filteredFiles, typeFilter]);
 
-  const clearSelection = useCallback(() => setSelected(new Set()), []);
+  const clearSelection = useCallback(() => {
+    setSelected(new Set());
+    setScanSelectionDefault(false);
+    setScanSelectionOverrides(new Set());
+  }, []);
 
   // ── Drag-and-drop onto the Compress page (#16) ──────────────────────────────
   // Accepts files/folders dropped from Explorer or elsewhere in the app and adds
@@ -1681,10 +1949,13 @@ export function CompressView({
       candidate: CompressFile[],
       requestBase: Omit<CompressJobRequest, "paths">,
       exemptExternal: Set<string>,
+      directorySelection: CompressionScanDirectory[] = [],
+      excludedPaths: string[] = [],
     ): Promise<boolean> => {
       if (startAttemptRef.current) return startAttemptRef.current;
+      pendingStartCancelledRef.current = false;
       const attempt = (async (): Promise<boolean> => {
-      if (candidate.length === 0) return false;
+      if (candidate.length === 0 && directorySelection.length === 0) return false;
 
       // Stale-path guard: drop selections that no longer exist in the scan tree
       // or that point at a prior run's [COMPRESSED] output. Dragged-in external
@@ -1728,23 +1999,26 @@ export function CompressView({
         setPreflightNotice("");
       }
 
-      if (runnable.length === 0) {
+      if (runnable.length === 0 && directorySelection.length === 0) {
         setRunStatus("idle");
         toast.info("Nothing to compress — all selected files were missing or already compressed.");
         return false;
       }
 
       // Authoritative backend pre-flight (on-disk existence + cloud placeholders).
-      const pf = await compressPreflight(runnable.map((f) => f.path));
-      const badSet = new Set([...pf.missing, ...pf.placeholder].map((p) => normPath(p)));
-      const liveRunnable = badSet.size ? runnable.filter((f) => !badSet.has(normPath(f.path))) : runnable;
-      if (badSet.size > 0) {
-        const bits: string[] = [];
-        if (pf.missing.length > 0) bits.push(`${pf.missing.length} no longer present`);
-        if (pf.placeholder.length > 0) bits.push(`${pf.placeholder.length} cloud-only (not downloaded)`);
-        toast.info(`Pre-flight skipped ${badSet.size} file${badSet.size === 1 ? "" : "s"}: ${bits.join(", ")}.`);
+      let liveRunnable = runnable;
+      if (runnable.length > 0) {
+        const pf = await compressPreflight(runnable.map((f) => f.path));
+        const badSet = new Set([...pf.missing, ...pf.placeholder].map((p) => normPath(p)));
+        liveRunnable = badSet.size ? runnable.filter((f) => !badSet.has(normPath(f.path))) : runnable;
+        if (badSet.size > 0) {
+          const bits: string[] = [];
+          if (pf.missing.length > 0) bits.push(`${pf.missing.length} no longer present`);
+          if (pf.placeholder.length > 0) bits.push(`${pf.placeholder.length} cloud-only (not downloaded)`);
+          toast.info(`Pre-flight skipped ${badSet.size} file${badSet.size === 1 ? "" : "s"}: ${bits.join(", ")}.`);
+        }
       }
-      if (liveRunnable.length === 0) {
+      if (liveRunnable.length === 0 && directorySelection.length === 0) {
         setRunStatus("idle");
         toast.info("Nothing to compress — all selected files are missing or cloud-only.");
         return false;
@@ -1759,15 +2033,53 @@ export function CompressView({
       // into the legacy setup-page Map before the first encoder even starts.
       setProgress(new Map());
       setRunStatus("running");
+      setJobId(null);
       runStartRef.current = Date.now();
 
       try {
-        const id = await startCompressJob({ ...requestBase, paths: liveRunnable.map((f) => f.path) });
+        const started = await startCompressJob({
+          ...requestBase,
+          paths: liveRunnable.map((f) => f.path),
+          ...(directorySelection.length > 0 ? { scanDirectories: directorySelection } : {}),
+          ...(excludedPaths.length > 0 ? { excludePaths: excludedPaths } : {}),
+        });
+        const id = started.jobId;
+        if (pendingStartCancelledRef.current) {
+          const cancelled = await cancelCompressJob(id);
+          setJobId(id);
+          setRunStatus("cancelled");
+          if (!cancelled.ok) toast.error(cancelled.error ?? "Could not cancel the job after it started.");
+          return false;
+        }
+        if (
+          started.skippedUnavailable > 0
+          || started.skippedIneligible > 0
+          || started.skippedMissing > 0
+        ) {
+          const reasons = [
+            started.skippedUnavailable > 0
+              ? `${started.skippedUnavailable.toLocaleString()} without an installed encoder`
+              : "",
+            started.skippedIneligible > 0
+              ? `${started.skippedIneligible.toLocaleString()} no longer eligible for compression`
+              : "",
+            started.skippedMissing > 0
+              ? `${started.skippedMissing.toLocaleString()} no longer present`
+              : "",
+          ].filter(Boolean);
+          toast.info(
+            `Skipped ${reasons.join(" and ")}.`,
+          );
+        }
         setJobId(id);
         setTab("progress");
         void attachStream(id);
         return true;
       } catch (e) {
+        if (pendingStartCancelledRef.current) {
+          setRunStatus("cancelled");
+          return false;
+        }
         finalizedRef.current = true;
         setRunStatus("error");
         setRunError(e instanceof Error ? e.message : String(e));
@@ -1788,36 +2100,97 @@ export function CompressView({
   );
 
   const handleStart = useCallback(async () => {
-    const encoderRunnable = selectedFiles.filter((f) => kindAvailable(f.kind));
-    if (encoderRunnable.length === 0) return;
-    const skipped = selectedFiles.length - encoderRunnable.length;
+    if (folderListingLoading || folderListingError) return;
+    const explicitSelected = selectedFiles.filter((file) => !file.scanBacked);
+    const selectedScanBacked = selectedFiles.length - explicitSelected.length;
+    const activeDirectories = selectedScanBacked > 0 ? scanDirectories : [];
+    const excludedPaths = activeDirectories.length > 0
+      ? scanDirectoryFiles.filter((file) => !isFileSelected(file)).map((file) => file.path)
+      : [];
+    const encoderRunnable = explicitSelected.filter((f) => kindAvailable(f.kind));
+    if (encoderRunnable.length === 0 && activeDirectories.length === 0) return;
+    const skipped = explicitSelected.length - encoderRunnable.length;
     if (skipped > 0) {
       toast.info(`Skipping ${skipped} file${skipped === 1 ? "" : "s"} whose encoder isn't installed.`);
     }
-    await runFiles(encoderRunnable, buildRequestBase(), externalPathSet);
-  }, [selectedFiles, kindAvailable, runFiles, buildRequestBase, externalPathSet]);
+    await runFiles(
+      encoderRunnable,
+      buildRequestBase(),
+      externalPathSet,
+      activeDirectories,
+      excludedPaths,
+    );
+  }, [
+    selectedFiles,
+    scanDirectoryFiles,
+    scanDirectories,
+    isFileSelected,
+    folderListingLoading,
+    folderListingError,
+    kindAvailable,
+    runFiles,
+    buildRequestBase,
+    externalPathSet,
+  ]);
 
   // ── Job queue (#18) ─────────────────────────────────────────────────────────
   // Enqueue the current selection as a frozen batch to auto-start when the
   // active run finishes. Each batch snapshots its files + request so later
   // control changes don't alter it.
   const handleEnqueue = useCallback(async () => {
-    const encoderRunnable = selectedFiles.filter((f) => kindAvailable(f.kind));
-    if (encoderRunnable.length === 0) return;
+    if (folderListingLoading || folderListingError) return;
+    const explicitSelected = selectedFiles.filter((file) => !file.scanBacked);
+    const selectedScanBacked = selectedFiles.length - explicitSelected.length;
+    const activeDirectories = selectedScanBacked > 0 ? scanDirectories : [];
+    const excludedPaths = activeDirectories.length > 0
+      ? scanDirectoryFiles.filter((file) => !isFileSelected(file)).map((file) => file.path)
+      : [];
+    const encoderRunnable = explicitSelected.filter((f) => kindAvailable(f.kind));
+    if (encoderRunnable.length === 0 && activeDirectories.length === 0) return;
     try {
-      const id = await startCompressJob({
+      const started = await startCompressJob({
         ...buildRequestBase(),
         paths: encoderRunnable.map((file) => file.path),
+        ...(activeDirectories.length > 0 ? { scanDirectories: activeDirectories } : {}),
+        ...(excludedPaths.length > 0 ? { excludePaths: excludedPaths } : {}),
         queued: true,
       });
-      setJobId(id);
+      setJobId(started.jobId);
       setSelected(new Set());
+      setScanSelectionDefault(true);
+      setScanSelectionOverrides(new Set());
+      setScanDirectorySources([]);
+      setScanDirectoryFiles([]);
+      setFolderListingScanned(0);
+      setFolderListingLoaded(0);
+      setScopePaths((scope) => scope && scope.size === 0 ? null : scope);
       setTab("progress");
-      toast.info(`Queued ${encoderRunnable.length} file${encoderRunnable.length === 1 ? "" : "s"}. The batch is persisted and will survive a restart.`);
+      const skippedParts = [
+        started.skippedUnavailable > 0
+          ? `${started.skippedUnavailable.toLocaleString()} without an installed encoder`
+          : "",
+        started.skippedIneligible > 0
+          ? `${started.skippedIneligible.toLocaleString()} no longer eligible for compression`
+          : "",
+        started.skippedMissing > 0
+          ? `${started.skippedMissing.toLocaleString()} no longer present`
+          : "",
+      ].filter(Boolean);
+      const skipped = skippedParts.length > 0 ? ` Skipped ${skippedParts.join(" and ")}.` : "";
+      toast.info(`Queued ${started.total.toLocaleString()} file${started.total === 1 ? "" : "s"}.${skipped} The batch is persisted and will survive a restart.`);
     } catch (error) {
       toast.error(`Could not queue compression: ${error instanceof Error ? error.message : String(error)}`);
     }
-  }, [selectedFiles, kindAvailable, buildRequestBase, externalPathSet]);
+  }, [
+    selectedFiles,
+    scanDirectoryFiles,
+    scanDirectories,
+    isFileSelected,
+    folderListingLoading,
+    folderListingError,
+    kindAvailable,
+    buildRequestBase,
+  ]);
 
   // Kick off the queue manually when idle (the auto-runner only fires after a
   // terminal state; this starts the first batch so the rest then chain).
@@ -1866,8 +2239,8 @@ export function CompressView({
       // as the scan root so the backend's containment check passes.
       const parent = path.replace(/[\\/]+[^\\/]+$/, "");
       try {
-        const id = await startCompressJob({ ...req, paths: [path], scanRoot: parent || req.scanRoot });
-        setJobId(id);
+        const started = await startCompressJob({ ...req, paths: [path], scanRoot: parent || req.scanRoot });
+        setJobId(started.jobId);
         setTab("progress");
         const presetName = presetOverride
           ? (PRESETS.find((p) => p.id === presetOverride)?.label ?? "Custom")
@@ -1881,6 +2254,7 @@ export function CompressView({
   );
 
   const handleStop = useCallback(async () => {
+    pendingStartCancelledRef.current = true;
     abortRef.current?.abort();
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
     finalizedRef.current = true;
@@ -1997,15 +2371,32 @@ export function CompressView({
         />
       ) : (
       <>
-      {scopePaths && !inRun && (
+      {(scopePaths || scanDirectorySources.length > 0) && !inRun && (
         <div className="compress-notice scoped">
           <span className="ct-ico"><Icon name="funnel" size={14} /></span>
-          <span>
-            Compressing <b>{files.length.toLocaleString()}</b> selected item{files.length === 1 ? "" : "s"}.
-          </span>
+          {folderListingLoading ? (
+            <span>
+              Checking <b>{folderListingScanned.toLocaleString()}</b> of <b>{scanDirectoryFileCount.toLocaleString()}</b> files… <b>{folderListingLoaded.toLocaleString()}</b> can be compressed.
+            </span>
+          ) : (
+            <span>
+              Compressing <b>{files.length.toLocaleString()}</b> listed item{files.length === 1 ? "" : "s"}.
+            </span>
+          )}
           <button
             className="compress-scope-clear"
-            onClick={() => { setScopePaths(null); setPreselectNotice(""); }}
+            onClick={() => {
+              setScopePaths(null);
+              setScanDirectorySources([]);
+              setScanDirectoryFiles([]);
+              setScanSelectionDefault(true);
+              setScanSelectionOverrides(new Set());
+              setFolderListingScanned(0);
+              setFolderListingLoaded(0);
+              setFolderListingLoading(false);
+              setFolderListingError("");
+              setPreselectNotice("");
+            }}
             title="Show every compressible file in the scan instead"
           >
             Show all files
@@ -2216,7 +2607,7 @@ export function CompressView({
 
         {!inRun && (
           <>
-            {runnableSelected.length > 0 && (
+            {runnableSelected.length > 0 && !folderListingLoading && (
               <span
                 className="compress-estimate"
                 title="Rough heuristic from each file's type and the active codec/quality/resolution — not a measurement. Actual results vary."
@@ -2224,18 +2615,18 @@ export function CompressView({
                 Est. ~{formatBytes(savingsEstimate.savedBytes)} saved ({savingsEstimate.pctSaved.toFixed(0)}%)
               </span>
             )}
-            <button className="compress-btn" onClick={selectAll} disabled={filteredFiles.length === 0}>
+            <button className="compress-btn" onClick={selectAll} disabled={folderListingLoading || filteredFiles.length === 0}>
               Select all
             </button>
-            <button className="compress-btn" onClick={clearSelection} disabled={selected.size === 0}>
+            <button className="compress-btn" onClick={clearSelection} disabled={folderListingLoading || selectedCount === 0}>
               Clear
             </button>
-            {runnableSelected.length > 0 && (
+            {runnableCount > 0 && (
               <button
                 className="compress-btn"
                 onClick={handleEnqueue}
-                disabled={outputMode === "folder" && !outputDir.trim()}
-                title="Stash this selection as a queued batch and clear it so you can pick the next. Queued batches run one after another."
+                disabled={folderListingLoading || !!folderListingError || (outputMode === "folder" && !outputDir.trim())}
+                title={`Queue ${runnableCount.toLocaleString()} selected file(s)`}
               >
                 <Icon name="file-zip" size={13} /> Add to queue
               </button>
@@ -2253,16 +2644,20 @@ export function CompressView({
               <button
                 className="compress-btn primary"
                 onClick={() => void handleStart()}
-                disabled={starting || runnableSelected.length === 0 || (outputMode === "folder" && !outputDir.trim())}
+                disabled={starting || folderListingLoading || !!folderListingError || runnableCount === 0 || (outputMode === "folder" && !outputDir.trim())}
                 title={
-                  runnableSelected.length === 0
+                  folderListingLoading
+                    ? "Wait until every file has been listed"
+                    : folderListingError
+                      ? "The complete folder listing could not be loaded"
+                      : runnableCount === 0
                     ? "Select at least one file whose encoder is available"
                     : outputMode === "folder" && !outputDir.trim()
                       ? "Enter a destination folder, or switch Output back to In place"
-                      : `Compress ${runnableSelected.length} file(s)`
+                      : `Compress ${runnableCount.toLocaleString()} file(s)`
                 }
               >
-                <Icon name="file-zip" size={13} /> {starting ? "Starting…" : `Compress ${runnableSelected.length > 0 ? `(${runnableSelected.length})` : ""}`}
+                <Icon name="file-zip" size={13} /> {starting ? "Starting…" : `Compress ${runnableCount > 0 ? `(${runnableCount.toLocaleString()})` : ""}`}
               </button>
             )}
           </>
@@ -2272,14 +2667,14 @@ export function CompressView({
             <button
               className="compress-btn"
               onClick={handleEnqueue}
-              disabled={runnableSelected.length === 0 || (outputMode === "folder" && !outputDir.trim())}
+              disabled={runnableCount === 0 || (outputMode === "folder" && !outputDir.trim())}
               title={
-                runnableSelected.length === 0
+                runnableCount === 0
                   ? "Select files to queue"
-                  : `Queue ${runnableSelected.length} file(s) to start after the current job`
+                  : `Queue ${runnableCount.toLocaleString()} file(s) to start after the current job`
               }
             >
-              <Icon name="file-zip" size={13} /> Add to queue {runnableSelected.length > 0 ? `(${runnableSelected.length})` : ""}
+              <Icon name="file-zip" size={13} /> Add to queue {runnableCount > 0 ? `(${runnableCount.toLocaleString()})` : ""}
             </button>
             <button className="compress-btn danger" onClick={() => void handleStop()}>
               <Icon name="stop-fill" size={13} /> Stop
@@ -2563,12 +2958,17 @@ export function CompressView({
       {!inRun && (
         <div className="compress-toolbar">
           <div className="compress-summary">
-            {selected.size > 0 ? (
+            {folderListingLoading ? (
               <>
-                <span className="compress-total">{formatBytes(selectedBytes)}</span>
+                <span className="compress-total">{folderListingLoaded.toLocaleString()}</span>
+                <span className="compress-total-label">compressible files found</span>
+              </>
+            ) : selectedCount > 0 ? (
+              <>
+                <span className="compress-total">{formatBytes(selectedTotalBytes)}</span>
                 <span className="compress-total-label">selected</span>
                 <span className="compress-selected">
-                  {selected.size.toLocaleString()} file{selected.size === 1 ? "" : "s"}
+                  {selectedCount.toLocaleString()} file{selectedCount === 1 ? "" : "s"}
                 </span>
               </>
             ) : (
@@ -2576,7 +2976,7 @@ export function CompressView({
             )}
           </div>
           <div className="compress-toolbar-spacer" />
-          <div className="compress-group" role="tablist" aria-label="Filter by type">
+          {!folderListingLoading && <div className="compress-group" role="tablist" aria-label="Filter by type">
             {FILTERS.map((f) => (
               <button
                 key={f.id}
@@ -2588,7 +2988,7 @@ export function CompressView({
                 {f.label}
               </button>
             ))}
-          </div>
+          </div>}
         </div>
       )}
 
@@ -2612,7 +3012,26 @@ export function CompressView({
           <EmptyState icon="warning" title="Compression failed" hint={runError} error />
         )}
 
-        {!inRun && files.length === 0 && (
+        {!inRun && scanDirectorySources.length > 0 && (folderListingLoading || !!folderListingError) && (
+          <div className="compress-scan-directories">
+            <div className="compress-group-row compress-scan-directory-heading">
+              <span className="compress-group-label-row">
+                {folderListingError ? "Could not check every file" : "Checking compression eligibility"}
+                <span className="compress-group-count">
+                  {folderListingScanned.toLocaleString()} / {scanDirectoryFileCount.toLocaleString()} checked
+                </span>
+              </span>
+              <span className="compress-group-size">{formatBytes(scanDirectoryBytes)}</span>
+            </div>
+            <div className="compress-scan-directory-note">
+              {folderListingError
+                ? folderListingError
+                : `${folderListingLoaded.toLocaleString()} files with an available, worthwhile compression pipeline found so far.`}
+            </div>
+          </div>
+        )}
+
+        {!inRun && !folderListingLoading && !folderListingError && files.length === 0 && (
           <EmptyState
             icon="file-zip"
             title="Nothing to compress"
@@ -2641,8 +3060,8 @@ export function CompressView({
                 // In selection mode the header carries a select-all checkbox for
                 // its group; in run mode it's a plain label.
                 const groupItems = inRun ? [] : (groups.find((g) => KIND_LABEL[g.kind] === row.label)?.items ?? []);
-                const allOn = groupItems.length > 0 && groupItems.every((f) => selected.has(f.id));
-                const someOn = !allOn && groupItems.some((f) => selected.has(f.id));
+                const allOn = groupItems.length > 0 && groupItems.every(isFileSelected);
+                const someOn = !allOn && groupItems.some(isFileSelected);
                 return (
                   <div key={row.key} className="compress-group-row" style={common}>
                     {!inRun && (
@@ -2666,7 +3085,7 @@ export function CompressView({
 
               if (row.type === "file") {
                 const f = row.file;
-                const isChecked = selected.has(f.id);
+                const isChecked = isFileSelected(f);
                 const avail = kindAvailable(f.kind);
                 return (
                   <div
@@ -2680,7 +3099,7 @@ export function CompressView({
                       type="checkbox"
                       className="compress-check"
                       checked={isChecked}
-                      onChange={() => toggleFile(f.id)}
+                      onChange={() => toggleFile(f)}
                     />
                     <span className="compress-row-name" title={f.path}>{f.name}</span>
                     {!avail && <span className="compress-chip-status skipped" title="Encoder not installed">no tool</span>}

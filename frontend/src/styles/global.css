@@ -1016,6 +1016,11 @@ input:focus, select:focus {
 }
 
 .row:hover:not(.selected) { background: var(--vsc-list-selected); }
+html.native-context-menu-open .row:hover {
+  background: transparent !important;
+  box-shadow: none;
+}
+html.native-context-menu-open .row.selected:hover::after { display: none; }
 .row.selected { background: var(--selected); border-bottom-color: rgba(0,120,212,0.12); }
 .row.selected.primary-selected { box-shadow: inset 0 0 0 1px rgba(0,120,212,0.22); }
 .row.drop-target,
@@ -4049,6 +4054,13 @@ input:focus, select:focus {
 /* File list */
 .compress-body { flex: 1 1 0; min-height: 0; overflow: auto; position: relative; }
 .compress-body.drag-active { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.compress-scan-directories { border-bottom: 1px solid var(--vsc-border); }
+.compress-scan-directory-heading { min-height: 30px; }
+.compress-scan-directory-row { min-height: 34px; padding-left: 30px; }
+.compress-scan-directory-note {
+  padding: 8px 14px 9px 30px; color: var(--text-5); background: var(--panel);
+  border-top: 1px solid var(--border); font-size: 11px;
+}
 .compress-dnd-overlay {
   position: absolute; inset: 0; z-index: 5; display: flex; align-items: center; justify-content: center;
   background: color-mix(in srgb, var(--accent) 12%, transparent); pointer-events: none;
@@ -4108,6 +4120,7 @@ input:focus, select:focus {
   color: var(--text); cursor: default; user-select: none;
 }
 .compress-row:hover { background: var(--hover); }
+html.native-context-menu-open .compress-row:hover { background: transparent; }
 .compress-row.on { background: var(--selected); }
 .compress-check { cursor: pointer; flex: 0 0 auto; accent-color: var(--accent); }
 .compress-row-name {
@@ -4294,6 +4307,7 @@ input:focus, select:focus {
 .compress-jobfiles-body { max-height: 320px; overflow-y: auto; }
 .compress-jobfile-row { border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text); cursor: default; user-select: none; }
 .compress-jobfile-row:hover { background: var(--hover); }
+html.native-context-menu-open .compress-jobfile-row:hover { background: transparent; }
 .compress-jobfile-row.selected { background: var(--selected); }
 .compress-jobfiles .cjf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .compress-jobfiles .cjf-kind { color: var(--text-5); text-transform: capitalize; }
@@ -4350,6 +4364,7 @@ input:focus, select:focus {
 .compress-log-vbody { flex: 1 1 0; min-height: 0; overflow-y: auto; }
 .compress-log-vrow { border-bottom: 1px solid var(--border); color: var(--text); cursor: default; user-select: none; }
 .compress-log-vrow:hover { background: var(--hover); }
+html.native-context-menu-open .compress-log-vrow:hover { background: transparent; }
 .compress-log-vrow.selected { background: var(--selected); }
 .compress-log-vtable .num { text-align: right; font-variant-numeric: tabular-nums; }
 .compress-log-vtable .clog-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

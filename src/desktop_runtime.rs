@@ -5,14 +5,26 @@ use crate::compress_job::{
 use crate::io::LockRecover;
 use crate::v2::{CompressionFileRecord, CompressionPageQuery, V2Store};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompressionScanDirectory {
+    pub scan_id: String,
+    pub directory_id: i64,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompressionStartRequest {
+    #[serde(default)]
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub scan_directories: Vec<CompressionScanDirectory>,
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
     #[serde(default = "default_preset")]
     pub preset: String,
     #[serde(default)]
@@ -65,11 +77,16 @@ pub struct CompressionFilesRequest {
 pub struct CompressionStartResult {
     pub job_id: String,
     pub status: String,
+    pub total: usize,
+    pub skipped_unavailable: usize,
+    pub skipped_ineligible: usize,
+    pub skipped_missing: usize,
 }
 
 pub struct DesktopRuntime {
     state: Arc<CompressionRuntimeState>,
     store: Arc<V2Store>,
+    starting_paths: Mutex<HashSet<u64>>,
 }
 
 impl DesktopRuntime {
@@ -80,7 +97,11 @@ impl DesktopRuntime {
             let _ = invalidation_store.mark_scans_stale_for_path(path);
         }));
         compress_job::start_queue_scheduler(Arc::clone(&state));
-        Arc::new(Self { state, store })
+        Arc::new(Self {
+            state,
+            store,
+            starting_paths: Mutex::new(HashSet::new()),
+        })
     }
 
     pub fn compression_tools_json(&self) -> String {
@@ -89,19 +110,111 @@ impl DesktopRuntime {
 
     pub fn start_compression(
         &self,
-        request: CompressionStartRequest,
+        mut request: CompressionStartRequest,
     ) -> Result<CompressionStartResult, String> {
-        if request.paths.is_empty() {
-            return Err("Missing paths".to_string());
+        let handbrake_available = crate::compress_tools::detect_handbrake().found;
+        let image_available = crate::compress_tools::detect_image().0.found;
+        let mut skipped_unavailable = 0usize;
+        let mut skipped_ineligible = 0usize;
+        let needs_dedup = request.scan_directories.len() > 1
+            || (!request.scan_directories.is_empty() && !request.paths.is_empty());
+        let mut seen = needs_dedup.then(HashSet::<String>::new);
+        let mut indexed_files = Vec::<(String, u64)>::new();
+        let mut push_file = |path: String, size: u64| {
+            if seen
+                .as_mut()
+                .is_some_and(|seen| !seen.insert(compression_path_key(&path)))
+            {
+                return;
+            }
+            indexed_files.push((path, size));
+        };
+        for path in std::mem::take(&mut request.paths) {
+            let size = std::fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            match crate::compression_eligibility(
+                &path,
+                size,
+                handbrake_available,
+                image_available,
+                request.min_size_bytes,
+            ) {
+                crate::CompressionEligibility::Eligible => push_file(path, size),
+                crate::CompressionEligibility::EncoderUnavailable => skipped_unavailable += 1,
+                crate::CompressionEligibility::KnownNoGain
+                | crate::CompressionEligibility::TooSmall => skipped_ineligible += 1,
+            }
         }
-        let fingerprints = compress_job::path_fingerprints(&request.paths);
-        if let Some(conflict) =
-            compress_job::active_path_conflict(&self.state.jobs.lock_recover(), &fingerprints)
+        let mut scan_files = Vec::new();
+        for directory in &request.scan_directories {
+            scan_files.extend(
+                self.store
+                    .query_all_subtree_files(&directory.scan_id, directory.directory_id)?,
+            );
+        }
+        if !request.exclude_paths.is_empty() {
+            let excluded = request
+                .exclude_paths
+                .iter()
+                .map(|path| compression_path_key(path))
+                .collect::<HashSet<_>>();
+            scan_files.retain(|file| !excluded.contains(&compression_path_key(&file.path)));
+        }
+        scan_files.retain(|file| {
+            match crate::compression_eligibility(
+                &file.path,
+                file.size,
+                handbrake_available,
+                image_available,
+                request.min_size_bytes,
+            ) {
+                crate::CompressionEligibility::Eligible => true,
+                crate::CompressionEligibility::EncoderUnavailable => {
+                    skipped_unavailable += 1;
+                    false
+                }
+                crate::CompressionEligibility::KnownNoGain
+                | crate::CompressionEligibility::TooSmall => {
+                    skipped_ineligible += 1;
+                    false
+                }
+            }
+        });
+        let skipped_missing = self
+            .store
+            .validate_indexed_sources_authorized(&mut scan_files)?;
+        for file in scan_files {
+            push_file(file.path, file.size);
+        }
+        drop(push_file);
+        if indexed_files.is_empty() {
+            return Err(
+                if skipped_missing > 0 && skipped_unavailable == 0 && skipped_ineligible == 0 {
+                    "No files from this scan still exist".to_string()
+                } else {
+                    "No selected files can be compressed with the current tools and settings"
+                        .to_string()
+                },
+            );
+        }
+        let fingerprints = compress_job::indexed_path_fingerprints(&indexed_files);
         {
-            return Err(format!(
-                "Files are already active in compression job {}",
-                conflict.job_id
-            ));
+            let mut starting_paths = self.starting_paths.lock_recover();
+            let jobs = self.state.jobs.lock_recover();
+            if let Some(conflict) = compress_job::active_path_conflict(&jobs, &fingerprints) {
+                return Err(format!(
+                    "Files are already active in compression job {}",
+                    conflict.job_id
+                ));
+            }
+            if fingerprints
+                .iter()
+                .any(|fingerprint| starting_paths.contains(fingerprint))
+            {
+                return Err("Files are already being prepared for compression".to_string());
+            }
+            starting_paths.extend(fingerprints.iter().copied());
         }
         let original_action = request
             .original_action
@@ -128,19 +241,39 @@ impl DesktopRuntime {
             output_dir: request.output_dir,
         };
         let job = if request.queued {
-            compress_job::create_queued_job(&request.paths, &request.preset, &opts)
+            compress_job::create_queued_job_from_indexed_files(
+                indexed_files,
+                &request.preset,
+                &opts,
+            )
         } else {
-            compress_job::create_job(&request.paths, &request.preset, &opts)
+            compress_job::create_job_from_indexed_files(indexed_files, &request.preset, &opts)
         };
         let result = CompressionStartResult {
             job_id: job.id.clone(),
             status: if request.queued { "queued" } else { "running" }.to_string(),
+            total: job.total,
+            skipped_unavailable,
+            skipped_ineligible,
+            skipped_missing,
         };
-        self.bind_persistent_job(&job, &result.status)?;
-        self.state
-            .jobs
-            .lock_recover()
-            .insert(job.id.clone(), Arc::clone(&job));
+        if let Err(error) = self.bind_persistent_job(&job, &result.status) {
+            let mut starting_paths = self.starting_paths.lock_recover();
+            for fingerprint in &fingerprints {
+                starting_paths.remove(fingerprint);
+            }
+            return Err(error);
+        }
+        {
+            let mut starting_paths = self.starting_paths.lock_recover();
+            self.state
+                .jobs
+                .lock_recover()
+                .insert(job.id.clone(), Arc::clone(&job));
+            for fingerprint in &fingerprints {
+                starting_paths.remove(fingerprint);
+            }
+        }
         if !request.queued {
             compress_job::spawn_job(Arc::clone(&self.state), job);
         }
@@ -225,6 +358,10 @@ impl DesktopRuntime {
         let result = CompressionStartResult {
             job_id: job.id.clone(),
             status: "running".to_string(),
+            total: job.total,
+            skipped_unavailable: 0,
+            skipped_ineligible: 0,
+            skipped_missing: 0,
         };
         self.bind_persistent_job(&job, &result.status)?;
         self.state
@@ -432,4 +569,40 @@ fn default_codec() -> String {
 }
 fn default_zip_level() -> i64 {
     -1
+}
+
+fn compression_path_key(path: &str) -> String {
+    path.replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_request_accepts_scan_directory_without_paths() {
+        let request: CompressionStartRequest = serde_json::from_value(serde_json::json!({
+            "scanDirectories": [{ "scanId": "scan-123", "directoryId": 42 }]
+        }))
+        .unwrap();
+        assert!(request.paths.is_empty());
+        assert_eq!(request.scan_directories.len(), 1);
+        assert_eq!(request.scan_directories[0].scan_id, "scan-123");
+        assert_eq!(request.scan_directories[0].directory_id, 42);
+        assert!(request.exclude_paths.is_empty());
+    }
+
+    #[test]
+    fn compression_request_accepts_scan_file_exclusions() {
+        let request: CompressionStartRequest = serde_json::from_value(serde_json::json!({
+            "scanDirectories": [{ "scanId": "scan-123", "directoryId": 42 }],
+            "excludePaths": ["C:\\Media\\skip.mp4"]
+        }))
+        .unwrap();
+        assert_eq!(request.exclude_paths, vec!["C:\\Media\\skip.mp4"]);
+        assert_eq!(
+            compression_path_key("C:\\MEDIA\\skip.mp4\\"),
+            "c:/media/skip.mp4"
+        );
+    }
 }

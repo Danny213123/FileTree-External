@@ -158,6 +158,499 @@ pub(crate) fn native_drag_files(_paths: Vec<String>) -> Result<NativeDragResult,
     Err("Native file dragging is only available on Windows".to_string())
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct NativeMoveResult {
+    pub(crate) aborted: bool,
+    pub(crate) moved: usize,
+    pub(crate) skipped: usize,
+    pub(crate) failed: usize,
+}
+
+/// Move files/folders through the same `IFileOperation` engine Explorer uses.
+/// Because `FOF_SILENT` is deliberately absent, Windows supplies its normal
+/// progress, collision, cancellation, and elevation UI for non-trivial moves.
+#[cfg(windows)]
+pub(crate) fn native_move_files(
+    paths: Vec<String>,
+    destination: String,
+    owner_handle: isize,
+) -> Result<NativeMoveResult, String> {
+    use std::ffi::c_void;
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
+    use windows::Win32::UI::Shell::{
+        FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FOF_WANTNUKEWARNING,
+        FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE, FOFX_SHOWELEVATIONPROMPT, FileOperation,
+        IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
+    };
+    use windows::core::PCWSTR;
+
+    struct OleGuard(bool);
+    impl Drop for OleGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { OleUninitialize() };
+            }
+        }
+    }
+
+    fn path_key(path: &Path) -> String {
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    }
+
+    fn within(candidate: &Path, parent: &Path) -> bool {
+        let candidate = path_key(candidate);
+        let parent = path_key(parent);
+        candidate == parent
+            || candidate
+                .strip_prefix(&parent)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+
+    fn shell_item(path: &Path) -> windows::core::Result<IShellItem> {
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(once(0))
+            .collect::<Vec<_>>();
+        unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }
+    }
+
+    let owner = HWND(owner_handle as *mut c_void);
+    if owner.is_invalid() {
+        return Err("The FileTree window is unavailable".to_string());
+    }
+    let destination_path = Path::new(&destination);
+    if !destination_path.is_dir() {
+        return Err(format!("Destination is not a folder: {destination}"));
+    }
+
+    let _ole = OleGuard(unsafe { OleInitialize(None) }.is_ok());
+    let destination_item = shell_item(destination_path)
+        .map_err(|error| format!("Windows could not open the destination: {error}"))?;
+    let operation: IFileOperation =
+        unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|error| format!("Windows could not start the move operation: {error}"))?;
+    unsafe { operation.SetOwnerWindow(owner) }
+        .map_err(|error| format!("Windows could not attach the move dialog: {error}"))?;
+    let flags = FILEOPERATION_FLAGS(
+        FOF_ALLOWUNDO.0
+            | FOF_NOCONFIRMMKDIR.0
+            | FOF_WANTNUKEWARNING.0
+            | FOFX_ADDUNDORECORD.0
+            | FOFX_RECYCLEONDELETE.0
+            | FOFX_SHOWELEVATIONPROMPT.0,
+    );
+    unsafe { operation.SetOperationFlags(flags) }
+        .map_err(|error| format!("Windows could not configure the move operation: {error}"))?;
+
+    let mut result = NativeMoveResult::default();
+    let mut queued = Vec::new();
+    for path_text in paths {
+        let source = Path::new(&path_text);
+        let Some(name) = source.file_name() else {
+            result.failed += 1;
+            continue;
+        };
+        if std::fs::symlink_metadata(source).is_err() {
+            result.failed += 1;
+            continue;
+        }
+        let target = destination_path.join(name);
+        if path_key(source) == path_key(&target) {
+            result.skipped += 1;
+            continue;
+        }
+        if source.is_dir() && within(destination_path, source) {
+            result.failed += 1;
+            continue;
+        }
+        let source_item = match shell_item(source) {
+            Ok(item) => item,
+            Err(_) => {
+                result.failed += 1;
+                continue;
+            }
+        };
+        if unsafe {
+            operation.MoveItem(
+                &source_item,
+                &destination_item,
+                PCWSTR::null(),
+                None::<&IFileOperationProgressSink>,
+            )
+        }
+        .is_err()
+        {
+            result.failed += 1;
+            continue;
+        }
+        queued.push(path_text);
+    }
+
+    if queued.is_empty() {
+        return Ok(result);
+    }
+    let perform_error = unsafe { operation.PerformOperations() }.err();
+    result.aborted = unsafe { operation.GetAnyOperationsAborted() }
+        .map(|value| value.as_bool())
+        .unwrap_or(false);
+    for source in queued {
+        if std::fs::symlink_metadata(&source).is_err() {
+            result.moved += 1;
+        } else if result.aborted || perform_error.is_none() {
+            // A source left in place after a successful operation is normally a
+            // collision the user chose to skip.
+            result.skipped += 1;
+        } else {
+            result.failed += 1;
+        }
+    }
+    if let Some(error) = perform_error
+        && !result.aborted
+        && result.moved == 0
+    {
+        return Err(format!("Windows could not complete the move: {error}"));
+    }
+    Ok(result)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn native_move_files(
+    _paths: Vec<String>,
+    _destination: String,
+    _owner_handle: isize,
+) -> Result<NativeMoveResult, String> {
+    Err("Native file moves are only available on Windows".to_string())
+}
+
+#[cfg(windows)]
+struct ShellMenuMessageBridge {
+    menu3: Option<windows::Win32::UI::Shell::IContextMenu3>,
+    menu2: Option<windows::Win32::UI::Shell::IContextMenu2>,
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn shell_menu_subclass_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::Shell::DefSubclassProc;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
+    };
+
+    if reference_data != 0
+        && matches!(
+            message,
+            WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR
+        )
+    {
+        let bridge = unsafe { &*(reference_data as *const ShellMenuMessageBridge) };
+        if let Some(menu) = &bridge.menu3 {
+            let mut result = LRESULT(0);
+            if unsafe { menu.HandleMenuMsg2(message, wparam, lparam, Some(&mut result)) }.is_ok() {
+                return result;
+            }
+        } else if let Some(menu) = &bridge.menu2 {
+            if unsafe { menu.HandleMenuMsg(message, wparam, lparam) }.is_ok() {
+                return LRESULT(0);
+            }
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+/// Display Explorer's classic "Show more options" context menu for physical
+/// files/folders. Cascades remain lazy, matching Explorer instead of blocking
+/// initial display while every submenu and Shift-only extension initializes.
+#[cfg(windows)]
+pub(crate) fn shell_context_menu(
+    paths: Vec<String>,
+    owner_handle: isize,
+    screen_x: i32,
+    screen_y: i32,
+) -> Result<Option<String>, String> {
+    use std::ffi::c_void;
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, WPARAM};
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        CMF_ASYNCVERBSTATE, CMF_CANRENAME, CMF_EXPLORE, CMIC_MASK_PTINVOKE, CMINVOKECOMMANDINFO,
+        CMINVOKECOMMANDINFOEX, GCS_VERBW, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder,
+        RemoveWindowSubclass, SHBindToParent, SHParseDisplayName, SetWindowSubclass,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, HMENU, PostMessageW,
+        SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+        WM_NULL, WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+    use windows::core::{Interface, PCSTR, PCWSTR, PSTR, w};
+
+    const MENU_ID_FIRST: u32 = 1;
+    const MENU_ID_LAST: u32 = 0x7fff;
+    const SUBCLASS_ID: usize = 0x4654_434d;
+    const CMIC_MASK_UNICODE: u32 = 0x0000_4000;
+
+    struct OleGuard(bool);
+    impl Drop for OleGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { OleUninitialize() };
+            }
+        }
+    }
+
+    struct PidlGuard(Vec<*mut ITEMIDLIST>);
+    impl Drop for PidlGuard {
+        fn drop(&mut self) {
+            for &pidl in &self.0 {
+                if !pidl.is_null() {
+                    unsafe { CoTaskMemFree(Some(pidl.cast::<c_void>())) };
+                }
+            }
+        }
+    }
+
+    struct MenuGuard(windows::Win32::UI::WindowsAndMessaging::HMENU);
+    impl Drop for MenuGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyMenu(self.0) };
+        }
+    }
+
+    struct ProxyWindow(HWND);
+    impl Drop for ProxyWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    let owner = HWND(owner_handle as *mut c_void);
+    if owner.is_invalid() {
+        return Err("The FileTree window is unavailable".to_string());
+    }
+
+    let mut existing = paths
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    if existing.is_empty() {
+        return Err("No existing files or folders were selected".to_string());
+    }
+
+    // IShellFolder::GetUIObjectOf accepts a multi-selection only when every
+    // child belongs to one parent folder. Keep the clicked item first and fall
+    // back to that item alone if the FileTree selection crosses directories.
+    let parent_key = |path: &str| {
+        Path::new(path)
+            .parent()
+            .map(|parent| {
+                parent
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default()
+    };
+    let first_parent = parent_key(&existing[0]);
+    if existing
+        .iter()
+        .skip(1)
+        .any(|path| parent_key(path) != first_parent)
+    {
+        existing.truncate(1);
+    }
+
+    let _ole = OleGuard(unsafe { OleInitialize(None) }.is_ok());
+    // This function runs on a dedicated STA worker. Keep every shell menu
+    // callback on that worker by using a tiny local owner window; the real
+    // FileTree HWND is still supplied when the selected command is invoked.
+    let proxy = ProxyWindow(
+        unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                owner,
+                HMENU::default(),
+                HINSTANCE::default(),
+                None,
+            )
+        }
+        .map_err(|error| format!("Windows could not create a context-menu worker: {error}"))?,
+    );
+    let menu_owner = proxy.0;
+    let mut pidls = PidlGuard(Vec::with_capacity(existing.len()));
+    for path in &existing {
+        let wide = Path::new(path)
+            .as_os_str()
+            .encode_wide()
+            .chain(once(0))
+            .collect::<Vec<_>>();
+        let mut pidl = std::ptr::null_mut();
+        unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None) }
+            .map_err(|error| format!("Windows could not resolve {path}: {error}"))?;
+        if pidl.is_null() {
+            return Err(format!("Windows could not resolve {path}"));
+        }
+        pidls.0.push(pidl);
+    }
+
+    let mut parent_folder: Option<IShellFolder> = None;
+    let mut children = Vec::<*const ITEMIDLIST>::with_capacity(pidls.0.len());
+    for &pidl in &pidls.0 {
+        let mut child = std::ptr::null_mut();
+        let folder: IShellFolder = unsafe { SHBindToParent(pidl, Some(&mut child)) }
+            .map_err(|error| format!("Windows could not open the containing folder: {error}"))?;
+        if child.is_null() {
+            return Err("Windows returned an invalid shell item".to_string());
+        }
+        if parent_folder.is_none() {
+            parent_folder = Some(folder);
+        }
+        children.push(child);
+    }
+
+    let context: IContextMenu = unsafe {
+        parent_folder
+            .as_ref()
+            .ok_or_else(|| "Windows could not resolve the containing folder".to_string())?
+            .GetUIObjectOf(menu_owner, &children, None)
+    }
+    .map_err(|error| format!("Windows could not create the context menu: {error}"))?;
+    let menu = MenuGuard(
+        unsafe { CreatePopupMenu() }
+            .map_err(|error| format!("Windows could not create the context menu: {error}"))?,
+    );
+    unsafe {
+        context.QueryContextMenu(
+            menu.0,
+            0,
+            MENU_ID_FIRST,
+            MENU_ID_LAST,
+            // Let supporting shell extensions evaluate expensive verb state in
+            // the background instead of delaying the initial popup.
+            CMF_EXPLORE | CMF_CANRENAME | CMF_ASYNCVERBSTATE,
+        )
+    }
+    .map_err(|error| format!("Windows could not populate the context menu: {error}"))?;
+
+    let bridge = Box::new(ShellMenuMessageBridge {
+        menu3: context.cast::<IContextMenu3>().ok(),
+        menu2: context.cast::<IContextMenu2>().ok(),
+    });
+    let subclassed = unsafe {
+        SetWindowSubclass(
+            menu_owner,
+            Some(shell_menu_subclass_proc),
+            SUBCLASS_ID,
+            (&*bridge as *const ShellMenuMessageBridge) as usize,
+        )
+    }
+    .as_bool();
+
+    unsafe {
+        let _ = SetForegroundWindow(owner);
+    }
+    let command = unsafe {
+        TrackPopupMenuEx(
+            menu.0,
+            TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0,
+            screen_x,
+            screen_y,
+            menu_owner,
+            None,
+        )
+    }
+    .0 as u32;
+    if subclassed {
+        unsafe {
+            let _ = RemoveWindowSubclass(menu_owner, Some(shell_menu_subclass_proc), SUBCLASS_ID);
+        }
+    }
+    // Destroy the worker-owned window while the bridge is still alive. This
+    // keeps its callback pointer valid even if subclass removal ever fails.
+    drop(proxy);
+    // Required by TrackPopupMenu's foreground-window contract; without this,
+    // dismissing one menu can make the next click immediately disappear.
+    let _ = unsafe { PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0)) };
+    drop(bridge);
+
+    if command < MENU_ID_FIRST {
+        return Ok(None);
+    }
+    let command_offset = command - MENU_ID_FIRST;
+    let mut verb_buffer = [0u16; 260];
+    let verb = unsafe {
+        context.GetCommandString(
+            command_offset as usize,
+            GCS_VERBW,
+            None,
+            PSTR(verb_buffer.as_mut_ptr().cast::<u8>()),
+            verb_buffer.len() as u32,
+        )
+    }
+    .ok()
+    .and_then(|_| {
+        let length = verb_buffer.iter().position(|value| *value == 0)?;
+        (length > 0).then(|| String::from_utf16_lossy(&verb_buffer[..length]))
+    });
+
+    let ordinal_a = PCSTR(command_offset as usize as *const u8);
+    let ordinal_w = PCWSTR(command_offset as usize as *const u16);
+    let invoke = CMINVOKECOMMANDINFOEX {
+        cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
+        fMask: CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE,
+        hwnd: owner,
+        lpVerb: ordinal_a,
+        lpVerbW: ordinal_w,
+        nShow: SW_SHOWNORMAL.0,
+        ptInvoke: POINT {
+            x: screen_x,
+            y: screen_y,
+        },
+        ..Default::default()
+    };
+    unsafe {
+        context
+            .InvokeCommand((&invoke as *const CMINVOKECOMMANDINFOEX).cast::<CMINVOKECOMMANDINFO>())
+    }
+    .map_err(|error| format!("Windows could not run the selected command: {error}"))?;
+    Ok(verb)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn shell_context_menu(
+    _paths: Vec<String>,
+    _owner_handle: isize,
+    _screen_x: i32,
+    _screen_y: i32,
+) -> Result<Option<String>, String> {
+    Err("The Windows shell context menu is only available on Windows".to_string())
+}
+
 #[cfg(windows)]
 #[repr(C)]
 struct DataBlob {
@@ -1078,5 +1571,40 @@ mod tests {
         assert!(cache.get("first").is_none());
         assert_eq!(cache.get("second"), Some(vec![2; 6]));
         assert!(cache.bytes <= 8);
+    }
+
+    #[test]
+    fn native_move_uses_windows_file_operation() {
+        use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+
+        let root = std::env::temp_dir().join(format!(
+            "filetree-native-move-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source_dir = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source_dir).expect("create native move source");
+        std::fs::create_dir_all(&destination).expect("create native move destination");
+        let source = source_dir.join("move-me.txt");
+        std::fs::write(&source, b"native move").expect("write native move source");
+
+        let owner = unsafe { GetDesktopWindow() };
+        let result = native_move_files(
+            vec![source.to_string_lossy().into_owned()],
+            destination.to_string_lossy().into_owned(),
+            owner.0 as isize,
+        )
+        .expect("move through IFileOperation");
+
+        assert!(!result.aborted);
+        assert_eq!(result.moved, 1);
+        assert_eq!(result.failed, 0);
+        assert!(!source.exists());
+        assert!(destination.join("move-me.txt").exists());
+        std::fs::remove_dir_all(root).expect("remove native move fixture");
     }
 }

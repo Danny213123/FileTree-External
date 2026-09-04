@@ -126,8 +126,8 @@ interface TreeTableProps {
   onContextMenu: (id: number, x: number, y: number) => void;
   onSortChange: (key: SortKey) => void;
   onToggleBookmark: (path: string) => void;
-  /** Quick-load this row (or the active multi-selection it belongs to) into the
-   *  Compress page. Folders are expanded to their contained files upstream. */
+  /** Quick-load this row (or its active multi-selection) into Compression.
+   *  Persisted folders are passed as scan-backed descriptors upstream. */
   onCompress?: (id: number) => void;
   onCopySelected?: () => void;
   /** Called when the user drags rows from inside FileTree onto a folder row. */

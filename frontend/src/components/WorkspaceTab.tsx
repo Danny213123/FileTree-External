@@ -10,9 +10,9 @@ import {
   clipboardWriteFiles, clipboardReadFiles, copyItemsNative, hasNativeCopy,
   compress, extract, checksum, copyText,
   setAttributes, setTimes,
-  fetchServerSearch, fetchSubtreeFiles,
+  fetchServerSearch, shellContextMenu,
 } from "../api/client";
-import type { ScanOptions, ExportFormat, CompressionSourceFile } from "../api/client";
+import type { ScanOptions, ExportFormat, CompressionSource } from "../api/client";
 import type { NodeRecord, SortKey, TagEntry } from "../api/types";
 import type { FilterRule } from "../hooks/useFilterRules";
 import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow, type AgentApi } from "../lib/agent";
@@ -340,10 +340,8 @@ interface WorkspaceTabProps {
   heatTint: boolean;
   onClose3D: () => void;
   onToggleBookmark: (path: string) => void;
-  // Quick-load file(s) into the Compress page. Receives concrete file metadata
-  // (folders already expanded to their contained files) and switches the
-  // activity view to Compress — same mechanism as the right-click "Compress…".
-  onCompress: (files: CompressionSourceFile[]) => void;
+  // Quick-load files or persisted scan folders into the Compress page.
+  onCompress: (sources: CompressionSource[]) => void;
   onScanPath: (path: string) => void;
   onStateChange: () => void;
   // Publish this pane's sidebar/status snapshot to the shared workbench store
@@ -1156,34 +1154,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     treeRef.current.setSelectedId(ids[ids.length - 1]);
   }, []);
 
-  const [fileContextMenu, setFileContextMenu] = useState<{
-    id: number;
-    path: string;
-    isDir: boolean;
-    x: number;
-    y: number;
-  } | null>(null);
-
-  useEffect(() => {
-    if (!fileContextMenu) return;
-    const dismiss = () => setFileContextMenu(null);
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") dismiss();
-    };
-    window.addEventListener("pointerdown", dismiss);
-    window.addEventListener("blur", dismiss);
-    window.addEventListener("resize", dismiss);
-    window.addEventListener("scroll", dismiss, true);
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("pointerdown", dismiss);
-      window.removeEventListener("blur", dismiss);
-      window.removeEventListener("resize", dismiss);
-      window.removeEventListener("scroll", dismiss, true);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [fileContextMenu]);
-
   const handleContextMenu = useCallback((id: number, x: number, y: number) => {
     const t = treeRef.current;
     const selIds = selectedIdsRef.current;
@@ -1191,88 +1161,85 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     if (!alreadySelected) handleSelectRow(id, "single");
     const node = t.nodeById.get(id);
     if (!node || node.id < 0 || !node.path) return;
-    setFileContextMenu({
-      id,
-      path: node.path,
-      isDir: node.dir,
-      x: Math.max(4, Math.min(x, window.innerWidth - 224)),
-      y: Math.max(4, Math.min(y, window.innerHeight - 220)),
+    const targetIds = alreadySelected && selIds.size > 1
+      ? [id, ...Array.from(selIds).filter((selectedId) => selectedId !== id)]
+      : [id];
+    const paths = targetIds
+      .map((targetId) => t.nodeById.get(targetId))
+      .filter((target): target is NodeRecord => !!target && target.id >= 0 && !!target.path)
+      .map((target) => target.path);
+    void shellContextMenu(paths, x, y).catch((error: unknown) => {
+      toast.error(error instanceof Error ? error.message : String(error));
     });
   }, [handleSelectRow]);
 
-  // Quick "Compress" row action. Mirrors handleContextMenu's target rule: when
-  // the clicked row is part of a multi-selection, act on the whole selection;
-  // otherwise act on just that row. Folders are expanded to their contained
-  // files so the Compress page receives concrete file metadata — files only,
-  // deduped, order-stable. Lazy scans use a bounded paged backend query because
-  // collapsed descendants are intentionally absent from nodeById.
+  // Quick "Compress" row action. Persisted folders stay as compact scan/id
+  // descriptors: their recursive file count and size were aggregated during
+  // scanning, and Rust resolves the paths only when the job starts. This keeps
+  // a 500K-file folder from crossing IPC just to open the setup page.
   const handleCompress = useCallback((id: number) => {
     const t = treeRef.current;
     const selIds = selectedIdsRef.current;
-    const targetIds = selIds.has(id) && selIds.size > 1 ? [...selIds] : [id];
+    const rawTargetIds = selIds.has(id) && selIds.size > 1 ? [...selIds] : [id];
+    const targetSet = new Set(rawTargetIds);
+    const targetIds = rawTargetIds.filter((targetId) => {
+      // Keep explicitly selected files even when their parent folder is also
+      // selected: a watcher may have added them after the immutable scan index
+      // was written. Rust deduplicates files that are already in the index.
+      if (!t.nodeById.get(targetId)?.dir) return true;
+      let parent = t.nodeById.get(targetId)?.parent;
+      while (parent != null) {
+        if (targetSet.has(parent)) return false;
+        parent = t.nodeById.get(parent)?.parent;
+      }
+      return true;
+    });
     const scan = dataRef.current;
-    // A v2 scan id is authoritative: even a scan that is not marked lazy may
-    // have a bounded renderer cache after incremental refreshes. Always resolve
-    // folders from SQLite when the persisted scan is available.
-    const hasPersistedScan = !!scan?.scanId;
-    const rootPath = scan?.rootPath ?? "";
-
-    const filesToCompress: CompressionSourceFile[] = [];
+    const scanId = scan?.scanId;
+    const sources: CompressionSource[] = [];
     const seen = new Set<string>();
     const normalizePath = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
     const pushFilePath = (p: string, size = 0) => {
       const key = normalizePath(p);
       if (!p || seen.has(key)) return;
       seen.add(key);
-      filesToCompress.push({ path: p, size });
+      sources.push({ path: p, size });
     };
     const pushFile = (node: NodeRecord) => {
       if (node.dir || node.id < 0 || !node.path) return;
       pushFilePath(node.path, node.size);
     };
 
-    const containsFolder = targetIds.some((tid) => t.nodeById.get(tid)?.dir);
-    if (containsFolder) toast.info("Loading every file in the selected folder for compression...");
-
-    const run = async () => {
-      let loadFailed = false;
-      for (const tid of targetIds) {
-        const node = t.nodeById.get(tid);
-        if (!node) continue;
-        if (!node.dir) {
-          pushFile(node);
-          continue;
-        }
-        if (hasPersistedScan) {
-          // V2: descendant files always come from the backend, not the bounded
-          // renderer tree. This is required for drive roots and refreshed tabs.
-          try {
-            const files = await fetchSubtreeFiles({
-              rootPath,
-              scanId: scan?.scanId,
-              dirId: node.id,
-            });
-            for (const file of files) pushFilePath(file.path, file.size);
-          } catch (err) {
-            loadFailed = true;
-            console.warn("subtree-files fetch failed for", node.path, err);
-            toast.error(`Couldn't load files from ${node.name}: ${err instanceof Error ? err.message : String(err)}`);
-          }
-          continue;
-        }
-        // Full mode: walk descendants, collecting every file underneath it.
-        const queue = [node.id];
-        for (let qi = 0; qi < queue.length; qi++) {
-          const cur = t.nodeById.get(queue[qi]);
-          if (!cur) continue;
-          if (!cur.dir) { pushFile(cur); continue; }
-          for (const childId of cur.children) queue.push(childId);
-        }
+    for (const tid of targetIds) {
+      const node = t.nodeById.get(tid);
+      if (!node) continue;
+      if (!node.dir) {
+        pushFile(node);
+        continue;
       }
-      if (filesToCompress.length > 0) onCompress(filesToCompress);
-      else if (containsFolder && !loadFailed) toast.info("This folder has no files to compress.");
-    };
-    void run();
+      if (scanId && node.id >= 0 && node.path) {
+        sources.push({
+          sourceType: "scan-directory",
+          scanId,
+          directoryId: node.id,
+          path: node.path,
+          name: node.name,
+          size: node.size,
+          fileCount: node.files,
+        });
+        continue;
+      }
+      // Browser/headless fallback: only full trees lack a persisted scan id.
+      const queue = [node.id];
+      for (let qi = 0; qi < queue.length; qi++) {
+        const cur = t.nodeById.get(queue[qi]);
+        if (!cur) continue;
+        if (!cur.dir) { pushFile(cur); continue; }
+        for (const childId of cur.children) queue.push(childId);
+      }
+    }
+    if (sources.length > 0) onCompress(sources);
+    else toast.info("This selection has no files to compress.");
   }, [onCompress]);
 
   // Latest value of the configurable double-click action, read inside the stable
@@ -1562,7 +1529,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // user's choice. With "Apply to all" (default) one choice resolves every
   // remaining collision in a single batched call; unchecked, we re-prompt for
   // each item in turn (Skip/Overwrite/Rename) until done or Cancel.
-  // NOTE: in the Electron app, moves go through the native shell (IFileOperation)
+  // NOTE: in the desktop app, moves go through the native shell (IFileOperation)
   // which presents Windows' OWN Replace/Skip/Keep-both dialog, so this dialog is
   // the dev/browser fallback. (See handleInternalMove.)
   const runMoveWithConflicts = useCallback(
@@ -1807,7 +1774,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // "Move to…" / "Copy to…" (ribbon / context / palette). #42: a richer dialog
   // with recent destinations + an inline "New folder…" affordance replaces the
   // old plain text prompt. Move routes through handleInternalMove (native shell
-  // move in Electron, /api/move-items fallback in dev); Copy routes through the
+  // move in Tauri/Electron, /api/move-items fallback in dev); Copy routes through the
   // guarded native copy (runPasteCopy). The chosen destination is recorded as a
   // recent on confirm so it's one click away next time.
   const [moveToPrompt, setMoveToPrompt] = useState<{ mode: "move" | "copy" } | null>(null);
@@ -2770,78 +2737,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           onConfirm={(dest) => { void handleMoveToConfirm(dest); }}
           onCancel={() => setMoveToPrompt(null)}
         />
-      )}
-
-      {fileContextMenu && (
-        <div
-          className="context-menu file-context-menu"
-          role="menu"
-          style={{ left: fileContextMenu.x, top: fileContextMenu.y }}
-          onPointerDown={(event) => event.stopPropagation()}
-          onContextMenu={(event) => event.preventDefault()}
-        >
-          <button
-            role="menuitem"
-            onClick={() => {
-              const path = fileContextMenu.path;
-              setFileContextMenu(null);
-              void openPath(path).catch((error: unknown) => {
-                toast.error(error instanceof Error ? error.message : String(error));
-              });
-            }}
-          >
-            <Icon name={fileContextMenu.isDir ? "folder-open" : "explorer"} size={13} />
-            {fileContextMenu.isDir ? "Open in File Explorer" : "Open"}
-          </button>
-          {fileContextMenu.isDir && (
-            <button
-              role="menuitem"
-              onClick={() => {
-                const path = fileContextMenu.path;
-                setFileContextMenu(null);
-                openLocation(path);
-              }}
-            >
-              <Icon name="explorer" size={13} />
-              Open in FileTree
-            </button>
-          )}
-          <button
-            role="menuitem"
-            onClick={() => {
-              const path = fileContextMenu.path;
-              setFileContextMenu(null);
-              void revealPath(path).catch((error: unknown) => {
-                toast.error(error instanceof Error ? error.message : String(error));
-              });
-            }}
-          >
-            <Icon name="folder" size={13} />
-            Reveal in File Explorer
-          </button>
-          <div className="menu-separator" />
-          <button
-            role="menuitem"
-            onClick={() => {
-              setFileContextMenu(null);
-              setMoveToPrompt({ mode: "move" });
-            }}
-          >
-            <Icon name="arrow-repeat" size={13} />
-            Move to...
-          </button>
-          <button
-            role="menuitem"
-            onClick={() => {
-              const id = fileContextMenu.id;
-              setFileContextMenu(null);
-              handleCompress(id);
-            }}
-          >
-            <Icon name="file-zip" size={13} />
-            Compress
-          </button>
-        </div>
       )}
 
       {moveNotice && <div className="move-toast" role="status">{moveNotice}</div>}

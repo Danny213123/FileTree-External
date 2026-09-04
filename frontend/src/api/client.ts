@@ -318,6 +318,21 @@ export interface CompressionSourceFile {
   size: number;
 }
 
+/** A folder selection backed by the persisted scan index. Its file count and
+ * aggregate size were computed during the scan, so opening Compression never
+ * has to transfer every descendant path through the WebView. */
+export interface CompressionScanDirectorySource {
+  sourceType: "scan-directory";
+  scanId: string;
+  directoryId: number;
+  path: string;
+  name: string;
+  size: number;
+  fileCount: number;
+}
+
+export type CompressionSource = CompressionSourceFile | CompressionScanDirectorySource;
+
 export async function fetchSubtreeFiles(opts: {
   rootPath: string;
   scanId?: string;
@@ -349,6 +364,63 @@ export async function fetchSubtreeFiles(opts: {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = (await res.json()) as { paths?: string[] };
   return (data.paths ?? []).map((path) => ({ path, size: 0 }));
+}
+
+export interface CompressionCandidateStats {
+  scanned: number;
+  eligible: number;
+  skippedUnavailable: number;
+  skippedNoGain: number;
+  skippedTooSmall: number;
+}
+
+interface CompressionCandidateBatch {
+  items: CompressionSourceFile[];
+  progress: CompressionCandidateStats;
+}
+
+/** Stream only files with an available, worthwhile compression pipeline. */
+export async function streamCompressionCandidates(
+  opts: {
+    rootPath: string;
+    scanId?: string;
+    dirId: number;
+    allowVideo: boolean;
+    allowImage: boolean;
+    minSizeBytes: number;
+    signal?: AbortSignal;
+  },
+  onBatch: (files: CompressionSourceFile[], progress: CompressionCandidateStats) => void,
+): Promise<CompressionCandidateStats> {
+  if (isTauriV2()) {
+    if (!opts.scanId) throw new Error("The current scan has no v2 scan id");
+    const channel = new Channel<CompressionCandidateBatch>();
+    channel.onmessage = (batch) => {
+      if (!opts.signal?.aborted) onBatch(batch.items, batch.progress);
+    };
+    const stats = await invoke<CompressionCandidateStats>("scan_compression_candidates_stream", {
+      scanId: opts.scanId,
+      directoryId: opts.dirId,
+      allowVideo: opts.allowVideo,
+      allowImage: opts.allowImage,
+      minSizeBytes: opts.minSizeBytes,
+      onBatch: channel,
+    });
+    if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    return stats;
+  }
+  const files = await fetchSubtreeFiles(opts);
+  if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  const eligible = files.filter((file) => file.size >= opts.minSizeBytes);
+  const stats: CompressionCandidateStats = {
+    scanned: files.length,
+    eligible: eligible.length,
+    skippedUnavailable: 0,
+    skippedNoGain: 0,
+    skippedTooSmall: files.length - eligible.length,
+  };
+  onBatch(eligible, stats);
+  return stats;
 }
 
 /** Return the largest descendant file for a folder hover without loading its
@@ -1019,9 +1091,9 @@ export interface NativeMoveResult {
   failed: number;
 }
 
-/** True when running in Electron with the native shell move-operation available. */
+/** True when the desktop runtime can use Windows' native file-operation UI. */
 export function hasNativeMove(): boolean {
-  return typeof eAPI().moveItemsNative === "function";
+  return isTauriV2() || typeof eAPI().moveItemsNative === "function";
 }
 
 /**
@@ -1033,6 +1105,9 @@ export async function moveItemsNative(
   paths: string[],
   destination: string,
 ): Promise<NativeMoveResult> {
+  if (isTauriV2()) {
+    return invoke<NativeMoveResult>("native_move_items", { paths, destination });
+  }
   const api = eAPI();
   if (!api.moveItemsNative) throw new Error("native move unavailable");
   return api.moveItemsNative(paths, destination);
@@ -1294,14 +1369,45 @@ export async function dragOut(paths: string[]): Promise<void> {
   });
 }
 
-export async function shellContextMenu(paths: string | string[], x: number, y: number): Promise<void> {
-  if (eAPI().shellContextMenu) {
-    await eAPI().shellContextMenu!(paths, x, y);
-  } else {
-    const first = Array.isArray(paths) ? paths[0] : paths;
-    if (!first) return;
-    const params = new URLSearchParams({ path: first, x: String(Math.round(x)), y: String(Math.round(y)) });
-    await fetch(`/api/shell-context-menu?${params}`);
+const NATIVE_CONTEXT_MENU_CLASS = "native-context-menu-open";
+let activeNativeContextMenus = 0;
+
+function setNativeContextMenuOpen(open: boolean): void {
+  activeNativeContextMenus = Math.max(0, activeNativeContextMenus + (open ? 1 : -1));
+  if (typeof document !== "undefined") {
+    document.documentElement.classList.toggle(
+      NATIVE_CONTEXT_MENU_CLASS,
+      activeNativeContextMenus > 0,
+    );
+  }
+}
+
+export async function shellContextMenu(
+  paths: string | string[],
+  x: number,
+  y: number,
+): Promise<string | null> {
+  const targets = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
+  if (targets.length === 0) return null;
+  setNativeContextMenuOpen(true);
+  try {
+    if (isTauriV2()) {
+      return await invoke<string | null>("shell_context_menu", {
+        paths: targets,
+        clientX: Math.round(x),
+        clientY: Math.round(y),
+      });
+    }
+    if (eAPI().shellContextMenu) {
+      await eAPI().shellContextMenu!(targets, x, y);
+    } else {
+      const first = targets[0];
+      const params = new URLSearchParams({ path: first, x: String(Math.round(x)), y: String(Math.round(y)) });
+      await fetch(`/api/shell-context-menu?${params}`);
+    }
+    return null;
+  } finally {
+    setNativeContextMenuOpen(false);
   }
 }
 
@@ -1699,33 +1805,46 @@ const COMPRESS_TOOLS_NONE: CompressTools = {
  * (endpoint missing, offline, malformed body) it reports everything but the
  * built-in zip as not-found so the page degrades to "zip only".
  */
+let compressToolsCache: CompressTools | null = null;
+let compressToolsPending: Promise<CompressTools> | null = null;
+
 export async function fetchCompressTools(signal?: AbortSignal): Promise<CompressTools> {
-  try {
-    const data = isTauriV2()
-      ? await invoke<Partial<CompressTools>>("compression_tools")
-      : await (async () => {
-          const res = await fetch("/api/compress-tools", { signal });
-          if (!res.ok) return null;
-          return res.json() as Promise<Partial<CompressTools>>;
-        })();
-    if (!data) return COMPRESS_TOOLS_NONE;
-    return {
-      handbrake: data.handbrake ?? { found: false },
-      image: data.image ?? { found: false, kind: null },
-      zip: { found: true },
-      // Pass through the capability/availability diagnostics so the Performance
-      // panel can gate the GPU controls on effective availability and show
-      // ground-truth evidence (resolved binary, `-h` parse, adapters).
-      caps: data.caps,
-      available: data.available,
-      gpu: data.gpu,
-      gpuHardware: data.gpuHardware,
-      handbrakeHParseOk: data.handbrakeHParseOk,
-      handbrakeEncodersRaw: data.handbrakeEncodersRaw,
-    };
-  } catch {
-    return COMPRESS_TOOLS_NONE;
+  if (compressToolsCache) return compressToolsCache;
+  if (!compressToolsPending) {
+    compressToolsPending = (async () => {
+      try {
+        const data = isTauriV2()
+          ? await invoke<Partial<CompressTools>>("compression_tools")
+          : await (async () => {
+              const res = await fetch("/api/compress-tools");
+              if (!res.ok) return null;
+              return res.json() as Promise<Partial<CompressTools>>;
+            })();
+        if (!data) return COMPRESS_TOOLS_NONE;
+        return {
+          handbrake: data.handbrake ?? { found: false },
+          image: data.image ?? { found: false, kind: null },
+          zip: { found: true },
+          // Pass through the capability/availability diagnostics so the Performance
+          // panel can gate the GPU controls on effective availability and show
+          // ground-truth evidence (resolved binary, `-h` parse, adapters).
+          caps: data.caps,
+          available: data.available,
+          gpu: data.gpu,
+          gpuHardware: data.gpuHardware,
+          handbrakeHParseOk: data.handbrakeHParseOk,
+          handbrakeEncodersRaw: data.handbrakeEncodersRaw,
+        };
+      } catch {
+        return COMPRESS_TOOLS_NONE;
+      }
+    })();
   }
+  const tools = await compressToolsPending;
+  compressToolsCache = tools;
+  compressToolsPending = null;
+  if (signal?.aborted) return tools;
+  return tools;
 }
 
 /**
@@ -1737,6 +1856,8 @@ export async function installCompressTool(
   tool: "handbrake" | "image",
 ): Promise<CompressInstallResult> {
   const r = await postMutation("/api/compress-tools/install", { tool });
+  compressToolsCache = null;
+  compressToolsPending = null;
   if (!r.ok) return { ok: false, error: mutateErrorText(r) };
   const d = (r.data ?? {}) as Partial<CompressInstallResult>;
   return {
@@ -1816,9 +1937,17 @@ export async function compressPreflight(paths: string[]): Promise<CompressPrefli
   }
 }
 
-/** Start a compression job. Returns the new job id (throws on failure so the
- *  caller can surface why the job couldn't start). */
-export async function startCompressJob(body: CompressJobRequest): Promise<string> {
+/** Start a compression job (throws so the caller can surface why it failed). */
+export interface CompressJobStartResult {
+  jobId: string;
+  status: string;
+  total: number;
+  skippedUnavailable: number;
+  skippedIneligible: number;
+  skippedMissing: number;
+}
+
+export async function startCompressJob(body: CompressJobRequest): Promise<CompressJobStartResult> {
   // Forward the custom-preset video knobs only when defined (mirrors how the
   // other optional fields are sent), so older/non-custom requests are unchanged.
   const payload: CompressJobRequest = { ...body };
@@ -1827,15 +1956,30 @@ export async function startCompressJob(body: CompressJobRequest): Promise<string
   if (body.customQuality !== undefined) payload.customQuality = body.customQuality;
   else delete payload.customQuality;
   if (isTauriV2()) {
-    const result = await invoke<{ jobId: string; status: string }>("compression_start", { request: payload });
+    const result = await invoke<CompressJobStartResult>("compression_start", { request: payload });
     if (!result.jobId) throw new Error("Rust did not return a job id");
-    return result.jobId;
+    return {
+      jobId: result.jobId,
+      status: result.status,
+      total: result.total ?? body.paths.length,
+      skippedUnavailable: result.skippedUnavailable ?? 0,
+      skippedIneligible: result.skippedIneligible ?? 0,
+      skippedMissing: result.skippedMissing ?? 0,
+    };
   }
   const r = await postMutation("/api/compress-jobs", payload);
   if (!r.ok) throw new Error(mutateErrorText(r));
-  const id = (r.data as { jobId?: string } | null)?.jobId;
+  const data = r.data as Partial<CompressJobStartResult> | null;
+  const id = data?.jobId;
   if (!id) throw new Error("Server did not return a job id");
-  return id;
+  return {
+    jobId: id,
+    status: data?.status ?? (body.queued ? "queued" : "running"),
+    total: data?.total ?? body.paths.length,
+    skippedUnavailable: data?.skippedUnavailable ?? 0,
+    skippedIneligible: data?.skippedIneligible ?? 0,
+    skippedMissing: data?.skippedMissing ?? 0,
+  };
 }
 
 /** Hard-cancel a running job (kills the active encoder child server-side). */

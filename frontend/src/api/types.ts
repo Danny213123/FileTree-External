@@ -696,9 +696,20 @@ export type CompressCodec = "h264" | "h265" | "av1";
  *  (irreversible); `keep` leaves the original beside the new file. */
 export type OriginalAction = "recycle" | "delete" | "keep";
 
+export interface CompressionScanDirectory {
+  scanId: string;
+  directoryId: number;
+}
+
 /** Body for POST /api/compress-jobs. */
 export interface CompressJobRequest {
   paths: string[];
+  /** Persisted scan folders resolved inside Rust when the job starts. This
+   * avoids sending hundreds of thousands of descendant paths over Tauri IPC. */
+  scanDirectories?: CompressionScanDirectory[];
+  /** Scan-backed files unchecked in the per-file list. Usually small; explicit
+   * paths remain independent and can intentionally re-include the same file. */
+  excludePaths?: string[];
   preset: CompressPreset;
   /** Tri-state disposition of the original after a verified compress. */
   originalAction: OriginalAction;

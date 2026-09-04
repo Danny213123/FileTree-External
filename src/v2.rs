@@ -197,6 +197,13 @@ pub struct SubtreeFileItem {
     pub size: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct IndexedCompressionSource {
+    pub path: String,
+    pub size: u64,
+    pub is_link: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubtreeFilePage {
@@ -720,40 +727,14 @@ impl V2Store {
         query.limit = query.limit.clamp(1, SUBTREE_FILE_PAGE_MAX);
         let db_path = self.scans_dir.join(format!("{}.db", query.scan_id));
         let conn = open_scan_connection(&db_path).map_err(|error| error.to_string())?;
-        let directory_path = conn
-            .query_row(
-                "SELECT dir_path FROM nodes WHERE id=?1 AND is_dir=1",
-                params![query.directory_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("Directory is not present in scan: {}", query.directory_id))?;
-        let descendant_pattern = format!("{}\\%", escape_duplicate_like(&directory_path));
+        subtree_directory_file_count(&conn, query.directory_id)?;
         let fetch_limit = query.limit.saturating_add(1);
-        let sql = r#"SELECT
-               CASE WHEN p.dir_path IS NULL OR p.dir_path='' THEN n.name
-                    WHEN substr(p.dir_path,-1,1) IN ('\','/') THEN p.dir_path || n.name
-                    ELSE p.dir_path || '\' || n.name END,
-               n.size
-             FROM nodes n LEFT JOIN nodes p ON p.id=n.parent_id
-             WHERE n.is_dir=0 AND (p.dir_path=?1 OR p.dir_path LIKE ?2 ESCAPE '!')
-             ORDER BY n.id ASC LIMIT ?3 OFFSET ?4"#;
-        let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
+        let sql = format!("{SUBTREE_FILE_SELECT_SQL} ORDER BY n.id ASC LIMIT ?2 OFFSET ?3");
+        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
         let rows = stmt
             .query_map(
-                params![
-                    directory_path,
-                    descendant_pattern,
-                    fetch_limit as i64,
-                    query.offset as i64
-                ],
-                |row| {
-                    Ok(SubtreeFileItem {
-                        path: row.get(0)?,
-                        size: row.get::<_, i64>(1)?.max(0) as u64,
-                    })
-                },
+                params![query.directory_id, fetch_limit as i64, query.offset as i64],
+                subtree_file_from_row,
             )
             .map_err(|error| error.to_string())?;
         let mut items = rows
@@ -768,6 +749,79 @@ impl V2Store {
             limit: query.limit,
             has_more,
         })
+    }
+
+    /// Resolve every file under one persisted scan directory in a single
+    /// SQLite traversal. Folder-compression jobs call this inside Rust so a
+    /// large selection never crosses Tauri IPC as hundreds of paged path DTOs.
+    pub fn query_all_subtree_files(
+        &self,
+        scan_id: &str,
+        directory_id: i64,
+    ) -> Result<Vec<IndexedCompressionSource>, String> {
+        if !safe_scan_id(scan_id) {
+            return Err("Invalid scan id".to_string());
+        }
+        let db_path = self.scans_dir.join(format!("{scan_id}.db"));
+        let conn = open_scan_connection(&db_path).map_err(|error| error.to_string())?;
+        let expected = subtree_directory_file_count(&conn, directory_id)?;
+        let mut stmt = conn
+            .prepare(SUBTREE_FILE_SELECT_SQL)
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![directory_id], indexed_subtree_file_from_row)
+            .map_err(|error| error.to_string())?;
+        let mut items = Vec::with_capacity(expected);
+        for row in rows {
+            items.push(row.map_err(|error| error.to_string())?);
+        }
+        self.touch_scan(scan_id).ok();
+        Ok(items)
+    }
+
+    /// Stream a directory's complete recursive file list in bounded chunks.
+    /// One SQLite cursor performs the traversal, so the renderer can list every
+    /// file without either side constructing a giant IPC response.
+    pub fn stream_subtree_files<F>(
+        &self,
+        scan_id: &str,
+        directory_id: i64,
+        chunk_size: usize,
+        mut on_chunk: F,
+    ) -> Result<usize, String>
+    where
+        F: FnMut(Vec<SubtreeFileItem>) -> Result<(), String>,
+    {
+        if !safe_scan_id(scan_id) {
+            return Err("Invalid scan id".to_string());
+        }
+        let db_path = self.scans_dir.join(format!("{scan_id}.db"));
+        let conn = open_scan_connection(&db_path).map_err(|error| error.to_string())?;
+        subtree_directory_file_count(&conn, directory_id)?;
+        let mut stmt = conn
+            .prepare(SUBTREE_FILE_SELECT_SQL)
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![directory_id], subtree_file_from_row)
+            .map_err(|error| error.to_string())?;
+        let chunk_size = chunk_size.clamp(1, SUBTREE_FILE_PAGE_MAX);
+        let mut chunk = Vec::with_capacity(chunk_size);
+        let mut total = 0usize;
+        for row in rows {
+            chunk.push(row.map_err(|error| error.to_string())?);
+            total += 1;
+            if chunk.len() == chunk_size {
+                on_chunk(std::mem::replace(
+                    &mut chunk,
+                    Vec::with_capacity(chunk_size),
+                ))?;
+            }
+        }
+        if !chunk.is_empty() {
+            on_chunk(chunk)?;
+        }
+        self.touch_scan(scan_id).ok();
+        Ok(total)
     }
 
     /// Return the largest file anywhere below a directory. Folder hover uses
@@ -1250,30 +1304,137 @@ impl V2Store {
     }
 
     pub fn source_path_is_authorized(&self, path: &str) -> bool {
-        let requested = Path::new(path);
-        let resolved = if requested.exists() {
-            fs::canonicalize(requested).ok()
-        } else {
-            requested
-                .parent()
-                .and_then(|parent| fs::canonicalize(parent).ok())
-        };
-        let Some(resolved) = resolved else {
+        self.source_paths_are_authorized(&[path])
+    }
+
+    /// Authorize a batch with one catalog read and one canonicalization per
+    /// matching scan root. Context menus commonly receive a large selection;
+    /// validating each item with a fresh SQLite connection made right-click
+    /// latency grow linearly with the selection size.
+    pub fn source_paths_are_authorized(&self, paths: &[&str]) -> bool {
+        if paths.is_empty() {
             return false;
-        };
+        }
         let Ok(conn) = self.open_state() else {
             return false;
         };
         let Ok(mut stmt) = conn.prepare(
             "SELECT root_path FROM scan_catalog WHERE status IN ('scanning','done') ORDER BY last_used DESC",
         ) else { return false };
-        let Ok(roots) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
             return false;
         };
-        roots
-            .filter_map(Result::ok)
+        let roots = rows.filter_map(Result::ok).collect::<Vec<_>>();
+        let mut canonical_roots = HashMap::<String, Option<PathBuf>>::new();
+        paths.iter().all(|path| {
+            let requested = Path::new(path);
+            // canonicalize already determines whether the item exists; calling
+            // exists first added a redundant filesystem round trip to every
+            // context-menu request. Keep the parent fallback for operations on
+            // an item that disappeared after its scan.
+            let resolved = fs::canonicalize(requested).ok().or_else(|| {
+                requested
+                    .parent()
+                    .and_then(|parent| fs::canonicalize(parent).ok())
+            });
+            let Some(resolved) = resolved else {
+                return false;
+            };
+            roots.iter().any(|root| {
+                // Avoid touching unrelated historical/offline roots. This text
+                // check is only a prefilter; canonical containment below remains
+                // the security boundary against symlink/path traversal escapes.
+                if !path_is_within_text(path, root) {
+                    return false;
+                }
+                canonical_roots
+                    .entry(root.clone())
+                    .or_insert_with(|| fs::canonicalize(root).ok())
+                    .as_ref()
+                    .is_some_and(|root| resolved.starts_with(root))
+            })
+        })
+    }
+
+    /// Validate scan-indexed sources against live filesystem metadata. Parent
+    /// canonicalization is cached, while current or scan-time file links are
+    /// resolved individually. Sources removed since the scan are dropped.
+    pub fn validate_indexed_sources_authorized(
+        &self,
+        sources: &mut Vec<IndexedCompressionSource>,
+    ) -> Result<usize, String> {
+        if sources.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.open_state().map_err(|error| error.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT root_path FROM scan_catalog \
+                 WHERE status IN ('scanning','done') ORDER BY last_used DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let root_rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let root_texts = root_rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        let canonical_roots = root_texts
+            .iter()
             .filter_map(|root| fs::canonicalize(root).ok())
-            .any(|root| resolved.starts_with(root))
+            .collect::<Vec<_>>();
+        let mut parent_authorized = HashMap::<PathBuf, bool>::new();
+        let mut retained = Vec::with_capacity(sources.len());
+        let mut missing = 0usize;
+
+        for source in std::mem::take(sources) {
+            let requested = Path::new(&source.path);
+            let metadata = match fs::symlink_metadata(requested) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing += 1;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Could not validate compression source {}: {error}",
+                        source.path
+                    ));
+                }
+            };
+            let authorized = if source.is_link || metadata.file_type().is_symlink() {
+                let resolved = fs::canonicalize(requested).map_err(|error| {
+                    format!(
+                        "Could not resolve compression source {}: {error}",
+                        source.path
+                    )
+                })?;
+                canonical_roots
+                    .iter()
+                    .any(|root| resolved.starts_with(root))
+            } else if let Some(parent) = requested.parent() {
+                *parent_authorized
+                    .entry(parent.to_path_buf())
+                    .or_insert_with(|| {
+                        fs::canonicalize(parent).ok().is_some_and(|resolved| {
+                            canonical_roots
+                                .iter()
+                                .any(|root| resolved.starts_with(root))
+                        })
+                    })
+            } else {
+                false
+            };
+            if !authorized {
+                return Err(format!(
+                    "Source path is outside the scanned directories: {}",
+                    source.path
+                ));
+            }
+            retained.push(source);
+        }
+        *sources = retained;
+        Ok(missing)
     }
 
     pub fn load_json_setting(&self, key: &str, fallback: &str) -> Result<String, String> {
@@ -2503,6 +2664,7 @@ fn create_scan_schema(conn: &Connection) -> rusqlite::Result<()> {
            depth INTEGER NOT NULL,errors INTEGER NOT NULL,extension TEXT NOT NULL,owner TEXT NOT NULL,attributes INTEGER NOT NULL\
          );\
          CREATE INDEX nodes_parent ON nodes(parent_id,id);\
+         CREATE INDEX nodes_parent_kind ON nodes(parent_id,is_dir,id);\
          CREATE INDEX nodes_parent_size ON nodes(parent_id,size DESC,id);\
          CREATE INDEX nodes_parent_name ON nodes(parent_id,name COLLATE NOCASE,id);\
          CREATE INDEX nodes_extension ON nodes(extension,id);\
@@ -2635,6 +2797,50 @@ fn escape_duplicate_like(value: &str) -> String {
         .replace('!', "!!")
         .replace('%', "!%")
         .replace('_', "!_")
+}
+
+const SUBTREE_FILE_SELECT_SQL: &str = r#"WITH RECURSIVE directories(id,dir_path) AS (
+    SELECT id,dir_path FROM nodes WHERE id=?1 AND is_dir=1
+    UNION ALL
+    SELECT n.id,n.dir_path
+      FROM nodes n JOIN directories d ON n.parent_id=d.id
+     WHERE n.is_dir=1
+)
+SELECT CASE WHEN d.dir_path IS NULL OR d.dir_path='' THEN n.name
+            WHEN substr(d.dir_path,-1,1) IN ('\','/') THEN d.dir_path || n.name
+            ELSE d.dir_path || '\' || n.name END,
+       n.size,
+       n.is_link
+  FROM directories d JOIN nodes n ON n.parent_id=d.id
+ WHERE n.is_dir=0"#;
+
+fn subtree_directory_file_count(conn: &Connection, directory_id: i64) -> Result<usize, String> {
+    conn.query_row(
+        "SELECT files FROM nodes WHERE id=?1 AND is_dir=1",
+        params![directory_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .map(|count| count.max(0) as usize)
+    .ok_or_else(|| format!("Directory is not present in scan: {directory_id}"))
+}
+
+fn subtree_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubtreeFileItem> {
+    Ok(SubtreeFileItem {
+        path: row.get(0)?,
+        size: row.get::<_, i64>(1)?.max(0) as u64,
+    })
+}
+
+fn indexed_subtree_file_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<IndexedCompressionSource> {
+    Ok(IndexedCompressionSource {
+        path: row.get(0)?,
+        size: row.get::<_, i64>(1)?.max(0) as u64,
+        is_link: row.get::<_, i64>(2)? != 0,
+    })
 }
 
 fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodePageItem> {
@@ -3368,6 +3574,72 @@ mod tests {
             .unwrap();
         assert_eq!(widened.limit, SUBTREE_FILE_PAGE_MAX);
         assert_eq!(widened.items.len(), 3);
+        let mut all = store
+            .query_all_subtree_files(&handle.scan_id, directory.items[0].id)
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all.iter().map(|item| item.size).sum::<u64>(), 60);
+        let mut streamed = Vec::new();
+        let streamed_total = store
+            .stream_subtree_files(&handle.scan_id, directory.items[0].id, 2, |batch| {
+                streamed.push(batch);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(streamed_total, 3);
+        assert_eq!(
+            streamed.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(
+            streamed.iter().flatten().map(|item| item.size).sum::<u64>(),
+            60
+        );
+        assert_eq!(
+            store.validate_indexed_sources_authorized(&mut all).unwrap(),
+            0
+        );
+        assert!(
+            store.source_paths_are_authorized(
+                &all.iter()
+                    .map(|item| item.path.as_str())
+                    .collect::<Vec<_>>()
+            )
+        );
+        let outside_root = store.data_root().join("not-scanned.txt");
+        fs::write(&outside_root, b"not authorized").unwrap();
+        let outside_text = outside_root.to_string_lossy().into_owned();
+        assert!(
+            !store.source_paths_are_authorized(&[all[0].path.as_str(), outside_text.as_str(),])
+        );
+        let mut unauthorized = vec![IndexedCompressionSource {
+            path: outside_text,
+            size: 14,
+            is_link: false,
+        }];
+        assert!(
+            store
+                .validate_indexed_sources_authorized(&mut unauthorized)
+                .is_err()
+        );
+        let mut removed = vec![IndexedCompressionSource {
+            path: selected
+                .join("removed-after-scan.txt")
+                .to_string_lossy()
+                .into_owned(),
+            size: 1,
+            is_link: false,
+        }];
+        assert_eq!(
+            store
+                .validate_indexed_sources_authorized(&mut removed)
+                .unwrap(),
+            1
+        );
+        assert!(removed.is_empty());
+        let entire_scan = store.query_all_subtree_files(&handle.scan_id, 0).unwrap();
+        assert_eq!(entire_scan.len(), 4);
+        assert_eq!(entire_scan.iter().map(|item| item.size).sum::<u64>(), 100);
         let preview = store
             .query_largest_subtree_file(&handle.scan_id, directory.items[0].id)
             .unwrap()

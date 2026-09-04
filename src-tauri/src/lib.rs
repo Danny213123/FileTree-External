@@ -1,10 +1,11 @@
 use filetree_core::v2::{
     BOOKMARKS_JSON_MAX_BYTES, DuplicateProgress, DuplicateScanRequest, DuplicateScanResult,
     MemoryStats, NodePage, NodePageItem, SETTINGS_JSON_MAX_BYTES, ScanHandle, ScanProgress,
-    ScanQuery, ScanRequest, SubtreeFilePage, SubtreeFilesQuery, V2Store,
+    ScanQuery, ScanRequest, SubtreeFileItem, SubtreeFilePage, SubtreeFilesQuery, V2Store,
 };
 use filetree_core::{
-    CompressionFilesRequest, CompressionStartRequest, CompressionStartResult, DesktopRuntime,
+    CompressionEligibility, CompressionFilesRequest, CompressionStartRequest,
+    CompressionStartResult, DesktopRuntime, compression_eligibility,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -602,6 +603,98 @@ async fn scan_subtree_files(
         .map_err(|error| format!("Subtree file query worker failed: {error}"))?
 }
 
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompressionCandidateStats {
+    scanned: usize,
+    eligible: usize,
+    skipped_unavailable: usize,
+    skipped_no_gain: usize,
+    skipped_too_small: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompressionCandidateBatch {
+    items: Vec<SubtreeFileItem>,
+    progress: CompressionCandidateStats,
+}
+
+#[tauri::command]
+async fn scan_compression_candidates_stream(
+    state: State<'_, Arc<V2Store>>,
+    scan_id: String,
+    directory_id: i64,
+    allow_video: bool,
+    allow_image: bool,
+    min_size_bytes: u64,
+    on_batch: Channel<CompressionCandidateBatch>,
+) -> Result<CompressionCandidateStats, String> {
+    let store = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut stats = CompressionCandidateStats::default();
+        let mut pending = Vec::with_capacity(500);
+        let mut last_sent_scanned = 0usize;
+        store
+            .stream_subtree_files(&scan_id, directory_id, 500, |batch| {
+                stats.scanned += batch.len();
+                for item in batch {
+                    match compression_eligibility(
+                        &item.path,
+                        item.size,
+                        allow_video,
+                        allow_image,
+                        min_size_bytes,
+                    ) {
+                        CompressionEligibility::Eligible => {
+                            stats.eligible += 1;
+                            pending.push(item);
+                        }
+                        CompressionEligibility::EncoderUnavailable => {
+                            stats.skipped_unavailable += 1;
+                        }
+                        CompressionEligibility::KnownNoGain => stats.skipped_no_gain += 1,
+                        CompressionEligibility::TooSmall => stats.skipped_too_small += 1,
+                    }
+                }
+                let first_progress = last_sent_scanned == 0 && stats.scanned > 0;
+                let items = if pending.len() >= 500 {
+                    let remainder = pending.split_off(500);
+                    Some(std::mem::replace(&mut pending, remainder))
+                } else if first_progress || stats.scanned.saturating_sub(last_sent_scanned) >= 5_000
+                {
+                    Some(std::mem::take(&mut pending))
+                } else {
+                    None
+                };
+                if let Some(items) = items {
+                    last_sent_scanned = stats.scanned;
+                    on_batch
+                        .send(CompressionCandidateBatch {
+                            items,
+                            progress: stats.clone(),
+                        })
+                        .map_err(|error| error.to_string())?;
+                    pending.reserve(500);
+                }
+                Ok(())
+            })
+            .and_then(|_| {
+                if !pending.is_empty() || stats.scanned != last_sent_scanned {
+                    on_batch
+                        .send(CompressionCandidateBatch {
+                            items: pending,
+                            progress: stats.clone(),
+                        })
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(stats)
+            })
+    })
+    .await
+    .map_err(|error| format!("Compression candidate stream worker failed: {error}"))?
+}
+
 #[tauri::command]
 async fn scan_folder_preview(
     state: State<'_, Arc<V2Store>>,
@@ -732,6 +825,15 @@ fn require_authorized_path(store: &V2Store, path: &str) -> Result<(), String> {
     }
 }
 
+fn require_authorized_paths(store: &V2Store, paths: &[String]) -> Result<(), String> {
+    let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    if store.source_paths_are_authorized(&paths) {
+        Ok(())
+    } else {
+        Err("One or more paths are outside the scanned directories".to_string())
+    }
+}
+
 #[tauri::command]
 fn open_path(state: State<'_, Arc<V2Store>>, path: String) -> Result<(), String> {
     require_authorized_path(&state, &path)?;
@@ -755,14 +857,46 @@ async fn move_items(
         return Err("Select between 1 and 1,000 items to move".to_string());
     }
     require_authorized_path(&state, &destination)?;
-    for path in &paths {
-        require_authorized_path(&state, path)?;
-    }
+    require_authorized_paths(&state, &paths)?;
     tauri::async_runtime::spawn_blocking(move || {
         filetree_core::move_items(paths, destination, conflict)
     })
     .await
     .map_err(|error| format!("Move worker failed: {error}"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeMoveResponse {
+    aborted: bool,
+    moved: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+#[tauri::command]
+fn native_move_items(
+    window: tauri::WebviewWindow,
+    state: State<'_, Arc<V2Store>>,
+    paths: Vec<String>,
+    destination: String,
+) -> Result<NativeMoveResponse, String> {
+    if paths.is_empty() || paths.len() > 1_000 {
+        return Err("Select between 1 and 1,000 items to move".to_string());
+    }
+    require_authorized_path(&state, &destination)?;
+    require_authorized_paths(&state, &paths)?;
+    // Keep this command synchronous on the window thread: IFileOperation owns
+    // a modal Explorer progress/collision dialog and pumps that UI until the
+    // move completes or the user cancels it.
+    let owner = window.hwnd().map_err(|error| error.to_string())?;
+    let result = filetree_core::move_items_with_windows(paths, destination, owner.0 as isize)?;
+    Ok(NativeMoveResponse {
+        aborted: result.aborted,
+        moved: result.moved,
+        skipped: result.skipped,
+        failed: result.failed,
+    })
 }
 
 #[derive(Serialize)]
@@ -782,9 +916,7 @@ fn native_drag(
     if paths.is_empty() || paths.len() > 1_000 {
         return Err("Select between 1 and 1,000 items to drag".to_string());
     }
-    for path in &paths {
-        require_authorized_path(&state, path)?;
-    }
+    require_authorized_paths(&state, &paths)?;
     // This command intentionally remains synchronous: OLE must inherit the UI
     // thread's active mouse capture for SHDoDragDrop to own the gesture.
     let result = filetree_core::start_native_drag(paths)?;
@@ -809,6 +941,40 @@ fn native_drag(
         client_y: inside.then_some((result.drop_y - position.y) as f64 / scale),
         outcome,
     })
+}
+
+#[tauri::command]
+async fn shell_context_menu(
+    window: tauri::WebviewWindow,
+    state: State<'_, Arc<V2Store>>,
+    paths: Vec<String>,
+    client_x: i32,
+    client_y: i32,
+) -> Result<Option<String>, String> {
+    if paths.is_empty() || paths.len() > 1_000 {
+        return Err("Select between 1 and 1,000 files or folders".to_string());
+    }
+    require_authorized_paths(&state, &paths)?;
+
+    // Browser pointer coordinates are logical client pixels. Explorer's popup
+    // API expects physical screen pixels, so translate through Tauri's client
+    // origin and current monitor scale factor before entering the modal menu.
+    let position = window.inner_position().map_err(|error| error.to_string())?;
+    let size = window.inner_size().map_err(|error| error.to_string())?;
+    let scale = window.scale_factor().map_err(|error| error.to_string())?;
+    let local_x =
+        ((client_x.max(0) as f64 * scale).round() as i32).min(size.width.saturating_sub(1) as i32);
+    let local_y =
+        ((client_y.max(0) as f64 * scale).round() as i32).min(size.height.saturating_sub(1) as i32);
+    let owner = window.hwnd().map_err(|error| error.to_string())?;
+    let owner_handle = owner.0 as isize;
+    let screen_x = position.x.saturating_add(local_x);
+    let screen_y = position.y.saturating_add(local_y);
+    tauri::async_runtime::spawn_blocking(move || {
+        filetree_core::show_shell_context_menu(paths, owner_handle, screen_x, screen_y)
+    })
+    .await
+    .map_err(|error| format!("Windows context-menu worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -901,21 +1067,27 @@ fn compression_tools(runtime: State<'_, Arc<DesktopRuntime>>) -> Result<Value, S
 }
 
 #[tauri::command]
-fn compression_start(
+async fn compression_start(
     store: State<'_, Arc<V2Store>>,
     runtime: State<'_, Arc<DesktopRuntime>>,
     request: CompressionStartRequest,
 ) -> Result<CompressionStartResult, String> {
-    if let Some(path) = request
-        .paths
-        .iter()
-        .find(|path| !store.source_path_is_authorized(path))
-    {
-        return Err(format!(
-            "Source path is outside the scanned directories: {path}"
-        ));
-    }
-    runtime.start_compression(request)
+    let store = Arc::clone(store.inner());
+    let runtime = Arc::clone(runtime.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(path) = request
+            .paths
+            .iter()
+            .find(|path| !store.source_path_is_authorized(path))
+        {
+            return Err(format!(
+                "Source path is outside the scanned directories: {path}"
+            ));
+        }
+        runtime.start_compression(request)
+    })
+    .await
+    .map_err(|error| format!("Compression start worker failed: {error}"))?
 }
 
 #[derive(Deserialize)]
@@ -1048,7 +1220,9 @@ pub fn run() {
             open_path,
             reveal_path,
             move_items,
+            native_move_items,
             native_drag,
+            shell_context_menu,
             fs_watch_start,
             fs_watch_stop,
             directory_snapshot,
@@ -1069,6 +1243,7 @@ pub fn run() {
             scan_find,
             scan_page,
             scan_subtree_files,
+            scan_compression_candidates_stream,
             scan_folder_preview,
             duplicates_scan,
             duplicates_cancel,

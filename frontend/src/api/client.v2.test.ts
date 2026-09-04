@@ -8,7 +8,16 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { fetchFolderPreview, fetchServerSearch, fetchSubtreeFiles, moveItems } from "./client";
+import {
+  fetchFolderPreview,
+  fetchServerSearch,
+  fetchSubtreeFiles,
+  moveItems,
+  moveItemsNative,
+  shellContextMenu,
+  startCompressJob,
+  streamCompressionCandidates,
+} from "./client";
 
 describe("v2 bounded client queries", () => {
   beforeEach(() => {
@@ -70,6 +79,60 @@ describe("v2 bounded client queries", () => {
     expect(result.moved).toEqual(["D:\\Downloads\\source"]);
   });
 
+  it("routes interactive moves through Windows native file operations", async () => {
+    vi.mocked(invoke).mockResolvedValue({
+      aborted: false,
+      moved: 2,
+      skipped: 0,
+      failed: 0,
+    });
+
+    await expect(moveItemsNative(
+      ["D:\\Downloads\\one.bin", "D:\\Downloads\\two.bin"],
+      "E:\\Archive",
+    )).resolves.toEqual({
+      aborted: false,
+      moved: 2,
+      skipped: 0,
+      failed: 0,
+    });
+
+    expect(invoke).toHaveBeenCalledWith("native_move_items", {
+      paths: ["D:\\Downloads\\one.bin", "D:\\Downloads\\two.bin"],
+      destination: "E:\\Archive",
+    });
+  });
+
+  it("opens the expanded Windows context menu for the complete selection", async () => {
+    vi.mocked(invoke).mockResolvedValue("properties");
+
+    await expect(shellContextMenu(
+      ["D:\\Downloads\\one.txt", "D:\\Downloads\\two.txt"],
+      125.4,
+      240.6,
+    )).resolves.toBe("properties");
+
+    expect(invoke).toHaveBeenCalledWith("shell_context_menu", {
+      paths: ["D:\\Downloads\\one.txt", "D:\\Downloads\\two.txt"],
+      clientX: 125,
+      clientY: 241,
+    });
+  });
+
+  it("suppresses row hover styling until the native context menu closes", async () => {
+    let closeMenu: ((value: string | null) => void) | undefined;
+    vi.mocked(invoke).mockImplementation(() => new Promise((resolve) => {
+      closeMenu = resolve;
+    }));
+
+    const menu = shellContextMenu("D:\\Downloads\\one.txt", 40, 60);
+    expect(document.documentElement).toHaveClass("native-context-menu-open");
+
+    closeMenu?.("properties");
+    await expect(menu).resolves.toBe("properties");
+    expect(document.documentElement).not.toHaveClass("native-context-menu-open");
+  });
+
   it("loads folder descendants through bounded Tauri pages", async () => {
     vi.mocked(invoke)
       .mockResolvedValueOnce({
@@ -104,6 +167,62 @@ describe("v2 bounded client queries", () => {
     });
   });
 
+  it("streams only eligible folder files through bounded channel messages", async () => {
+    vi.mocked(invoke).mockImplementationOnce(async (_command, args) => {
+      const channel = (args as {
+        onBatch: {
+          onmessage?: (batch: {
+            items: Array<{ path: string; size: number }>;
+            progress: {
+              scanned: number;
+              eligible: number;
+              skippedUnavailable: number;
+              skippedNoGain: number;
+              skippedTooSmall: number;
+            };
+          }) => void;
+        };
+      }).onBatch;
+      channel.onmessage?.({
+        items: [{ path: "E:\\Media\\one.mp4", size: 10 }],
+        progress: {
+          scanned: 2, eligible: 1, skippedUnavailable: 0, skippedNoGain: 1, skippedTooSmall: 0,
+        },
+      });
+      channel.onmessage?.({
+        items: [{ path: "E:\\Media\\nested\\two.jpg", size: 20 }],
+        progress: {
+          scanned: 3, eligible: 2, skippedUnavailable: 0, skippedNoGain: 1, skippedTooSmall: 0,
+        },
+      });
+      return {
+        scanned: 3, eligible: 2, skippedUnavailable: 0, skippedNoGain: 1, skippedTooSmall: 0,
+      };
+    });
+    const files: Array<{ path: string; size: number }> = [];
+
+    await expect(streamCompressionCandidates({
+      rootPath: "E:\\",
+      scanId: "folder-stream",
+      dirId: 42,
+      allowVideo: true,
+      allowImage: true,
+      minSizeBytes: 0,
+    }, (batch) => files.push(...batch))).resolves.toEqual({
+      scanned: 3, eligible: 2, skippedUnavailable: 0, skippedNoGain: 1, skippedTooSmall: 0,
+    });
+
+    expect(files).toHaveLength(2);
+    expect(invoke).toHaveBeenCalledWith("scan_compression_candidates_stream", {
+      scanId: "folder-stream",
+      directoryId: 42,
+      allowVideo: true,
+      allowImage: true,
+      minSizeBytes: 0,
+      onBatch: expect.anything(),
+    });
+  });
+
   it("loads one largest descendant for a folder hover", async () => {
     vi.mocked(invoke).mockResolvedValue({ path: "E:\\Media\\largest.mkv", size: 9_000 });
 
@@ -114,6 +233,40 @@ describe("v2 bounded client queries", () => {
     expect(invoke).toHaveBeenCalledWith("scan_folder_preview", {
       scanId: "folder-hover",
       directoryId: 77,
+    });
+  });
+
+  it("starts a folder job with a compact persisted-scan descriptor", async () => {
+    vi.mocked(invoke).mockResolvedValue({
+      jobId: "job-1",
+      status: "running",
+      total: 546_920,
+      skippedUnavailable: 0,
+      skippedIneligible: 0,
+      skippedMissing: 0,
+    });
+
+    await expect(startCompressJob({
+      paths: [],
+      scanDirectories: [{ scanId: "scan-large", directoryId: 42 }],
+      preset: "balanced",
+      originalAction: "keep",
+      recycleOriginals: false,
+      tagFilename: true,
+    })).resolves.toEqual({
+      jobId: "job-1",
+      status: "running",
+      total: 546_920,
+      skippedUnavailable: 0,
+      skippedIneligible: 0,
+      skippedMissing: 0,
+    });
+
+    expect(invoke).toHaveBeenCalledWith("compression_start", {
+      request: expect.objectContaining({
+        paths: [],
+        scanDirectories: [{ scanId: "scan-large", directoryId: 42 }],
+      }),
     });
   });
 });

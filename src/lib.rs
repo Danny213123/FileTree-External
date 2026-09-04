@@ -33,9 +33,37 @@ mod xlsx;
 pub mod v2;
 
 pub use desktop_runtime::{
-    CompressionFilesRequest, CompressionStartRequest, CompressionStartResult, DesktopRuntime,
+    CompressionFilesRequest, CompressionScanDirectory, CompressionStartRequest,
+    CompressionStartResult, DesktopRuntime,
 };
 pub use file_ops::{MoveItemsResult, move_items};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressionEligibility {
+    Eligible,
+    EncoderUnavailable,
+    KnownNoGain,
+    TooSmall,
+}
+
+/// Cheap scan-index eligibility check shared by folder discovery and job start.
+/// It deliberately avoids opening file contents so very large folders remain
+/// fast; definitive filesystem and encoder validation still happens at start.
+pub fn compression_eligibility(
+    path: &str,
+    size: u64,
+    video_encoder_available: bool,
+    image_encoder_available: bool,
+    min_size_bytes: u64,
+) -> CompressionEligibility {
+    compress_job::compression_eligibility(
+        std::path::Path::new(path),
+        size,
+        video_encoder_available,
+        image_encoder_available,
+        min_size_bytes,
+    )
+}
 
 pub fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -108,6 +136,37 @@ pub fn start_native_drag(paths: Vec<String>) -> Result<NativeDragOutcome, String
         drop_x: result.drop_x,
         drop_y: result.drop_y,
     })
+}
+
+pub struct NativeMoveOutcome {
+    pub aborted: bool,
+    pub moved: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+pub fn move_items_with_windows(
+    paths: Vec<String>,
+    destination: String,
+    owner_handle: isize,
+) -> Result<NativeMoveOutcome, String> {
+    windows_native::native_move_files(paths, destination, owner_handle).map(|result| {
+        NativeMoveOutcome {
+            aborted: result.aborted,
+            moved: result.moved,
+            skipped: result.skipped,
+            failed: result.failed,
+        }
+    })
+}
+
+pub fn show_shell_context_menu(
+    paths: Vec<String>,
+    owner_handle: isize,
+    screen_x: i32,
+    screen_y: i32,
+) -> Result<Option<String>, String> {
+    windows_native::shell_context_menu(paths, owner_handle, screen_x, screen_y)
 }
 
 pub fn run_cli() {

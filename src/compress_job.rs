@@ -403,8 +403,16 @@ fn path_fingerprint(path: &str) -> u64 {
     hasher.finish()
 }
 
+#[cfg(test)]
 pub(crate) fn path_fingerprints(paths: &[String]) -> HashSet<u64> {
     paths.iter().map(|path| path_fingerprint(path)).collect()
+}
+
+pub(crate) fn indexed_path_fingerprints(files: &[(String, u64)]) -> HashSet<u64> {
+    files
+        .iter()
+        .map(|(path, _)| path_fingerprint(path))
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -534,16 +542,34 @@ pub(crate) fn create_job(
     preset: &str,
     opts: &CompressOptions,
 ) -> Arc<CompressJob> {
-    let id = new_job_id();
-    let path_fingerprints = path_fingerprints(paths);
-    let files: Vec<FileState> = paths
+    let indexed_files = paths
         .iter()
+        .map(|path| {
+            let size = std::fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            (path.clone(), size)
+        })
+        .collect();
+    create_job_from_indexed_files(indexed_files, preset, opts)
+}
+
+/// Build a job from metadata already captured by the v2 scan. This avoids a
+/// synchronous filesystem metadata call for every file when a large persisted
+/// folder selection starts.
+pub(crate) fn create_job_from_indexed_files(
+    indexed_files: Vec<(String, u64)>,
+    preset: &str,
+    opts: &CompressOptions,
+) -> Arc<CompressJob> {
+    let id = new_job_id();
+    let path_fingerprints = indexed_path_fingerprints(&indexed_files);
+    let files: Vec<FileState> = indexed_files
+        .into_iter()
         .enumerate()
-        .map(|(i, p)| {
-            let path = Path::new(p);
-            let kind = classify(path);
-            let orig = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            FileState::new(i, p.clone(), kind, orig, "pending")
+        .map(|(i, (path, size))| {
+            let kind = classify(Path::new(&path));
+            FileState::new(i, path, kind, size, "pending")
         })
         .collect();
     let total = files.len();
@@ -1209,12 +1235,16 @@ where
 /// Create a persisted job that has not started yet. It can be reordered or
 /// removed safely and survives an application restart because its manifest is
 /// written before the request returns.
-pub(crate) fn create_queued_job(
-    paths: &[String],
+pub(crate) fn create_queued_job_from_indexed_files(
+    files: Vec<(String, u64)>,
     preset: &str,
     opts: &CompressOptions,
 ) -> Arc<CompressJob> {
-    let job = create_job(paths, preset, opts);
+    let job = create_job_from_indexed_files(files, preset, opts);
+    prepare_queued_job(job)
+}
+
+fn prepare_queued_job(job: Arc<CompressJob>) -> Arc<CompressJob> {
     *job.status.lock_recover() = "queued".to_string();
     job.active_started_at.store(0, Ordering::Relaxed);
     write_manifest(&job);
@@ -2822,6 +2852,31 @@ fn media_pre_skip(kind: FileKind, path: &Path, orig: u64) -> Option<&'static str
             }
         }
         FileKind::Other => None,
+    }
+}
+
+pub(crate) fn compression_eligibility(
+    path: &Path,
+    size: u64,
+    video_encoder_available: bool,
+    image_encoder_available: bool,
+    min_size_bytes: u64,
+) -> crate::CompressionEligibility {
+    use crate::CompressionEligibility::{Eligible, EncoderUnavailable, KnownNoGain, TooSmall};
+
+    if has_compressed_filename_tag(path) || is_incomplete_download(path) {
+        return KnownNoGain;
+    }
+    if size == 0 || (min_size_bytes > 0 && size < min_size_bytes) {
+        return TooSmall;
+    }
+    let kind = classify(path);
+    match kind {
+        FileKind::Video if !video_encoder_available => EncoderUnavailable,
+        FileKind::Image if !image_encoder_available => EncoderUnavailable,
+        FileKind::Other if is_already_compressed_ext(path) => KnownNoGain,
+        FileKind::Video | FileKind::Image if media_pre_skip(kind, path, size).is_some() => TooSmall,
+        _ => Eligible,
     }
 }
 
@@ -6632,6 +6687,58 @@ mod encoder_tests {
     }
 
     #[test]
+    fn compression_eligibility_filters_files_the_job_would_pre_skip() {
+        use crate::CompressionEligibility::{Eligible, EncoderUnavailable, KnownNoGain, TooSmall};
+
+        assert_eq!(
+            compression_eligibility(Path::new("report.txt"), 100_000, false, false, 0),
+            Eligible
+        );
+        assert_eq!(
+            compression_eligibility(Path::new("audio.wav"), 100_000, false, false, 0),
+            Eligible
+        );
+        assert_eq!(
+            compression_eligibility(Path::new("archive.zip"), 100_000, true, true, 0),
+            KnownNoGain
+        );
+        assert_eq!(
+            compression_eligibility(Path::new("song.mp3"), 100_000, true, true, 0),
+            KnownNoGain
+        );
+        assert_eq!(
+            compression_eligibility(
+                Path::new("movie [COMPRESSED].mp4"),
+                10_000_000,
+                true,
+                true,
+                0,
+            ),
+            KnownNoGain
+        );
+        assert_eq!(
+            compression_eligibility(Path::new("movie.mp4"), 10_000_000, false, true, 0),
+            EncoderUnavailable
+        );
+        assert_eq!(
+            compression_eligibility(Path::new("photo.jpg"), 100_000, true, false, 0),
+            EncoderUnavailable
+        );
+        assert_eq!(
+            compression_eligibility(Path::new("short.mp4"), 500_000, true, true, 0),
+            TooSmall
+        );
+        assert_eq!(
+            compression_eligibility(Path::new("tiny.bmp"), 10_000, true, true, 0),
+            TooSmall
+        );
+        assert_eq!(
+            compression_eligibility(Path::new("small.txt"), 10_000, true, true, 20_000),
+            TooSmall
+        );
+    }
+
+    #[test]
     fn compression_concurrency_defaults_to_two_and_never_exceeds_it() {
         let defaults = CompressOptions::default();
         assert_eq!(defaults.resolved_concurrency(), 2);
@@ -6733,6 +6840,23 @@ mod encoder_tests {
                 .front()
                 .is_some_and(|line| line.contains("\"index\":100"))
         );
+    }
+
+    #[test]
+    fn indexed_job_uses_scan_sizes_without_filesystem_metadata() {
+        let job = create_job_from_indexed_files(
+            vec![
+                ("missing-video.mp4".to_string(), 12_345),
+                ("missing-document.txt".to_string(), 67_890),
+            ],
+            "balanced",
+            &CompressOptions::default(),
+        );
+        assert_eq!(job.total, 2);
+        assert_eq!(job.files[0].orig_bytes.load(Ordering::Relaxed), 12_345);
+        assert_eq!(job.files[0].kind, FileKind::Video);
+        assert_eq!(job.files[1].orig_bytes.load(Ordering::Relaxed), 67_890);
+        assert_eq!(job.files[1].kind, FileKind::Other);
     }
 
     #[test]
