@@ -1762,10 +1762,9 @@ export function CompressView({
   // Right-clicking a file row opens the same Windows shell menu the file table
   // uses. If the clicked row is part of a multi-selection, the menu acts on the
   // whole selection (scoped to the files currently visible here); otherwise just
-  // the clicked row. Returned verbs (rename / delete / reveal / open-new-tab /
-  // compress) are dispatched by the app-level handler in App.tsx, which rescans
-  // the focused pane on a mutation — and since `files` is derived from that
-  // pane's tree, this view stays in sync without any extra bookkeeping.
+  // the clicked row. Native verbs execute in the shell worker; Copy/Cut are
+  // deliberately completed by shellContextMenu through FileTree's persistent
+  // CF_HDROP clipboard path.
   const handleRowContextMenu = useCallback(
     (file: CompressFile, e: React.MouseEvent) => {
       e.preventDefault();
@@ -1773,7 +1772,9 @@ export function CompressView({
         selected.has(file.id) && selected.size > 1
           ? selectedFiles.map((f) => f.path)
           : [file.path];
-      void shellContextMenu(paths, e.clientX, e.clientY);
+      void shellContextMenu(paths, e.clientX, e.clientY).catch((error: unknown) => {
+        toast.error(error instanceof Error ? error.message : String(error));
+      });
     },
     [selected, selectedFiles],
   );

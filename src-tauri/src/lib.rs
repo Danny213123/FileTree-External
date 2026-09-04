@@ -37,15 +37,36 @@ struct DuplicateScanRegistry {
     cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
-const EXTERNAL_COPY_GRANT_TTL: Duration = Duration::from_secs(30);
+const EXTERNAL_DROP_PENDING_TTL: Duration = Duration::from_secs(30);
+const EXTERNAL_CAPABILITY_LIMIT: usize = 128;
 
 /// One-shot capabilities for paths supplied by the operating system rather
 /// than by the renderer. Tauri commands otherwise accept only paths beneath a
-/// scanned root. Clipboard reads and native file-drop events replace this set,
-/// and a copy consumes every outside-root capability it uses.
+/// scanned root. A native drop is claimable only briefly; clipboard reads mint
+/// their capability directly. Claimed tokens remain valid while a transfer is
+/// confirmed or queued, and the eventual copy/move consumes the token.
 #[derive(Default)]
 struct ExternalCopyGrants {
-    paths: Mutex<HashMap<String, Instant>>,
+    next_token: AtomicU64,
+    inner: Mutex<ExternalCopyGrantState>,
+}
+
+#[derive(Default)]
+struct ExternalCopyGrantState {
+    pending_drop_paths: HashMap<String, Instant>,
+    capabilities: HashMap<String, ExternalPathCapability>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExternalTransferKind {
+    Copy,
+    Move,
+}
+
+struct ExternalPathCapability {
+    paths: HashSet<String>,
+    kind: ExternalTransferKind,
+    issued_at: Instant,
 }
 
 impl ExternalCopyGrants {
@@ -63,49 +84,120 @@ impl ExternalCopyGrants {
         )
     }
 
-    fn replace_keys(&self, keys: impl IntoIterator<Item = String>) {
-        let expires_at = Instant::now() + EXTERNAL_COPY_GRANT_TTL;
-        if let Ok(mut granted) = self.paths.lock() {
-            granted.clear();
-            granted.extend(keys.into_iter().map(|key| (key, expires_at)));
-        }
+    fn keys_from_strings(paths: &[String]) -> Option<HashSet<String>> {
+        paths
+            .iter()
+            .map(|path| Self::path_key(Path::new(path)))
+            .collect()
     }
 
-    fn grant_strings(&self, paths: &[String]) {
-        self.replace_keys(
-            paths
+    fn next_capability_token(&self) -> String {
+        let sequence = self.next_token.fetch_add(1, Ordering::Relaxed) + 1;
+        let issued = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{:x}-{issued:x}-{sequence:x}", std::process::id())
+    }
+
+    fn insert_capability(
+        &self,
+        state: &mut ExternalCopyGrantState,
+        paths: HashSet<String>,
+        kind: ExternalTransferKind,
+    ) -> Option<String> {
+        if paths.is_empty() {
+            return None;
+        }
+        while state.capabilities.len() >= EXTERNAL_CAPABILITY_LIMIT {
+            let Some(oldest) = state
+                .capabilities
                 .iter()
-                .filter_map(|path| Self::path_key(Path::new(path))),
+                .min_by_key(|(_, capability)| capability.issued_at)
+                .map(|(token, _)| token.clone())
+            else {
+                break;
+            };
+            state.capabilities.remove(&oldest);
+        }
+        let token = self.next_capability_token();
+        state.capabilities.insert(
+            token.clone(),
+            ExternalPathCapability {
+                paths,
+                kind,
+                issued_at: Instant::now(),
+            },
         );
+        Some(token)
+    }
+
+    fn grant_clipboard(&self, paths: &[String], kind: ExternalTransferKind) -> Option<String> {
+        let keys = Self::keys_from_strings(paths)?;
+        let mut state = self.inner.lock().ok()?;
+        self.insert_capability(&mut state, keys, kind)
     }
 
     fn grant_native_drop(&self, paths: &[PathBuf]) {
-        self.replace_keys(paths.iter().filter_map(|path| Self::path_key(path)));
+        let expires_at = Instant::now() + EXTERNAL_DROP_PENDING_TTL;
+        if let Ok(mut state) = self.inner.lock() {
+            state.pending_drop_paths.clear();
+            state.pending_drop_paths.extend(
+                paths
+                    .iter()
+                    .filter_map(|path| Self::path_key(path))
+                    .map(|key| (key, expires_at)),
+            );
+        }
     }
 
-    fn consume_strings(&self, paths: &[String]) -> bool {
-        if paths.is_empty() {
-            return true;
+    fn claim_native_drop(&self, paths: &[String]) -> Option<String> {
+        let keys = Self::keys_from_strings(paths)?;
+        if keys.is_empty() {
+            return None;
         }
-        let Some(keys) = paths
-            .iter()
-            .map(|path| Self::path_key(Path::new(path)))
-            .collect::<Option<HashSet<_>>>()
-        else {
-            return false;
-        };
         let now = Instant::now();
-        let Ok(mut granted) = self.paths.lock() else {
+        let mut state = self.inner.lock().ok()?;
+        state
+            .pending_drop_paths
+            .retain(|_, expires_at| *expires_at > now);
+        if !keys
+            .iter()
+            .all(|key| state.pending_drop_paths.contains_key(key))
+        {
+            return None;
+        }
+        for key in &keys {
+            state.pending_drop_paths.remove(key);
+        }
+        self.insert_capability(&mut state, keys, ExternalTransferKind::Copy)
+    }
+
+    fn consume_capability(
+        &self,
+        token: Option<&str>,
+        paths: &[String],
+        kind: ExternalTransferKind,
+    ) -> bool {
+        let Some(token) = token else {
+            return paths.is_empty();
+        };
+        let Some(keys) = Self::keys_from_strings(paths) else {
             return false;
         };
-        granted.retain(|_, expires_at| *expires_at > now);
-        if !keys.iter().all(|key| granted.contains_key(key)) {
+        let Ok(mut state) = self.inner.lock() else {
             return false;
+        };
+        let Some(capability) = state.capabilities.remove(token) else {
+            return false;
+        };
+        capability.kind == kind && keys.iter().all(|key| capability.paths.contains(key))
+    }
+
+    fn revoke_capability(&self, token: &str) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.capabilities.remove(token);
         }
-        for key in keys {
-            granted.remove(&key);
-        }
-        true
     }
 }
 
@@ -519,8 +611,8 @@ async fn directory_snapshot(
 #[cfg(test)]
 mod desktop_tests {
     use super::{
-        ExternalCopyGrants, collapse_changed_directories, directory_snapshot_rows,
-        watch_directories_for_paths,
+        ExternalCopyGrants, ExternalTransferKind, collapse_changed_directories,
+        directory_snapshot_rows, normalize_icon_extension, watch_directories_for_paths,
     };
     use std::{collections::HashMap, fs};
 
@@ -543,10 +635,47 @@ mod desktop_tests {
         let other = other.to_string_lossy().into_owned();
         let grants = ExternalCopyGrants::default();
 
-        grants.grant_strings(std::slice::from_ref(&granted));
-        assert!(!grants.consume_strings(std::slice::from_ref(&other)));
-        assert!(grants.consume_strings(std::slice::from_ref(&granted)));
-        assert!(!grants.consume_strings(std::slice::from_ref(&granted)));
+        let clipboard_token = grants
+            .grant_clipboard(std::slice::from_ref(&granted), ExternalTransferKind::Move)
+            .expect("clipboard capability");
+        let native_path = std::path::PathBuf::from(&granted);
+        grants.grant_native_drop(std::slice::from_ref(&native_path));
+        let drop_token = grants
+            .claim_native_drop(std::slice::from_ref(&granted))
+            .expect("drop capability");
+
+        // A later OS event must not revoke an operation already waiting in the
+        // pausable transfer queue.
+        assert!(grants.consume_capability(
+            Some(&clipboard_token),
+            std::slice::from_ref(&granted),
+            ExternalTransferKind::Move,
+        ));
+        assert!(!grants.consume_capability(
+            Some(&clipboard_token),
+            std::slice::from_ref(&granted),
+            ExternalTransferKind::Move,
+        ));
+        // Native drops are copy-only; presenting their token to the destructive
+        // move command consumes and rejects it.
+        assert!(!grants.consume_capability(
+            Some(&drop_token),
+            std::slice::from_ref(&granted),
+            ExternalTransferKind::Move,
+        ));
+        assert!(!grants.consume_capability(
+            Some(&drop_token),
+            std::slice::from_ref(&granted),
+            ExternalTransferKind::Copy,
+        ));
+        let wrong_path_token = grants
+            .grant_clipboard(std::slice::from_ref(&granted), ExternalTransferKind::Copy)
+            .expect("second clipboard capability");
+        assert!(!grants.consume_capability(
+            Some(&wrong_path_token),
+            std::slice::from_ref(&other),
+            ExternalTransferKind::Copy,
+        ));
 
         fs::remove_dir_all(root).expect("remove grant test folder");
     }
@@ -652,6 +781,14 @@ mod desktop_tests {
         );
 
         fs::remove_dir_all(root).expect("remove watcher test root");
+    }
+
+    #[test]
+    fn shell_icon_extensions_are_normalized_and_bounded() {
+        assert_eq!(normalize_icon_extension(".DOCX").unwrap(), "docx");
+        assert!(normalize_icon_extension("").is_err());
+        assert!(normalize_icon_extension("../exe").is_err());
+        assert!(normalize_icon_extension(&"x".repeat(65)).is_err());
     }
 }
 
@@ -944,6 +1081,36 @@ fn require_existing_copy_sources(paths: &[String]) -> Result<(), String> {
     }
 }
 
+fn require_native_source_authorization(
+    store: &V2Store,
+    grants: &ExternalCopyGrants,
+    paths: &[String],
+    provenance: Option<&str>,
+    kind: ExternalTransferKind,
+) -> Result<(), String> {
+    let external_paths = paths
+        .iter()
+        .filter(|path| !store.source_path_is_authorized(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if external_paths.is_empty() {
+        // Clipboard reads also mint a token for in-root sources. Discard it so
+        // the bounded capability store does not retain completed operations.
+        if let Some(provenance) = provenance {
+            grants.revoke_capability(provenance);
+        }
+        return Ok(());
+    }
+    if grants.consume_capability(provenance, &external_paths, kind) {
+        Ok(())
+    } else {
+        Err(
+            "Sources outside scanned directories must come from the current clipboard or file drop"
+                .to_string(),
+        )
+    }
+}
+
 #[tauri::command]
 fn open_path(state: State<'_, Arc<V2Store>>, path: String) -> Result<(), String> {
     require_authorized_path(&state, &path)?;
@@ -988,14 +1155,23 @@ struct NativeMoveResponse {
 fn native_move_items(
     window: tauri::WebviewWindow,
     state: State<'_, Arc<V2Store>>,
+    grants: State<'_, ExternalCopyGrants>,
     paths: Vec<String>,
     destination: String,
+    provenance: Option<String>,
 ) -> Result<NativeMoveResponse, String> {
     if paths.is_empty() || paths.len() > 1_000 {
         return Err("Select between 1 and 1,000 items to move".to_string());
     }
     require_authorized_path(&state, &destination)?;
-    require_authorized_paths(&state, &paths)?;
+    require_existing_copy_sources(&paths)?;
+    require_native_source_authorization(
+        &state,
+        &grants,
+        &paths,
+        provenance.as_deref(),
+        ExternalTransferKind::Move,
+    )?;
     // Keep this command synchronous on the window thread: IFileOperation owns
     // a modal Explorer progress/collision dialog and pumps that UI until the
     // move completes or the user cancels it.
@@ -1016,23 +1192,20 @@ async fn native_copy_items(
     grants: State<'_, ExternalCopyGrants>,
     paths: Vec<String>,
     destination: String,
+    provenance: Option<String>,
 ) -> Result<NativeMoveResponse, String> {
     if paths.is_empty() || paths.len() > 1_000 {
         return Err("Select between 1 and 1,000 items to copy".to_string());
     }
     require_authorized_path(&state, &destination)?;
     require_existing_copy_sources(&paths)?;
-    let external_paths = paths
-        .iter()
-        .filter(|path| !state.source_path_is_authorized(path))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !grants.consume_strings(&external_paths) {
-        return Err(
-            "Copy sources outside scanned directories must come from the current clipboard or file drop"
-                .to_string(),
-        );
-    }
+    require_native_source_authorization(
+        &state,
+        &grants,
+        &paths,
+        provenance.as_deref(),
+        ExternalTransferKind::Copy,
+    )?;
     let owner = window.hwnd().map_err(|error| error.to_string())?;
     let owner_handle = owner.0 as isize;
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -1053,6 +1226,8 @@ async fn native_copy_items(
 struct ClipboardFilesResponse {
     paths: Vec<String>,
     prefer_move: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<String>,
 }
 
 #[tauri::command]
@@ -1087,11 +1262,36 @@ async fn clipboard_read_files(
     })
     .await
     .map_err(|error| format!("Windows clipboard worker failed: {error}"))??;
-    grants.grant_strings(&result.paths);
+    let kind = if result.prefer_move {
+        ExternalTransferKind::Move
+    } else {
+        ExternalTransferKind::Copy
+    };
+    let provenance = grants.grant_clipboard(&result.paths, kind);
     Ok(ClipboardFilesResponse {
         paths: result.paths,
         prefer_move: result.prefer_move,
+        provenance,
     })
+}
+
+#[tauri::command]
+fn claim_external_paths(
+    grants: State<'_, ExternalCopyGrants>,
+    paths: Vec<String>,
+) -> Result<String, String> {
+    if paths.is_empty() || paths.len() > 1_000 {
+        return Err("Select between 1 and 1,000 dropped items".to_string());
+    }
+    require_existing_copy_sources(&paths)?;
+    grants
+        .claim_native_drop(&paths)
+        .ok_or_else(|| "The dropped-file authorization expired; drop the items again".to_string())
+}
+
+#[tauri::command]
+fn release_external_paths(grants: State<'_, ExternalCopyGrants>, provenance: String) {
+    grants.revoke_capability(&provenance);
 }
 
 #[derive(Serialize)]
@@ -1145,6 +1345,7 @@ async fn shell_context_menu(
     paths: Vec<String>,
     client_x: i32,
     client_y: i32,
+    defer_paste: Option<bool>,
 ) -> Result<Option<String>, String> {
     if paths.is_empty() || paths.len() > 1_000 {
         return Err("Select between 1 and 1,000 files or folders".to_string());
@@ -1166,7 +1367,13 @@ async fn shell_context_menu(
     let screen_x = position.x.saturating_add(local_x);
     let screen_y = position.y.saturating_add(local_y);
     tauri::async_runtime::spawn_blocking(move || {
-        filetree_core::show_shell_context_menu(paths, owner_handle, screen_x, screen_y)
+        filetree_core::show_shell_context_menu(
+            paths,
+            owner_handle,
+            screen_x,
+            screen_y,
+            defer_paste.unwrap_or(false),
+        )
     })
     .await
     .map_err(|error| format!("Windows context-menu worker failed: {error}"))?
@@ -1174,18 +1381,54 @@ async fn shell_context_menu(
 
 #[tauri::command]
 async fn file_icon(extension: String) -> Result<Option<String>, String> {
-    if extension.is_empty()
-        || extension.len() > 64
-        || extension.chars().any(|value| {
+    let extension = normalize_icon_extension(&extension)?;
+    tauri::async_runtime::spawn_blocking(move || filetree_core::shell_icon_data_url(&extension))
+        .await
+        .map_err(|error| format!("Shell icon worker failed: {error}"))
+}
+
+const FILE_ICON_BATCH_MAX: usize = 128;
+
+fn normalize_icon_extension(extension: &str) -> Result<String, String> {
+    let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 64
+        || normalized.chars().any(|value| {
             value.is_control()
                 || matches!(value, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
         })
     {
         return Err("Invalid file extension".to_string());
     }
-    tauri::async_runtime::spawn_blocking(move || filetree_core::shell_icon_data_url(&extension))
-        .await
-        .map_err(|error| format!("Shell icon worker failed: {error}"))
+    Ok(normalized)
+}
+
+#[tauri::command]
+async fn file_icons(extensions: Vec<String>) -> Result<HashMap<String, Option<String>>, String> {
+    if extensions.len() > FILE_ICON_BATCH_MAX {
+        return Err(format!(
+            "Too many file extensions (maximum {FILE_ICON_BATCH_MAX})"
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(extensions.len());
+    for extension in extensions {
+        let extension = normalize_icon_extension(&extension)?;
+        if seen.insert(extension.clone()) {
+            normalized.push(extension);
+        }
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        normalized
+            .into_iter()
+            .map(|extension| {
+                let image = filetree_core::shell_icon_data_url(&extension);
+                (extension, image)
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| format!("Shell icon batch worker failed: {error}"))
 }
 
 #[tauri::command]
@@ -1439,12 +1682,15 @@ pub fn run() {
             native_copy_items,
             clipboard_write_files,
             clipboard_read_files,
+            claim_external_paths,
+            release_external_paths,
             native_drag,
             shell_context_menu,
             fs_watch_start,
             fs_watch_stop,
             directory_snapshot,
             file_icon,
+            file_icons,
             file_thumbnail,
             terminal::terminal_profiles,
             terminal::terminal_spawn,

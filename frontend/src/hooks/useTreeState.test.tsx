@@ -130,6 +130,55 @@ describe("useTreeState watcher patches", () => {
     });
   });
 
+  it("preserves an existing file id and selection across watcher metadata updates", async () => {
+    const lazy: LazyOptions = {
+      enabled: true,
+      rootPath: "E:\\",
+      scannedAt: 1,
+      scanId: "scan-1",
+    };
+    const { result } = renderHook(() => useTreeState(lazy));
+    act(() => result.current.setNodes([
+      node({ children: [12], size: 1_024, files: 1 }),
+      node({
+        id: 12,
+        parent: 0,
+        path: "E:\\notes.txt",
+        name: "notes.txt",
+        dir: false,
+        depth: 1,
+        size: 1_024,
+        allocated: 4_096,
+        files: 1,
+        extension: "txt",
+      }),
+    ]));
+    act(() => result.current.setSelectedId(12));
+
+    act(() => result.current.patchDirectory("e:/", [
+      node({ path: "e:\\", name: "e:\\", children: [1] }),
+      node({
+        id: 1,
+        parent: 0,
+        path: "e:\\NOTES.txt",
+        name: "NOTES.txt",
+        dir: false,
+        depth: 1,
+        size: 2_048,
+        allocated: 4_096,
+        files: 1,
+        extension: "txt",
+      }),
+    ]));
+
+    await waitFor(() => {
+      expect(result.current.nodeById.get(12)?.size).toBe(2_048);
+      expect(result.current.nodeById.get(12)?.name).toBe("NOTES.txt");
+      expect(result.current.nodeById.get(0)?.children).toEqual([12]);
+      expect(result.current.selectedId).toBe(12);
+    });
+  });
+
   it("propagates watcher-created folder aggregates to the visible root", async () => {
     const lazy: LazyOptions = {
       enabled: true,

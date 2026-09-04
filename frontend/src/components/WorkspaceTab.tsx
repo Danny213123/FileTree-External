@@ -8,6 +8,7 @@ import {
   hasNativeMove, moveItemsNative, fetchDupesV2Bounded, runCommand,
   exportUrl, printReportAsPdf, webFetch, webSearch,
   clipboardWriteFiles, clipboardReadFiles, copyItemsNative, hasNativeCopy,
+  releaseExternalPaths,
   compress, extract, checksum, copyText,
   setAttributes, setTimes,
   fetchServerSearch, shellContextMenu,
@@ -17,7 +18,7 @@ import type { NodeRecord, SortKey, TagEntry } from "../api/types";
 import type { FilterRule } from "../hooks/useFilterRules";
 import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow, type AgentApi } from "../lib/agent";
 import { confirmRisky, isCrossDrive } from "../lib/confirmRisky";
-import { pushUndo, parentDir } from "../lib/undo";
+import { clearUndo, pushUndo, parentDir } from "../lib/undo";
 import { beginTransfer, finishTransfer, enqueueTransfer, transferDedupeKey } from "../lib/transfers";
 import { searchNodesAdvanced, filtersActive, toServerSearchParams, type SearchFilters } from "../lib/search";
 import { exportResults } from "../lib/exportRows";
@@ -105,7 +106,7 @@ export interface WorkspaceTabHandle {
   /** Paste CF_HDROP clipboard files into the focused folder (move or copy). #9 */
   doPaste: () => void;
   /** Drop Explorer files into a specific folder (drag-in): move same-drive, copy cross-drive. #9 */
-  dropExternalInto: (paths: string[], destination: string) => Promise<void>;
+  dropExternalInto: (paths: string[], destination: string, provenance?: string) => Promise<void>;
   doRename: () => void;
   doRenamePath: (path: string) => void;
   /** Open the bulk-rename dialog for the current selection (F3). */
@@ -1248,28 +1249,6 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     treeRef.current.setSelectedId(ids[ids.length - 1]);
   }, []);
 
-  const handleContextMenu = useCallback((node: NodeRecord, x: number, y: number) => {
-    const selIds = selectedIdsRef.current;
-    const id = node.id;
-    const alreadySelected = selIds.has(id);
-    if (!alreadySelected) handleSelectRow(id, "single");
-    if (!node || node.id < 0 || !node.path) return;
-    const targetIds = alreadySelected && selIds.size > 1
-      ? [id, ...Array.from(selIds).filter((selectedId) => selectedId !== id)]
-      : [id];
-    const currentNodes = actionNodeByIdRef.current;
-    const paths = targetIds
-      .map((targetId) => (
-        targetId === id ? node : currentNodes.get(targetId)
-      ))
-      .filter((target): target is NodeRecord => !!target && target.id >= 0 && !!target.path)
-      .map((target) => target.path)
-      .filter((path, index, all) => all.indexOf(path) === index);
-    void shellContextMenu(paths, x, y).catch((error: unknown) => {
-      toast.error(error instanceof Error ? error.message : String(error));
-    });
-  }, [handleSelectRow]);
-
   // Quick "Compress" row action. Persisted folders stay as compact scan/id
   // descriptors: their recursive file count and size were aggregated during
   // scanning, and Rust resolves the paths only when the job starts. This keeps
@@ -1531,13 +1510,12 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const handleOpenTerminal = useCallback(() => {
     let cwd = data?.rootPath || scanPath;
     if (selectedNode?.path) {
-      const parentId = selectedNode.parent;
       cwd = selectedNode.dir
         ? selectedNode.path
-        : (parentId != null ? tree.nodeById.get(parentId)?.path ?? cwd : cwd);
+        : parentDirOf(selectedNode.path) || cwd;
     }
     onOpenTerminal?.(cwd);
-  }, [selectedNode, tree, data, scanPath, onOpenTerminal]);
+  }, [selectedNode, data, scanPath, onOpenTerminal]);
 
   const [renamingId, setRenamingId] = useState<number | null>(null);
   const [bulkRenameOpen, setBulkRenameOpen] = useState(false);
@@ -1661,13 +1639,28 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // which presents Windows' OWN Replace/Skip/Keep-both dialog, so this dialog is
   // the dev/browser fallback. (See handleInternalMove.)
   const runMoveWithConflicts = useCallback(
-    async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string; moved: boolean }> => {
+    async (sources: string[], destination: string): Promise<{
+      ok: boolean;
+      error?: string;
+      movedPaths: string[];
+      skipped: number;
+      canceled: boolean;
+      undoSafe: boolean;
+    }> => {
       const detected = await moveItems(sources, destination);
       if (!detected.ok && detected.error) {
-        return { ok: false, error: detected.error, moved: false };
+        return {
+          ok: false,
+          error: detected.error,
+          movedPaths: detected.moved,
+          skipped: Math.max(0, sources.length - detected.moved.length),
+          canceled: false,
+          undoSafe: false,
+        };
       }
       const allErrors = [...detected.errors];
-      let moved = detected.moved.length > 0;
+      const movedPaths = [...detected.moved];
+      let canceled = false;
       const conflicts = detected.conflicts;
       if (conflicts.length > 0) {
         let start = 0;
@@ -1681,13 +1674,16 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             isFirst ? undefined : start + 1,
             conflicts.length,
           );
-          if (choice === "cancel") break;
+          if (choice === "cancel") {
+            canceled = true;
+            break;
+          }
           const targets = applyToAll ? conflicts.slice(start) : [conflicts[start]];
           if (choice === "replace" || choice === "keep-both") {
             const resolved = await moveItems(targets.map((c) => c.src), destination, choice);
             if (!resolved.ok && resolved.error) allErrors.push(resolved.error);
             allErrors.push(...resolved.errors);
-            moved = moved || resolved.moved.length > 0;
+            movedPaths.push(...resolved.moved);
           }
           if (applyToAll) break;
           start += 1;
@@ -1696,9 +1692,31 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         const n = detected.alreadyThere.length;
         setMoveNotice(n === 1 ? "Already in this folder." : `${n} items are already in this folder.`);
       }
-      return allErrors.length > 0
-        ? { ok: false, error: [...new Set(allErrors)].join("; "), moved }
-        : { ok: true, moved };
+      const normalizedMoved = new Set(
+        movedPaths.map((path) => path.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase()),
+      );
+      const confirmedMovedPaths = sources.filter((path) =>
+        normalizedMoved.has(path.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase()),
+      );
+      const skipped = Math.max(0, sources.length - confirmedMovedPaths.length);
+      const ok = allErrors.length === 0 && !canceled && skipped === 0;
+      const error = allErrors.length > 0
+        ? [...new Set(allErrors)].join("; ")
+        : canceled
+          ? `Move canceled after ${confirmedMovedPaths.length} of ${sources.length} items.`
+          : skipped > 0
+            ? `${skipped} item${skipped === 1 ? "" : "s"} not moved.`
+            : undefined;
+      return {
+        ok,
+        error,
+        movedPaths: confirmedMovedPaths,
+        skipped,
+        canceled,
+        // Any collision can rename or merge a destination. Without an exact
+        // output path, a custom undo could move pre-existing destination data.
+        undoSafe: ok && conflicts.length === 0,
+      };
     },
     [askConflict],
   );
@@ -1752,8 +1770,15 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // COPY (IFileOperation): native progress/collision dialogs, recycle-on-
   // overwrite, descendant/no-op skip, and per-item audit — never a raw copy that
   // could clobber. Risk-scoped confirm for large/many batches mirrors moves (#9).
-  const runPasteCopy = useCallback(async (sources: string[], destination: string): Promise<void> => {
-    if (sources.length === 0 || !destination) return;
+  const runPasteCopy = useCallback(async (
+    sources: string[],
+    destination: string,
+    provenance?: string,
+  ): Promise<void> => {
+    if (sources.length === 0 || !destination) {
+      void releaseExternalPaths(provenance).catch(() => {});
+      return;
+    }
     const byPath = nodeByPathRef.current;
     const copyBytes = sources.reduce((sum, s) => sum + (byPath.get(s)?.size ?? 0), 0);
     const proceed = await confirmRisky({
@@ -1763,8 +1788,16 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       totalBytes: copyBytes,
       names: sources.map((s) => byPath.get(s)?.name ?? basenameFromPath(s)),
     });
-    if (!proceed) { setMoveNotice("Paste canceled."); return; }
-    if (!hasNativeCopy()) { setMoveNotice("Paste-copy requires the FileTree desktop app."); return; }
+    if (!proceed) {
+      void releaseExternalPaths(provenance).catch(() => {});
+      setMoveNotice("Paste canceled.");
+      return;
+    }
+    if (!hasNativeCopy()) {
+      void releaseExternalPaths(provenance).catch(() => {});
+      setMoveNotice("Paste-copy requires the FileTree desktop app.");
+      return;
+    }
     // F10: track the copy in the transfer queue. The queue serializes transfers
     // and honors a Pause (between transfers) — see lib/transfers.
     await enqueueTransfer(
@@ -1774,17 +1807,34 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       async () => {
         try {
           suppressWatchRef.current = true;
-          const res = await copyItemsNative(sources, destination);
-          if (res.failed > 0) {
-            setMoveNotice(`${res.failed} item${res.failed === 1 ? "" : "s"} could not be copied${res.aborted ? " (canceled)" : ""}.`);
-          } else if (res.moved === 0 && res.skipped > 0) {
-            setMoveNotice("Nothing to paste here.");
+          const res = await copyItemsNative(sources, destination, provenance);
+          const unaccounted = Math.max(0, sources.length - res.moved - res.skipped - res.failed);
+          const incomplete = res.skipped + res.failed + unaccounted;
+          if (res.aborted || incomplete > 0) {
+            const details = [
+              res.skipped > 0 ? `${res.skipped} skipped` : "",
+              res.failed > 0 ? `${res.failed} failed` : "",
+              unaccounted > 0 ? `${unaccounted} unconfirmed` : "",
+            ].filter(Boolean).join(", ");
+            setMoveNotice(
+              `${res.moved > 0 ? `Copied ${res.moved} of ${sources.length}` : "Nothing copied"}`
+              + `${details ? ` (${details})` : ""}${res.aborted ? " — canceled" : ""}.`,
+            );
           }
-          if (res.moved > 0) refreshAfterMutation([...sources, destination]);
-          else suppressWatchRef.current = false;
+          if (res.moved > 0 || res.aborted || res.failed > 0 || unaccounted > 0) {
+            refreshAfterMutation([...sources, destination]);
+          } else {
+            suppressWatchRef.current = false;
+          }
+          const ok = !res.aborted && incomplete === 0 && res.moved === sources.length;
+          const notCopied = Math.max(0, sources.length - res.moved);
           return {
-            ok: res.failed === 0,
-            error: res.failed > 0 ? `${res.failed} item${res.failed === 1 ? "" : "s"} failed` : undefined,
+            ok,
+            error: ok
+              ? undefined
+              : notCopied > 0
+                ? `${notCopied} item${notCopied === 1 ? "" : "s"} not copied`
+                : "Copy was canceled",
           };
         } catch (e) {
           suppressWatchRef.current = false;
@@ -1794,17 +1844,28 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         }
       },
       transferDedupeKey("copy", sources, destination),
+      () => {
+        void releaseExternalPaths(provenance).catch(() => {});
+      },
     );
   }, [refreshAfterMutation]);
 
-  const handleInternalMove = useCallback(async (sources: string[], destination: string): Promise<{ ok: boolean; error?: string }> => {
-    if (sources.length === 0 || !destination) return { ok: true };
+  const handleInternalMove = useCallback(async (
+    sources: string[],
+    destination: string,
+    provenance?: string,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    if (sources.length === 0 || !destination) {
+      void releaseExternalPaths(provenance).catch(() => {});
+      return { ok: true };
+    }
     // Drop any source whose move would be a no-op or unsafe — dropped onto
     // itself, into one of its own descendants, or into the folder it already
     // lives in directly. The guard is normalized + case-insensitive (reliable on
     // Windows), replacing the old case-sensitive self/descendant string check.
     const realSources = sources.filter((s) => s && !isNoOpMove(s, destination));
     if (realSources.length === 0) {
+      void releaseExternalPaths(provenance).catch(() => {});
       // Everything was already in place / self-targeted: nothing to move. Surface
       // a brief, non-error notice (mirrors runMoveWithConflicts' alreadyThere
       // path) rather than failing or silently doing nothing.
@@ -1826,6 +1887,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       names: realSources.map((s) => byPath.get(s)?.name ?? basenameFromPath(s)),
     });
     if (!proceedMove) {
+      void releaseExternalPaths(provenance).catch(() => {});
       setMoveNotice("Move canceled.");
       return { ok: true };
     }
@@ -1841,43 +1903,59 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           suppressWatchRef.current = true;
           let outcome: { ok: boolean; error?: string };
           let didMove = false;
+          let movedCount = 0;
+          let canUndoCompleteBatch = false;
           if (hasNativeMove()) {
-            const res = await moveItemsNative(realSources, destination);
-            // Honor the native result instead of assuming success. A fully
-            // cancelled dialog (nothing moved, nothing failed) is just a no-op
-            // notice, while any item that didn't make it — a per-item failure or
-            // a "Skip" in the native collision dialog — is surfaced.
-            if (res.aborted && res.moved === 0 && res.failed === 0) {
-              setMoveNotice("Move canceled.");
-              outcome = { ok: true };
-            } else if (res.failed > 0) {
-              didMove = res.moved > 0;
-              outcome = {
-                ok: false,
-                error: `${res.failed} item${res.failed === 1 ? "" : "s"} could not be moved${res.aborted ? " (move canceled)" : ""}.`,
-              };
-            } else {
-              didMove = res.moved > 0;
-              outcome = { ok: true };
-            }
+            const res = await moveItemsNative(realSources, destination, provenance);
+            movedCount = res.moved;
+            didMove = movedCount > 0;
+            const unaccounted = Math.max(0, realSources.length - res.moved - res.skipped - res.failed);
+            const incomplete = res.skipped + res.failed + unaccounted;
+            const complete = !res.aborted
+              && incomplete === 0
+              && res.moved === realSources.length;
+            // IFileOperation may keep both under a generated name or merge a
+            // folder. Its aggregate response does not expose exact output
+            // paths, so FileTree must not construct a basename-based undo.
+            canUndoCompleteBatch = false;
+            outcome = complete
+              ? { ok: true }
+              : {
+                  ok: false,
+                  error: `${movedCount > 0 ? `Moved ${movedCount} of ${realSources.length}` : "Nothing moved"}`
+                    + `${res.skipped ? `; ${res.skipped} skipped` : ""}`
+                    + `${res.failed ? `; ${res.failed} failed` : ""}`
+                    + `${unaccounted ? `; ${unaccounted} unconfirmed` : ""}`
+                    + `${res.aborted ? " (canceled)" : ""}.`,
+                };
           } else {
+            void releaseExternalPaths(provenance).catch(() => {});
             const fallback = await runMoveWithConflicts(realSources, destination);
             outcome = fallback;
-            didMove = fallback.moved;
+            didMove = fallback.movedPaths.length > 0;
+            movedCount = fallback.movedPaths.length;
+            canUndoCompleteBatch = fallback.undoSafe;
           }
-          // Phase 6 undo: record the reverse move (each item back to its original
-          // parent) when at least one item actually moved. The executor only
-          // moves back items still present at the destination, so partial moves
-          // are safe.
-          if (didMove) {
+          // Record a custom reverse move only when the fallback confirmed every
+          // original basename and no collision could rename or merge output.
+          // Native IFileOperation already records its own shell undo metadata,
+          // but does not expose enough output identity for FileTree's undo stack.
+          // If files moved without a safe custom inverse, discard older entries
+          // so Ctrl+Z cannot target an unrelated operation across this boundary.
+          if (canUndoCompleteBatch) {
             pushUndo({
               kind: "move",
               destination,
               items: realSources.map((s) => ({ name: basenameFromPath(s), originalParent: parentDir(s) })),
             });
-            if (outcome.ok) {
-              toast.success(`Moved ${itemsLabel(realSources.length)} to \u201C${basenameFromPath(destination)}\u201D.`, { action: undoAction });
-            }
+          } else if (didMove) {
+            clearUndo();
+          }
+          if (outcome.ok) {
+            toast.success(
+              `Moved ${itemsLabel(movedCount)} to \u201C${basenameFromPath(destination)}\u201D.`,
+              canUndoCompleteBatch ? { action: undoAction } : undefined,
+            );
           }
           if (didMove || !outcome.ok) refreshAfterMutation([...realSources, destination]);
           else suppressWatchRef.current = false;
@@ -1889,6 +1967,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
         }
       },
       transferDedupeKey("move", realSources, destination),
+      () => {
+        void releaseExternalPaths(provenance).catch(() => {});
+      },
     );
   }, [refreshAfterMutation, runMoveWithConflicts, undoAction]);
 
@@ -1897,36 +1978,77 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // recycle-on-overwrite, risk confirm, audit, undo); a Copy pastes via the
   // guarded native copy above (#9). Declared after handleInternalMove so the
   // const is initialised before these closures capture it.
-  const runPaste = useCallback(async () => {
+  const runPaste = useCallback(async (destination?: string) => {
     if (!data) return;
     try {
       const clip = await clipboardReadFiles();
       if (!clip.paths.length) { setMoveNotice("Clipboard has no files to paste."); return; }
-      const dest = pasteTargetFolder();
+      const dest = destination?.trim() || pasteTargetFolder();
       if (!dest) return;
       if (clip.preferMove) {
-        const outcome = await handleInternalMove(clip.paths, dest);
+        const outcome = await handleInternalMove(clip.paths, dest, clip.provenance);
         if (!outcome.ok) setMoveNotice(`Paste failed: ${outcome.error ?? "unknown error"}`);
       } else {
-        await runPasteCopy(clip.paths, dest);
+        await runPasteCopy(clip.paths, dest, clip.provenance);
       }
     } catch (error) {
       setMoveNotice(`Paste failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }, [data, pasteTargetFolder, handleInternalMove, runPasteCopy]);
 
-  // Explorer drag-in dropped onto a folder row: Explorer-like effect — same-drive
-  // MOVE, cross-drive COPY (avoids the move=copy+delete hazard). Both route
-  // through the guarded engines, so the data-safety guards still fire (#9).
-  const dropExternalInto = useCallback(async (sources: string[], destination: string): Promise<void> => {
+  // The Windows shell worker returns Copy/Cut/Paste without invoking them.
+  // Copy/Cut are dispatched centrally by shellContextMenu; Paste needs this
+  // row's explicit folder destination and uses the same provenance-bound flow
+  // as Ctrl+V. Capturing the clicked row also avoids waiting for React selection
+  // state to commit after a right-click on an unselected item.
+  const handleContextMenu = useCallback((node: NodeRecord, x: number, y: number) => {
+    const selIds = selectedIdsRef.current;
+    const id = node.id;
+    const alreadySelected = selIds.has(id);
+    if (!alreadySelected) handleSelectRow(id, "single");
+    if (!node || node.id < 0 || !node.path) return;
+    const targetIds = alreadySelected && selIds.size > 1
+      ? [id, ...Array.from(selIds).filter((selectedId) => selectedId !== id)]
+      : [id];
+    const currentNodes = actionNodeByIdRef.current;
+    const paths = targetIds
+      .map((targetId) => (
+        targetId === id ? node : currentNodes.get(targetId)
+      ))
+      .filter((target): target is NodeRecord => !!target && target.id >= 0 && !!target.path)
+      .map((target) => target.path)
+      .filter((path, index, all) => all.indexOf(path) === index);
+    const pasteDestination = node.dir
+      ? node.path
+      : parentDirOf(node.path) || dataRef.current?.rootPath;
+    void shellContextMenu(paths, x, y, { deferPaste: true })
+      .then((verb) => {
+        const normalized = verb?.toLowerCase();
+        if (normalized === "copy") {
+          setMoveNotice(`Copied ${itemsLabel(paths.length)} to the clipboard.`);
+        } else if (normalized === "cut") {
+          setMoveNotice(`Cut ${itemsLabel(paths.length)} to the clipboard.`);
+        } else if (normalized === "paste" && pasteDestination) {
+          return runPaste(pasteDestination);
+        }
+      })
+      .catch((error: unknown) => {
+        toast.error(error instanceof Error ? error.message : String(error));
+      });
+  }, [handleSelectRow, runPaste]);
+
+  // Explorer drag-in is copy-only. Tauri's native drop event does not expose
+  // Ctrl/Shift drop intent, so treating a same-drive drop as a destructive move
+  // could delete the source against the user's intent. Explicit Cut/Paste still
+  // carries a MOVE capability from the OS clipboard.
+  const dropExternalInto = useCallback(async (
+    sources: string[],
+    destination: string,
+    provenance?: string,
+  ): Promise<void> => {
     if (sources.length === 0 || !destination) return;
-    if (isCrossDrive(sources, destination)) {
-      await runPasteCopy(sources, destination);
-    } else {
-      const outcome = await handleInternalMove(sources, destination);
-      if (!outcome.ok) setMoveNotice(`Drop failed: ${outcome.error ?? "unknown error"}`);
-    }
-  }, [handleInternalMove, runPasteCopy]);
+    await runPasteCopy(sources, destination, provenance);
+  }, [runPasteCopy]);
 
   // "Move to…" / "Copy to…" (ribbon / context / palette). #42: a richer dialog
   // with recent destinations + an inline "New folder…" affordance replaces the
@@ -2328,7 +2450,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     doChecksum: () => { void runChecksum(); },
     doCutFiles: runCutFiles,
     doPaste: () => { void runPaste(); },
-    dropExternalInto: (paths, destination) => dropExternalInto(paths, destination),
+    dropExternalInto: (paths, destination, provenance) => dropExternalInto(paths, destination, provenance),
     doExport: (format) => {
       if (!data) return;
       // "pdf" isn't a server format: per roadmap #8, PDF = print the HTML
@@ -2349,7 +2471,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     },
     doSelectPaths: (paths) => {
       const byPath = new Map<string, number>();
-      for (const n of treeRef.current.nodeById.values()) {
+      for (const n of actionNodeByIdRef.current.values()) {
         if (n.id >= 0 && n.path) byPath.set(n.path.toLowerCase(), n.id);
       }
       const ids: number[] = [];

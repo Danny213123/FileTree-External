@@ -9,6 +9,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import { invoke } from "@tauri-apps/api/core";
 import {
+  claimExternalPaths,
   clipboardReadFiles,
   clipboardWriteFiles,
   copyItemsNative,
@@ -17,6 +18,7 @@ import {
   fetchSubtreeFiles,
   moveItems,
   moveItemsNative,
+  releaseExternalPaths,
   shellContextMenu,
   startCompressJob,
   streamCompressionCandidates,
@@ -103,6 +105,7 @@ describe("v2 bounded client queries", () => {
     expect(invoke).toHaveBeenCalledWith("native_move_items", {
       paths: ["D:\\Downloads\\one.bin", "D:\\Downloads\\two.bin"],
       destination: "E:\\Archive",
+      provenance: undefined,
     });
   });
 
@@ -112,23 +115,30 @@ describe("v2 bounded client queries", () => {
       .mockResolvedValueOnce({
         paths: ["D:\\Downloads\\one.bin"],
         preferMove: false,
+        provenance: "clipboard-1",
       })
       .mockResolvedValueOnce({
         aborted: false,
         moved: 1,
         skipped: 0,
         failed: 0,
-      });
+      })
+      .mockResolvedValueOnce("drop-1")
+      .mockResolvedValueOnce(undefined);
 
     await expect(clipboardWriteFiles(["D:\\Downloads\\one.bin"], false)).resolves.toBe(true);
     await expect(clipboardReadFiles()).resolves.toEqual({
       paths: ["D:\\Downloads\\one.bin"],
       preferMove: false,
+      provenance: "clipboard-1",
     });
     await expect(copyItemsNative(
       ["D:\\Downloads\\one.bin"],
       "E:\\Archive",
+      "clipboard-1",
     )).resolves.toMatchObject({ moved: 1, failed: 0 });
+    await expect(claimExternalPaths(["D:\\Downloads\\one.bin"])).resolves.toBe("drop-1");
+    await expect(releaseExternalPaths("drop-1")).resolves.toBeUndefined();
 
     expect(invoke).toHaveBeenNthCalledWith(1, "clipboard_write_files", {
       paths: ["D:\\Downloads\\one.bin"],
@@ -138,6 +148,13 @@ describe("v2 bounded client queries", () => {
     expect(invoke).toHaveBeenNthCalledWith(3, "native_copy_items", {
       paths: ["D:\\Downloads\\one.bin"],
       destination: "E:\\Archive",
+      provenance: "clipboard-1",
+    });
+    expect(invoke).toHaveBeenNthCalledWith(4, "claim_external_paths", {
+      paths: ["D:\\Downloads\\one.bin"],
+    });
+    expect(invoke).toHaveBeenNthCalledWith(5, "release_external_paths", {
+      provenance: "drop-1",
     });
   });
 
@@ -154,6 +171,84 @@ describe("v2 bounded client queries", () => {
       paths: ["D:\\Downloads\\one.txt", "D:\\Downloads\\two.txt"],
       clientX: 125,
       clientY: 241,
+      deferPaste: false,
+    });
+  });
+
+  it("routes deferred shell Copy through the persistent file clipboard", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce("copy")
+      .mockResolvedValueOnce(true);
+
+    await expect(shellContextMenu(
+      ["D:\\Downloads\\one.txt", "D:\\Downloads\\two.txt"],
+      10,
+      20,
+    )).resolves.toBe("copy");
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "shell_context_menu", {
+      paths: ["D:\\Downloads\\one.txt", "D:\\Downloads\\two.txt"],
+      clientX: 10,
+      clientY: 20,
+      deferPaste: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "clipboard_write_files", {
+      paths: ["D:\\Downloads\\one.txt", "D:\\Downloads\\two.txt"],
+      cut: false,
+    });
+  });
+
+  it("routes deferred shell Cut with the move clipboard effect", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce("CUT")
+      .mockResolvedValueOnce(true);
+
+    await expect(shellContextMenu("D:\\Downloads\\one.txt", 10, 20)).resolves.toBe("CUT");
+
+    expect(invoke).toHaveBeenNthCalledWith(2, "clipboard_write_files", {
+      paths: ["D:\\Downloads\\one.txt"],
+      cut: true,
+    });
+  });
+
+  it("limits cross-parent shell Copy to the item represented by the menu", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce("copy")
+      .mockResolvedValueOnce(true);
+
+    await shellContextMenu(
+      ["D:\\Downloads\\one.txt", "E:\\Archive\\two.txt"],
+      10,
+      20,
+    );
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "shell_context_menu", {
+      paths: ["D:\\Downloads\\one.txt"],
+      clientX: 10,
+      clientY: 20,
+      deferPaste: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "clipboard_write_files", {
+      paths: ["D:\\Downloads\\one.txt"],
+      cut: false,
+    });
+  });
+
+  it("returns deferred shell Paste for contextual workspace dispatch", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce("paste");
+
+    await expect(shellContextMenu(
+      "D:\\Downloads\\Destination",
+      10,
+      20,
+      { deferPaste: true },
+    )).resolves.toBe("paste");
+
+    expect(invoke).toHaveBeenCalledWith("shell_context_menu", {
+      paths: ["D:\\Downloads\\Destination"],
+      clientX: 10,
+      clientY: 20,
+      deferPaste: true,
     });
   });
 

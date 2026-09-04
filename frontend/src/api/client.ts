@@ -1104,9 +1104,10 @@ export function hasNativeMove(): boolean {
 export async function moveItemsNative(
   paths: string[],
   destination: string,
+  provenance?: string,
 ): Promise<NativeMoveResult> {
   if (isTauriV2()) {
-    return invoke<NativeMoveResult>("native_move_items", { paths, destination });
+    return invoke<NativeMoveResult>("native_move_items", { paths, destination, provenance });
   }
   const api = eAPI();
   if (!api.moveItemsNative) throw new Error("native move unavailable");
@@ -1118,6 +1119,8 @@ export interface ClipboardFiles {
   paths: string[];
   /** True when the source tagged the items as a Cut (paste should MOVE them). */
   preferMove: boolean;
+  /** One-shot Tauri capability binding outside-root paths to this OS clipboard read. */
+  provenance?: string;
 }
 
 /** True when the native shell COPY (for paste-copy / drag-in copy) is available. */
@@ -1139,9 +1142,10 @@ export function hasClipboardFiles(): boolean {
 export async function copyItemsNative(
   paths: string[],
   destination: string,
+  provenance?: string,
 ): Promise<NativeMoveResult> {
   if (isTauriV2()) {
-    return invoke<NativeMoveResult>("native_copy_items", { paths, destination });
+    return invoke<NativeMoveResult>("native_copy_items", { paths, destination, provenance });
   }
   const api = eAPI();
   if (!api.copyItemsNative) throw new Error("native copy unavailable");
@@ -1178,6 +1182,18 @@ export async function clipboardReadFiles(): Promise<ClipboardFiles> {
   } catch {
     return { paths: [], preferMove: false };
   }
+}
+
+/** Claim the one-shot capability created by a native Tauri file-drop event. */
+export async function claimExternalPaths(paths: string[]): Promise<string | undefined> {
+  if (!isTauriV2()) return undefined;
+  return invoke<string>("claim_external_paths", { paths });
+}
+
+/** Revoke an unused outside-root capability after a canceled paste/drop. */
+export async function releaseExternalPaths(provenance?: string): Promise<void> {
+  if (!isTauriV2() || !provenance) return;
+  await invoke<void>("release_external_paths", { provenance });
 }
 
 /** True when the native Recycle Bin restore (Phase 6 undo) is available. */
@@ -1394,21 +1410,50 @@ function setNativeContextMenuOpen(open: boolean): void {
   }
 }
 
+export interface ShellContextMenuOptions {
+  /** Return Paste to the caller instead of invoking it in the native worker. */
+  deferPaste?: boolean;
+}
+
+function shellMenuParentKey(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const separator = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  return (separator < 0 ? "" : trimmed.slice(0, separator))
+    .replace(/\//g, "\\")
+    .toLowerCase();
+}
+
 export async function shellContextMenu(
   paths: string | string[],
   x: number,
   y: number,
+  options: ShellContextMenuOptions = {},
 ): Promise<string | null> {
-  const targets = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
-  if (targets.length === 0) return null;
+  const requestedTargets = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
+  if (requestedTargets.length === 0) return null;
+  // IShellFolder menus only support siblings. Match the native fallback before
+  // dispatch so deferred Copy/Cut cannot act on paths omitted from the menu.
+  const firstParent = shellMenuParentKey(requestedTargets[0]);
+  const targets = requestedTargets.every((path) => shellMenuParentKey(path) === firstParent)
+    ? requestedTargets
+    : [requestedTargets[0]];
   setNativeContextMenuOpen(true);
   try {
     if (isTauriV2()) {
-      return await invoke<string | null>("shell_context_menu", {
+      const verb = await invoke<string | null>("shell_context_menu", {
         paths: targets,
         clientX: Math.round(x),
         clientY: Math.round(y),
+        deferPaste: options.deferPaste === true,
       });
+      // The native menu intentionally defers Copy/Cut: shell clipboard data can
+      // be tied to its short-lived STA worker. Write a concrete CF_HDROP through
+      // FileTree's persistent clipboard command, matching Ctrl+C/Ctrl+X.
+      if (verb?.toLowerCase() === "copy" || verb?.toLowerCase() === "cut") {
+        const written = await clipboardWriteFiles(targets, verb.toLowerCase() === "cut");
+        if (!written) throw new Error("The desktop file clipboard is unavailable.");
+      }
+      return verb;
     }
     if (eAPI().shellContextMenu) {
       await eAPI().shellContextMenu!(targets, x, y);

@@ -128,6 +128,53 @@ describe("TreeTable double click", () => {
     });
     expect(onContextMenu).toHaveBeenCalledWith(file, 123, 234);
   });
+
+  it("excludes hidden cached selections from a flat-row drag", () => {
+    const stale = {
+      ...file,
+      id: 99,
+      name: "stale.mp4",
+      path: "E:\\Media\\stale.mp4",
+    };
+    const view = render(
+      <TreeTable
+        rows={[file]}
+        flat
+        lazy
+        nodeById={new Map([[stale.id, stale]])}
+        expanded={new Set()}
+        selectedId={file.id}
+        selectedIds={new Set([file.id, stale.id])}
+        sortKey="name"
+        sortDir={1}
+        metric="size"
+        unit="auto"
+        decimals={1}
+        visibleColumns={new Set(["name"])}
+        columnWidths={{}}
+        onColumnResize={vi.fn()}
+        bookmarks={new Set()}
+        onToggleExpand={vi.fn()}
+        onSelect={vi.fn()}
+        onDoubleClick={vi.fn()}
+        onContextMenu={vi.fn()}
+        onSortChange={vi.fn()}
+        onToggleBookmark={vi.fn()}
+      />,
+    );
+    const setData = vi.fn();
+    fireEvent.dragStart(view.container.querySelector(".row")!, {
+      dataTransfer: {
+        effectAllowed: "none",
+        setData,
+      },
+    });
+
+    expect(setData).toHaveBeenCalledWith(
+      "application/x-filetree-paths",
+      JSON.stringify([file.path]),
+    );
+  });
 });
 
 describe("TreeTable lazy expansion", () => {

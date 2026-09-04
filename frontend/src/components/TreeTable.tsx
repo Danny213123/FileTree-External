@@ -683,10 +683,10 @@ function TreeTableInner({
   const selectedDragNodes = useMemo(
     () => dedupeNestedNodes(
       Array.from(selectedIds)
-        .map((id) => nodeById.get(id) ?? rowById.get(id))
+        .map((id) => flat ? rowById.get(id) : nodeById.get(id))
         .filter((node): node is NodeRecord => !!node && node.id >= 0 && !!node.path),
     ),
-    [nodeById, rowById, selectedIds],
+    [flat, nodeById, rowById, selectedIds],
   );
 
   const reportInternalMoveError = useCallback((message: string) => {

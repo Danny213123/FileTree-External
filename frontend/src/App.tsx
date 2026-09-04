@@ -14,6 +14,7 @@ import {
   fetchDriveSpace,
   fetchAppVersion,
   fetchCompressTools,
+  claimExternalPaths,
   notify,
 } from "./api/client";
 import type { AppSettings, CompressionSource } from "./api/client";
@@ -237,6 +238,7 @@ export default function App() {
   const [specialFolders, setSpecialFolders] = useState<SpecialFolder[]>([]);
   const [darkMode, setDarkModeState] = useState(true);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const settingsLoadStartedRef = useRef(false);
   // #47 customizable shortcuts: persisted override map (localStorage) overlaying
   // the built-in defaults, plus the editor dialog's open state. A ref mirror is
   // read by the (stable) global keydown handler so rebinds take effect live.
@@ -645,6 +647,11 @@ export default function App() {
 
   // Load settings + config + drives on mount
   useEffect(() => {
+    // React StrictMode replays mount effects in development. Hydrating twice
+    // replaces every restored tab with a second set of IDs, abandoning the
+    // first set's in-flight scans and their SQLite files.
+    if (settingsLoadStartedRef.current) return;
+    settingsLoadStartedRef.current = true;
     Promise.all([
       fetchConfig(),
       fetchDrives(),
@@ -986,7 +993,12 @@ export default function App() {
     // Real Explorer drag-in still flows through externalDrop. Capture the
     // unsubscribe so cleanup removes exactly this listener — keeping the count at
     // 1 even under StrictMode double-mount.
-    const handleExternalPaths = (paths: string[], clientX?: number, clientY?: number) => {
+    const handleExternalPaths = (
+      paths: string[],
+      clientX?: number,
+      clientY?: number,
+      claimNativeDrop = false,
+    ) => {
       if (paths.length === 0) return;
       const el = clientX == null || clientY == null
         ? null
@@ -994,7 +1006,14 @@ export default function App() {
       const folderRow = el?.closest<HTMLElement>('.row[data-node-dir="1"]');
       const destFolder = folderRow?.dataset.nodePath;
       if (destFolder) {
-        void getActiveRefRef.current()?.dropExternalInto(paths, destFolder);
+        void (async () => {
+          const provenance = claimNativeDrop
+            ? await claimExternalPaths(paths)
+            : undefined;
+          await getActiveRefRef.current()?.dropExternalInto(paths, destFolder, provenance);
+        })().catch((error: unknown) => {
+          toast.error(`Drop failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
         return;
       }
       paths.forEach((p) => handleOpenInNewTab(p));
@@ -1059,7 +1078,7 @@ export default function App() {
           if ((window as unknown as { __FILETREE_NATIVE_DRAG_ACTIVE__?: boolean }).__FILETREE_NATIVE_DRAG_ACTIVE__) {
             return;
           }
-          handleExternalPaths(payload.paths, logical.x, logical.y);
+          handleExternalPaths(payload.paths, logical.x, logical.y, true);
         });
         if (disposed) unlisten(); else tauriUnlisten = unlisten;
       }).catch((error) => console.warn("Tauri drag/drop listener failed", error));

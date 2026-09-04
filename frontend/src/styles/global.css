@@ -1144,6 +1144,7 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  position: relative;
 }
 
 /* Folder: classic two-tone folder shape inside the 16×16 slot */
@@ -1159,19 +1160,31 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
 /* Real Windows shell icon — sized to exactly match the .kind slot */
 .kind-shell-icon {
   display: block;
+  position: absolute;
+  inset: 0;
   width: 16px;
   height: 16px;
   object-fit: contain;
   image-rendering: auto;
+  opacity: 0;
+}
+
+.kind-shell-icon.is-ready {
+  opacity: 1;
 }
 
 .kind-file-generic {
-  display: block;
-  width: 12px;
-  height: 14px;
-  border: 1px solid var(--text-3);
-  border-radius: 1px;
-  opacity: 0.65;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--text-3);
+  opacity: 0.9;
+}
+
+.kind-file-generic.is-hidden {
+  visibility: hidden;
 }
 
 /* File badge: solid background, white bold text — fallback for non-Windows */

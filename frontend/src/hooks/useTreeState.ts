@@ -899,8 +899,10 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
         return id;
       };
 
-      // Immediate subfolders we preserve from the old tree (keep descendants +
-      // aggregate sizes); files and brand-new folders spliced in with fresh ids.
+      // Immediate subfolders preserve their old tree (descendants + aggregate
+      // sizes). Existing files also preserve their ids while taking fresh live
+      // metadata, so watcher patches cannot invalidate selection between a
+      // pointer-down and the resulting open/context-menu action.
       const preservedDirPaths: string[] = [];
       const refreshedPreservedDirs = new Map<string, NodeRecord>();
       const addedNodes: NodeRecord[] = [];
@@ -917,10 +919,19 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
             refreshedPreservedDirs.set(normalizedNodePath(old.path), child);
           }
           rootChildIds.push(old.id);
+        } else if (!child.dir && old && !old.dir) {
+          addedNodes.push({
+            ...child,
+            id: old.id,
+            parent: targetNode.id,
+            depth: targetNode.depth + 1,
+            children: [],
+          });
+          rootChildIds.push(old.id);
         } else {
-          // New/changed file, or a brand-new folder: take the fresh node. A new
-          // folder remains an unknown lazy stub until first expansion, so drop
-          // the shallow depth-limit error it would otherwise carry.
+          // A brand-new entry or one whose file/folder type changed gets a live
+          // id. A new folder remains an unknown lazy stub until first expansion,
+          // so drop the shallow depth-limit error it would otherwise carry.
           const newId = allocateLiveId();
           addedNodes.push({
             ...child,

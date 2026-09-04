@@ -20,6 +20,13 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+#[cfg(windows)]
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+
 use crate::dupes::{HashInput, hash_candidate_groups, next_hash_cache_seq};
 use crate::model::HashCacheEntry;
 
@@ -447,6 +454,10 @@ impl V2Store {
         store
             .import_v1_catalog()
             .map_err(|error| error.to_string())?;
+        // Interrupted scans never reach scan_catalog. Reclaim indexes left by
+        // dead FileTree processes before they can accumulate outside the cache
+        // budget. A live process's in-progress index is deliberately preserved.
+        let _ = store.cleanup_orphan_scan_databases();
         spawn_compression_writer(store.state_path.clone(), compression_rx);
         Ok(store)
     }
@@ -532,7 +543,10 @@ impl V2Store {
                     status,
                     nodes,
                 );
-                let _ = store.enforce_scan_disk_budget();
+                // The result is published to the renderer immediately after
+                // this call, so the just-completed index must remain available
+                // even when it alone exceeds the cache budget.
+                let _ = store.enforce_scan_disk_budget_preserving(&thread_handle.scan_id);
                 callback(ScanProgress {
                     scan_id: thread_handle.scan_id,
                     stage: status.to_string(),
@@ -1319,8 +1333,11 @@ impl V2Store {
             return false;
         };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT root_path FROM scan_catalog WHERE status IN ('scanning','done') ORDER BY last_used DESC",
-        ) else { return false };
+            "SELECT root_path FROM scan_catalog \
+             WHERE status IN ('scanning','done','stale') ORDER BY last_used DESC",
+        ) else {
+            return false;
+        };
         let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
             return false;
         };
@@ -1370,7 +1387,7 @@ impl V2Store {
         let mut stmt = conn
             .prepare(
                 "SELECT root_path FROM scan_catalog \
-                 WHERE status IN ('scanning','done') ORDER BY last_used DESC",
+                 WHERE status IN ('scanning','done','stale') ORDER BY last_used DESC",
             )
             .map_err(|error| error.to_string())?;
         let root_rows = stmt
@@ -1711,6 +1728,18 @@ impl V2Store {
     }
 
     pub fn enforce_scan_disk_budget(&self) -> Result<u64, String> {
+        self.enforce_scan_disk_budget_with_limit(SCAN_DISK_BUDGET_BYTES, None)
+    }
+
+    fn enforce_scan_disk_budget_preserving(&self, scan_id: &str) -> Result<u64, String> {
+        self.enforce_scan_disk_budget_with_limit(SCAN_DISK_BUDGET_BYTES, Some(scan_id))
+    }
+
+    fn enforce_scan_disk_budget_with_limit(
+        &self,
+        budget_bytes: u64,
+        preserve_scan_id: Option<&str>,
+    ) -> Result<u64, String> {
         let active: HashSet<String> = self
             .jobs
             .lock_unpoisoned()
@@ -1736,13 +1765,23 @@ impl V2Store {
             .map_err(|error| error.to_string())?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?;
-        let mut total = directory_size(&self.scans_dir);
+        // Only catalogued databases participate in LRU eviction. Counting
+        // abandoned files here could make them evict the sole valid result,
+        // after which scan_page would open an empty SQLite file and report
+        // "no such table: nodes".
+        let mut total = entries
+            .iter()
+            .map(|(_, path, _, _)| database_family_size(path))
+            .sum::<u64>();
         let mut freed = 0u64;
         for (scan_id, path, pinned, _) in entries {
-            if total <= SCAN_DISK_BUDGET_BYTES {
+            if total <= budget_bytes {
                 break;
             }
-            if pinned || active.contains(&scan_id) {
+            if pinned
+                || active.contains(&scan_id)
+                || preserve_scan_id.is_some_and(|preserved| preserved == scan_id)
+            {
                 continue;
             }
             let bytes = database_family_size(&path);
@@ -1753,6 +1792,49 @@ impl V2Store {
             )
             .map_err(|error| error.to_string())?;
             total = total.saturating_sub(bytes);
+            freed = freed.saturating_add(bytes);
+        }
+        Ok(freed)
+    }
+
+    fn cleanup_orphan_scan_databases(&self) -> Result<u64, String> {
+        let conn = self.open_state().map_err(|error| error.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT scan_id FROM scan_catalog")
+            .map_err(|error| error.to_string())?;
+        let catalogued = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<HashSet<_>>>()
+            .map_err(|error| error.to_string())?;
+        drop(stmt);
+        drop(conn);
+
+        // V2Store::open calls this before scans can start in this process. The
+        // jobs check also keeps the helper safe for tests and future runtime use.
+        let jobs = self.jobs.lock_unpoisoned();
+        let mut freed = 0u64;
+        let entries = fs::read_dir(&self.scans_dir).map_err(|error| error.to_string())?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("db") {
+                continue;
+            }
+            let Some(scan_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !safe_scan_id(scan_id) || catalogued.contains(scan_id) || jobs.contains_key(scan_id)
+            {
+                continue;
+            }
+            let Some(owner_pid) = scan_owner_process_id(scan_id) else {
+                continue;
+            };
+            if owner_pid != std::process::id() && process_is_alive(owner_pid) {
+                continue;
+            }
+            let bytes = database_family_size(&path);
+            remove_database_family(&path);
             freed = freed.saturating_add(bytes);
         }
         Ok(freed)
@@ -2917,6 +2999,42 @@ fn safe_scan_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
 }
 
+fn scan_owner_process_id(scan_id: &str) -> Option<u32> {
+    let mut parts = scan_id.split('-');
+    parts.next()?;
+    let process_id = u32::from_str_radix(parts.next()?, 16).ok()?;
+    parts.next()?;
+    if process_id == 0 || parts.next().is_some() {
+        return None;
+    }
+    Some(process_id)
+}
+
+#[cfg(windows)]
+fn process_is_alive(process_id: u32) -> bool {
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) else {
+            return false;
+        };
+        let mut exit_code = 0u32;
+        let running = GetExitCodeProcess(handle, &mut exit_code).is_ok()
+            && exit_code == STILL_ACTIVE.0 as u32;
+        let _ = CloseHandle(handle);
+        running
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_alive(process_id: u32) -> bool {
+    Path::new("/proc").join(process_id.to_string()).exists()
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn process_is_alive(_process_id: u32) -> bool {
+    // Without a portable liveness primitive, preserve another process's file.
+    true
+}
+
 fn now_ms() -> u64 {
     system_time_ms(SystemTime::now())
 }
@@ -3612,6 +3730,36 @@ mod tests {
         assert!(
             !store.source_paths_are_authorized(&[all[0].path.as_str(), outside_text.as_str(),])
         );
+        assert_eq!(
+            store
+                .mark_scans_stale_for_path(&selected.join("a.mp4"))
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .find_completed_scan(&source.to_string_lossy())
+                .is_none()
+        );
+        // Staleness invalidates indexed measurements, not the user's authority
+        // over the root they explicitly scanned. Live open/context/watch
+        // commands must remain usable while the watcher reconciles its rows.
+        assert!(
+            store.source_paths_are_authorized(
+                &all.iter()
+                    .map(|item| item.path.as_str())
+                    .collect::<Vec<_>>()
+            )
+        );
+        assert!(!store.source_path_is_authorized(&outside_text));
+        let mut stale_sources = all.clone();
+        assert_eq!(
+            store
+                .validate_indexed_sources_authorized(&mut stale_sources)
+                .unwrap(),
+            0
+        );
+        assert_eq!(stale_sources.len(), all.len());
         let mut unauthorized = vec![IndexedCompressionSource {
             path: outside_text,
             size: 14,
@@ -3713,6 +3861,55 @@ mod tests {
     fn scan_id_rejects_path_traversal() {
         assert!(!safe_scan_id("../state"));
         assert!(safe_scan_id("abc-123"));
+    }
+
+    #[test]
+    fn disk_budget_ignores_and_reclaims_uncatalogued_scan_files() {
+        let store = temp_store("orphan-budget");
+        let scan_id = new_scan_id();
+        let scan_path = store.scans_dir.join(format!("{scan_id}.db"));
+        fs::write(&scan_path, [0u8; 64]).unwrap();
+        store
+            .upsert_scan_catalog(&scan_id, store.data_root(), &scan_path, "done", 1)
+            .unwrap();
+
+        let orphan_id = new_scan_id();
+        let orphan_path = store.scans_dir.join(format!("{orphan_id}.db"));
+        fs::write(&orphan_path, [0u8; 128]).unwrap();
+
+        let valid_bytes = database_family_size(&scan_path);
+        assert_eq!(
+            store
+                .enforce_scan_disk_budget_with_limit(valid_bytes, None)
+                .unwrap(),
+            0
+        );
+        assert!(scan_path.is_file());
+        assert!(store.catalog_handle(&scan_id).unwrap().is_some());
+
+        assert!(store.cleanup_orphan_scan_databases().unwrap() >= 128);
+        assert!(!orphan_path.exists());
+        assert!(scan_path.is_file());
+    }
+
+    #[test]
+    fn disk_budget_preserves_the_scan_being_published() {
+        let store = temp_store("published-budget");
+        let scan_id = new_scan_id();
+        let scan_path = store.scans_dir.join(format!("{scan_id}.db"));
+        fs::write(&scan_path, [0u8; 64]).unwrap();
+        store
+            .upsert_scan_catalog(&scan_id, store.data_root(), &scan_path, "done", 1)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .enforce_scan_disk_budget_with_limit(0, Some(&scan_id))
+                .unwrap(),
+            0
+        );
+        assert!(scan_path.is_file());
+        assert!(store.catalog_handle(&scan_id).unwrap().is_some());
     }
 
     #[test]

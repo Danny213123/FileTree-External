@@ -536,22 +536,16 @@ fn native_transfer_files(
             }
             None => {}
         }
-        // A progress sink should always report queued items. Retain conservative
-        // filesystem fallbacks for older shell extensions that omit callbacks.
-        if move_items {
-            if std::fs::symlink_metadata(&source).is_err() {
-                result.moved += 1;
-            } else if result.aborted || perform_error.is_none() {
-                // A source left in place after a successful operation is
-                // normally a collision the user chose to skip.
-                result.skipped += 1;
-            } else {
-                result.failed += 1;
-            }
-        } else if !target_existed && target.exists() {
-            result.moved += 1;
-        } else if result.aborted || perform_error.is_none() {
+        // A progress sink should always report queued items. If an older shell
+        // extension omits the callback, never infer completion from a partial
+        // destination left by a canceled operation or from a pre-existing
+        // overwrite target.
+        if result.aborted {
             result.skipped += 1;
+        } else if move_items && std::fs::symlink_metadata(&source).is_err() {
+            result.moved += 1;
+        } else if perform_error.is_none() && !target_existed && target.exists() {
+            result.moved += 1;
         } else {
             result.failed += 1;
         }
@@ -868,6 +862,13 @@ unsafe extern "system" fn shell_menu_subclass_proc(
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
+#[cfg(windows)]
+fn is_deferred_clipboard_verb(verb: &str, defer_paste: bool) -> bool {
+    verb.eq_ignore_ascii_case("copy")
+        || verb.eq_ignore_ascii_case("cut")
+        || (defer_paste && verb.eq_ignore_ascii_case("paste"))
+}
+
 /// Display Explorer's classic "Show more options" context menu for physical
 /// files/folders. Cascades remain lazy, matching Explorer instead of blocking
 /// initial display while every submenu and Shift-only extension initializes.
@@ -877,6 +878,7 @@ pub(crate) fn shell_context_menu(
     owner_handle: isize,
     screen_x: i32,
     screen_y: i32,
+    defer_paste: bool,
 ) -> Result<Option<String>, String> {
     use std::ffi::c_void;
     use std::iter::once;
@@ -1084,15 +1086,15 @@ pub(crate) fn shell_context_menu(
             let _ = RemoveWindowSubclass(menu_owner, Some(shell_menu_subclass_proc), SUBCLASS_ID);
         }
     }
-    // Destroy the worker-owned window while the bridge is still alive. This
-    // keeps its callback pointer valid even if subclass removal ever fails.
-    drop(proxy);
     // Required by TrackPopupMenu's foreground-window contract; without this,
     // dismissing one menu can make the next click immediately disappear.
     let _ = unsafe { PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0)) };
-    drop(bridge);
 
     if command < MENU_ID_FIRST {
+        // Destroy the worker-owned window while the bridge is still alive. This
+        // keeps its callback pointer valid even if subclass removal ever fails.
+        drop(proxy);
+        drop(bridge);
         return Ok(None);
     }
     let command_offset = command - MENU_ID_FIRST;
@@ -1112,6 +1114,22 @@ pub(crate) fn shell_context_menu(
         (length > 0).then(|| String::from_utf16_lossy(&verb_buffer[..length]))
     });
 
+    // Copy/Cut commonly use an OLE delayed-rendering data object tied to this
+    // short-lived STA worker, so invoking them here can report success while
+    // leaving an unusable clipboard after the worker exits. A workspace Paste
+    // also needs FileTree's provenance-bound transfer accounting, while callers
+    // without a contextual destination may leave Paste native. Return deferred
+    // canonical verbs without invoking them; the renderer dispatches them
+    // through the same concrete CF_HDROP and IFileOperation paths as shortcuts.
+    if verb
+        .as_deref()
+        .is_some_and(|value| is_deferred_clipboard_verb(value, defer_paste))
+    {
+        drop(proxy);
+        drop(bridge);
+        return Ok(verb);
+    }
+
     let ordinal_a = PCSTR(command_offset as usize as *const u8);
     let ordinal_w = PCWSTR(command_offset as usize as *const u16);
     let invoke = CMINVOKECOMMANDINFOEX {
@@ -1127,11 +1145,17 @@ pub(crate) fn shell_context_menu(
         },
         ..Default::default()
     };
-    unsafe {
+    let invoke_result = unsafe {
         context
             .InvokeCommand((&invoke as *const CMINVOKECOMMANDINFOEX).cast::<CMINVOKECOMMANDINFO>())
     }
-    .map_err(|error| format!("Windows could not run the selected command: {error}"))?;
+    .map_err(|error| format!("Windows could not run the selected command: {error}"));
+    // Keep the context-menu owner and its message bridge alive until a native
+    // verb finishes initializing. Always destroy the owner before the bridge in
+    // case removing the subclass failed.
+    drop(proxy);
+    drop(bridge);
+    invoke_result?;
     Ok(verb)
 }
 
@@ -1141,6 +1165,7 @@ pub(crate) fn shell_context_menu(
     _owner_handle: isize,
     _screen_x: i32,
     _screen_y: i32,
+    _defer_paste: bool,
 ) -> Result<Option<String>, String> {
     Err("The Windows shell context menu is only available on Windows".to_string())
 }
@@ -1957,6 +1982,20 @@ pub(crate) fn shell_thumbnail_png(
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_clipboard_verbs_are_deferred_to_filetree() {
+        for verb in ["copy", "Copy", "cut", "CUT"] {
+            assert!(is_deferred_clipboard_verb(verb, false));
+            assert!(is_deferred_clipboard_verb(verb, true));
+        }
+        assert!(is_deferred_clipboard_verb("paste", true));
+        assert!(is_deferred_clipboard_verb("Paste", true));
+        assert!(!is_deferred_clipboard_verb("paste", false));
+        for verb in ["open", "properties", "delete", "pastelink"] {
+            assert!(!is_deferred_clipboard_verb(verb, true));
+        }
+    }
 
     #[test]
     fn dpapi_round_trip_uses_encrypted_bytes() {

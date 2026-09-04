@@ -200,8 +200,9 @@ pub fn show_shell_context_menu(
     owner_handle: isize,
     screen_x: i32,
     screen_y: i32,
+    defer_paste: bool,
 ) -> Result<Option<String>, String> {
-    windows_native::shell_context_menu(paths, owner_handle, screen_x, screen_y)
+    windows_native::shell_context_menu(paths, owner_handle, screen_x, screen_y, defer_paste)
 }
 
 pub fn run_cli() {

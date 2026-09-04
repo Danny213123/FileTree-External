@@ -126,10 +126,14 @@ export function enqueueTransfer(
   count: number,
   worker: () => Promise<TransferResult>,
   dedupeKey?: string,
+  onDedupe?: () => void,
 ): Promise<TransferResult> {
   if (dedupeKey) {
     const existing = dedupedTransfers.get(dedupeKey);
-    if (existing && existing.expiresAt > Date.now()) return existing.promise;
+    if (existing && existing.expiresAt > Date.now()) {
+      onDedupe?.();
+      return existing.promise;
+    }
     if (existing) dedupedTransfers.delete(dedupeKey);
   }
   const id = nextId++;
