@@ -13,11 +13,14 @@ import {
   clipboardReadFiles,
   clipboardWriteFiles,
   copyItemsNative,
+  compressLogPath,
+  fetchCompressLog,
   fetchFolderPreview,
   fetchServerSearch,
   fetchSubtreeFiles,
   moveItems,
   moveItemsNative,
+  openCompressionLog,
   releaseExternalPaths,
   shellContextMenu,
   startCompressJob,
@@ -58,6 +61,30 @@ describe("v2 bounded client queries", () => {
       query: expect.objectContaining({ limit: 500, offset: 0, search: "summer video", countTotal: false }),
     }));
     expect(result).toEqual({ matches: [], total: 1_200, capped: true });
+  });
+
+  it("loads compression history through the Tauri command", async () => {
+    vi.mocked(invoke).mockResolvedValue([{ jobId: "job-1", name: "clip.mp4" }]);
+
+    await expect(fetchCompressLog(1000)).resolves.toEqual([
+      { jobId: "job-1", name: "clip.mp4" },
+    ]);
+    expect(invoke).toHaveBeenCalledWith("compression_log", { limit: 1000 });
+  });
+
+  it("resolves and opens app-owned compression logs through scoped commands", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce({ path: "C:\\AppData\\FileTree\\compress-log.csv" })
+      .mockResolvedValueOnce(undefined);
+
+    await expect(compressLogPath()).resolves.toBe("C:\\AppData\\FileTree\\compress-log.csv");
+    await expect(openCompressionLog("history", true)).resolves.toBeUndefined();
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "compression_log_path", { kind: "history" });
+    expect(invoke).toHaveBeenNthCalledWith(2, "compression_log_action", {
+      kind: "history",
+      reveal: true,
+    });
   });
 
   it("routes file moves through Tauri and preserves the verified result", async () => {

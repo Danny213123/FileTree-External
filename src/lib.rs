@@ -92,6 +92,21 @@ pub fn reveal_system_path(path: &str) -> Result<(), String> {
     io::reveal_path(path).map_err(|error| error.to_string())
 }
 
+/// Recent per-file compression outcomes for the desktop History view.
+pub fn compression_history_json(limit: usize) -> String {
+    compress_log::read_rows_json(limit.min(10_000))
+}
+
+/// App-owned compression artifacts. These are exposed individually so the
+/// desktop shell never needs to authorize an arbitrary renderer-supplied path.
+pub fn compression_history_path() -> std::path::PathBuf {
+    compress_log::log_path()
+}
+
+pub fn compression_debug_log_path() -> std::path::PathBuf {
+    compress_debug::log_path()
+}
+
 pub fn protect_secret(value: &[u8]) -> Result<Vec<u8>, String> {
     windows_native::protect_secret(value)
 }

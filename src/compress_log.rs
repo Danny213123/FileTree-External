@@ -450,13 +450,17 @@ pub(crate) fn read_rows_json(limit: usize) -> String {
         Ok(t) => t,
         Err(_) => return "[]".to_string(),
     };
+    rows_json_from_text(&text, limit)
+}
+
+fn rows_json_from_text(text: &str, limit: usize) -> String {
     let mut records = parse_csv(&text);
     if records.is_empty() {
         return "[]".to_string();
     }
     // Drop the header row.
     records.remove(0);
-    let start = records.len().saturating_sub(limit.max(0));
+    let start = records.len().saturating_sub(limit);
     let slice = &records[start..];
 
     let mut s = String::with_capacity(slice.len() * 160 + 2);
@@ -615,4 +619,50 @@ fn parse_csv(text: &str) -> Vec<Vec<String>> {
         records.push(record);
     }
     records
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_rows_round_trip_to_frontend_json() {
+        let row = Row {
+            job_id: "job-1",
+            index: 7,
+            path: r#"C:\Media\a, "quoted".mp4"#,
+            name: r#"a, "quoted".mp4"#,
+            kind: "video",
+            preset: "balanced",
+            status: "success",
+            orig_bytes: 1_000,
+            new_bytes: 700,
+            saved_bytes: 300,
+            pct_saved: 30.0,
+            ratio: 0.7,
+            tool: "HandBrakeCLI",
+            codec_params: "--encoder nvenc_h264",
+            duration_ms: 1_250,
+            out_path: r#"C:\Media\a.compressed.mp4"#,
+            recycled: true,
+            error: "",
+            reason: "success",
+            exit_code: Some(0),
+            tool_version: "1.9",
+            command: r#"HandBrakeCLI -i "a, quoted.mp4""#,
+            stderr_excerpt: "line one\nline two",
+        };
+        let text = format!("{HEADER}{}", format_row(&row));
+        let value: serde_json::Value =
+            serde_json::from_str(&rows_json_from_text(&text, 10)).expect("valid JSON");
+        let parsed = &value[0];
+
+        assert_eq!(parsed["jobId"], "job-1");
+        assert_eq!(parsed["index"], 7);
+        assert_eq!(parsed["name"], r#"a, "quoted".mp4"#);
+        assert_eq!(parsed["savedBytes"], 300);
+        assert_eq!(parsed["reason"], "success");
+        assert_eq!(parsed["exitCode"], 0);
+        assert_eq!(parsed["stderrExcerpt"], "line one\nline two");
+    }
 }

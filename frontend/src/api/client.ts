@@ -672,7 +672,19 @@ export async function saveBookmarks(paths: string[]): Promise<void> {
 
 // ── Settings ─────────────────────────────────────────────────
 
+export interface AppTabSettings {
+  metric?: string;
+  unit?: string;
+  showFiles?: boolean;
+  sortKey?: string;
+  sortDir?: 1 | -1;
+  columnWidths?: Record<string, number>;
+}
+
 export interface AppSettings {
+  /** Monotonic wall-clock marker used to prefer the close-time shadow if the
+   *  process exited before the asynchronous SQLite write completed. */
+  sessionSavedAt?: number;
   darkMode?: boolean;
   threads?: number;
   includeHidden?: boolean;
@@ -687,6 +699,8 @@ export interface AppSettings {
   sortKey?: string;
   sortDir?: number;
   openTabs?: string[];
+  /** Per-tab view state parallel to `openTabs`. */
+  tabState?: AppTabSettings[];
   /** Per-tab metadata parallel to `openTabs` by index (#49): custom label,
    *  color label, and pinned state. */
   tabMeta?: { label?: string; color?: string; pinned?: boolean }[];
@@ -696,6 +710,7 @@ export interface AppSettings {
   decimals?: number;
   // Split-pane layout: each group references tab indices into openTabs.
   paneGroups?: { tabs: number[]; active: number; width?: number; toolbarHidden?: boolean }[];
+  focusedGroupIndex?: number;
   // VS Code workbench layout
   activeView?: string;
   sidebarOpen?: boolean;
@@ -704,10 +719,22 @@ export interface AppSettings {
   panelHeight?: number;
   chatOpen?: boolean;
   chatWidth?: number;
+  chatSessionId?: string;
+  terminalOpen?: boolean;
+  terminalHeight?: number;
+  terminalCwd?: string;
   // Inspector (right-side Details/Preview panes)
   previewOpen?: boolean;
   detailsOpen?: boolean;
   inspectorWidth?: number;
+  // Treemap presentation. The transient 3D modal itself is intentionally not
+  // restored; its host panel and stable display preferences are.
+  treemapDetail?: number;
+  tmShowSingleFiles?: boolean;
+  tmShowHierarchy?: boolean;
+  tmShowLegend?: boolean;
+  tmShowLabels?: boolean;
+  tmDragDrop?: boolean;
   // Low-space monitor (F9): alert when a drive's free space drops below this
   // percentage. `lowSpaceAlerts` toggles the monitor on/off.
   lowSpaceThreshold?: number;
@@ -2255,17 +2282,23 @@ export async function streamCompressJob(
 }
 
 /** Fetch the last `limit` rows of the persistent compress CSV log (newest last)
- *  for the History tab. Returns `[]` if no compression has run yet or the
- *  endpoint is unavailable (never throws). */
+ *  for the History tab. A missing log returns `[]`; desktop command failures
+ *  throw so the UI does not misreport an I/O/runtime error as empty history. */
 export async function fetchCompressLog(
   limit = 500,
   signal?: AbortSignal,
 ): Promise<CompressLogRow[]> {
   try {
+    if (isTauriV2()) {
+      if (signal?.aborted) return [];
+      const rows = await invoke<CompressLogRow[]>("compression_log", { limit });
+      return Array.isArray(rows) ? rows : [];
+    }
     const res = await fetch(`/api/compress-log?limit=${encodeURIComponent(limit)}`, { signal });
     if (!res.ok) return [];
     return (await res.json()) as CompressLogRow[];
-  } catch {
+  } catch (error) {
+    if (isTauriV2() && !signal?.aborted) throw error;
     return [];
   }
 }
@@ -2279,6 +2312,10 @@ export function compressLogCsvUrl(): string {
  *  an empty string if it can't be read. */
 export async function compressLogPath(): Promise<string> {
   try {
+    if (isTauriV2()) {
+      const r = await invoke<{ path?: string }>("compression_log_path", { kind: "history" });
+      return r.path ?? "";
+    }
     const r = await getJson<{ path?: string }>("/api/compress-log/path");
     return r.path ?? "";
   } catch {
@@ -2295,11 +2332,31 @@ export function compressDebugLogUrl(): string {
  *  reveal/open). Returns an empty string if it can't be read. */
 export async function compressDebugPath(): Promise<string> {
   try {
+    if (isTauriV2()) {
+      const r = await invoke<{ path?: string }>("compression_log_path", { kind: "debug" });
+      return r.path ?? "";
+    }
     const r = await getJson<{ path?: string }>("/api/compress-debug/path");
     return r.path ?? "";
   } catch {
     return "";
   }
+}
+
+/** Open or reveal an app-owned compression log without granting the renderer
+ * arbitrary access to FileTree's application-data directory. */
+export async function openCompressionLog(
+  kind: "history" | "debug",
+  reveal = false,
+): Promise<void> {
+  if (isTauriV2()) {
+    await invoke("compression_log_action", { kind, reveal });
+    return;
+  }
+  const path = kind === "history" ? await compressLogPath() : await compressDebugPath();
+  if (!path) throw new Error("The compression log has not been created yet");
+  if (reveal) await revealPath(path);
+  else await openPath(path);
 }
 
 /** Copy arbitrary text to the clipboard (Electron `copyText`, else /api/copy-path). */

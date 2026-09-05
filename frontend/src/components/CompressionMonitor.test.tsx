@@ -66,6 +66,7 @@ const emptyPage: CompressJobFilesPage = {
 describe("CompressionMonitor controls", () => {
   beforeEach(() => {
     localStorage.clear();
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1280 });
     Object.values(api).forEach((mock) => mock.mockReset());
     api.listCompressJobs.mockResolvedValue([job]);
     api.fetchCompressJobFiles.mockResolvedValue(emptyPage);
@@ -94,7 +95,7 @@ describe("CompressionMonitor controls", () => {
 
   it("includes skipped and failed files in the Completed quick view", async () => {
     render(<CompressionMonitor focusJobId={job.id} />);
-    await screen.findByText("Run metrics");
+    await screen.findByText("Metrics");
     api.fetchCompressJobFiles.mockClear();
 
     fireEvent.click(screen.getByRole("button", { name: "Completed" }));
@@ -104,6 +105,75 @@ describe("CompressionMonitor controls", () => {
         job.id,
         expect.objectContaining({ status: "done,skipped,error" }),
       );
+    });
+  });
+
+  it("shows the operational columns while keeping advanced filters disclosed", async () => {
+    render(<CompressionMonitor focusJobId={job.id} />);
+    await screen.findByText("Metrics");
+
+    expect(screen.queryByRole("combobox", { name: "Filter by file type" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Pause queue" })).toBeInTheDocument();
+    expect(screen.queryByText("Pause queue")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("columnheader").map((header) => header.textContent)).toEqual([
+      "File", "Progress", "Stage", "Elapsed", "ETA", "Rate",
+      "Encoder", "Original / output", "Saved", "Result",
+    ]);
+    expect(screen.getByRole("button", { name: "Choose columns" })).toHaveTextContent("Columns");
+    expect(screen.queryByText("nvenc")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Filters" }));
+    expect(screen.getByRole("combobox", { name: "Filter by file type" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run details" }));
+    expect(screen.getByText("nvenc")).toBeInTheDocument();
+  });
+
+  it("hides live-only controls but preserves the completed run telemetry structure", async () => {
+    api.listCompressJobs.mockResolvedValue([{
+      ...job,
+      status: "done",
+      done: 2,
+      pending: 0,
+      workCompletedBytes: 200,
+      activeWorkBytes: 0,
+      activeCount: 0,
+      active: false,
+    }]);
+
+    const { container } = render(<CompressionMonitor focusJobId={job.id} />);
+    const metrics = await screen.findByText("Metrics");
+
+    expect(screen.queryByRole("spinbutton", { name: "Workers" })).not.toBeInTheDocument();
+    expect(container.querySelector(".cm-job-header")).toHaveClass("tone-good");
+    expect(screen.getByRole("progressbar", { name: "Overall compression progress" }))
+      .toHaveAttribute("aria-valuetext", "100%; 2 completed, 0 skipped, 0 failed");
+    expect(metrics.closest("details")).toHaveAttribute("open");
+    const telemetry = screen.getByLabelText("Compression telemetry");
+    for (const label of ["GPU encode", "Sessions", "Aggregate", "Pipeline CPU", "RAM", "Read", "Write", "Free space"]) {
+      expect(telemetry).toHaveTextContent(label);
+    }
+    expect(screen.getByText("Telemetry was not recorded for this completed run.")).toBeInTheDocument();
+  });
+
+  it("supports keyboard resizing and persists pane and column widths", async () => {
+    render(<CompressionMonitor focusJobId={job.id} />);
+
+    const runsResize = await screen.findByRole("separator", { name: "Resize compression runs pane" });
+    fireEvent.keyDown(runsResize, { key: "ArrowRight" });
+    await waitFor(() => expect(runsResize).toHaveAttribute("aria-valuenow", "292"));
+
+    const fileColumnResize = screen.getByRole("separator", { name: "Resize File column" });
+    fireEvent.keyDown(fileColumnResize, { key: "ArrowRight" });
+    await waitFor(() => expect(fileColumnResize).toHaveAttribute("aria-valuenow", "182"));
+
+    await waitFor(() => {
+      const saved = JSON.parse(localStorage.getItem("filetree.compress.monitor.v4") ?? "{}") as {
+        runsWidth?: number;
+        widths?: Record<string, number>;
+      };
+      expect(saved.runsWidth).toBe(292);
+      expect(saved.widths?.name).toBe(182);
     });
   });
 });

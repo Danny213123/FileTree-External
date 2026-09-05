@@ -1602,6 +1602,47 @@ async fn compression_list(runtime: State<'_, Arc<DesktopRuntime>>) -> Result<Val
         .map_err(|error| format!("Compression list worker failed: {error}"))?
 }
 
+fn compression_artifact_path(kind: &str) -> Result<std::path::PathBuf, String> {
+    match kind {
+        "history" => Ok(filetree_core::compression_history_path()),
+        "debug" => Ok(filetree_core::compression_debug_log_path()),
+        _ => Err("Unknown compression log kind".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn compression_log(limit: Option<usize>) -> Result<Value, String> {
+    let limit = limit.unwrap_or(500).clamp(1, 10_000);
+    tauri::async_runtime::spawn_blocking(move || {
+        json_value(filetree_core::compression_history_json(limit))
+    })
+    .await
+    .map_err(|error| format!("Compression history worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn compression_log_path(kind: String) -> Result<Value, String> {
+    let path = compression_artifact_path(&kind)?;
+    Ok(serde_json::json!({
+        "path": path.to_string_lossy(),
+        "exists": path.is_file(),
+    }))
+}
+
+#[tauri::command]
+fn compression_log_action(kind: String, reveal: bool) -> Result<(), String> {
+    let path = compression_artifact_path(&kind)?;
+    if !path.is_file() {
+        return Err("The compression log has not been created yet".to_string());
+    }
+    let path = path.to_string_lossy();
+    if reveal {
+        filetree_core::reveal_system_path(&path)
+    } else {
+        filetree_core::open_system_path(&path)
+    }
+}
+
 #[tauri::command]
 async fn compression_files(
     runtime: State<'_, Arc<DesktopRuntime>>,
@@ -1717,6 +1758,9 @@ pub fn run() {
             compression_start,
             compression_control,
             compression_list,
+            compression_log,
+            compression_log_path,
+            compression_log_action,
             compression_files,
             compression_telemetry,
             compression_subscribe,

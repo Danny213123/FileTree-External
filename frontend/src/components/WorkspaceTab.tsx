@@ -13,7 +13,7 @@ import {
   setAttributes, setTimes,
   fetchServerSearch, shellContextMenu,
 } from "../api/client";
-import type { ScanOptions, ExportFormat, CompressionSource } from "../api/client";
+import type { ScanOptions, ExportFormat, CompressionSource, AppTabSettings } from "../api/client";
 import type { NodeRecord, SortKey, TagEntry } from "../api/types";
 import type { FilterRule } from "../hooks/useFilterRules";
 import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow, type AgentApi } from "../lib/agent";
@@ -72,6 +72,7 @@ export interface WorkspaceTabHandle {
   /** Copy the current selection to the clipboard as a TSV table (Copy as table). */
   doCopyAsTable: () => void;
   getScanPath: () => string;
+  getViewState: () => AppTabSettings;
   getScanning: () => boolean;
   getNodeById: () => Map<number, NodeRecord>;
   getAgentApi: () => AgentApi;
@@ -296,6 +297,7 @@ const VERY_LARGE_SCAN_NODES = 2_000_000;
 interface WorkspaceTabProps {
   tabId: string;
   initialPath: string;
+  initialViewState?: AppTabSettings;
   active: boolean;
   // Drives search/results behavior; the shared side bar (App) tracks its own.
   activeView: ViewId;
@@ -355,7 +357,7 @@ interface WorkspaceTabProps {
 
 const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(function WorkspaceTab(
   {
-    tabId, initialPath, active, activeView, searchQuery, searchFilters, toolbarVisible,
+    tabId, initialPath, initialViewState, active, activeView, searchQuery, searchFilters, toolbarVisible,
     bookmarkList, tagsByPath, activeTagFilter, onSetTags, onClearTagFilter,
     threads, includeHidden, followLinks, collectOwners, onCollectOwnersChange, exclude,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
@@ -396,6 +398,24 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     };
   }, [data?.lazy, data?.rootPath, data?.scannedAt, data?.scanId]);
   const tree = useTreeState(lazyOptions);
+  const initialViewAppliedRef = useRef(false);
+  useEffect(() => {
+    if (initialViewAppliedRef.current || !initialViewState) return;
+    initialViewAppliedRef.current = true;
+    if (["size", "allocated", "files", "folders"].includes(initialViewState.metric ?? "")) {
+      tree.setMetric(initialViewState.metric as Metric);
+    }
+    if (["auto", "tb", "gb", "mb", "kb", "bytes"].includes(initialViewState.unit ?? "")) {
+      tree.setUnit(initialViewState.unit as Unit);
+    }
+    if (initialViewState.showFiles !== undefined) tree.setShowFiles(initialViewState.showFiles);
+    if (initialViewState.sortKey && (initialViewState.sortDir === 1 || initialViewState.sortDir === -1)) {
+      tree.setSort(initialViewState.sortKey as SortKey, initialViewState.sortDir);
+    }
+    if (initialViewState.columnWidths) {
+      tree.setColumnWidthsAll(initialViewState.columnWidths as Partial<Record<SortKey, number>>);
+    }
+  }, [initialViewState, tree]);
   // Latest tree snapshot for stable callbacks / async watch handlers (avoids
   // recreating callbacks every render and reading stale expansion state).
   const treeRef = useRef(tree);
@@ -919,6 +939,23 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   // focused. Kept out of the high-frequency tree effect below so expand / filter
   // / select still never reach the shell.
   useEffect(() => { if (active) onStateChange(); }, [scanPath, active, onStateChange]);
+
+  // These are durable per-tab presentation settings. Notify the shell so its
+  // debounced session snapshot includes the latest value (including a final
+  // column resize); selection, hover, and expansion remain on the workbench-only
+  // path and do not re-render App.
+  useEffect(() => {
+    if (active) onStateChange();
+  }, [
+    active,
+    tree.metric,
+    tree.unit,
+    tree.showFiles,
+    tree.sortKey,
+    tree.sortDir,
+    tree.columnWidths,
+    onStateChange,
+  ]);
 
   // The Explorer side bar / status bar / inspector live once in App (shared,
   // around the editor groups) and pull their data from the focused pane's
@@ -2422,6 +2459,14 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     getSelectionSummary: () => selectionSummary,
     doCopyAsTable: runCopyAsTable,
     getScanPath: () => scanPath,
+    getViewState: () => ({
+      metric: tree.metric,
+      unit: tree.unit,
+      showFiles: tree.showFiles,
+      sortKey: tree.sortKey,
+      sortDir: tree.sortDir,
+      columnWidths: tree.columnWidths as Record<string, number>,
+    }),
     getScanning: () => status === "scanning",
     getNodeById: () => tree.nodeById,
     getAgentApi: () => agentApi,

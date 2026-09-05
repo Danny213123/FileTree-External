@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NodeRecord } from "../api/types";
 import { Treemap, resolveTreemapViewId } from "./Treemap";
@@ -76,6 +76,7 @@ describe("Treemap lazy folder loading", () => {
   });
 
   afterEach(() => {
+    cleanup();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -160,5 +161,78 @@ describe("Treemap lazy folder loading", () => {
     );
 
     expect(screen.getByText("This folder is empty.")).toBeInTheDocument();
+  });
+
+  it("keeps the previous frame while a first-time folder visit loads", async () => {
+    const folder = node({
+      id: 1,
+      parent: 0,
+      name: "Users",
+      path: "C:\\Users",
+      depth: 1,
+      files: 1,
+      size: 60,
+    });
+    const rootFile = node({
+      id: 2,
+      parent: 0,
+      name: "pagefile.sys",
+      path: "C:\\pagefile.sys",
+      dir: false,
+      depth: 1,
+      files: 1,
+      size: 40,
+    });
+    const root = node({ children: [1, 2], folders: 1, files: 2 });
+    const initialNodes = new Map([[0, root], [1, folder], [2, rootFile]]);
+    const view = render(
+      <Treemap
+        {...baseProps}
+        nodeById={initialNodes}
+        selectedId={0}
+        loadedDirs={new Set([0])}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /export the treemap/i })).toBeEnabled();
+
+    view.rerender(
+      <Treemap
+        {...baseProps}
+        nodeById={initialNodes}
+        selectedId={1}
+        loadedDirs={new Set([0])}
+      />,
+    );
+
+    expect(screen.getByText("Loading Users…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /export the treemap/i })).toBeEnabled();
+    expect(screen.queryByText("Loading folder contents…")).not.toBeInTheDocument();
+
+    const child = node({
+      id: 3,
+      parent: 1,
+      name: "profile.dat",
+      path: "C:\\Users\\profile.dat",
+      dir: false,
+      depth: 2,
+      files: 1,
+      size: 60,
+    });
+    view.rerender(
+      <Treemap
+        {...baseProps}
+        nodeById={new Map([
+          [0, root],
+          [1, { ...folder, children: [3] }],
+          [2, rootFile],
+          [3, child],
+        ])}
+        selectedId={1}
+        loadedDirs={new Set([0, 1])}
+      />,
+    );
+
+    await waitFor(() => expect(screen.queryByText("Loading Users…")).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: /export the treemap/i })).toBeEnabled();
   });
 });

@@ -17,7 +17,7 @@ import {
   claimExternalPaths,
   notify,
 } from "./api/client";
-import type { AppSettings, CompressionSource } from "./api/client";
+import type { AppSettings, AppTabSettings, CompressionSource } from "./api/client";
 import { isTauriV2 } from "./api/v2";
 import type { DriveEntry, SpecialFolder, SortKey, Unit, ScanResult, TagEntry, SmartFolder, NodeRecord } from "./api/types";
 import { isActiveRule } from "./hooks/useFilterRules";
@@ -62,6 +62,7 @@ import { ScheduleWizard } from "./components/ScheduleWizard";
 import { LazyView } from "./components/LazyView";
 import { CompressView } from "./components/CompressView";
 import { recordSample as recordDriveSample } from "./lib/driveForecast";
+import { newestSessionSettings, writeSessionShadow } from "./lib/sessionState";
 
 // Heavy, not-always-visible views are code-split via React.lazy so they leave
 // the main bundle and load on first use (xterm rides along with TerminalPanel;
@@ -91,6 +92,7 @@ function newGroupId() { return `g${nextGroupId++}`; }
 interface TabEntry {
   id: string;
   initialPath: string;
+  initialViewState?: AppTabSettings;
   ref: React.RefObject<WorkspaceTabHandle>;
   // #49 Tab QoL (all optional / persisted): a user override label (else the
   // derived folder name), a color-label accent, and pinned state.
@@ -261,13 +263,13 @@ export default function App() {
   const [accent, setAccent] = useState<string>(() => loadAccent());
   const [uiScale, setUiScale] = useState<number>(() => loadScale());
   const [appearanceOpen, setAppearanceOpen] = useState(false);
-  const [treemapDetail] = useState(3);
-  const [tmShowSingleFiles] = useState(true);
+  const [treemapDetail, setTreemapDetail] = useState(3);
+  const [tmShowSingleFiles, setTmShowSingleFiles] = useState(true);
   const [tmShow3D, setTmShow3D] = useState(false);
   const [tmShowHierarchy, setTmShowHierarchy] = useState(true);
   const [tmShowLegend, setTmShowLegend] = useState(true);
   const [tmShowLabels, setTmShowLabels] = useState(true);
-  const [tmDragDrop] = useState(false);
+  const [tmDragDrop, setTmDragDrop] = useState(false);
   // Details-list view prefs are GLOBAL (shared by every tab/pane) and persisted
   // server-side like metric/unit. `unit` stays per-tab (in useTreeState).
   const [decimals, setDecimals] = useState(2);
@@ -496,9 +498,11 @@ export default function App() {
 
   // ── Consolidated settings persistence (server overwrites the whole file) ──
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveChain = useRef<Promise<void>>(Promise.resolve());
   const buildSettings = useCallback((): AppSettings => {
     const rs = getActiveRef()?.getRibbonState();
     return {
+      sessionSavedAt: Date.now(),
       darkMode, threads, includeHidden, followLinks, collectOwners, exclude,
       lastPath: rs?.scanPath ?? "",
       metric: rs?.metric ?? "size",
@@ -506,6 +510,7 @@ export default function App() {
       showFiles: rs?.showFiles ?? true,
       recentPaths: loadRecentPaths(),
       openTabs: tabs.map((t) => t.ref.current?.getScanPath() ?? t.initialPath),
+      tabState: tabs.map((t) => t.ref.current?.getViewState() ?? t.initialViewState ?? {}),
       // #49: per-tab metadata parallel to openTabs by index (custom label /
       // color / pinned). Kept separate so old index-based paneGroups still work.
       tabMeta: tabs.map((t) => ({ label: t.customLabel, color: t.color, pinned: t.pinned })),
@@ -519,27 +524,98 @@ export default function App() {
         width: g.width,
         toolbarHidden: g.toolbarHidden,
       })),
+      focusedGroupIndex: Math.max(0, groups.findIndex((g) => g.id === focusedGroupId)),
       activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth,
+      chatSessionId,
+      terminalOpen, terminalHeight, terminalCwd,
       previewOpen, detailsOpen, inspectorWidth,
+      treemapDetail, tmShowSingleFiles, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
       lowSpaceAlerts, lowSpaceThreshold,
     };
   }, [darkMode, threads, includeHidden, followLinks, collectOwners, exclude, getActiveRef, tabs, groups,
-      visibleColumns, decimals,
+      focusedGroupId, visibleColumns, decimals,
       activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth,
-      previewOpen, detailsOpen, inspectorWidth, lowSpaceAlerts, lowSpaceThreshold]);
+      chatSessionId, terminalOpen, terminalHeight, terminalCwd,
+      previewOpen, detailsOpen, inspectorWidth,
+      treemapDetail, tmShowSingleFiles, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
+      lowSpaceAlerts, lowSpaceThreshold]);
+
+  const queueSettingsSave = useCallback((snapshot: AppSettings): Promise<void> => {
+    const next = saveChain.current.catch(() => {}).then(() => saveSettings(snapshot));
+    saveChain.current = next;
+    return next;
+  }, []);
 
   const persist = useCallback(() => {
     if (!settingsLoaded) return;
+    const snapshot = buildSettings();
+    // Synchronous shadow covers browser page teardown, process kills, and the
+    // debounce window. SQLite remains the primary durable settings store.
+    writeSessionShadow(snapshot);
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => { saveSettings(buildSettings()).catch(() => {}); }, SETTINGS_DEBOUNCE_MS);
-  }, [settingsLoaded, buildSettings]);
+    saveTimer.current = setTimeout(() => {
+      saveTimer.current = null;
+      void queueSettingsSave(snapshot).catch(() => {});
+    }, SETTINGS_DEBOUNCE_MS);
+  }, [settingsLoaded, buildSettings, queueSettingsSave]);
+
+  const flushSettings = useCallback(async () => {
+    if (!settingsLoaded) return;
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    const snapshot = buildSettings();
+    writeSessionShadow(snapshot);
+    await queueSettingsSave(snapshot);
+  }, [settingsLoaded, buildSettings, queueSettingsSave]);
+  const flushSettingsRef = useRef(flushSettings);
+  flushSettingsRef.current = flushSettings;
 
   useEffect(() => { persist(); },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [darkMode, threads, includeHidden, followLinks, collectOwners, exclude, tabs, groups, focusedGroupId,
+    [darkMode, threads, includeHidden, followLinks, collectOwners, exclude, tabs, groups, focusedGroupId, tick,
      visibleColumns, decimals,
      activeView, sidebarOpen, sidebarWidth, panelOpen, panelHeight, chatOpen, chatWidth,
-     previewOpen, detailsOpen, inspectorWidth, lowSpaceAlerts, lowSpaceThreshold]);
+     chatSessionId, terminalOpen, terminalHeight, terminalCwd,
+     previewOpen, detailsOpen, inspectorWidth,
+     treemapDetail, tmShowSingleFiles, tmShowHierarchy, tmShowLegend, tmShowLabels, tmDragDrop,
+     lowSpaceAlerts, lowSpaceThreshold]);
+
+  // Flush normal Tauri window closes before destroying the webview. `pagehide`
+  // is the browser/abnormal-close fallback; even if its async write is cancelled,
+  // flushSettings has already written the synchronous shadow used at startup.
+  useEffect(() => {
+    let disposed = false;
+    let unlistenClose: (() => void) | undefined;
+    let closing = false;
+    if (isTauriV2()) {
+      void import("@tauri-apps/api/window").then(async ({ getCurrentWindow }) => {
+        const appWindow = getCurrentWindow();
+        const unlisten = await appWindow.onCloseRequested(async (event) => {
+          event.preventDefault();
+          if (closing) return;
+          closing = true;
+          try {
+            await flushSettingsRef.current();
+          } catch {
+            // The local shadow was written before the durable save attempt.
+          } finally {
+            await appWindow.destroy();
+          }
+        });
+        if (disposed) unlisten();
+        else unlistenClose = unlisten;
+      }).catch(() => {});
+    }
+    const handlePageHide = () => { void flushSettingsRef.current().catch(() => {}); };
+    window.addEventListener("pagehide", handlePageHide);
+    return () => {
+      disposed = true;
+      unlistenClose?.();
+      window.removeEventListener("pagehide", handlePageHide);
+    };
+  }, []);
 
   // #49 legacy crash-safe restore. Tauri v2 persists this state in SQLite and
   // deliberately avoids a second renderer-local source of truth. `tick` is
@@ -695,7 +771,8 @@ export default function App() {
       fetchSpecialFolders(),
       fetchBookmarks(),
       fetchSettings(),
-    ]).then(([config, driveList, folderList, savedBookmarks, settings]) => {
+    ]).then(([config, driveList, folderList, savedBookmarks, persistedSettings]) => {
+      const settings = newestSessionSettings(persistedSettings);
       if (settings.darkMode !== undefined) {
         setDarkModeState(settings.darkMode);
         document.documentElement.dataset.theme = settings.darkMode ? "dark" : "light";
@@ -720,15 +797,32 @@ export default function App() {
       }
       if (settings.sidebarOpen !== undefined) setSidebarOpen(settings.sidebarOpen);
       if (settings.sidebarWidth) setSidebarWidth(settings.sidebarWidth);
+      const restoreTerminalOpen = settings.terminalOpen === true;
       if (settings.panelOpen !== undefined || legacyTreemapView) {
-        setPanelOpen(legacyTreemapView || !!settings.panelOpen);
+        setPanelOpen(!restoreTerminalOpen && (legacyTreemapView || !!settings.panelOpen));
       }
       if (settings.panelHeight) setPanelHeight(settings.panelHeight);
       if (settings.chatOpen !== undefined) setChatOpen(settings.chatOpen);
       if (settings.chatWidth) setChatWidth(settings.chatWidth);
+      if (settings.chatSessionId) setChatSessionId(settings.chatSessionId);
+      if (settings.terminalHeight && settings.terminalHeight > 0) setTerminalHeight(settings.terminalHeight);
+      if (settings.terminalCwd !== undefined) setTerminalCwd(settings.terminalCwd);
+      if (restoreTerminalOpen) {
+        setTerminalMounted(true);
+        setTerminalOpen(true);
+        setTerminalReq((n) => n + 1);
+      }
       if (settings.previewOpen !== undefined) setPreviewOpen(settings.previewOpen);
       if (settings.detailsOpen !== undefined) setDetailsOpen(settings.detailsOpen);
       if (settings.inspectorWidth) setInspectorWidth(settings.inspectorWidth);
+      if (settings.treemapDetail !== undefined && settings.treemapDetail >= 1 && settings.treemapDetail <= 5) {
+        setTreemapDetail(settings.treemapDetail);
+      }
+      if (settings.tmShowSingleFiles !== undefined) setTmShowSingleFiles(settings.tmShowSingleFiles);
+      if (settings.tmShowHierarchy !== undefined) setTmShowHierarchy(settings.tmShowHierarchy);
+      if (settings.tmShowLegend !== undefined) setTmShowLegend(settings.tmShowLegend);
+      if (settings.tmShowLabels !== undefined) setTmShowLabels(settings.tmShowLabels);
+      if (settings.tmDragDrop !== undefined) setTmDragDrop(settings.tmDragDrop);
       // Low-space monitor (F9)
       if (settings.lowSpaceAlerts !== undefined) setLowSpaceAlerts(settings.lowSpaceAlerts);
       if (settings.lowSpaceThreshold !== undefined && settings.lowSpaceThreshold > 0) {
@@ -749,14 +843,25 @@ export default function App() {
       // dropping empty-path tabs together so the two stay aligned. Legacy
       // clients may fall back to localStorage; Tauri v2 uses SQLite as the sole
       // source of truth for restored tabs.
+      const legacyViewState: AppTabSettings = {
+        metric: settings.metric,
+        unit: settings.unit,
+        showFiles: settings.showFiles,
+        sortKey: settings.sortKey,
+        sortDir: settings.sortDir === 1 || settings.sortDir === -1 ? settings.sortDir : undefined,
+      };
       let pairs = (settings.openTabs ?? [])
-        .map((p, i) => ({ p, m: settings.tabMeta?.[i] as TabMeta | undefined }))
+        .map((p, i) => ({
+          p,
+          m: settings.tabMeta?.[i] as TabMeta | undefined,
+          s: settings.tabState?.[i] ?? legacyViewState,
+        }))
         .filter((x) => Boolean(x.p));
       if (pairs.length === 0 && !isTauriV2()) {
         const backup = readTabBackup();
         if (backup) {
           pairs = backup.openTabs
-            .map((p, i) => ({ p, m: backup.tabMeta[i] }))
+            .map((p, i) => ({ p, m: backup.tabMeta[i], s: legacyViewState }))
             .filter((x) => Boolean(x.p));
         }
       }
@@ -765,6 +870,7 @@ export default function App() {
         const restoredTabs = pairs.map((x) => ({
           id: newTabId(),
           initialPath: x.p,
+          initialViewState: x.s,
           ref: createRef<WorkspaceTabHandle>(),
           customLabel: x.m?.label,
           color: x.m?.color,
@@ -798,13 +904,14 @@ export default function App() {
         }
         built[built.length - 1].width = undefined; // last pane always flexes
         setGroups(built);
-        setFocusedGroupId(built[0].id);
+        const focusedIndex = settings.focusedGroupIndex ?? 0;
+        setFocusedGroupId(built[focusedIndex]?.id ?? built[0].id);
       } else {
         const path = settings.lastPath || config.initialPath || "";
         if (path) {
           setTabs((prev) => {
             const first = prev[0];
-            return [{ ...first, initialPath: path }, ...prev.slice(1)];
+            return [{ ...first, initialPath: path, initialViewState: legacyViewState }, ...prev.slice(1)];
           });
         }
       }
@@ -2043,6 +2150,7 @@ export default function App() {
                         ref={tab.ref}
                         tabId={tab.id}
                         initialPath={tab.initialPath}
+                        initialViewState={tab.initialViewState}
                         active={visible}
                         onOpenTerminal={handleOpenTerminal}
                         activeView={activeView}

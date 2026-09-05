@@ -30,10 +30,7 @@ import {
   openPath,
   revealPath,
   fetchCompressLog,
-  compressLogPath,
-  compressLogCsvUrl,
-  compressDebugPath,
-  compressDebugLogUrl,
+  openCompressionLog,
   testGpuEncoder,
   notify,
   type GpuTestResult,
@@ -3739,8 +3736,7 @@ function CompressHistory({
 }) {
   const [rows, setRows] = useState<CompressLogRow[]>([]);
   const [loading, setLoading] = useState(true);
-  const [csvPath, setCsvPath] = useState("");
-  const [debugPath, setDebugPath] = useState("");
+  const [loadError, setLoadError] = useState("");
   const [historySearch, setHistorySearch] = useState("");
   const [historyStatus, setHistoryStatus] = useState("");
   const [historyKind, setHistoryKind] = useState("");
@@ -3751,16 +3747,17 @@ function CompressHistory({
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
-    const [r, p, dp] = await Promise.all([
-      fetchCompressLog(1000, signal),
-      compressLogPath(),
-      compressDebugPath(),
-    ]);
-    if (signal?.aborted) return;
-    setRows(r);
-    setCsvPath(p);
-    setDebugPath(dp);
-    setLoading(false);
+    try {
+      const next = await fetchCompressLog(1000, signal);
+      if (signal?.aborted) return;
+      setRows(next);
+      setLoadError("");
+    } catch (error) {
+      if (signal?.aborted) return;
+      setLoadError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (!signal?.aborted) setLoading(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -3818,8 +3815,8 @@ function CompressHistory({
       if (r.status === "success") success += 1;
     }
     const pct = orig > 0 ? (saved / orig) * 100 : 0;
-    return { orig, neu, saved, success, pct, count: rows.length };
-  }, [display]);
+    return { orig, neu, saved, success, pct, count: display.length, total: rows.length };
+  }, [display, rows.length]);
 
   const sortHistory = (key: typeof historySort) => {
     if (historySort === key) setHistoryDirection((direction) => direction === "asc" ? "desc" : "asc");
@@ -3827,6 +3824,22 @@ function CompressHistory({
       setHistorySort(key);
       setHistoryDirection(key === "when" ? "desc" : "asc");
     }
+  };
+
+  const openLog = async (kind: "history" | "debug", reveal = false) => {
+    try {
+      await openCompressionLog(kind, reveal);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const clearHistoryFilters = () => {
+    setHistorySearch("");
+    setHistoryStatus("");
+    setHistoryKind("");
+    setHistoryEncoder("");
+    setHistoryDate("all");
   };
 
   // Virtualize the row body so a full 1000-row log stays responsive.
@@ -3854,12 +3867,12 @@ function CompressHistory({
     <div className="compress-history">
       <div className="compress-toolbar">
         <div className="compress-summary">
-          {totals.count > 0 ? (
+          {totals.total > 0 ? (
             <>
               <span className="compress-total">{formatBytes(totals.saved)}</span>
-              <span className="compress-total-label">saved total</span>
+              <span className="compress-total-label">saved</span>
               <span className="compress-selected">
-                {totals.success.toLocaleString()} compressed · {totals.pct.toFixed(1)}%
+                {totals.count.toLocaleString()} / {totals.total.toLocaleString()} shown
               </span>
             </>
           ) : (
@@ -3867,58 +3880,48 @@ function CompressHistory({
           )}
         </div>
         <div className="compress-toolbar-spacer" />
-        <button className="compress-btn" onClick={() => void load()} disabled={loading}>
-          <Icon name="arrow-repeat" size={13} /> Refresh
+        <button type="button" className="compress-btn compress-icon-btn" aria-label="Refresh history" title="Refresh history" onClick={() => void load()} disabled={loading}>
+          <Icon name="arrow-repeat" size={14} />
         </button>
         <button
-          className="compress-btn"
-          onClick={() => csvPath && void openPath(csvPath)}
-          disabled={!csvPath || totals.count === 0}
+          type="button"
+          className="compress-btn compress-icon-btn"
+          aria-label="Open compression history CSV"
+          onClick={() => void openLog("history")}
+          disabled={totals.total === 0}
           title="Open the CSV in its default application"
         >
-          <Icon name="file-text" size={13} /> Open CSV
+          <Icon name="file-text" size={14} />
         </button>
         <button
-          className="compress-btn"
-          onClick={() => csvPath && void revealPath(csvPath)}
-          disabled={!csvPath || totals.count === 0}
+          type="button"
+          className="compress-btn compress-icon-btn"
+          aria-label="Reveal compression history CSV"
+          onClick={() => void openLog("history", true)}
+          disabled={totals.total === 0}
           title="Show the CSV in Explorer"
         >
-          <Icon name="folder-open" size={13} /> Reveal in Explorer
+          <Icon name="folder-open" size={14} />
         </button>
-        <a
-          className="compress-btn"
-          href={compressLogCsvUrl()}
-          download="filetree-compress-log.csv"
-          title="Download the full CSV log"
-        >
-          <Icon name="arrow-up" size={13} /> Download
-        </a>
         <span className="compress-toolbar-divider" aria-hidden="true" />
         <button
-          className="compress-btn"
-          onClick={() => debugPath && void openPath(debugPath)}
-          disabled={!debugPath}
+          type="button"
+          className="compress-btn compress-icon-btn"
+          aria-label="Open compression debug log"
+          onClick={() => void openLog("debug")}
           title="Open the verbose diagnostic log (per-file command, exit code, stderr, decision + reason)"
         >
-          <Icon name="file-text" size={13} /> Open debug log
+          <Icon name="terminal" size={14} />
         </button>
         <button
-          className="compress-btn"
-          onClick={() => debugPath && void revealPath(debugPath)}
-          disabled={!debugPath}
+          type="button"
+          className="compress-btn compress-icon-btn"
+          aria-label="Reveal compression debug log"
+          onClick={() => void openLog("debug", true)}
           title="Show the debug log in Explorer"
         >
-          <Icon name="folder-open" size={13} /> Reveal
+          <Icon name="folder-open" size={14} />
         </button>
-        <a
-          className="compress-btn"
-          href={compressDebugLogUrl()}
-          download="filetree-compress-debug.log"
-          title="Download the full verbose debug log"
-        >
-          <Icon name="arrow-up" size={13} /> Debug log
-        </a>
       </div>
 
       <div className="compress-history-filters">
@@ -3942,11 +3945,26 @@ function CompressHistory({
       <div className="compress-body">
         {loading && rows.length === 0 ? (
           <EmptyState icon="clock-history" title="Loading history…" hint="Reading the compression log." />
-        ) : totals.count === 0 ? (
+        ) : loadError && rows.length === 0 ? (
+          <EmptyState
+            icon="warning"
+            title="History could not be loaded"
+            hint={loadError}
+            error
+            action={{ label: "Try again", onClick: () => void load() }}
+          />
+        ) : rows.length === 0 ? (
           <EmptyState
             icon="clock-history"
             title="No compression history"
             hint="Compress some files and each one will be logged here (and to compress-log.csv)."
+          />
+        ) : display.length === 0 ? (
+          <EmptyState
+            icon="search"
+            title="No matching history"
+            hint="Try clearing or broadening the current filters."
+            action={{ label: "Clear filters", onClick: clearHistoryFilters }}
           />
         ) : (
           <div className="compress-log-vtable">

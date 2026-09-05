@@ -395,26 +395,59 @@ export const Treemap = memo(function Treemap({
     () => resolveTreemapViewId(selectedId, nodeById),
     [selectedId, nodeById],
   );
+  const viewNode = nodeById.get(viewId);
+  const viewLoading = !!viewNode?.dir && (
+    (loadedDirs !== undefined && !loadedDirs.has(viewId))
+    || (viewNode.children.length === 0 && (viewNode.files > 0 || viewNode.folders > 0))
+  );
 
   useEffect(() => {
     onViewChange?.(viewId);
   }, [onViewChange, viewId]);
 
+  // A first visit to a lazy folder changes selectedId before its children arrive.
+  // Keep drawing the last complete frame until the latest requested scope is
+  // ready; otherwise topItems briefly becomes [] and the canvas is cleared. The
+  // requested id remains separate, so a late response for an earlier rapid click
+  // can never replace the newest selection.
+  const rootPath = nodeById.get(0)?.path ?? "";
+  const [renderFrame, setRenderFrame] = useState(() => ({
+    viewId,
+    isBundleSelected,
+    nodeById,
+    rootPath,
+  }));
+  useEffect(() => {
+    const rootChanged = renderFrame.rootPath !== rootPath;
+    if (viewLoading && !rootChanged) return;
+    setRenderFrame((previous) => {
+      if (
+        previous.viewId === viewId
+        && previous.isBundleSelected === isBundleSelected
+        && previous.nodeById === nodeById
+        && previous.rootPath === rootPath
+      ) return previous;
+      return { viewId, isBundleSelected, nodeById, rootPath };
+    });
+  }, [viewId, isBundleSelected, nodeById, rootPath, viewLoading, renderFrame.rootPath]);
+
+  const renderViewId = renderFrame.viewId;
+  const renderNodeById = renderFrame.nodeById;
+  const renderBundleSelected = renderFrame.isBundleSelected;
+
   const topItems = useMemo(() => {
-    const allKids = (nodeById.get(viewId)?.children ?? [])
-      .map(id => nodeById.get(id))
+    const allKids = (renderNodeById.get(renderViewId)?.children ?? [])
+      .map(id => renderNodeById.get(id))
       .filter((n): n is NodeRecord => {
         if (n === undefined || getValue(n, metric) <= 0) return false;
         // When a bundle is selected, show only files (that's what the bundle contains).
-        if (isBundleSelected) return !n.dir;
+        if (renderBundleSelected) return !n.dir;
         return showSingleFiles || n.dir;
       });
     return allKids
       .sort((a, b) => getValue(b, metric) - getValue(a, metric))
       .slice(0, maxTop);
-  }, [viewId, isBundleSelected, nodeById, metric, maxTop, showSingleFiles]);
-  const viewNode = nodeById.get(viewId);
-  const viewLoading = !!viewNode?.dir && loadedDirs !== undefined && !loadedDirs.has(viewId);
+  }, [renderViewId, renderBundleSelected, renderNodeById, metric, maxTop, showSingleFiles]);
   const emptyMessage = !viewNode
     ? "Open a scan to view its treemap."
     : viewLoading
@@ -449,7 +482,7 @@ export const Treemap = memo(function Treemap({
         });
       } else {
         const flat = flattenLayout(
-          [topRects[i]], nodeById,
+          [topRects[i]], renderNodeById,
           containerSize.w, containerSize.h,
           0, maxDepth, maxChildren, metric,
           branchColor, 0, 0, budget, darkMode,
@@ -465,7 +498,7 @@ export const Treemap = memo(function Treemap({
       }
     }
     return result;
-  }, [topItems, containerSize, nodeById, maxDepth, maxChildren, metric, showHierarchy, showLabels, darkMode]);
+  }, [topItems, containerSize, renderNodeById, maxDepth, maxChildren, metric, showHierarchy, showLabels, darkMode]);
 
   // Flat node→rect index for O(1) overlay highlight lookup (no tree walk per
   // hover). Rebuilt only when the layout changes.
@@ -499,9 +532,9 @@ export const Treemap = memo(function Treemap({
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      drawBase(ctx, flatRects, nodeById, darkMode);
+      drawBase(ctx, flatRects, renderNodeById, darkMode);
     });
-  }, [flatRects, nodeById, darkMode]);
+  }, [flatRects, renderNodeById, darkMode]);
 
   // Overlay layer: hover/drag highlights live in refs and are painted imperatively
   // (no React re-render per hovered cell). The effect only fires when the layout
@@ -533,7 +566,7 @@ export const Treemap = memo(function Treemap({
     const pm = pendingMoveRef.current;
     if (!pm) return;
     const hit = hitTest(flatRects, pm.mx, pm.my);
-    const hitNode = hit ? nodeById.get(hit.nodeId) : null;
+    const hitNode = hit ? renderNodeById.get(hit.nodeId) : null;
     if (canvasRef.current) {
       canvasRef.current.style.cursor =
         isDraggingRef.current && hitNode?.dir ? "copy"
@@ -565,7 +598,7 @@ export const Treemap = memo(function Treemap({
         tooltipApiRef.current?.show(hitNode, cx, cy);
       }, 400);
     }
-  }, [flatRects, nodeById, redrawOverlay]);
+  }, [flatRects, renderNodeById, redrawOverlay]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -599,20 +632,20 @@ export const Treemap = memo(function Treemap({
   const handleDoubleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const hit = getHit(e);
     if (!hit) return;
-    const node = nodeById.get(hit.nodeId);
+    const node = renderNodeById.get(hit.nodeId);
     if (node?.dir) onNavigate(hit.nodeId);
     else if (node && onOpen) onOpen(hit.nodeId);
-  }, [getHit, onNavigate, onOpen, nodeById]);
+  }, [getHit, onNavigate, onOpen, renderNodeById]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!dragDrop) return;
     const hit = getHit(e);
-    if (hit && nodeById.get(hit.nodeId)?.dir) {
+    if (hit && renderNodeById.get(hit.nodeId)?.dir) {
       isDraggingRef.current = true;
       setDragSourceId(hit.nodeId);
       if (canvasRef.current) canvasRef.current.style.cursor = "grabbing";
     }
-  }, [dragDrop, getHit, nodeById]);
+  }, [dragDrop, getHit, renderNodeById]);
 
   // #38: export the treemap as a PNG. The treemap is CANVAS-based (a base layer
   // + a transparent overlay for hover/selection), so we composite both onto an
@@ -658,8 +691,8 @@ export const Treemap = memo(function Treemap({
     if (canvasRef.current) canvasRef.current.style.cursor = "default";
 
     if (srcId == null || dstId == null || srcId === dstId) return;
-    const src = nodeById.get(srcId);
-    const dst = nodeById.get(dstId);
+    const src = renderNodeById.get(srcId);
+    const dst = renderNodeById.get(dstId);
     if (!src || !dst || !dst.dir) return;
     // Refuse no-op / unsafe drops: onto itself, into a descendant, or into the
     // folder it already lives in (parent-drop). `srcId === dstId` above only
@@ -674,15 +707,15 @@ export const Treemap = memo(function Treemap({
     // 405'd and treemap folder moves silently did nothing.
     const result = await onMoveItems?.([src.path], dst.path);
     if (result && !result.ok) alert(`Move failed: ${result.error}`);
-  }, [dragSourceId, nodeById, redrawOverlay, onMoveItems]);
+  }, [dragSourceId, renderNodeById, redrawOverlay, onMoveItems]);
 
   return (
     <>
     {show3D && (
       <Suspense fallback={null}>
         <Treemap3DModal
-          nodeById={nodeById}
-          viewId={viewId}
+          nodeById={renderNodeById}
+          viewId={renderViewId}
           metric={metric}
           onClose={onClose3D ?? (() => {})}
           onNavigate={onNavigate}
@@ -693,6 +726,7 @@ export const Treemap = memo(function Treemap({
       <div className="treemap-body">
         <button
           className="treemap-export"
+          aria-label="Export the treemap as a PNG image"
           title="Export the treemap as a PNG image"
           onClick={handleExportPng}
           disabled={flatRects.length === 0}
@@ -719,6 +753,12 @@ export const Treemap = memo(function Treemap({
             className="treemap-overlay"
           />
           <TreemapTooltip ref={tooltipApiRef} unit={unit} />
+          {viewLoading && topItems.length > 0 && (
+            <div className="treemap-refreshing" role="status">
+              <span className="wtab-spinner" />
+              Loading {viewNode?.name || "folder"}…
+            </div>
+          )}
           {topItems.length === 0 && (
             <div className="treemap-empty" role="status">
               <Icon name={viewLoading ? "clock-history" : "treemap"} size={22} />
