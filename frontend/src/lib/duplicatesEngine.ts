@@ -52,6 +52,11 @@ export function isUnder(child: string, parent: string): boolean {
   return c === p || c.startsWith(p + "/");
 }
 
+/** True when a file belongs to one of the user-designated protected locations. */
+export function isProtectedPath(path: string, protectedPaths: string[]): boolean {
+  return protectedPaths.some((root) => root.trim() !== "" && isUnder(path, root));
+}
+
 /**
  * Pick, for a target folder/drive, the best already-available scan result:
  * an exact root match, else the closest ancestor (longest rootPath). Returns
@@ -354,6 +359,76 @@ export function rebuildWithReference(
   const waste = kept.slice(1).reduce((s, f) => s + f.size, 0);
   const score = kept.length > 1 ? Math.min(...kept.slice(1).map((f) => f.score ?? 0)) : 100;
   return { files: kept, waste, score };
+}
+
+/**
+ * Apply folder-level protection to already-built groups. A protected member
+ * always becomes the keeper, while every protected member is excluded from the
+ * reclaimable-byte total. When protection is removed, the configured keeper
+ * rule is applied again so an old protected keeper does not stay sticky.
+ */
+export function applyProtectedLocations(
+  groups: DupeGroupV2[],
+  protectedPaths: string[],
+  criteria: DupeCriteria,
+  repri: ReprioritizeCriterion,
+  contentVerified: boolean,
+): DupeGroupV2[] {
+  return groups.map((group) => {
+    const candidates = group.files.map(dupeFileToCandidate);
+    const protectedMembers = candidates
+      .filter((file) => isProtectedPath(file.path, protectedPaths))
+      .sort((a, b) => normalizePath(a.path).localeCompare(normalizePath(b.path)));
+    const currentKeeper = group.files.find((file) => file.ref);
+    const currentKeeperIsProtected = currentKeeper
+      ? protectedMembers.some((file) => normalizePath(file.path) === normalizePath(currentKeeper.path))
+      : false;
+    const lostProtectedKeeper = protectedMembers.length === 0
+      && group.files.some((file) => file.ref && file.protected);
+    const keeper = protectedMembers.length > 0
+      ? currentKeeperIsProtected
+        ? candidates.find((file) => normalizePath(file.path) === normalizePath(currentKeeper!.path))
+        : protectedMembers[0]
+      : lostProtectedKeeper
+        ? candidates[referenceIndex(candidates, repri)]
+        : currentKeeper
+          ? candidates.find((file) => normalizePath(file.path) === normalizePath(currentKeeper.path))
+          : candidates[referenceIndex(candidates, repri)];
+    const rebuilt = keeper
+      ? rebuildWithReference(group, keeper.path, criteria, contentVerified)
+      : group;
+    return annotateProtectedLocations([rebuilt], protectedPaths)[0];
+  });
+}
+
+/**
+ * Add protection metadata without changing the current keeper. This is used
+ * after an explicit "Keep this copy" choice so a user decision is not replaced
+ * by the automatic keeper rule.
+ */
+export function annotateProtectedLocations(
+  groups: DupeGroupV2[],
+  protectedPaths: string[],
+): DupeGroupV2[] {
+  return groups.map((group) => {
+    const files = group.files.map((file) => ({
+      ...file,
+      protected: isProtectedPath(file.path, protectedPaths),
+    }));
+    const waste = files
+      .filter((file) => !file.ref && !file.protected)
+      .reduce((sum, file) => sum + file.size, 0);
+    return { ...group, files, waste };
+  });
+}
+
+/** Paths that can safely be selected for a file action. */
+export function actionableDuplicatePaths(groups: DupeGroupV2[]): string[] {
+  return groups.flatMap((group) =>
+    group.files
+      .filter((file) => !file.ref && !file.protected)
+      .map((file) => file.path),
+  );
 }
 
 /** Sort groups by wasted bytes descending (most impactful first). */

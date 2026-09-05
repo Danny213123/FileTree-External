@@ -52,16 +52,19 @@ pub(crate) struct DupeGroupV2 {
 //
 // Replaces the old byte-serial FNV-1a with a multiply-rotate hash that consumes
 // 8 bytes per step (~8× fewer multiplies), so full-file hashing of large dupe
-// candidates is markedly faster. Not cryptographic — exact mode still does a
-// byte-wise confirm — but the 64-bit space makes accidental collisions
-// astronomically rare, matching the previous behavior.
+// candidates is markedly faster. It is not cryptographic: callers can request
+// a byte-wise discovery confirmation, and every destructive desktop action
+// always performs one immediately before changing a file.
 //
 // Determinism note: `FastHasher` carries leftover (<8) bytes between `write`
 // calls so the 8-byte word boundaries are fixed to absolute byte offsets,
 // independent of how `File::read` chops the stream. Identical content therefore
 // always yields the same hash regardless of read chunking.
 
-const SAMPLE_BYTES: usize = 256 * 1024;
+const SAMPLE_BYTES: usize = 64 * 1024;
+const SAMPLE_REGIONS: u64 = 3;
+const FULL_SAMPLE_LIMIT: u64 = (SAMPLE_BYTES as u64) * SAMPLE_REGIONS;
+const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Multiplier from the FxHash/SeaHash family (a large odd constant with good
 /// avalanche behavior).
@@ -130,12 +133,28 @@ impl FastHasher {
     }
 }
 
-pub(crate) fn content_hash_file(path: &Path) -> io::Result<u64> {
-    let mut file = File::open(path)?;
-    let mut buffer = [0u8; 1024 * 1024];
+#[cfg(windows)]
+fn open_sequential(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // Hint Windows' cache manager to use aggressive read-ahead and discard old
+    // pages promptly. Duplicate hashing is a one-way sequential workload.
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0800_0000) // FILE_FLAG_SEQUENTIAL_SCAN
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_sequential(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+fn content_hash_file_with_buffer(path: &Path, buffer: &mut [u8]) -> io::Result<u64> {
+    let mut file = open_sequential(path)?;
     let mut hasher = FastHasher::new(0);
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = file.read(buffer)?;
         if read == 0 {
             break;
         }
@@ -144,14 +163,23 @@ pub(crate) fn content_hash_file(path: &Path) -> io::Result<u64> {
     Ok(hasher.finish())
 }
 
-fn content_hash_file_sample(path: &Path, size: u64) -> io::Result<u64> {
-    let mut file = File::open(path)?;
-    let mut buffer = [0u8; SAMPLE_BYTES];
-    let mut hasher = FastHasher::new(size);
+pub(crate) fn content_hash_file(path: &Path) -> io::Result<u64> {
+    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
+    content_hash_file_with_buffer(path, &mut buffer)
+}
 
-    if size <= (SAMPLE_BYTES as u64).saturating_mul(2) {
+fn content_hash_file_sample_with_buffer(
+    path: &Path,
+    size: u64,
+    buffer: &mut [u8],
+) -> io::Result<u64> {
+    let mut file = File::open(path)?;
+    let buffer = &mut buffer[..SAMPLE_BYTES];
+    let mut hasher = FastHasher::new(0);
+
+    if size <= FULL_SAMPLE_LIMIT {
         loop {
-            let read = file.read(&mut buffer)?;
+            let read = file.read(buffer)?;
             if read == 0 {
                 break;
             }
@@ -160,11 +188,18 @@ fn content_hash_file_sample(path: &Path, size: u64) -> io::Result<u64> {
         return Ok(hasher.finish());
     }
 
-    let read = file.read(&mut buffer)?;
+    let read = read_full(&mut file, buffer)?;
+    hasher.write(&buffer[..read]);
+
+    let middle = size
+        .saturating_div(2)
+        .saturating_sub((SAMPLE_BYTES as u64) / 2);
+    file.seek(SeekFrom::Start(middle))?;
+    let read = read_full(&mut file, buffer)?;
     hasher.write(&buffer[..read]);
 
     file.seek(SeekFrom::End(-(SAMPLE_BYTES as i64)))?;
-    let read = file.read(&mut buffer)?;
+    let read = read_full(&mut file, buffer)?;
     hasher.write(&buffer[..read]);
 
     Ok(hasher.finish())
@@ -176,7 +211,7 @@ fn content_hash_file_sample(path: &Path, size: u64) -> io::Result<u64> {
 // client (from already-scanned tabs + caches) and posts only the size-collision
 // candidates here, so this engine NEVER walks the filesystem. It groups by size,
 // uses a persistent `(path,size,mtime)->hash` cache, hashes uncached candidates
-// in parallel (sample fingerprint first to skip lone files, then a full FNV
+// in parallel (sample fingerprint first to skip lone files, then a full fast
 // hash), and optionally does a byte-wise confirm so confirmed groups are truly
 // identical (eliminates the astronomically rare 64-bit hash collision).
 
@@ -206,10 +241,10 @@ fn read_full(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
 /// True when `a` and `b` are byte-for-byte identical. Assumes equal size is the
 /// caller's expectation but re-checks it defensively.
 fn files_identical(a: &Path, b: &Path) -> io::Result<bool> {
-    let mut fa = File::open(a)?;
-    let mut fb = File::open(b)?;
-    let mut ba = vec![0u8; 64 * 1024];
-    let mut bb = vec![0u8; 64 * 1024];
+    let mut fa = open_sequential(a)?;
+    let mut fb = open_sequential(b)?;
+    let mut ba = vec![0u8; HASH_BUFFER_BYTES];
+    let mut bb = vec![0u8; HASH_BUFFER_BYTES];
     loop {
         let na = read_full(&mut fa, &mut ba)?;
         let nb = read_full(&mut fb, &mut bb)?;
@@ -223,6 +258,60 @@ fn files_identical(a: &Path, b: &Path) -> io::Result<bool> {
             return Ok(false);
         }
     }
+}
+
+fn is_reparse_metadata(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(windows)]
+fn lock_keeper_for_action(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn lock_keeper_for_action(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+pub(crate) fn verified_duplicate_pair(original: &Path, duplicate: &Path) -> Result<bool, String> {
+    let original_meta = fs::symlink_metadata(original)
+        .map_err(|error| format!("{}: {error}", original.display()))?;
+    let duplicate_meta = fs::symlink_metadata(duplicate)
+        .map_err(|error| format!("{}: {error}", duplicate.display()))?;
+    if !original_meta.is_file()
+        || !duplicate_meta.is_file()
+        || is_reparse_metadata(&original_meta)
+        || is_reparse_metadata(&duplicate_meta)
+    {
+        return Err(format!(
+            "{}: duplicate actions require regular non-link files",
+            duplicate.display()
+        ));
+    }
+    if original_meta.len() != duplicate_meta.len() {
+        return Ok(false);
+    }
+    files_identical(original, duplicate).map_err(|error| {
+        format!(
+            "{}: could not revalidate file: {error}",
+            duplicate.display()
+        )
+    })
 }
 
 /// Partition a set of same-size, same-hash candidate indices into byte-identical
@@ -257,12 +346,19 @@ fn byte_confirm_partition(
     classes
 }
 
-/// Run `work` items across up to `threads` worker threads, calling `f(index)`
-/// for each item index. Cooperative cancellation via `cancel`. Uses scoped
-/// threads so `f` can borrow surrounding state without `Arc`.
-fn parallel_for<F>(count: usize, threads: usize, cancel: Option<&Arc<AtomicBool>>, f: F)
-where
-    F: Fn(usize) + Sync,
+/// Run `work` items across up to `threads` workers. `init` creates reusable
+/// worker-local state (notably read buffers), avoiding a large allocation and
+/// zero-fill for every file. Scoped threads let the callbacks borrow inputs.
+fn parallel_for_with_state<S, I, F>(
+    count: usize,
+    threads: usize,
+    cancel: Option<&Arc<AtomicBool>>,
+    init: I,
+    f: F,
+) where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(usize, &mut S) + Sync,
 {
     if count == 0 {
         return;
@@ -272,6 +368,7 @@ where
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
+                let mut state = init();
                 loop {
                     if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
                         break;
@@ -280,7 +377,7 @@ where
                     if i >= count {
                         break;
                     }
-                    f(i);
+                    f(i, &mut state);
                 }
             });
         }
@@ -288,8 +385,8 @@ where
 }
 
 /// The single parallel duplicate-detection pipeline shared by every endpoint:
-/// size-grouping -> head/tail sample fingerprint -> full FNV hash only for the
-/// sample-colliding groups, reusing the persistent `(path,size,mtime)->hash`
+/// size-grouping -> head/middle/tail sample fingerprint -> full fast hash only
+/// for sample-colliding groups, reusing the persistent `(path,size,mtime)->hash`
 /// cache. Returns one `(full_hash, indices_into_files)` entry per duplicate
 /// group plus any per-file errors. When `cache_path` is set, newly-computed
 /// hashes are appended to the on-disk cache incrementally (survives restarts).
@@ -343,20 +440,26 @@ pub(crate) fn hash_candidate_groups(
     // join supplies the happens-before edge and Relaxed ordering is sufficient.
     let sample_fp: Vec<AtomicU64> = (0..files.len()).map(|_| AtomicU64::new(0)).collect();
     let sample_done: Vec<AtomicBool> = (0..files.len()).map(|_| AtomicBool::new(false)).collect();
-    parallel_for(uncached.len(), threads, cancel, |k| {
-        let i = uncached[k];
-        match content_hash_file_sample(&files[i].path, files[i].size) {
-            Ok(fp) => {
-                sample_fp[i].store(fp, Ordering::Relaxed);
-                sample_done[i].store(true, Ordering::Relaxed);
+    parallel_for_with_state(
+        uncached.len(),
+        threads,
+        cancel,
+        || vec![0u8; SAMPLE_BYTES],
+        |k, buffer| {
+            let i = uncached[k];
+            match content_hash_file_sample_with_buffer(&files[i].path, files[i].size, buffer) {
+                Ok(fp) => {
+                    sample_fp[i].store(fp, Ordering::Relaxed);
+                    sample_done[i].store(true, Ordering::Relaxed);
+                }
+                Err(e) => errors.lock().expect("hash errors lock").push(format!(
+                    "{}: {}",
+                    files[i].path.display(),
+                    e
+                )),
             }
-            Err(e) => errors.lock().expect("hash errors lock").push(format!(
-                "{}: {}",
-                files[i].path.display(),
-                e
-            )),
-        }
-    });
+        },
+    );
     if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
         return (Vec::new(), Vec::new());
     }
@@ -365,6 +468,7 @@ pub(crate) fn hash_candidate_groups(
     //    that shares a sample fingerprint with another uncached file in its
     //    bucket, OR sits in a bucket that already has cached (full-hash) files.
     let mut need_full: Vec<usize> = Vec::new();
+    let mut sampled_full: Vec<(usize, u64)> = Vec::new();
     for bucket in &buckets {
         let cached_present = bucket.iter().any(|&i| full_hash[i].is_some());
         let mut by_sample: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -377,9 +481,19 @@ pub(crate) fn hash_candidate_groups(
                 by_sample.entry(fp).or_default().push(i);
             }
         }
-        for (_, members) in by_sample {
+        for (sample, members) in by_sample {
             if members.len() > 1 || cached_present {
-                need_full.extend(members);
+                // For small files the sample pass consumed every byte with the
+                // same hasher seed as a normal full pass. Reuse that result
+                // instead of immediately reading the whole file a second time.
+                if files[members[0]].size <= FULL_SAMPLE_LIMIT {
+                    for i in members {
+                        full_hash[i] = Some(sample);
+                        sampled_full.push((i, sample));
+                    }
+                } else {
+                    need_full.extend(members);
+                }
             }
         }
     }
@@ -392,25 +506,32 @@ pub(crate) fn hash_candidate_groups(
 
     // 5. Full-hash phase (parallel). Collect (index, hash) then merge.
     let computed: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
-    parallel_for(need_full.len(), threads, cancel, |k| {
-        let i = need_full[k];
-        match content_hash_file(&files[i].path) {
-            Ok(h) => computed.lock().expect("computed lock").push((i, h)),
-            Err(e) => errors.lock().expect("hash errors lock").push(format!(
-                "{}: {}",
-                files[i].path.display(),
-                e
-            )),
-        }
-        if let Some(p) = progress {
-            p.files_hashed.fetch_add(1, Ordering::Relaxed);
-        }
-    });
+    parallel_for_with_state(
+        need_full.len(),
+        threads,
+        cancel,
+        || vec![0u8; HASH_BUFFER_BYTES],
+        |k, buffer| {
+            let i = need_full[k];
+            match content_hash_file_with_buffer(&files[i].path, buffer) {
+                Ok(h) => computed.lock().expect("computed lock").push((i, h)),
+                Err(e) => errors.lock().expect("hash errors lock").push(format!(
+                    "{}: {}",
+                    files[i].path.display(),
+                    e
+                )),
+            }
+            if let Some(p) = progress {
+                p.files_hashed.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+    );
     if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
         return (Vec::new(), Vec::new());
     }
 
-    let computed = computed.into_inner().expect("computed lock");
+    let mut computed = computed.into_inner().expect("computed lock");
+    computed.extend(sampled_full);
     if !computed.is_empty() {
         let mut new_entries: Vec<(PathBuf, HashCacheEntry)> = Vec::with_capacity(computed.len());
         // Update the in-memory cache (insert + bounded eviction) under the lock,
@@ -1272,6 +1393,172 @@ pub(crate) fn action_delete(paths: &[PathBuf], permanent: bool) -> Vec<String> {
     errors
 }
 
+static DUPLICATE_ACTION_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn duplicate_stage_path(path: &Path, operation: &str) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{}: path has no parent folder", path.display()))?;
+    for _ in 0..32 {
+        let sequence = DUPLICATE_ACTION_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".filetree-{operation}-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "{}: could not allocate a temporary action path",
+        path.display()
+    ))
+}
+
+fn rollback_staged_file(staged: &Path, original: &Path, error: String) -> String {
+    match fs::rename(staged, original) {
+        Ok(()) => error,
+        Err(rollback_error) => format!("{error}; rollback also failed: {rollback_error}"),
+    }
+}
+
+fn stage_verified_duplicate(
+    keeper: &Path,
+    duplicate: &Path,
+    operation: &str,
+) -> Result<(PathBuf, File), String> {
+    let keeper_lock = lock_keeper_for_action(keeper)
+        .map_err(|error| format!("{}: could not lock keeper: {error}", keeper.display()))?;
+    match verified_duplicate_pair(keeper, duplicate)? {
+        true => {}
+        false => {
+            return Err(format!(
+                "{}: file changed since the duplicate scan",
+                duplicate.display()
+            ));
+        }
+    }
+    let staged = duplicate_stage_path(duplicate, operation)?;
+    fs::rename(duplicate, &staged)
+        .map_err(|error| format!("{}: could not stage file: {error}", duplicate.display()))?;
+    match verified_duplicate_pair(keeper, &staged) {
+        Ok(true) => Ok((staged, keeper_lock)),
+        Ok(false) => Err(rollback_staged_file(
+            &staged,
+            duplicate,
+            format!(
+                "{}: staged file no longer matches its keeper",
+                duplicate.display()
+            ),
+        )),
+        Err(error) => Err(rollback_staged_file(&staged, duplicate, error)),
+    }
+}
+
+pub(crate) fn action_delete_verified(
+    keeper: &Path,
+    duplicate: &Path,
+    permanent: bool,
+) -> Vec<String> {
+    if !permanent {
+        let _keeper_lock = match lock_keeper_for_action(keeper) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return vec![format!(
+                    "{}: could not lock keeper: {error}",
+                    keeper.display()
+                )];
+            }
+        };
+        return match verified_duplicate_pair(keeper, duplicate) {
+            Ok(true) => action_delete(&[duplicate.to_path_buf()], false),
+            Ok(false) => vec![format!(
+                "{}: file changed since the duplicate scan",
+                duplicate.display()
+            )],
+            Err(error) => vec![error],
+        };
+    }
+
+    let (staged, _keeper_lock) = match stage_verified_duplicate(keeper, duplicate, "delete") {
+        Ok(value) => value,
+        Err(error) => return vec![error],
+    };
+    let result = crate::recycle::delete_path_permanent(&staged);
+    let error = result
+        .as_ref()
+        .err()
+        .map(|value| crate::preflight::describe_fs_error(value, duplicate));
+    let duplicate_text = duplicate.to_string_lossy().into_owned();
+    crate::audit::record(crate::audit::Entry {
+        op: "permanent-delete",
+        disposition: "permanent",
+        src: std::slice::from_ref(&duplicate_text),
+        error: error.as_deref(),
+        by: "server",
+        ..Default::default()
+    });
+    match error {
+        None => Vec::new(),
+        Some(error) => vec![rollback_staged_file(&staged, duplicate, error)],
+    }
+}
+
+pub(crate) fn action_transfer_verified(
+    action: &str,
+    keeper: &Path,
+    duplicate: &Path,
+    destination: &Path,
+) -> Vec<String> {
+    if action == "copy" {
+        let _keeper_lock = match lock_keeper_for_action(keeper) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return vec![format!(
+                    "{}: could not lock keeper: {error}",
+                    keeper.display()
+                )];
+            }
+        };
+        return match verified_duplicate_pair(keeper, duplicate) {
+            Ok(true) => {
+                let Some(name) = duplicate.file_name() else {
+                    return vec![format!("{}: source has no file name", duplicate.display())];
+                };
+                action_copy(&[(duplicate.to_path_buf(), destination.join(name))])
+            }
+            Ok(false) => vec![format!(
+                "{}: file changed since the duplicate scan",
+                duplicate.display()
+            )],
+            Err(error) => vec![error],
+        };
+    }
+    if action != "move" {
+        return vec!["Unknown duplicate transfer action".to_string()];
+    }
+    let (staged, _keeper_lock) = match stage_verified_duplicate(keeper, duplicate, "move") {
+        Ok(value) => value,
+        Err(error) => return vec![error],
+    };
+    let Some(name) = duplicate.file_name() else {
+        return vec![rollback_staged_file(
+            &staged,
+            duplicate,
+            format!("{}: source has no file name", duplicate.display()),
+        )];
+    };
+    let errors = action_move(&[(staged.clone(), destination.join(name))]);
+    if errors.is_empty() {
+        return errors;
+    }
+    if staged.exists() {
+        vec![rollback_staged_file(&staged, duplicate, errors.join("; "))]
+    } else {
+        errors
+    }
+}
+
 /// Canonicalized "same on-disk object?" check. Guards against copying a file
 /// onto itself (which `fs::copy` would truncate to zero bytes — silent data
 /// loss) and against treating a same-file move as a collision.
@@ -1324,6 +1611,54 @@ fn unique_dst(dst: &Path) -> PathBuf {
     }
 }
 
+#[cfg(windows)]
+fn copy_file_exclusive(src: &Path, dst: &Path) -> io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::CopyFileW;
+    use windows::core::PCWSTR;
+
+    let source = src
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = dst
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    unsafe { CopyFileW(PCWSTR(source.as_ptr()), PCWSTR(destination.as_ptr()), true) }
+        .map_err(|error| io::Error::from_raw_os_error(error.code().0 & 0xffff))?;
+    Ok(fs::metadata(dst)?.len())
+}
+
+#[cfg(not(windows))]
+fn copy_file_exclusive(src: &Path, dst: &Path) -> io::Result<u64> {
+    let mut source = File::open(src)?;
+    let mut destination = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    let copied = match io::copy(&mut source, &mut destination) {
+        Ok(copied) => copied,
+        Err(error) => {
+            drop(destination);
+            let _ = fs::remove_file(dst);
+            return Err(error);
+        }
+    };
+    if let Err(error) = destination.flush() {
+        drop(destination);
+        let _ = fs::remove_file(dst);
+        return Err(error);
+    }
+    if let Ok(metadata) = fs::metadata(src)
+        && let Err(error) = fs::set_permissions(dst, metadata.permissions())
+    {
+        drop(destination);
+        let _ = fs::remove_file(dst);
+        return Err(error);
+    }
+    Ok(copied)
+}
+
 /// Move each `src` to `dst`. Adds no-op / self-descendant guards and keep-both
 /// collision handling (an existing target is never silently clobbered), then
 /// tries an atomic rename, falling back to copy + remove for a cross-device move.
@@ -1362,14 +1697,25 @@ pub(crate) fn action_move(src_dst: &[(PathBuf, PathBuf)]) -> Vec<String> {
         // might not be able to finish (Phase 3).
         let result: io::Result<()> = match fs::rename(src, &target) {
             Ok(_) => Ok(()),
-            Err(_) => {
+            Err(error) if matches!(error.raw_os_error(), Some(17 | 18)) => {
                 let dest_dir = target.parent().unwrap_or_else(|| target.as_path());
                 if let Err(message) = crate::preflight::ensure_space_for_copy(src, dest_dir) {
                     Err(io::Error::new(io::ErrorKind::Other, message))
                 } else {
-                    fs::copy(src, &target).and_then(|_| fs::remove_file(src))
+                    copy_file_exclusive(src, &target).and_then(|_| {
+                        if let Err(remove_error) = fs::remove_file(src) {
+                            if let Err(cleanup_error) = fs::remove_file(&target) {
+                                return Err(io::Error::other(format!(
+                                    "{remove_error}; copied destination cleanup also failed: {cleanup_error}"
+                                )));
+                            }
+                            return Err(remove_error);
+                        }
+                        Ok(())
+                    })
                 }
             }
+            Err(error) => Err(error),
         };
         // Audit the move (Phase 5): exact src -> dst supports a future undo.
         let src_str = src.to_string_lossy().to_string();
@@ -1439,7 +1785,7 @@ pub(crate) fn action_copy(src_dst: &[(PathBuf, PathBuf)]) -> Vec<String> {
         let dest_dir = target.parent().unwrap_or_else(|| target.as_path());
         let result: io::Result<()> = match crate::preflight::ensure_space_for_copy(src, dest_dir) {
             Err(message) => Err(io::Error::new(io::ErrorKind::Other, message)),
-            Ok(()) => fs::copy(src, &target).map(|_| ()),
+            Ok(()) => copy_file_exclusive(src, &target).map(|_| ()),
         };
         // Audit the copy (Phase 5).
         let src_str = src.to_string_lossy().to_string();
@@ -1464,6 +1810,186 @@ pub(crate) fn action_copy(src_dst: &[(PathBuf, PathBuf)]) -> Vec<String> {
                 });
                 errors.push(message);
             }
+        }
+    }
+    errors
+}
+
+static LINK_BACKUP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn create_duplicate_link(original: &Path, link: &Path, symbolic: bool) -> io::Result<()> {
+    if !symbolic {
+        return fs::hard_link(original, link);
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(original, link)
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(original, link)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (original, link);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Symbolic links are not supported on this platform",
+        ))
+    }
+}
+
+/// Replace duplicate files with hard/symbolic links to their kept originals.
+/// The duplicate is renamed out of the way first; link creation is rolled back
+/// on failure, and the backup is recycled only after the replacement exists.
+pub(crate) fn action_link(pairs: &[(PathBuf, PathBuf)], symbolic: bool) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (original, link) in pairs {
+        let _keeper_lock = match lock_keeper_for_action(original) {
+            Ok(lock) => lock,
+            Err(error) => {
+                errors.push(format!(
+                    "{}: could not lock keeper: {error}",
+                    original.display()
+                ));
+                continue;
+            }
+        };
+        if same_file(original, link) {
+            continue;
+        }
+        match verified_duplicate_pair(original, link) {
+            Ok(true) => {}
+            Ok(false) => {
+                errors.push(format!(
+                    "{}: file changed since the duplicate scan; link replacement was skipped",
+                    link.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        }
+
+        let Some(parent) = link.parent() else {
+            errors.push(format!(
+                "{}: duplicate has no parent folder",
+                link.display()
+            ));
+            continue;
+        };
+        let sequence = LINK_BACKUP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let backup = parent.join(format!(
+            ".filetree-link-{}-{sequence}.bak",
+            std::process::id()
+        ));
+        let temporary_link = parent.join(format!(
+            ".filetree-link-{}-{sequence}.pending",
+            std::process::id()
+        ));
+
+        if let Err(error) = fs::rename(link, &backup) {
+            errors.push(format!(
+                "{}: could not stage duplicate: {error}",
+                link.display()
+            ));
+            continue;
+        }
+
+        match verified_duplicate_pair(original, &backup) {
+            Ok(true) => {}
+            Ok(false) => {
+                let rollback = fs::rename(&backup, link);
+                let suffix = rollback
+                    .err()
+                    .map(|error| format!("; rollback also failed: {error}"))
+                    .unwrap_or_default();
+                errors.push(format!(
+                    "{}: staged file changed during validation{suffix}",
+                    link.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                let rollback = fs::rename(&backup, link);
+                let suffix = rollback
+                    .err()
+                    .map(|rollback_error| format!("; rollback also failed: {rollback_error}"))
+                    .unwrap_or_default();
+                errors.push(format!("{error}{suffix}"));
+                continue;
+            }
+        }
+
+        if let Err(error) = create_duplicate_link(original, &temporary_link, symbolic) {
+            let rollback = fs::rename(&backup, link);
+            let suffix = rollback
+                .err()
+                .map(|rollback_error| format!("; rollback also failed: {rollback_error}"))
+                .unwrap_or_default();
+            errors.push(format!(
+                "{}: could not create replacement link: {error}{suffix}",
+                link.display()
+            ));
+            continue;
+        }
+
+        match files_identical(&backup, &temporary_link) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = fs::remove_file(&temporary_link);
+                let rollback = fs::rename(&backup, link);
+                let suffix = rollback
+                    .err()
+                    .map(|error| format!("; rollback also failed: {error}"))
+                    .unwrap_or_default();
+                errors.push(format!(
+                    "{}: keeper changed while the replacement link was created{suffix}",
+                    link.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary_link);
+                let rollback = fs::rename(&backup, link);
+                let suffix = rollback
+                    .err()
+                    .map(|rollback_error| format!("; rollback also failed: {rollback_error}"))
+                    .unwrap_or_default();
+                errors.push(format!(
+                    "{}: could not verify replacement link: {error}{suffix}",
+                    link.display()
+                ));
+                continue;
+            }
+        }
+
+        if let Err(error) = fs::rename(&temporary_link, link) {
+            let _ = fs::remove_file(&temporary_link);
+            let rollback = fs::rename(&backup, link);
+            let suffix = rollback
+                .err()
+                .map(|rollback_error| format!("; rollback also failed: {rollback_error}"))
+                .unwrap_or_default();
+            errors.push(format!(
+                "{}: could not install replacement link: {error}{suffix}",
+                link.display()
+            ));
+            continue;
+        }
+
+        if let Err(error) = crate::recycle::recycle_path(&backup) {
+            let rollback = fs::remove_file(link).and_then(|_| fs::rename(&backup, link));
+            let suffix = rollback
+                .err()
+                .map(|rollback_error| format!("; rollback also failed: {rollback_error}"))
+                .unwrap_or_default();
+            errors.push(format!(
+                "{}: staged duplicate could not be recycled ({error}){suffix}",
+                link.display(),
+            ));
         }
     }
     errors
@@ -1704,4 +2230,117 @@ pub(crate) fn write_groups_to_json<W: Write>(
     out.push('}');
     w.write_all(out.as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HashInput, action_delete_verified, action_transfer_verified, content_hash_file,
+        copy_file_exclusive, hash_candidate_groups, verified_duplicate_pair,
+    };
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::Mutex;
+
+    fn test_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "filetree_dupes_{name}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn verified_actions_stage_destructive_changes() {
+        let root = test_root("verified_actions");
+        let destination = root.join("destination");
+        fs::create_dir_all(&destination).expect("create destination");
+        let keeper = root.join("keeper.bin");
+        let moved = root.join("moved-copy.bin");
+        let deleted = root.join("deleted-copy.bin");
+        fs::write(&keeper, b"verified duplicate").expect("write keeper");
+        fs::write(&moved, b"verified duplicate").expect("write moved copy");
+        fs::write(&deleted, b"verified duplicate").expect("write deleted copy");
+
+        assert_eq!(verified_duplicate_pair(&keeper, &moved), Ok(true));
+        assert!(action_transfer_verified("move", &keeper, &moved, &destination).is_empty());
+        assert!(!moved.exists());
+        assert_eq!(
+            fs::read(destination.join("moved-copy.bin")).expect("read moved copy"),
+            b"verified duplicate"
+        );
+
+        assert!(action_delete_verified(&keeper, &deleted, true).is_empty());
+        assert!(!deleted.exists());
+        assert_eq!(
+            fs::read(&keeper).expect("read keeper"),
+            b"verified duplicate"
+        );
+        fs::remove_dir_all(root).expect("remove verified action test root");
+    }
+
+    #[test]
+    fn exclusive_copy_never_overwrites_an_existing_file() {
+        let root = test_root("exclusive_copy");
+        fs::create_dir_all(&root).expect("create copy test root");
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        fs::write(&source, b"new").expect("write source");
+        fs::write(&destination, b"existing").expect("write destination");
+
+        assert!(copy_file_exclusive(&source, &destination).is_err());
+        assert_eq!(
+            fs::read(&destination).expect("read destination"),
+            b"existing"
+        );
+        fs::remove_dir_all(root).expect("remove copy test root");
+    }
+
+    #[test]
+    fn small_file_samples_become_reusable_full_hashes() {
+        let root = test_root("small_hash_cache");
+        fs::create_dir_all(&root).expect("create hash cache test root");
+        let first = root.join("first.bin");
+        let second = root.join("second.bin");
+        let content = vec![0x5au8; 96 * 1024];
+        fs::write(&first, &content).expect("write first candidate");
+        fs::write(&second, &content).expect("write second candidate");
+        let files = vec![
+            HashInput {
+                path: first.clone(),
+                size: content.len() as u64,
+                mtime: 1,
+            },
+            HashInput {
+                path: second.clone(),
+                size: content.len() as u64,
+                mtime: 1,
+            },
+        ];
+        let cache = Mutex::new(HashMap::new());
+
+        let (groups, errors) = hash_candidate_groups(&files, false, &cache, None, None, None, 2);
+        assert!(errors.is_empty());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 2);
+        let expected = content_hash_file(&first).expect("hash first candidate");
+        let cached = cache.lock().expect("hash cache lock");
+        assert_eq!(cached.len(), 2);
+        assert!(cached.values().all(|entry| entry.hash == expected));
+        drop(cached);
+
+        // A repeat discovery pass should be served entirely by the cache. File
+        // actions perform their own byte comparison, so discovery does not need
+        // to reopen unchanged cached files.
+        fs::remove_file(&first).expect("remove first candidate");
+        fs::remove_file(&second).expect("remove second candidate");
+        let (cached_groups, cached_errors) =
+            hash_candidate_groups(&files, false, &cache, None, None, None, 2);
+        assert!(cached_errors.is_empty());
+        assert_eq!(cached_groups.len(), 1);
+        fs::remove_dir_all(root).expect("remove hash cache test root");
+    }
 }

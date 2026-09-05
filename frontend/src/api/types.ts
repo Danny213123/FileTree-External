@@ -176,6 +176,8 @@ export interface DupeFileV2 {
   size: number;
   modified: number;   // seconds since epoch
   ref: boolean;
+  /** File lives under a protected scan location and cannot be selected for actions. */
+  protected?: boolean;
   /** Overall match % vs the reference (0-100). Reference is 100. */
   score?: number;
   /** Per-criterion breakdown vs the reference. */

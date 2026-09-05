@@ -92,6 +92,89 @@ pub fn reveal_system_path(path: &str) -> Result<(), String> {
     io::reveal_path(path).map_err(|error| error.to_string())
 }
 
+/// File actions used by the desktop duplicate-review workflow. Authorization
+/// and protected-location policy are enforced by the Tauri command boundary;
+/// these helpers keep the proven action implementations shared with legacy.
+pub fn delete_duplicate_paths(paths: Vec<String>, permanent: bool) -> Vec<String> {
+    let paths = paths
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>();
+    dupes::action_delete(&paths, permanent)
+}
+
+pub fn delete_verified_duplicate(
+    keeper: String,
+    duplicate: String,
+    permanent: bool,
+) -> Vec<String> {
+    dupes::action_delete_verified(
+        std::path::Path::new(&keeper),
+        std::path::Path::new(&duplicate),
+        permanent,
+    )
+}
+
+pub fn transfer_duplicate_paths(
+    action: &str,
+    paths: Vec<String>,
+    destination: String,
+) -> Vec<String> {
+    let destination = std::path::PathBuf::from(destination);
+    let mut errors = Vec::new();
+    let mut pairs = Vec::new();
+    for source in paths.into_iter().map(std::path::PathBuf::from) {
+        let Some(name) = source.file_name().map(|value| value.to_owned()) else {
+            errors.push(format!("{}: source has no file name", source.display()));
+            continue;
+        };
+        pairs.push((source, destination.join(name)));
+    }
+    errors.extend(match action {
+        "move" => dupes::action_move(&pairs),
+        "copy" => dupes::action_copy(&pairs),
+        _ => vec!["Unknown duplicate transfer action".to_string()],
+    });
+    errors
+}
+
+pub fn transfer_verified_duplicate(
+    action: &str,
+    keeper: String,
+    duplicate: String,
+    destination: String,
+) -> Vec<String> {
+    dupes::action_transfer_verified(
+        action,
+        std::path::Path::new(&keeper),
+        std::path::Path::new(&duplicate),
+        std::path::Path::new(&destination),
+    )
+}
+
+pub fn replace_duplicate_paths_with_links(
+    pairs: Vec<(String, String)>,
+    symbolic: bool,
+) -> Vec<String> {
+    let pairs = pairs
+        .into_iter()
+        .map(|(original, link)| {
+            (
+                std::path::PathBuf::from(original),
+                std::path::PathBuf::from(link),
+            )
+        })
+        .collect::<Vec<_>>();
+    dupes::action_link(&pairs, symbolic)
+}
+
+pub fn verified_duplicate_pair(original: &str, duplicate: &str) -> Result<bool, String> {
+    dupes::verified_duplicate_pair(
+        std::path::Path::new(original),
+        std::path::Path::new(duplicate),
+    )
+}
+
 /// Recent per-file compression outcomes for the desktop History view.
 pub fn compression_history_json(limit: usize) -> String {
     compress_log::read_rows_json(limit.min(10_000))

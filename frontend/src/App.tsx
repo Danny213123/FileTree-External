@@ -77,6 +77,7 @@ const TerminalPanel = lazy(() => import("./components/TerminalPanel").then((m) =
 const DuplicatesResults = lazy(() => import("./components/DuplicatesResults").then((m) => ({ default: m.DuplicatesResults })));
 
 const SETTINGS_DEBOUNCE_MS = 700;
+const CLOSE_FLUSH_TIMEOUT_MS = 1_500;
 
 // Views that take over the whole editor area (replacing the workspace tabs),
 // each rendered from its own dedicated editor block below.
@@ -597,7 +598,12 @@ export default function App() {
           if (closing) return;
           closing = true;
           try {
-            await flushSettingsRef.current();
+            // A close must not be held hostage by a blocked SQLite/IPC write.
+            // The synchronous session shadow has already captured the state.
+            await Promise.race([
+              flushSettingsRef.current().catch(() => {}),
+              new Promise<void>((resolve) => setTimeout(resolve, CLOSE_FLUSH_TIMEOUT_MS)),
+            ]);
           } catch {
             // The local shadow was written before the durable save attempt.
           } finally {

@@ -14,12 +14,14 @@ import {
   clipboardWriteFiles,
   copyItemsNative,
   compressLogPath,
+  dupeAction,
   fetchCompressLog,
   fetchFolderPreview,
   fetchServerSearch,
   fetchSubtreeFiles,
   moveItems,
   moveItemsNative,
+  hardlinkPairs,
   openCompressionLog,
   releaseExternalPaths,
   shellContextMenu,
@@ -85,6 +87,82 @@ describe("v2 bounded client queries", () => {
       kind: "history",
       reveal: true,
     });
+  });
+
+  it("routes protected duplicate actions and link replacements through Tauri", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce({ ok: true, errors: [], succeeded: ["C:\\Downloads\\copy.bin"] })
+      .mockResolvedValueOnce({ ok: true, errors: [], succeeded: ["C:\\Downloads\\copy.bin"] });
+
+    await expect(dupeAction(
+      "delete",
+      ["C:\\Downloads\\copy.bin"],
+      {
+        permanent: false,
+        protectedPaths: ["C:\\Library"],
+        reviewToken: "review-1",
+        items: [{
+          path: "C:\\Downloads\\copy.bin",
+          keeper: "C:\\Library\\master.bin",
+        }],
+      },
+    )).resolves.toEqual({
+      ok: true,
+      errors: [],
+      succeeded: ["C:\\Downloads\\copy.bin"],
+    });
+    await expect(hardlinkPairs(
+      [{ original: "C:\\Library\\master.bin", link: "C:\\Downloads\\copy.bin" }],
+      "hardlink",
+      ["C:\\Library"],
+      "review-1",
+    )).resolves.toEqual({
+      ok: true,
+      errors: [],
+      succeeded: ["C:\\Downloads\\copy.bin"],
+    });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "duplicates_action", {
+      reviewToken: "review-1",
+      action: "delete",
+      items: [{
+        path: "C:\\Downloads\\copy.bin",
+        keeper: "C:\\Library\\master.bin",
+      }],
+      permanent: false,
+      destination: null,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "duplicates_link", {
+      reviewToken: "review-1",
+      pairs: [{ original: "C:\\Library\\master.bin", link: "C:\\Downloads\\copy.bin" }],
+      mode: "hardlink",
+    });
+  });
+
+  it("preserves completed duplicate chunks when a later chunk is rejected", async () => {
+    const items = Array.from({ length: 1_001 }, (_, index) => ({
+      path: `C:\\Downloads\\copy-${index}.bin`,
+      keeper: "C:\\Library\\master.bin",
+    }));
+    vi.mocked(invoke)
+      .mockResolvedValueOnce({
+        ok: true,
+        errors: [],
+        succeeded: items.slice(0, 1_000).map((item) => item.path),
+      })
+      .mockRejectedValueOnce(new Error("review expired"));
+
+    const result = await dupeAction(
+      "delete",
+      items.map((item) => item.path),
+      { items, reviewToken: "review-1" },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.succeeded).toHaveLength(1_000);
+    expect(result.errors).toEqual(["review expired"]);
+    expect(result.requiresRescan).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 
   it("routes file moves through Tauri and preserves the verified result", async () => {

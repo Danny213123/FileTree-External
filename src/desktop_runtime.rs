@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,17 +281,34 @@ impl DesktopRuntime {
         Ok(result)
     }
 
-    pub fn cancel_compression(&self, id: &str) -> bool {
-        let Some(job) = self.live_job(id) else {
-            return false;
-        };
-        job.cancel.store(true, Ordering::SeqCst);
-        for child in job.children.lock_recover().values_mut() {
-            let _ = child.kill();
+    pub fn cancel_compression(&self, id: &str) -> Result<(), String> {
+        let job = self
+            .live_job(id)
+            .ok_or_else(|| "Compression job was not found".to_string())?;
+        compress_job::cancel_job(&job);
+        if compress_job::wait_until_finished(&job, Duration::from_secs(8)) {
+            Ok(())
+        } else {
+            Err("Compression is still stopping because an encoder did not exit cleanly".to_string())
         }
-        job.events_cv.notify_all();
-        job.queue_cv.notify_all();
-        true
+    }
+
+    /// Stop live encoder processes when the desktop shell exits. Queued jobs
+    /// have no runner and remain persisted for the next launch.
+    pub fn shutdown(&self) {
+        let jobs = self
+            .state
+            .jobs
+            .lock_recover()
+            .values()
+            .filter(|job| {
+                job.runner_started.load(Ordering::SeqCst) && !job.finished.load(Ordering::SeqCst)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for job in jobs {
+            compress_job::cancel_job(&job);
+        }
     }
 
     pub fn pause_compression(&self, id: &str) -> Result<String, String> {

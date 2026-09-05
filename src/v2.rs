@@ -41,8 +41,105 @@ pub const SQLITE_CACHE_KIB: i64 = 8 * 1024;
 pub const MANAGED_MEMORY_BUDGET_BYTES: u64 = 96 * 1024 * 1024;
 pub const SETTINGS_JSON_MAX_BYTES: usize = 1024 * 1024;
 pub const BOOKMARKS_JSON_MAX_BYTES: usize = 2 * 1024 * 1024;
+const DUPLICATE_HASH_BATCH_FILE_TARGET: u64 = 4_096;
+const DUPLICATE_HASH_BATCH_SIZE_LIMIT: usize = 500;
 
 static NEXT_SCAN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Coalesce many small equal-size groups into one hashing pass. The hash engine
+/// creates scoped workers per pass, so processing one two-file size bucket at a
+/// time can spend more time creating threads and opening SQLite transactions
+/// than reading data. Batches stay bounded by both candidate count and SQLite's
+/// conservative host-parameter limit; a single unusually large size group is
+/// kept intact because equal-size members must be compared together.
+fn duplicate_hash_batches(size_groups: &[(i64, u64)]) -> Vec<Vec<i64>> {
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut batch_files = 0u64;
+
+    for &(size, files) in size_groups {
+        if !batch.is_empty()
+            && (batch_files.saturating_add(files) > DUPLICATE_HASH_BATCH_FILE_TARGET
+                || batch.len() >= DUPLICATE_HASH_BATCH_SIZE_LIMIT)
+        {
+            batches.push(std::mem::take(&mut batch));
+            batch_files = 0;
+        }
+        batch.push(size);
+        batch_files = batch_files.saturating_add(files);
+        if batch_files >= DUPLICATE_HASH_BATCH_FILE_TARGET {
+            batches.push(std::mem::take(&mut batch));
+            batch_files = 0;
+        }
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
+/// Load persistent hashes in bounded `IN` queries instead of issuing one
+/// SQLite statement per file. The candidates table already deduplicates paths
+/// case-insensitively, so an ASCII-folded key mirrors SQLite's `NOCASE`
+/// collation while preserving the current input path in the in-memory cache.
+fn load_duplicate_hash_cache(
+    state: &Connection,
+    inputs: &[HashInput],
+) -> Result<HashMap<PathBuf, HashCacheEntry>, String> {
+    const CACHE_QUERY_PATHS: usize = 400;
+    let mut cached = HashMap::new();
+
+    for chunk in inputs.chunks(CACHE_QUERY_PATHS) {
+        let paths = chunk
+            .iter()
+            .map(|input| input.path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let inputs_by_path = chunk
+            .iter()
+            .map(|input| (input.path.to_string_lossy().to_ascii_lowercase(), input))
+            .collect::<HashMap<_, _>>();
+        let placeholders = std::iter::repeat_n("?", paths.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT path,size,modified,hash FROM duplicate_hashes \
+             WHERE path IN ({placeholders})"
+        );
+        let mut statement = state.prepare(&sql).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params_from_iter(paths.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (stored_path, size, modified, hash) = row.map_err(|error| error.to_string())?;
+            let Some(input) = inputs_by_path.get(&stored_path.to_ascii_lowercase()) else {
+                continue;
+            };
+            if size != input.size || modified != input.mtime {
+                continue;
+            }
+            let Some(hash) = hash.parse::<u64>().ok() else {
+                continue;
+            };
+            cached.insert(
+                input.path.clone(),
+                HashCacheEntry {
+                    size,
+                    mtime: modified,
+                    hash,
+                    seq: next_hash_cache_seq(),
+                },
+            );
+        }
+    }
+    Ok(cached)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -935,6 +1032,7 @@ impl V2Store {
             hashing: 0,
             hashed: 0,
         });
+        let mut last_index_progress = Instant::now();
 
         for source in &request.sources {
             if cancel.load(Ordering::Relaxed) {
@@ -1033,6 +1131,15 @@ impl V2Store {
                             ])
                             .map_err(|error| error.to_string())? as u64,
                     );
+                    if last_index_progress.elapsed() >= Duration::from_millis(250) {
+                        progress(DuplicateProgress {
+                            phase: "indexing".to_string(),
+                            scanned,
+                            hashing: 0,
+                            hashed: 0,
+                        });
+                        last_index_progress = Instant::now();
+                    }
                 }
             }
             tx.commit().map_err(|error| error.to_string())?;
@@ -1065,15 +1172,21 @@ impl V2Store {
             )
             .map_err(|error| error.to_string())?
             .max(0) as u64;
-        let sizes = {
+        let size_groups = {
             let mut stmt = work
-                .prepare("SELECT size FROM candidates GROUP BY size HAVING COUNT(*)>1 ORDER BY size DESC")
+                .prepare(
+                    "SELECT size,COUNT(*) FROM candidates \
+                     GROUP BY size HAVING COUNT(*)>1 ORDER BY size DESC",
+                )
                 .map_err(|error| error.to_string())?;
-            stmt.query_map([], |row| row.get::<_, i64>(0))
-                .map_err(|error| error.to_string())?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|error| error.to_string())?
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?
         };
+        let hash_batches = duplicate_hash_batches(&size_groups);
 
         progress(DuplicateProgress {
             phase: "hashing".to_string(),
@@ -1085,17 +1198,20 @@ impl V2Store {
         let mut groups = Vec::new();
         let mut errors = Vec::new();
         let mut hashed = 0u64;
-        for size in sizes {
+        for size_batch in hash_batches {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             let files = {
-                let mut stmt = work
-                    .prepare(
-                        "SELECT path,name,size,modified_ms FROM candidates WHERE size=?1 ORDER BY path COLLATE NOCASE",
-                    )
-                    .map_err(|error| error.to_string())?;
-                stmt.query_map(params![size], |row| {
+                let placeholders = std::iter::repeat_n("?", size_batch.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT path,name,size,modified_ms FROM candidates \
+                     WHERE size IN ({placeholders}) ORDER BY size DESC,path COLLATE NOCASE"
+                );
+                let mut stmt = work.prepare(&sql).map_err(|error| error.to_string())?;
+                stmt.query_map(params_from_iter(size_batch.iter()), |row| {
                     Ok(DuplicateFile {
                         path: row.get(0)?,
                         name: row.get(1)?,
@@ -1115,42 +1231,17 @@ impl V2Store {
                     mtime: file.modified,
                 })
                 .collect::<Vec<_>>();
-            let mut cached = HashMap::new();
-            {
-                let mut lookup = state
-                    .prepare_cached(
-                        "SELECT hash FROM duplicate_hashes WHERE path=?1 COLLATE NOCASE AND size=?2 AND modified=?3",
-                    )
-                    .map_err(|error| error.to_string())?;
-                for input in &inputs {
-                    let value = lookup
-                        .query_row(
-                            params![
-                                input.path.to_string_lossy(),
-                                as_sql_i64(input.size),
-                                as_sql_i64(input.mtime)
-                            ],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .map_err(|error| error.to_string())?;
-                    if let Some(hash) = value.and_then(|value| value.parse::<u64>().ok()) {
-                        cached.insert(
-                            input.path.clone(),
-                            HashCacheEntry {
-                                size: input.size,
-                                mtime: input.mtime,
-                                hash,
-                                seq: next_hash_cache_seq(),
-                            },
-                        );
-                    }
-                }
-            }
+            let cached = load_duplicate_hash_cache(&state, &inputs)?;
+            let existing_cache_paths = cached.keys().cloned().collect::<HashSet<_>>();
             let cache = Mutex::new(cached);
             let (bucket_groups, bucket_errors) = hash_candidate_groups(
                 &inputs,
-                true,
+                // A full-file hash is sufficient for discovery. Every move,
+                // delete, copy, or link is still rechecked byte-for-byte by the
+                // duplicate action boundary immediately before mutation. Doing
+                // the same full read here made cached repeat scans unnecessarily
+                // reread all duplicate data.
+                false,
                 &cache,
                 None,
                 None,
@@ -1168,7 +1259,11 @@ impl V2Store {
             let cached = cache
                 .into_inner()
                 .map_err(|_| "Duplicate hash cache is unavailable")?;
-            {
+            let new_cache_entries = cached
+                .into_iter()
+                .filter(|(path, _)| !existing_cache_paths.contains(path))
+                .collect::<Vec<_>>();
+            if !new_cache_entries.is_empty() {
                 let tx = state
                     .unchecked_transaction()
                     .map_err(|error| error.to_string())?;
@@ -1179,14 +1274,15 @@ impl V2Store {
                              ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,updated_at=excluded.updated_at",
                         )
                         .map_err(|error| error.to_string())?;
-                    for (path, entry) in cached {
+                    let updated_at = now_ms() as i64;
+                    for (path, entry) in new_cache_entries {
                         upsert
                             .execute(params![
                                 path.to_string_lossy(),
                                 as_sql_i64(entry.size),
                                 as_sql_i64(entry.mtime),
                                 entry.hash.to_string(),
-                                now_ms() as i64,
+                                updated_at,
                             ])
                             .map_err(|error| error.to_string())?;
                     }
@@ -2144,6 +2240,13 @@ fn run_bounded_scan(
     row_tx
         .send(scan_row(0, None, root, root, 0, true, false))
         .map_err(|error| error.to_string())?;
+    progress(ScanProgress {
+        scan_id: scan_id.to_string(),
+        stage: "scanning".to_string(),
+        node_count: 1,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    });
+    let last_progress_ms = Arc::new(AtomicU64::new(0));
     let threads = request.threads.clamp(1, 16);
     let mut workers = Vec::with_capacity(threads);
     for worker_id in 0..threads {
@@ -2157,6 +2260,7 @@ fn run_bounded_scan(
         let scan_id = scan_id.to_string();
         let started = started;
         let visited = Arc::clone(&visited);
+        let last_progress_ms = Arc::clone(&last_progress_ms);
         workers.push(
             std::thread::Builder::new()
                 .name(format!("scan-enumerator-{worker_id}"))
@@ -2222,12 +2326,24 @@ fn run_bounded_scan(
                                         });
                                     }
                                 }
-                                if count % 2_048 == 0 {
+                                let elapsed_ms = started.elapsed().as_millis() as u64;
+                                let previous_ms = last_progress_ms.load(Ordering::Relaxed);
+                                let periodic_update = elapsed_ms.saturating_sub(previous_ms) >= 250;
+                                if (count % 2_048 == 0 || periodic_update)
+                                    && last_progress_ms
+                                        .compare_exchange(
+                                            previous_ms,
+                                            elapsed_ms.max(previous_ms.saturating_add(1)),
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                {
                                     progress(ScanProgress {
                                         scan_id: scan_id.clone(),
                                         stage: "scanning".to_string(),
                                         node_count: count,
-                                        elapsed_ms: started.elapsed().as_millis() as u64,
+                                        elapsed_ms,
                                     });
                                 }
                             }
@@ -3421,6 +3537,23 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_hash_batches_coalesce_small_groups_without_splitting_large_ones() {
+        let many_pairs = (1..=1_200).map(|size| (size, 2u64)).collect::<Vec<_>>();
+        let batches = duplicate_hash_batches(&many_pairs);
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            [500, 500, 200]
+        );
+        assert_eq!(
+            batches.into_iter().flatten().collect::<Vec<_>>().len(),
+            1_200
+        );
+
+        let oversized = duplicate_hash_batches(&[(9, 5_000), (8, 2), (7, 2)]);
+        assert_eq!(oversized, vec![vec![9], vec![8, 7]]);
+    }
+
+    #[test]
     fn search_query_parser_supports_tokens_phrases_exclusions_and_scopes() {
         assert_eq!(
             parse_search_terms(
@@ -3571,7 +3704,13 @@ mod tests {
             threads: 2,
             ..Default::default()
         };
-        let handle = store.start_scan(request, |_| {}).unwrap();
+        let progress_events = Arc::new(Mutex::new(Vec::<ScanProgress>::new()));
+        let captured_events = Arc::clone(&progress_events);
+        let handle = store
+            .start_scan(request, move |event| {
+                captured_events.lock_unpoisoned().push(event);
+            })
+            .unwrap();
         for _ in 0..200 {
             let status = store.scan_status(&handle.scan_id).unwrap();
             if status.status != "scanning" {
@@ -3580,6 +3719,13 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        let first_progress = progress_events
+            .lock_unpoisoned()
+            .first()
+            .cloned()
+            .expect("scan should publish progress immediately");
+        assert_eq!(first_progress.stage, "scanning");
+        assert_eq!(first_progress.node_count, 1);
         let root = store
             .query_nodes(ScanQuery {
                 scan_id: handle.scan_id.clone(),
@@ -3797,7 +3943,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_scan_uses_persisted_index_and_confirms_file_bytes() {
+    fn duplicate_scan_uses_persisted_index_and_full_content_hashes() {
         let store = temp_store("duplicates");
         let source = store.data_root().join("fixture");
         fs::create_dir_all(source.join("nested")).unwrap();
@@ -3827,20 +3973,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        let request = DuplicateScanRequest {
+            sources: vec![DuplicateSource {
+                scan_id: handle.scan_id,
+                target_path: source.to_string_lossy().into_owned(),
+            }],
+            min_size: 1,
+            threads: 2,
+            ..Default::default()
+        };
         let result = store
-            .find_exact_duplicates(
-                DuplicateScanRequest {
-                    sources: vec![DuplicateSource {
-                        scan_id: handle.scan_id,
-                        target_path: source.to_string_lossy().into_owned(),
-                    }],
-                    min_size: 1,
-                    threads: 2,
-                    ..Default::default()
-                },
-                Arc::new(AtomicBool::new(false)),
-                |_| {},
-            )
+            .find_exact_duplicates(request.clone(), Arc::new(AtomicBool::new(false)), |_| {})
             .unwrap();
 
         assert!(!result.cancelled);
@@ -3854,6 +3997,35 @@ mod tests {
         assert_eq!(
             result.groups[0].waste,
             b"identical duplicate bytes".len() as u64
+        );
+
+        let state = store.open_state().unwrap();
+        assert_eq!(
+            state
+                .query_row("SELECT COUNT(*) FROM duplicate_hashes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+        state
+            .execute("UPDATE duplicate_hashes SET updated_at=17", [])
+            .unwrap();
+        drop(state);
+        let repeated = store
+            .find_exact_duplicates(request, Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap();
+        assert_eq!(repeated.groups.len(), 1);
+        let state = store.open_state().unwrap();
+        assert_eq!(
+            state
+                .query_row(
+                    "SELECT COUNT(*) FROM duplicate_hashes WHERE updated_at=17",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
         );
     }
 

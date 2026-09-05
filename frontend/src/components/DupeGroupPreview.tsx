@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { DupeFileV2, DupeGroupV2 } from "../api/types";
 import { formatBytes } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
@@ -49,35 +49,117 @@ function MemberThumb({ file }: { file: DupeFileV2 }) {
   );
 }
 
-export function DupeGroupPreview({ group, onClose }: { group: DupeGroupV2; onClose: () => void }) {
+interface DupeGroupPreviewProps {
+  group: DupeGroupV2;
+  selected: Set<string>;
+  onToggle: (path: string) => void;
+  onKeep: (path: string) => void;
+  onClose: () => void;
+  disabled?: boolean;
+}
+
+export function DupeGroupPreview({
+  group,
+  selected,
+  onToggle,
+  onKeep,
+  onClose,
+  disabled = false,
+}: DupeGroupPreviewProps) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  const hasProtectedKeeper = group.files.some((file) => file.protected);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    panelRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (e.key !== "Tab" || !panelRef.current) return;
+      const focusable = [...panelRef.current.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      )];
+      if (focusable.length === 0) {
+        e.preventDefault();
+        panelRef.current.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (!panelRef.current.contains(active)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      } else if (e.shiftKey && (active === first || active === panelRef.current)) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
     document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      previouslyFocused?.focus();
+    };
+  }, []);
 
   return (
-    <div className="dgp-overlay" onMouseDown={onClose}>
-      <div className="dgp-panel" onMouseDown={(e) => e.stopPropagation()}>
+    <div className="dgp-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div
+        className="dgp-panel"
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="dgp-title"
+        tabIndex={-1}
+      >
         <div className="dgp-head">
-          <span>Preview group · {group.files.length} copies</span>
+          <span id="dgp-title">Compare copies</span>
+          <span className="dgp-head-meta">{group.files.length} files · {formatBytes(group.waste, "auto")} reclaimable</span>
           <button className="inspector-x" title="Close (Esc)" onClick={onClose} aria-label="Close preview">
             <Icon name="x" size={14} />
           </button>
         </div>
         <div className="dgp-body">
           {group.files.map((f) => (
-            <div key={f.path} className={`dgp-card${f.ref ? " dgp-card-ref" : ""}`}>
+            <div
+              key={f.path}
+              className={`dgp-card${f.ref ? " dgp-card-ref" : ""}${f.protected ? " dgp-card-protected" : ""}${selected.has(f.path) ? " dgp-card-selected" : ""}`}
+            >
               <MemberThumb file={f} />
               <div className="dgp-meta">
+                <div className={`dgp-role${f.protected ? " protected" : f.ref ? " keeper" : " copy"}`}>
+                  {f.protected ? <><Icon name="bookmark" size={10} /> Protected</> : f.ref ? <><Icon name="star-fill" size={10} /> Keeper</> : "Actionable copy"}
+                </div>
                 <div className="dgp-name" title={f.path}>
-                  {f.ref ? <Icon name="star-fill" size={11} /> : <Icon name="duplicates" size={11} />} {f.name}
+                  {f.name}
                 </div>
                 <div className="dgp-sub">{formatBytes(f.size, "auto")} · {f.modified > 0 ? formatDate(f.modified * 1000) : "—"}</div>
                 <div className="dgp-folder" title={f.path}>{folderOf(f.path)}</div>
                 <div className="dgp-actions">
                   <button onClick={() => void openPath(f.path)}>Open</button>
                   <button onClick={() => void revealPath(f.path)}>Reveal</button>
+                  {!f.ref && !hasProtectedKeeper && (
+                    <button className="dgp-keep" onClick={() => onKeep(f.path)} disabled={disabled}>Keep this copy</button>
+                  )}
+                  {!f.ref && !f.protected && (
+                    <label className="dgp-select">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(f.path)}
+                        disabled={disabled}
+                        onChange={() => onToggle(f.path)}
+                      />
+                      Select for action
+                    </label>
+                  )}
                 </div>
               </div>
             </div>

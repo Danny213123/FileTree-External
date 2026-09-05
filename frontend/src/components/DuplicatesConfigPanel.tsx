@@ -26,16 +26,31 @@ interface ScanTargetsProps {
   drives: DriveEntry[];
   selectedPaths: string[];
   customPaths: string[];
+  protectedPaths: string[];
   onToggle: (p: string) => void;
   onAddCustom: (p: string) => void;
   onRemoveCustom: (p: string) => void;
+  onToggleProtected: (p: string) => void;
+  controlsDisabled: boolean;
 }
 
-function ScanTargets({ drives, selectedPaths, customPaths, onToggle, onAddCustom, onRemoveCustom }: ScanTargetsProps) {
+function ScanTargets({
+  drives,
+  selectedPaths,
+  customPaths,
+  protectedPaths,
+  onToggle,
+  onAddCustom,
+  onRemoveCustom,
+  onToggleProtected,
+  controlsDisabled,
+}: ScanTargetsProps) {
   const [expanded, setExpanded] = useState(true);
   const [input, setInput] = useState("");
   const drivePaths = drives.map((d) => d.root);
   const selectedSet = new Set(selectedPaths);
+  const protectedSet = new Set(protectedPaths.map((path) => path.replace(/\\/g, "/").toLowerCase()));
+  const isProtected = (path: string) => protectedSet.has(path.replace(/\\/g, "/").toLowerCase());
 
   const add = () => {
     const p = input.trim();
@@ -46,47 +61,78 @@ function ScanTargets({ drives, selectedPaths, customPaths, onToggle, onAddCustom
 
   return (
     <div className="df-targets">
-      <button className="df-targets-header" onClick={() => setExpanded((v) => !v)}>
+      <button
+        className="df-targets-header"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+      >
         <span className="df-section-label" style={{ margin: 0 }}>Scan targets</span>
         <span className="df-targets-summary">
           {selectedPaths.length === 0 ? "none selected" : selectedPaths.map((p) => p.replace(/\\$/, "")).join(", ")}
         </span>
-        <span className="df-targets-arrow">{expanded ? "▲" : "▼"}</span>
+        <Icon name={expanded ? "chevron-down" : "chevron-right"} size={10} />
       </button>
 
       {expanded && (
         <div className="df-targets-body">
           {drives.map((d) => (
-            <label key={d.root} className="df-target-row df-target-drive">
+            <div key={d.root} className={`df-target-row df-target-drive${isProtected(d.root) ? " df-target-protected" : ""}`}>
               <span className="df-target-main">
-                <input type="checkbox" className="df-checkbox" checked={selectedSet.has(d.root)} onChange={() => onToggle(d.root)} />
-                <span className="df-target-icon"><Icon name="hdd" size={13} /></span>
-                <span className="df-target-path">{d.root}</span>
-                {d.label && <span className="df-target-label">{d.label}</span>}
+                <label className="df-target-choice">
+                  <input type="checkbox" className="df-checkbox" checked={selectedSet.has(d.root)} disabled={controlsDisabled} onChange={() => onToggle(d.root)} />
+                  <span className="df-target-icon"><Icon name="hdd" size={13} /></span>
+                  <span className="df-target-path">{d.root}</span>
+                  {d.label && <span className="df-target-label">{d.label}</span>}
+                </label>
+                <button
+                  className={`df-protect-btn${isProtected(d.root) ? " active" : ""}`}
+                  onClick={() => onToggleProtected(d.root)}
+                  disabled={controlsDisabled || (!selectedSet.has(d.root) && !isProtected(d.root))}
+                  aria-pressed={isProtected(d.root)}
+                  title={isProtected(d.root) ? "Protected: copies here cannot be selected for file actions" : "Protect this location"}
+                >
+                  <Icon name="bookmark" size={11} /> {isProtected(d.root) ? "Protected" : "Protect"}
+                </button>
               </span>
               <DriveCapacityBar total={d.total} free={d.free} />
-            </label>
+            </div>
           ))}
           {customPaths.filter((p) => !drivePaths.includes(p)).map((p) => (
-            <label key={p} className="df-target-row">
-              <input type="checkbox" className="df-checkbox" checked={selectedSet.has(p)} onChange={() => onToggle(p)} />
-              <span className="df-target-icon"><Icon name="folder" size={13} /></span>
-              <span className="df-target-path">{p}</span>
-              <button className="df-filter-remove" onClick={(e) => { e.preventDefault(); onRemoveCustom(p); }} title="Remove">✕</button>
-            </label>
+            <div key={p} className={`df-target-row${isProtected(p) ? " df-target-protected" : ""}`}>
+              <label className="df-target-choice">
+                <input type="checkbox" className="df-checkbox" checked={selectedSet.has(p)} disabled={controlsDisabled} onChange={() => onToggle(p)} />
+                <span className="df-target-icon"><Icon name="folder" size={13} /></span>
+                <span className="df-target-path">{p}</span>
+              </label>
+              <button
+                className={`df-protect-btn${isProtected(p) ? " active" : ""}`}
+                onClick={() => onToggleProtected(p)}
+                disabled={controlsDisabled || (!selectedSet.has(p) && !isProtected(p))}
+                aria-pressed={isProtected(p)}
+                title={isProtected(p) ? "Protected: copies here cannot be selected for file actions" : "Protect this location"}
+              >
+                <Icon name="bookmark" size={11} />
+                <span className="df-protect-label">{isProtected(p) ? "Protected" : "Protect"}</span>
+              </button>
+              <button className="df-filter-remove" disabled={controlsDisabled} onClick={(e) => { e.preventDefault(); onRemoveCustom(p); }} title="Remove">✕</button>
+            </div>
           ))}
           <div className="df-target-add">
             <input
               className="df-filter-input"
               type="text"
               value={input}
+              disabled={controlsDisabled}
               placeholder="Add folder path…"
               spellCheck={false}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && add()}
             />
-            <button className="df-icon-btn" onClick={add} title="Add path">＋</button>
+            <button className="df-icon-btn" disabled={controlsDisabled} onClick={add} title="Add path">＋</button>
           </div>
+          <p className="df-targets-help">
+            Protected locations are scanned, but their files always stay kept and cannot be selected for cleanup.
+          </p>
         </div>
       )}
     </div>
@@ -118,9 +164,12 @@ export function DuplicatesConfigPanel({
         drives={drives}
         selectedPaths={ctrl.selectedPaths}
         customPaths={ctrl.customPaths}
+        protectedPaths={ctrl.protectedPaths}
         onToggle={ctrl.togglePath}
         onAddCustom={ctrl.addCustomPath}
         onRemoveCustom={ctrl.removeCustomPath}
+        onToggleProtected={ctrl.toggleProtectedPath}
+        controlsDisabled={scanning || ctrl.actionPending}
       />
 
       {quickFolders.length > 0 && (
@@ -134,6 +183,8 @@ export function DuplicatesConfigPanel({
                   key={f.path}
                   className={`df-chip${on ? " df-chip-on" : ""}`}
                   title={f.path}
+                  aria-pressed={on}
+                  disabled={scanning || ctrl.actionPending}
                   onClick={() => (on ? ctrl.removeCustomPath(f.path) : ctrl.addCustomPath(f.path))}
                 >
                   {f.label}
@@ -145,8 +196,15 @@ export function DuplicatesConfigPanel({
       )}
 
       {/* Match criteria */}
-      <div className="df-sidebar-quick">
-        <div className="df-section-label">Match criteria</div>
+      <details className="df-config-section" open>
+        <summary>
+          <span>Matching</span>
+          <small>{ctrl.criteria.content.required ? "Verified content" : "Custom rules"}</small>
+        </summary>
+        <div className="df-config-section-body">
+        <p className="df-section-copy">
+          Exact content is safest. Optional fields explain differences without weakening verification.
+        </p>
         <div className="df-crit-head">
           <span className="df-crit-head-spacer" />
           <span className="df-crit-head-col" title="Include this criterion in matching & show its delta column">use</span>
@@ -202,15 +260,25 @@ export function DuplicatesConfigPanel({
         )}
 
         {!ctrl.criteria.content.enabled && (
-          <div className="df-footer-hint" style={{ textAlign: "left", marginTop: 6 }}>
+          <div className="df-inline-warning">
             Content off — matching by metadata only (no hashing). Enable a Size/Name/Date criterion as the key.
           </div>
         )}
-      </div>
+        </div>
+      </details>
 
       {/* Filters */}
-      <div className="df-sidebar-quick">
-        <div className="df-section-label">Filters</div>
+      <details className="df-config-section">
+        <summary>
+          <span>Filters</span>
+          <small>
+            ≥ {ctrl.minSizeKb.toLocaleString()} KB
+            {ctrl.maxSizeKb.trim() ? ` · ≤ ${ctrl.maxSizeKb} KB` : " · no max"}
+            {ctrl.extensions.trim() ? ` · ${ctrl.extensions}` : " · all types"}
+            {ctrl.includeHidden ? " · hidden included" : " · hidden excluded"}
+          </small>
+        </summary>
+        <div className="df-config-section-body">
         <label className="df-quick-row">
           <span className="df-quick-label">Min size</span>
           <input className="df-num-input" type="number" min={0} value={ctrl.minSizeKb}
@@ -233,20 +301,12 @@ export function DuplicatesConfigPanel({
             onChange={(e) => ctrl.setIncludeHidden(e.target.checked)} />
           <span style={{ marginLeft: 6 }}>Include hidden files</span>
         </label>
-      </div>
-
-      {/* Move / Copy destination */}
-      <div className="df-sidebar-quick">
-        <div className="df-section-label">Move / Copy destination</div>
-        <div className="df-dir-row">
-          <input className="df-filter-input df-dir-input" type="text" value={ctrl.destPath}
-            placeholder="D:\Archive" spellCheck={false} onChange={(e) => ctrl.setDestPath(e.target.value)} />
         </div>
-      </div>
+      </details>
 
       {/* Re-prioritize */}
-      <div className="df-sidebar-quick">
-        <div className="df-section-label">Reference file</div>
+      <div className="df-sidebar-quick df-keeper-settings">
+        <div className="df-section-label">Default keeper</div>
         <select className="df-select" value={ctrl.repriCriterion}
           onChange={(e) => ctrl.setRepriCriterion(e.target.value as ReprioritizeCriterion)}>
           {REPRIORITIZE_OPTIONS.map((o) => (
@@ -255,18 +315,20 @@ export function DuplicatesConfigPanel({
         </select>
         <button className="df-btn df-btn-sm" style={{ marginTop: 6 }}
           onClick={ctrl.reprioritizeApply} disabled={!ctrl.groups.length || scanning}>
-          Re-prioritize references
+          Apply keeper rule
         </button>
+        <p className="df-section-copy">Protected locations override this rule.</p>
       </div>
 
       {/* Ignore list */}
       {ctrl.ignoredCount > 0 && (
         <div className="df-sidebar-quick">
-          <div className="df-section-label">Ignore list</div>
+          <div className="df-section-label">Hidden matches</div>
           <div className="df-quick-row" style={{ alignItems: "center" }}>
-            <span style={{ flex: 1, fontSize: 12 }}>{ctrl.ignoredCount} ignored</span>
-            <button className="df-icon-btn" onClick={ctrl.clearIgnoreList} title="Clear ignore list">Clear</button>
+            <span style={{ flex: 1, fontSize: 12 }}>{ctrl.ignoredCount} hidden group{ctrl.ignoredCount !== 1 ? "s" : ""}</span>
+            <button className="df-icon-btn df-restore-btn" onClick={ctrl.restoreIgnoredGroups}>Restore</button>
           </div>
+          <p className="df-section-copy">Hidden groups stay dismissed in future scans until restored.</p>
         </div>
       )}
 
@@ -274,7 +336,7 @@ export function DuplicatesConfigPanel({
         {scanning ? (
           <button className="df-btn df-btn-stop" onClick={ctrl.stopScan}>■ Stop</button>
         ) : (
-          <button className="df-btn df-btn-scan" onClick={ctrl.startScan} disabled={!ctrl.canScan}>
+          <button className="df-btn df-btn-scan" onClick={ctrl.startScan} disabled={!ctrl.canScan || ctrl.actionPending}>
             {ctrl.canScan
               ? `Find duplicates in ${ctrl.selectedPaths.length} target${ctrl.selectedPaths.length > 1 ? "s" : ""}`
               : "Select targets to scan"}

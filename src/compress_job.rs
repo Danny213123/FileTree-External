@@ -34,6 +34,11 @@ use crate::io::{CompressLane, LockRecover, acquire_compress};
 /// a large waiting/active pool that lowers aggregate throughput.
 const MAX_COMPRESSION_WORKERS: usize = 2;
 const LIVE_EVENT_CAPACITY: usize = 4_096;
+/// Process shutdown must never strand a compression worker. A killed encoder
+/// can leave an inherited stdout/stderr handle open in one of its descendants,
+/// so both process reaping and pipe draining are deliberately bounded.
+const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const CHILD_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub(crate) struct JobEvents {
@@ -336,6 +341,26 @@ impl CompressJob {
             }
             events.lines.push_back(line.clone());
         }
+        self.events_cv.notify_all();
+        let sink = self.event_sink.lock_recover().clone();
+        if let Some(sink) = sink {
+            (sink.0)(&line);
+        }
+    }
+
+    /// Publish the terminal event and release path ownership before calling the
+    /// optional persistence sink. Appending first ensures stream readers can
+    /// never observe `finished` without also seeing the final `done` event.
+    fn finish_with_event(&self, line: String) {
+        {
+            let mut events = self.events.lock_recover();
+            if events.lines.len() >= LIVE_EVENT_CAPACITY {
+                events.lines.pop_front();
+                events.base = events.base.saturating_add(1);
+            }
+            events.lines.push_back(line.clone());
+        }
+        self.finished.store(true, Ordering::SeqCst);
         self.events_cv.notify_all();
         let sink = self.event_sink.lock_recover().clone();
         if let Some(sink) = sink {
@@ -1283,6 +1308,37 @@ fn begin_active_interval(job: &CompressJob) {
     }
 }
 
+/// Request a hard stop and wake every place a worker may be waiting. Encoder
+/// process trees are terminated while their parent handles are still valid so
+/// descendants cannot keep an inherited output pipe (and the job) alive.
+pub(crate) fn cancel_job(job: &CompressJob) {
+    job.cancel.store(true, Ordering::SeqCst);
+    for child in job.children.lock_recover().values_mut() {
+        terminate_child(child);
+    }
+    job.events_cv.notify_all();
+    job.queue_cv.notify_all();
+}
+
+/// Wait only for the bounded cancellation handshake exposed to callers. The
+/// worker owns final cleanup; this polling wait cannot itself hold a job lock or
+/// deadlock that cleanup.
+pub(crate) fn wait_until_finished(job: &CompressJob, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !job.finished.load(Ordering::SeqCst) {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(20)),
+        );
+    }
+    true
+}
+
 pub(crate) fn pause_job(job: &Arc<CompressJob>) -> Result<String, String> {
     let queue = job.queue.lock_recover();
     let mut status = job.status.lock_recover();
@@ -1653,7 +1709,10 @@ fn force_finalize_job(job: &Arc<CompressJob>) {
     *job.status.lock_recover() = status.to_string();
     write_manifest(job);
     let total_saved = job.saved_bytes.load(Ordering::Relaxed);
-    job.emit(ev_done(
+    // Path ownership is safe to release once every worker has stopped and the
+    // terminal manifest exists. Publish this before invoking an optional event
+    // sink, since persistence backpressure there must not strand cancellation.
+    job.finish_with_event(ev_done(
         &job.id,
         done,
         error,
@@ -1662,8 +1721,6 @@ fn force_finalize_job(job: &Arc<CompressJob>) {
         job.total,
         total_saved,
     ));
-    job.finished.store(true, Ordering::SeqCst);
-    job.events_cv.notify_all();
 }
 
 /// Live outcome tallies shared across the parallel worker threads.
@@ -1997,7 +2054,10 @@ fn run_job(state: Arc<CompressionRuntimeState>, job: Arc<CompressJob>) {
         "[job_end] job={} done={done_count} skipped={skipped_count} error={error_count} verifyFailed={verify_failed_count} total={} saved={total_saved} status={status}",
         job.id, job.total
     ));
-    job.emit(ev_done(
+    // All process/file workers are quiescent and the terminal manifest is on
+    // disk. Release path ownership before the optional event sink runs so a
+    // backed-up persistence channel cannot leave the job falsely active.
+    job.finish_with_event(ev_done(
         &job.id,
         done_count,
         error_count,
@@ -2006,8 +2066,6 @@ fn run_job(state: Arc<CompressionRuntimeState>, job: Arc<CompressJob>) {
         job.total,
         total_saved,
     ));
-    job.finished.store(true, Ordering::SeqCst);
-    job.events_cv.notify_all();
 }
 
 /// Extract a human-readable message from a caught panic payload. `panic!`
@@ -3408,6 +3466,107 @@ struct VerifyRun {
     stderr: String,
 }
 
+fn spawn_pipe_reader<T, F>(read: F) -> std::sync::mpsc::Receiver<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let value = read();
+        let _ = sender.send(value);
+    });
+    receiver
+}
+
+fn receive_pipe_before<T: Default>(
+    receiver: Option<std::sync::mpsc::Receiver<T>>,
+    deadline: Instant,
+) -> T {
+    let Some(receiver) = receiver else {
+        return T::default();
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        receiver.try_recv().unwrap_or_default()
+    } else {
+        receiver.recv_timeout(remaining).unwrap_or_default()
+    }
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(pid: u32) {
+    use std::process::Stdio;
+
+    // `Child::kill` only terminates the direct process on Windows. Encoders and
+    // verification tools may launch helpers which inherit our pipe handles, so
+    // ask taskkill to terminate the complete tree before killing the parent.
+    let taskkill = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .map(|root| root.join("System32").join("taskkill.exe"))
+        .unwrap_or_else(|| PathBuf::from("taskkill.exe"));
+    let pid = pid.to_string();
+    let mut command = Command::new(taskkill);
+    command
+        .args(["/PID", pid.as_str(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    compress_tools::no_window(&mut command);
+    let Ok(mut killer) = command.spawn() else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_millis(750);
+    loop {
+        match killer.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = killer.kill();
+                return;
+            }
+        }
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    #[cfg(windows)]
+    terminate_process_tree(child.id());
+    let _ = child.kill();
+}
+
+fn reap_child_bounded(mut child: Child, terminate: bool) {
+    if terminate {
+        terminate_child(&mut child);
+    }
+    let deadline = Instant::now() + CHILD_REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                // Never make the compression worker wait forever. A detached
+                // reaper owns only the process handle, not the job reservation.
+                let _ = std::thread::Builder::new()
+                    .name("compression-child-reaper".to_string())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    });
+                return;
+            }
+        }
+    }
+}
+
 /// Spawn a verification helper (`ffmpeg`/`HandBrakeCLI`/`magick`) as the job's
 /// active child for `index` so a cancel kills it, capturing BOTH stdout and
 /// stderr to the end. Unlike [`run_child`] it keeps stdout (tools like
@@ -3439,15 +3598,15 @@ fn run_verify_capture(job: &Arc<CompressJob>, index: usize, mut cmd: Command) ->
     let stderr = child.stderr.take();
     job.children.lock_recover().insert(index, child);
 
-    let out_handle = stdout.map(|mut pipe| {
-        std::thread::spawn(move || {
+    let out_receiver = stdout.map(|mut pipe| {
+        spawn_pipe_reader(move || {
             let mut s = Vec::new();
             let _ = pipe.read_to_end(&mut s);
             s
         })
     });
-    let err_handle = stderr.map(|mut pipe| {
-        std::thread::spawn(move || {
+    let err_receiver = stderr.map(|mut pipe| {
+        spawn_pipe_reader(move || {
             let mut s = Vec::new();
             let _ = pipe.read_to_end(&mut s);
             s
@@ -3458,7 +3617,7 @@ fn run_verify_capture(job: &Arc<CompressJob>, index: usize, mut cmd: Command) ->
     let exit_status: Option<std::process::ExitStatus> = loop {
         if job.cancel.load(Ordering::SeqCst) {
             if let Some(c) = job.children.lock_recover().get_mut(&index) {
-                let _ = c.kill();
+                terminate_child(c);
             }
             cancelled = true;
             break None;
@@ -3479,15 +3638,13 @@ fn run_verify_capture(job: &Arc<CompressJob>, index: usize, mut cmd: Command) ->
             None => std::thread::sleep(std::time::Duration::from_millis(40)),
         }
     };
-    if let Some(mut c) = job.children.lock_recover().remove(&index) {
-        let _ = c.wait();
+    cancelled |= job.cancel.load(Ordering::SeqCst);
+    if let Some(child) = job.children.lock_recover().remove(&index) {
+        reap_child_bounded(child, cancelled || exit_status.is_none());
     }
-    let stdout = out_handle
-        .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
-    let stderr = err_handle
-        .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
+    let drain_deadline = Instant::now() + CHILD_OUTPUT_DRAIN_TIMEOUT;
+    let stdout = receive_pipe_before(out_receiver, drain_deadline);
+    let stderr = receive_pipe_before(err_receiver, drain_deadline);
     let (success, exit_code) = match exit_status {
         Some(st) => (st.success(), st.code()),
         None => (false, None),
@@ -4351,19 +4508,19 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     // HandBrake 1.11 emits live encode progress on stdout on some Windows
     // systems. Parse it instead of silently draining it; the returned bounded
     // text tail is discarded because only stderr is diagnostic.
-    let out_handle = stdout.map(|pipe| {
+    let out_receiver = stdout.map(|pipe| {
         let job = Arc::clone(job);
         let last_activity = Arc::clone(&last_activity);
-        std::thread::spawn(move || read_progress(pipe, &job, index, &last_activity))
+        spawn_pipe_reader(move || read_progress(pipe, &job, index, &last_activity))
     });
 
     // Parse percentage + fps from stderr (HandBrake/ffmpeg both report there) and
     // accumulate a bounded tail of the non-progress lines so a failure can be
     // explained. The thread returns the captured tail + parsed fps.
-    let err_handle = stderr.map(|pipe| {
+    let err_receiver = stderr.map(|pipe| {
         let job = Arc::clone(job);
         let last_activity = Arc::clone(&last_activity);
-        std::thread::spawn(move || read_progress(pipe, &job, index, &last_activity))
+        spawn_pipe_reader(move || read_progress(pipe, &job, index, &last_activity))
     });
 
     // Poll for completion / cancellation / inactivity. Track the real exit status
@@ -4374,7 +4531,7 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
     let exit_status: Option<std::process::ExitStatus> = loop {
         if job.cancel.load(Ordering::SeqCst) {
             if let Some(c) = job.children.lock_recover().get_mut(&index) {
-                let _ = c.kill();
+                terminate_child(c);
             }
             cancelled = true;
             break None;
@@ -4385,7 +4542,7 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
         // whole pool forever.
         if now_ms().saturating_sub(last_activity.load(Ordering::Relaxed)) > inactivity_limit {
             if let Some(c) = job.children.lock_recover().get_mut(&index) {
-                let _ = c.kill();
+                terminate_child(c);
             }
             timed_out = true;
             break None;
@@ -4409,16 +4566,17 @@ fn run_child(job: &Arc<CompressJob>, index: usize, mut cmd: Command) -> EncodeRe
         }
     };
 
-    // Reap the child and drop its handle; readers finish once the pipes close.
-    if let Some(mut c) = job.children.lock_recover().remove(&index) {
-        let _ = c.wait();
+    cancelled |= job.cancel.load(Ordering::SeqCst);
+
+    // Reap the child and drain its readers, but bound both operations. A helper
+    // process retaining an inherited pipe must not keep the job permanently
+    // active after its encoder has already been killed.
+    if let Some(child) = job.children.lock_recover().remove(&index) {
+        reap_child_bounded(child, cancelled || timed_out || exit_status.is_none());
     }
-    let (_, stdout_fps) = out_handle
-        .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
-    let (mut stderr_tail, stderr_fps) = err_handle
-        .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
+    let drain_deadline = Instant::now() + CHILD_OUTPUT_DRAIN_TIMEOUT;
+    let (_, stdout_fps) = receive_pipe_before(out_receiver, drain_deadline);
+    let (mut stderr_tail, stderr_fps) = receive_pipe_before(err_receiver, drain_deadline);
     // Prefer stdout because it carries HandBrake's genuine live encode rate in
     // affected builds; stderr may only contain a static source-frame-rate line.
     let fps = stdout_fps.or(stderr_fps);
@@ -4528,6 +4686,12 @@ fn read_progress<R: std::io::Read>(
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        // A bounded drain may detach this reader if a descendant retained the
+        // pipe. Once cancellation is visible, never let late descendant output
+        // mutate a job that has already been finalized and released.
+        if job.cancel.load(Ordering::SeqCst) {
+            break;
+        }
         // Any output resets the inactivity watchdog: the child is alive and
         // working, so it must not be killed as a hang.
         last_activity.store(now_ms(), Ordering::Relaxed);
@@ -6888,6 +7052,23 @@ mod encoder_tests {
     }
 
     #[test]
+    fn finishing_a_job_publishes_terminal_event_before_releasing_reader() {
+        let job = create_job(&[], "balanced", &CompressOptions::default());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        subscribe_job_events(Arc::clone(&job), move |line| {
+            let _ = sender.send(line);
+        });
+
+        job.finish_with_event("{\"type\":\"done\"}\n".to_string());
+
+        assert!(job.finished.load(Ordering::SeqCst));
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "{\"type\":\"done\"}\n"
+        );
+    }
+
+    #[test]
     fn indexed_job_uses_scan_sizes_without_filesystem_metadata() {
         let job = create_job_from_indexed_files(
             vec![
@@ -7697,6 +7878,58 @@ mod manifest_tests {
             }
             _ => panic!("expected Done(success=false) from the watchdog"),
         }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn pipe_drain_timeout_never_waits_for_a_stuck_reader() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let start = Instant::now();
+        let value = receive_pipe_before(Some(receiver), Instant::now() + Duration::from_millis(25));
+        assert!(value.is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "stuck pipe drain must be bounded"
+        );
+        drop(sender);
+    }
+
+    /// `cmd.exe` waits on a `ping.exe` descendant which inherits its output
+    /// pipes. Killing only cmd leaves ping holding those pipes open, reproducing
+    /// the cancelled-but-still-active job that previously blocked every retry.
+    #[cfg(windows)]
+    #[test]
+    fn run_child_cancel_terminates_descendants_and_returns_promptly() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+        let job = create_job(
+            &["cancel-tree.mp4".to_string()],
+            "balanced",
+            &CompressOptions::default(),
+        );
+        let cancel = Arc::clone(&job.cancel);
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            cancel.store(true, Ordering::SeqCst);
+        });
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/D", "/C", "ping.exe 127.0.0.1 -n 11"]);
+
+        let start = Instant::now();
+        let result = run_child(&job, 0, cmd);
+        let elapsed = start.elapsed();
+        let _ = cancel_thread.join();
+
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "cancelling an encoder tree must not wait on inherited pipes; took {elapsed:?}"
+        );
+        assert!(matches!(result, EncodeResult::Cancelled));
+        assert!(
+            job.children.lock_recover().is_empty(),
+            "cancelled child handles must be released"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }

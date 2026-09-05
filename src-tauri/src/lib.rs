@@ -34,7 +34,33 @@ struct FsWatchEntry {
 
 #[derive(Default)]
 struct DuplicateScanRegistry {
-    cancel: Mutex<Option<Arc<AtomicBool>>>,
+    next_review_id: AtomicU64,
+    cancel: Mutex<Option<DuplicateScanCancellation>>,
+    review: Mutex<DuplicateReviewState>,
+}
+
+struct DuplicateScanCancellation {
+    request_id: String,
+    flag: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct DuplicateReviewState {
+    token: Option<String>,
+    members: HashMap<String, DuplicateMemberSnapshot>,
+    active_by_group: HashMap<u64, HashSet<String>>,
+    in_flight: HashSet<String>,
+    authorized_roots: Vec<PathBuf>,
+    protected_roots: Vec<PathBuf>,
+}
+
+struct DuplicateMemberSnapshot {
+    group_id: u64,
+    identity_key: String,
+    canonical_path: PathBuf,
+    size: u64,
+    modified_ns: u128,
+    file_identity: (u64, u64),
 }
 
 const EXTERNAL_DROP_PENDING_TTL: Duration = Duration::from_secs(30);
@@ -611,10 +637,13 @@ async fn directory_snapshot(
 #[cfg(test)]
 mod desktop_tests {
     use super::{
-        ExternalCopyGrants, ExternalTransferKind, collapse_changed_directories,
-        directory_snapshot_rows, normalize_icon_extension, watch_directories_for_paths,
+        DuplicateActionItem, DuplicateReviewState, ExternalCopyGrants, ExternalTransferKind,
+        collapse_changed_directories, directory_snapshot_rows, duplicate_member_snapshot,
+        normalize_icon_extension, normalized_review_path, validate_duplicate_plan_and_reserve,
+        watch_directories_for_paths,
     };
-    use std::{collections::HashMap, fs};
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
 
     #[test]
     fn external_copy_grants_are_exact_and_one_shot() {
@@ -790,6 +819,69 @@ mod desktop_tests {
         assert!(normalize_icon_extension("../exe").is_err());
         assert!(normalize_icon_extension(&"x".repeat(65)).is_err());
     }
+
+    #[test]
+    fn duplicate_review_tokens_enforce_membership_protection_and_survival() {
+        let root = std::env::temp_dir().join(format!(
+            "filetree_desktop_duplicate_review_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let protected = root.join("protected");
+        fs::create_dir_all(&protected).expect("create protected test folder");
+        let keeper = root.join("keeper.bin");
+        let duplicate = protected.join("duplicate.bin");
+        fs::write(&keeper, b"same").expect("write keeper");
+        fs::write(&duplicate, b"same").expect("write duplicate");
+
+        let keeper_text = keeper.to_string_lossy().into_owned();
+        let duplicate_text = duplicate.to_string_lossy().into_owned();
+        let keeper_key = normalized_review_path(&keeper_text).expect("keeper key");
+        let duplicate_key = normalized_review_path(&duplicate_text).expect("duplicate key");
+        let members = HashMap::from([
+            (
+                keeper_key.clone(),
+                duplicate_member_snapshot(&keeper, 7).expect("keeper snapshot"),
+            ),
+            (
+                duplicate_key.clone(),
+                duplicate_member_snapshot(&duplicate, 7).expect("duplicate snapshot"),
+            ),
+        ]);
+        let mut review = DuplicateReviewState {
+            token: Some("review-token".to_string()),
+            members,
+            active_by_group: HashMap::from([(
+                7,
+                HashSet::from([keeper_key.clone(), duplicate_key.clone()]),
+            )]),
+            authorized_roots: vec![fs::canonicalize(&root).expect("canonical root")],
+            protected_roots: vec![fs::canonicalize(&protected).expect("canonical protected root")],
+            ..DuplicateReviewState::default()
+        };
+        let plan = [DuplicateActionItem {
+            path: duplicate_text,
+            keeper: keeper_text,
+        }];
+
+        assert!(validate_duplicate_plan_and_reserve(&review, "stale-token", &plan).is_err());
+        assert!(validate_duplicate_plan_and_reserve(&review, "review-token", &plan).is_err());
+
+        review.protected_roots.clear();
+        assert_eq!(
+            validate_duplicate_plan_and_reserve(&review, "review-token", &plan)
+                .expect("valid plan")
+                .len(),
+            1
+        );
+        review.in_flight.insert(keeper_key);
+        assert!(validate_duplicate_plan_and_reserve(&review, "review-token", &plan).is_err());
+
+        fs::remove_dir_all(root).expect("remove duplicate review test root");
+    }
 }
 
 #[tauri::command]
@@ -946,21 +1038,171 @@ async fn scan_folder_preview(
     .map_err(|error| format!("Folder preview query worker failed: {error}"))?
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopDuplicateScanResult {
+    #[serde(flatten)]
+    result: DuplicateScanResult,
+    review_token: String,
+}
+
+fn canonical_directory(path: &str) -> Result<PathBuf, String> {
+    let canonical = fs::canonicalize(path).map_err(|error| format!("{path}: {error}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("{path}: expected an existing folder"));
+    }
+    Ok(canonical)
+}
+
+fn normalized_canonical_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+#[cfg(windows)]
+fn duplicate_metadata_identity(
+    file: &fs::File,
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<(u64, u64), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+        .map_err(|error| format!("{}: could not read file identity: {error}", path.display()))?;
+    Ok((
+        info.dwVolumeSerialNumber as u64,
+        ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+    ))
+}
+
+#[cfg(unix)]
+fn duplicate_metadata_identity(
+    _file: &fs::File,
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn duplicate_metadata_identity(
+    _file: &fs::File,
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(u64, u64), String> {
+    Ok((metadata.len(), 0))
+}
+
+fn duplicate_member_snapshot(
+    path: &Path,
+    group_id: u64,
+) -> Result<DuplicateMemberSnapshot, String> {
+    let path_metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if path_metadata.file_attributes() & 0x400 != 0 {
+            return Err(format!(
+                "{}: reparse points are not actionable",
+                path.display()
+            ));
+        }
+    }
+    if !path_metadata.is_file() || path_metadata.file_type().is_symlink() {
+        return Err(format!("{}: expected a regular file", path.display()));
+    }
+    let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let canonical =
+        fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    Ok(DuplicateMemberSnapshot {
+        group_id,
+        identity_key: normalized_canonical_path(&canonical),
+        canonical_path: canonical,
+        size: metadata.len(),
+        modified_ns,
+        file_identity: duplicate_metadata_identity(&file, path, &metadata)?,
+    })
+}
+
 #[tauri::command]
 async fn duplicates_scan(
     state: State<'_, Arc<V2Store>>,
     registry: State<'_, DuplicateScanRegistry>,
+    request_id: String,
     request: DuplicateScanRequest,
+    protected_paths: Vec<String>,
     on_progress: Channel<DuplicateProgress>,
-) -> Result<DuplicateScanResult, String> {
+) -> Result<DesktopDuplicateScanResult, String> {
+    if request_id.is_empty() || request_id.len() > 128 {
+        return Err("Invalid duplicate scan request id".to_string());
+    }
+    if protected_paths.len() > 1_000 || protected_paths.iter().any(|path| path.len() > 32_768) {
+        return Err("Protected-location policy exceeds desktop limits".to_string());
+    }
+    let mut authorized_roots = request
+        .sources
+        .iter()
+        .map(|source| canonical_directory(&source.target_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    authorized_roots.sort_by_key(|path| normalized_canonical_path(path));
+    authorized_roots.dedup_by(|left, right| {
+        normalized_canonical_path(left) == normalized_canonical_path(right)
+    });
+    let mut protected_roots = protected_paths
+        .iter()
+        .map(|path| canonical_directory(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    if protected_roots.iter().any(|path| {
+        !authorized_roots
+            .iter()
+            .any(|root| review_path_is_within(path, root) || review_path_is_within(root, path))
+    }) {
+        return Err("Protected locations must be inside selected scan targets".to_string());
+    }
+    protected_roots.sort_by_key(|path| normalized_canonical_path(path));
+    protected_roots.dedup_by(|left, right| {
+        normalized_canonical_path(left) == normalized_canonical_path(right)
+    });
+
+    {
+        let mut review = registry
+            .review
+            .lock()
+            .map_err(|_| "Duplicate review state is unavailable".to_string())?;
+        if !review.in_flight.is_empty() {
+            return Err("Wait for the current duplicate action to finish".to_string());
+        }
+        *review = DuplicateReviewState::default();
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut active = registry
             .cancel
             .lock()
             .map_err(|_| "Duplicate scan registry is unavailable".to_string())?;
-        if let Some(previous) = active.replace(Arc::clone(&cancel)) {
-            previous.store(true, Ordering::Relaxed);
+        if let Some(previous) = active.replace(DuplicateScanCancellation {
+            request_id: request_id.clone(),
+            flag: Arc::clone(&cancel),
+        }) {
+            previous.flag.store(true, Ordering::Relaxed);
         }
     }
     let store = Arc::clone(state.inner());
@@ -972,27 +1214,542 @@ async fn duplicates_scan(
     })
     .await
     .map_err(|error| format!("Duplicate scan worker failed: {error}"))?;
-    if let Ok(mut active) = registry.cancel.lock() {
-        if active
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &cancel))
+    let mut result = outcome?;
+    if result.cancelled {
+        if let Ok(mut active) = registry.cancel.lock()
+            && active
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(&current.flag, &cancel))
         {
             active.take();
         }
+        return Ok(DesktopDuplicateScanResult {
+            result,
+            review_token: String::new(),
+        });
     }
-    outcome
+
+    let sequence = registry.next_review_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let issued = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let review_token = format!("{:x}-{issued:x}-{sequence:x}", std::process::id());
+    let mut review = DuplicateReviewState {
+        token: Some(review_token.clone()),
+        authorized_roots,
+        protected_roots,
+        ..DuplicateReviewState::default()
+    };
+    for (group_index, group) in result.groups.iter().enumerate() {
+        let group_id = group_index as u64;
+        for file in &group.files {
+            let Ok(path_key) = normalized_review_path(&file.path) else {
+                continue;
+            };
+            let Ok(identity) = fs::canonicalize(&file.path) else {
+                continue;
+            };
+            if !review
+                .authorized_roots
+                .iter()
+                .any(|root| review_path_is_within(&identity, root))
+            {
+                continue;
+            }
+            let Ok(snapshot) = duplicate_member_snapshot(Path::new(&file.path), group_id) else {
+                continue;
+            };
+            review
+                .active_by_group
+                .entry(group_id)
+                .or_default()
+                .insert(path_key.clone());
+            review.members.insert(path_key, snapshot);
+        }
+    }
+    let mut active = registry
+        .cancel
+        .lock()
+        .map_err(|_| "Duplicate scan registry is unavailable".to_string())?;
+    if cancel.load(Ordering::Relaxed)
+        || !active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.flag, &cancel))
+    {
+        result.groups.clear();
+        result.cancelled = true;
+        return Ok(DesktopDuplicateScanResult {
+            result,
+            review_token: String::new(),
+        });
+    }
+    *registry
+        .review
+        .lock()
+        .map_err(|_| "Duplicate review state is unavailable".to_string())? = review;
+    active.take();
+    Ok(DesktopDuplicateScanResult {
+        result,
+        review_token,
+    })
 }
 
 #[tauri::command]
-fn duplicates_cancel(registry: State<'_, DuplicateScanRegistry>) -> bool {
+fn duplicates_cancel(registry: State<'_, DuplicateScanRegistry>, request_id: String) -> bool {
     let Ok(active) = registry.cancel.lock() else {
         return false;
     };
-    let Some(cancel) = active.as_ref() else {
+    let Some(active) = active.as_ref() else {
         return false;
     };
-    cancel.store(true, Ordering::Relaxed);
+    if active.request_id != request_id {
+        return false;
+    }
+    active.flag.store(true, Ordering::Relaxed);
     true
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateActionResponse {
+    ok: bool,
+    errors: Vec<String>,
+    succeeded: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateLinkPair {
+    original: String,
+    link: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateActionItem {
+    path: String,
+    keeper: String,
+}
+
+struct DuplicatePlanReservation {
+    path_key: String,
+    group_id: u64,
+    requested_path: String,
+    canonical_path: String,
+    canonical_keeper: String,
+}
+
+fn normalized_review_path(path: &str) -> Result<String, String> {
+    let path_value = Path::new(path);
+    if !path_value.is_absolute()
+        || path_value
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!("{path}: expected an absolute normalized path"));
+    }
+    Ok(path
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase())
+}
+
+fn review_path_is_within(candidate: &Path, root: &Path) -> bool {
+    let candidate = normalized_canonical_path(candidate);
+    let root = normalized_canonical_path(root);
+    candidate == root
+        || candidate
+            .strip_prefix(&root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn canonical_location_without_following_entry(path: &str) -> Result<PathBuf, String> {
+    let normalized = normalized_review_path(path)?;
+    let value = Path::new(path);
+    let parent = value
+        .parent()
+        .ok_or_else(|| format!("{normalized}: path has no parent folder"))?;
+    let name = value
+        .file_name()
+        .ok_or_else(|| format!("{normalized}: path has no file name"))?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    Ok(canonical_parent.join(name))
+}
+
+fn validate_duplicate_plan_and_reserve(
+    review: &DuplicateReviewState,
+    review_token: &str,
+    items: &[DuplicateActionItem],
+) -> Result<Vec<DuplicatePlanReservation>, String> {
+    if review.token.as_deref() != Some(review_token) || review_token.is_empty() {
+        return Err(
+            "Duplicate results are stale; run a new scan before changing files".to_string(),
+        );
+    }
+    let selected = items
+        .iter()
+        .map(|item| normalized_review_path(&item.path))
+        .collect::<Result<HashSet<_>, _>>()?;
+    if selected.len() != items.len() {
+        return Err("Duplicate action plan contains the same file more than once".to_string());
+    }
+    let mut selected_by_group = HashMap::<u64, usize>::new();
+    let mut reservations = Vec::with_capacity(items.len());
+    for item in items {
+        let path = normalized_review_path(&item.path)?;
+        let keeper = normalized_review_path(&item.keeper)?;
+        if path == keeper || selected.contains(&keeper) {
+            return Err("Every duplicate group must retain an unselected keeper".to_string());
+        }
+        if review.in_flight.contains(&path) || review.in_flight.contains(&keeper) {
+            return Err("Another duplicate action is already using one of these files".to_string());
+        }
+        let Some(path_member) = review.members.get(&path) else {
+            return Err(format!(
+                "{}: file and keeper are not in the current verified duplicate scan",
+                item.path
+            ));
+        };
+        let Some(keeper_member) = review.members.get(&keeper) else {
+            return Err(format!(
+                "{}: file and keeper are not in the current verified duplicate scan",
+                item.path
+            ));
+        };
+        if path_member.group_id != keeper_member.group_id {
+            return Err(format!(
+                "{}: file and keeper are not in the same verified duplicate group",
+                item.path
+            ));
+        }
+        let Some(active) = review.active_by_group.get(&path_member.group_id) else {
+            return Err(format!(
+                "{}: duplicate group is no longer active",
+                item.path
+            ));
+        };
+        if !active.contains(&path) || !active.contains(&keeper) {
+            return Err(format!(
+                "{}: duplicate result was already changed; run a new scan",
+                item.path
+            ));
+        }
+        let current_path = duplicate_member_snapshot(Path::new(&item.path), path_member.group_id)?;
+        if current_path.identity_key != path_member.identity_key
+            || current_path.size != path_member.size
+            || current_path.modified_ns != path_member.modified_ns
+            || current_path.file_identity != path_member.file_identity
+        {
+            return Err(format!(
+                "{}: file identity changed since the duplicate scan",
+                item.path
+            ));
+        }
+        let canonical =
+            fs::canonicalize(&item.path).map_err(|error| format!("{}: {error}", item.path))?;
+        if !review
+            .authorized_roots
+            .iter()
+            .any(|root| review_path_is_within(&canonical, root))
+        {
+            return Err(format!(
+                "{}: file resolves outside the authorized scan locations",
+                item.path
+            ));
+        }
+        let current_keeper =
+            duplicate_member_snapshot(Path::new(&item.keeper), keeper_member.group_id)?;
+        if current_keeper.identity_key != keeper_member.identity_key
+            || current_keeper.size != keeper_member.size
+            || current_keeper.modified_ns != keeper_member.modified_ns
+            || current_keeper.file_identity != keeper_member.file_identity
+        {
+            return Err(format!(
+                "{}: keeper identity changed since the duplicate scan",
+                item.keeper
+            ));
+        }
+        let canonical_keeper =
+            fs::canonicalize(&item.keeper).map_err(|error| format!("{}: {error}", item.keeper))?;
+        if !review
+            .authorized_roots
+            .iter()
+            .any(|root| review_path_is_within(&canonical_keeper, root))
+        {
+            return Err(format!(
+                "{}: keeper resolves outside the authorized scan locations",
+                item.keeper
+            ));
+        }
+        let protected_location = canonical_location_without_following_entry(&item.path)?;
+        if review
+            .protected_roots
+            .iter()
+            .any(|root| review_path_is_within(&protected_location, root))
+        {
+            return Err(format!(
+                "{}: file is inside a protected duplicate location",
+                item.path
+            ));
+        }
+        *selected_by_group.entry(path_member.group_id).or_default() += 1;
+        reservations.push(DuplicatePlanReservation {
+            path_key: path,
+            group_id: path_member.group_id,
+            requested_path: item.path.clone(),
+            canonical_path: path_member.canonical_path.to_string_lossy().into_owned(),
+            canonical_keeper: keeper_member.canonical_path.to_string_lossy().into_owned(),
+        });
+    }
+    for (group_id, selected_count) in selected_by_group {
+        let active_count = review
+            .active_by_group
+            .get(&group_id)
+            .map_or(0, HashSet::len);
+        if selected_count >= active_count {
+            return Err("Every verified duplicate group must retain at least one file".to_string());
+        }
+    }
+    Ok(reservations)
+}
+
+fn validate_duplicate_destination(
+    review: &DuplicateReviewState,
+    destination: &str,
+) -> Result<PathBuf, String> {
+    let canonical = canonical_directory(destination)?;
+    if !review
+        .authorized_roots
+        .iter()
+        .any(|root| review_path_is_within(&canonical, root))
+    {
+        return Err(
+            "Destination must be inside one of the folders authorized by this scan".to_string(),
+        );
+    }
+    Ok(canonical)
+}
+
+#[tauri::command]
+async fn duplicates_action(
+    registry: State<'_, DuplicateScanRegistry>,
+    review_token: String,
+    action: String,
+    items: Vec<DuplicateActionItem>,
+    permanent: Option<bool>,
+    destination: Option<String>,
+) -> Result<DuplicateActionResponse, String> {
+    if items.is_empty() || items.len() > 1_000 {
+        return Err("Select between 1 and 1,000 duplicate files".to_string());
+    }
+    if !matches!(action.as_str(), "delete" | "move" | "copy") {
+        return Err("Unknown duplicate file action".to_string());
+    }
+    let destination = destination.unwrap_or_default();
+    let (reservations, locked_paths, destination_for_worker) = {
+        let mut review = registry
+            .review
+            .lock()
+            .map_err(|_| "Duplicate review state is unavailable".to_string())?;
+        let reservations = validate_duplicate_plan_and_reserve(&review, &review_token, &items)?;
+        let mut destination_for_worker = destination.clone();
+        if matches!(action.as_str(), "move" | "copy") {
+            if destination.trim().is_empty() {
+                return Err("Choose a destination folder".to_string());
+            }
+            let canonical_destination = validate_duplicate_destination(&review, &destination)?;
+            destination_for_worker = canonical_destination.to_string_lossy().into_owned();
+            if action == "move" {
+                for item in &items {
+                    let parent = Path::new(&item.path)
+                        .parent()
+                        .ok_or_else(|| format!("{}: path has no parent folder", item.path))?;
+                    let canonical_parent = fs::canonicalize(parent)
+                        .map_err(|error| format!("{}: {error}", parent.display()))?;
+                    if normalized_canonical_path(&canonical_parent)
+                        == normalized_canonical_path(&canonical_destination)
+                    {
+                        return Err(format!(
+                            "{}: source is already in the destination folder",
+                            item.path
+                        ));
+                    }
+                }
+            }
+        }
+        let locked_paths = items
+            .iter()
+            .flat_map(|item| [&item.path, &item.keeper])
+            .map(|path| normalized_review_path(path))
+            .collect::<Result<HashSet<_>, _>>()?;
+        review.in_flight.extend(locked_paths.iter().cloned());
+        (reservations, locked_paths, destination_for_worker)
+    };
+    let action_for_worker = action.clone();
+    let worker_items = reservations
+        .iter()
+        .map(|reservation| {
+            (
+                reservation.canonical_keeper.clone(),
+                reservation.canonical_path.clone(),
+                reservation.requested_path.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let response = tauri::async_runtime::spawn_blocking(move || {
+        let mut errors = Vec::new();
+        let mut succeeded = Vec::new();
+        for (keeper, path, requested_path) in worker_items {
+            let item_errors = match action_for_worker.as_str() {
+                "delete" => filetree_core::delete_verified_duplicate(
+                    keeper,
+                    path,
+                    permanent.unwrap_or(false),
+                ),
+                "move" | "copy" => filetree_core::transfer_verified_duplicate(
+                    &action_for_worker,
+                    keeper,
+                    path,
+                    destination_for_worker.clone(),
+                ),
+                _ => unreachable!(),
+            };
+            if item_errors.is_empty() {
+                succeeded.push(requested_path);
+            } else {
+                errors.extend(item_errors);
+            }
+        }
+        DuplicateActionResponse {
+            ok: errors.is_empty(),
+            errors,
+            succeeded,
+        }
+    })
+    .await
+    .map_err(|error| format!("Duplicate action worker failed: {error}"));
+
+    let mut review = registry
+        .review
+        .lock()
+        .map_err(|_| "Duplicate review state is unavailable".to_string())?;
+    if review.token.as_deref() == Some(review_token.as_str()) {
+        for path in &locked_paths {
+            review.in_flight.remove(path);
+        }
+    }
+    let response = response?;
+    if action != "copy" && review.token.as_deref() == Some(review_token.as_str()) {
+        let succeeded = response
+            .succeeded
+            .iter()
+            .filter_map(|path| normalized_review_path(path).ok())
+            .collect::<HashSet<_>>();
+        for reservation in reservations {
+            if succeeded.contains(&reservation.path_key)
+                && let Some(active) = review.active_by_group.get_mut(&reservation.group_id)
+            {
+                active.remove(&reservation.path_key);
+            }
+        }
+    }
+    Ok(response)
+}
+
+#[tauri::command]
+async fn duplicates_link(
+    registry: State<'_, DuplicateScanRegistry>,
+    review_token: String,
+    pairs: Vec<DuplicateLinkPair>,
+    mode: String,
+) -> Result<DuplicateActionResponse, String> {
+    if pairs.is_empty() || pairs.len() > 1_000 {
+        return Err("Select between 1 and 1,000 duplicate files".to_string());
+    }
+    if !matches!(mode.as_str(), "hardlink" | "symlink") {
+        return Err("Unknown duplicate link type".to_string());
+    }
+    let plan = pairs
+        .iter()
+        .map(|pair| DuplicateActionItem {
+            path: pair.link.clone(),
+            keeper: pair.original.clone(),
+        })
+        .collect::<Vec<_>>();
+    let (reservations, locked_paths) = {
+        let mut review = registry
+            .review
+            .lock()
+            .map_err(|_| "Duplicate review state is unavailable".to_string())?;
+        let reservations = validate_duplicate_plan_and_reserve(&review, &review_token, &plan)?;
+        let locked_paths = plan
+            .iter()
+            .flat_map(|item| [&item.path, &item.keeper])
+            .map(|path| normalized_review_path(path))
+            .collect::<Result<HashSet<_>, _>>()?;
+        review.in_flight.extend(locked_paths.iter().cloned());
+        (reservations, locked_paths)
+    };
+    let worker_pairs = reservations
+        .iter()
+        .map(|reservation| {
+            (
+                reservation.canonical_keeper.clone(),
+                reservation.canonical_path.clone(),
+                reservation.requested_path.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let response = tauri::async_runtime::spawn_blocking(move || {
+        let mut errors = Vec::new();
+        let mut succeeded = Vec::new();
+        for (keeper, path, requested_path) in worker_pairs {
+            let item_errors = filetree_core::replace_duplicate_paths_with_links(
+                vec![(keeper, path)],
+                mode == "symlink",
+            );
+            if item_errors.is_empty() {
+                succeeded.push(requested_path);
+            } else {
+                errors.extend(item_errors);
+            }
+        }
+        DuplicateActionResponse {
+            ok: errors.is_empty(),
+            errors,
+            succeeded,
+        }
+    })
+    .await
+    .map_err(|error| format!("Duplicate link worker failed: {error}"));
+
+    let mut review = registry
+        .review
+        .lock()
+        .map_err(|_| "Duplicate review state is unavailable".to_string())?;
+    if review.token.as_deref() == Some(review_token.as_str()) {
+        for path in &locked_paths {
+            review.in_flight.remove(path);
+        }
+    }
+    let response = response?;
+    if review.token.as_deref() == Some(review_token.as_str()) {
+        let succeeded = response
+            .succeeded
+            .iter()
+            .filter_map(|path| normalized_review_path(path).ok())
+            .collect::<HashSet<_>>();
+        for reservation in reservations {
+            if succeeded.contains(&reservation.path_key)
+                && let Some(active) = review.active_by_group.get_mut(&reservation.group_id)
+            {
+                active.remove(&reservation.path_key);
+            }
+        }
+    }
+    Ok(response)
 }
 
 #[tauri::command]
@@ -1552,7 +2309,10 @@ async fn compression_control(
 ) -> Result<Value, String> {
     let runtime = Arc::clone(runtime.inner());
     tauri::async_runtime::spawn_blocking(move || match action.as_str() {
-        "cancel" => Ok(serde_json::json!({ "ok": runtime.cancel_compression(&request.id) })),
+        "cancel" => {
+            runtime.cancel_compression(&request.id)?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
         "pause" => {
             Ok(serde_json::json!({ "ok": true, "status": runtime.pause_compression(&request.id)? }))
         }
@@ -1752,6 +2512,8 @@ pub fn run() {
             scan_folder_preview,
             duplicates_scan,
             duplicates_cancel,
+            duplicates_action,
+            duplicates_link,
             scan_pin,
             memory_stats,
             compression_tools,
@@ -1783,6 +2545,7 @@ pub fn run() {
         }
         if matches!(event, tauri::RunEvent::Exit) {
             filetree_core::set_keep_awake(false);
+            app_handle.state::<Arc<DesktopRuntime>>().shutdown();
             app_handle
                 .state::<Arc<terminal::TerminalRegistry>>()
                 .kill_all();

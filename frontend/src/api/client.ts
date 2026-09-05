@@ -1702,16 +1702,81 @@ export async function fetchDupesHash(
   return res.json() as Promise<DupeHashResult>;
 }
 
+export interface DupeActionItem {
+  path: string;
+  keeper: string;
+}
+
+export interface DupeActionResult {
+  ok: boolean;
+  errors: string[];
+  succeeded: string[];
+  requiresRescan?: boolean;
+}
+
 export async function dupeAction(
   action: "delete" | "move" | "copy",
   paths: string[],
-  opts: { permanent?: boolean; dest?: string },
-): Promise<{ ok: boolean; errors: string[] }> {
+  opts: {
+    permanent?: boolean;
+    dest?: string;
+    protectedPaths?: string[];
+    items?: DupeActionItem[];
+    reviewToken?: string;
+  },
+): Promise<DupeActionResult> {
+  if (isTauriV2()) {
+    if (!opts.items || opts.items.length !== paths.length || !opts.reviewToken) {
+      return { ok: false, errors: ["Duplicate action plan is incomplete; run the scan again."], succeeded: [] };
+    }
+    const errors: string[] = [];
+    const succeeded: string[] = [];
+    let requiresRescan = false;
+    for (let offset = 0; offset < opts.items.length; offset += 1_000) {
+      try {
+        const result = await invoke<DupeActionResult>("duplicates_action", {
+          reviewToken: opts.reviewToken,
+          action,
+          items: opts.items.slice(offset, offset + 1_000),
+          permanent: opts.permanent ?? false,
+          destination: opts.dest ?? null,
+        });
+        if (!result || !Array.isArray(result.errors) || !Array.isArray(result.succeeded)) {
+          throw new Error("Invalid duplicate action response");
+        }
+        errors.push(...(result.errors ?? []));
+        succeeded.push(...(result.succeeded ?? []));
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+        requiresRescan = true;
+        break;
+      }
+    }
+    return {
+      ok: errors.length === 0,
+      errors,
+      succeeded,
+      ...(requiresRescan ? { requiresRescan: true } : {}),
+    };
+  }
   const r = await postMutation("/api/dupes-action", {
-    action, paths, permanent: opts.permanent ?? false, dest: opts.dest ?? "",
+    action,
+    paths,
+    permanent: opts.permanent ?? false,
+    dest: opts.dest ?? "",
+    protectedPaths: opts.protectedPaths ?? [],
+    items: opts.items ?? [],
+    reviewToken: opts.reviewToken ?? "",
   });
-  if (!r.ok) return { ok: false, errors: [mutateErrorText(r)] };
-  return (r.data as { ok: boolean; errors: string[] } | null) ?? { ok: false, errors: ["Invalid response"] };
+  if (!r.ok) return { ok: false, errors: [mutateErrorText(r)], succeeded: [], requiresRescan: true };
+  const data = r.data as { ok?: boolean; errors?: string[]; succeeded?: string[] } | null;
+  if (!data) return { ok: false, errors: ["Invalid response"], succeeded: [], requiresRescan: true };
+  return {
+    ok: data.ok ?? false,
+    errors: data.errors ?? [],
+    succeeded: data.succeeded ?? (data.ok ? paths : []),
+    requiresRescan: !data.ok && !Array.isArray(data.succeeded),
+  };
 }
 
 /**
@@ -1724,11 +1789,50 @@ export async function dupeAction(
 export async function hardlinkPairs(
   pairs: { original: string; link: string }[],
   mode: "hardlink" | "symlink",
-): Promise<{ ok: boolean; errors: string[] }> {
-  const r = await postMutation("/api/hardlink", { mode, pairs });
-  if (!r.ok) return { ok: false, errors: [mutateErrorText(r)] };
-  const d = (r.data ?? {}) as { ok?: boolean; errors?: string[] };
-  return { ok: d.ok ?? false, errors: d.errors ?? [] };
+  protectedPaths: string[] = [],
+  reviewToken?: string,
+): Promise<DupeActionResult> {
+  if (isTauriV2()) {
+    if (!reviewToken) {
+      return { ok: false, errors: ["Duplicate action plan is incomplete; run the scan again."], succeeded: [] };
+    }
+    const errors: string[] = [];
+    const succeeded: string[] = [];
+    let requiresRescan = false;
+    for (let offset = 0; offset < pairs.length; offset += 1_000) {
+      try {
+        const result = await invoke<DupeActionResult>("duplicates_link", {
+          reviewToken,
+          pairs: pairs.slice(offset, offset + 1_000),
+          mode,
+        });
+        if (!result || !Array.isArray(result.errors) || !Array.isArray(result.succeeded)) {
+          throw new Error("Invalid duplicate link response");
+        }
+        errors.push(...(result.errors ?? []));
+        succeeded.push(...(result.succeeded ?? []));
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+        requiresRescan = true;
+        break;
+      }
+    }
+    return {
+      ok: errors.length === 0,
+      errors,
+      succeeded,
+      ...(requiresRescan ? { requiresRescan: true } : {}),
+    };
+  }
+  const r = await postMutation("/api/hardlink", { mode, pairs, protectedPaths, reviewToken: reviewToken ?? "" });
+  if (!r.ok) return { ok: false, errors: [mutateErrorText(r)], succeeded: [], requiresRescan: true };
+  const d = (r.data ?? {}) as { ok?: boolean; errors?: string[]; succeeded?: string[] };
+  return {
+    ok: d.ok ?? false,
+    errors: d.errors ?? [],
+    succeeded: d.succeeded ?? (d.ok ? pairs.map((pair) => pair.link) : []),
+    requiresRescan: !d.ok && !Array.isArray(d.succeeded),
+  };
 }
 
 /** One item FileTree recycled, as recorded in the audit log (#30). */
@@ -1767,6 +1871,7 @@ export async function dupeMakeRef(
 }
 
 export async function dupeIgnorePair(a: string, b: string): Promise<{ ok: boolean; count: number }> {
+  if (isTauriV2()) return { ok: true, count: 0 };
   const body = JSON.stringify({ a, b });
   const res = await fetch("/api/dupes-ignore", { method: "POST", headers: { "Content-Type": "application/json" }, body });
   if (!res.ok) return { ok: false, count: 0 };
@@ -1774,6 +1879,7 @@ export async function dupeIgnorePair(a: string, b: string): Promise<{ ok: boolea
 }
 
 export async function dupeClearIgnoreList(): Promise<{ ok: boolean }> {
+  if (isTauriV2()) return { ok: true };
   const res = await fetch("/api/dupes-ignore", { method: "DELETE" });
   if (!res.ok) return { ok: false };
   return res.json() as Promise<{ ok: boolean }>;

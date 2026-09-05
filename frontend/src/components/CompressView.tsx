@@ -808,9 +808,11 @@ export function CompressView({
   // stop a double-click (or two mounted panes) from issuing duplicate creates.
   const startAttemptRef = useRef<Promise<boolean> | null>(null);
   const pendingStartCancelledRef = useRef(false);
+  const stoppingRef = useRef(false);
 
   const [runStatus, setRunStatus] = useState<RunStatus>("idle");
   const [starting, setStarting] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [, setProgress] = useState<Map<number, FileProg>>(new Map());
   const [jobId, setJobId] = useState<string | null>(null);
   const [runError, setRunError] = useState("");
@@ -1794,7 +1796,11 @@ export function CompressView({
           break;
         case "done":
           // Job summaries are authoritative; this event closes the live run.
-          finalize("done", ev.savedBytes, ev.done);
+          finalize(
+            pendingStartCancelledRef.current ? "cancelled" : "done",
+            ev.savedBytes,
+            ev.done,
+          );
           break;
       }
     },
@@ -2172,20 +2178,40 @@ export function CompressView({
   );
 
   const handleStop = useCallback(async () => {
+    if (stoppingRef.current) return;
+    stoppingRef.current = true;
+    setStopping(true);
     pendingStartCancelledRef.current = true;
     abortRef.current?.abort();
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
     finalizedRef.current = true;
-    setRunStatus("cancelled");
-    if (jobId) {
-      const res = await cancelCompressJob(jobId);
-      if (!res.ok) toast.error(res.error ?? "Could not cancel the job.");
+    try {
+      if (jobId) {
+        const res = await cancelCompressJob(jobId);
+        if (!res.ok) {
+          const message = res.error ?? "Could not cancel the job.";
+          finalizedRef.current = false;
+          setRunError(message);
+          void attachStream(jobId);
+          toast.error(message);
+          return;
+        }
+      } else if (startAttemptRef.current) {
+        // Stop can race the create request before a job id reaches React state.
+        // `runFiles` observes pendingStartCancelledRef and performs the native
+        // cancellation; keep this view locked until that handshake completes.
+        await startAttemptRef.current;
+      }
+      setRunStatus("cancelled");
+      // Some files may have completed before the stop; refresh without retaining
+      // a duplicate per-file progress map in the renderer.
+      invalidateAllScanCache();
+      onRescan();
+    } finally {
+      stoppingRef.current = false;
+      setStopping(false);
     }
-    // Some files may have completed before the stop; refresh without retaining
-    // a duplicate per-file progress map in the renderer.
-    invalidateAllScanCache();
-    onRescan();
-  }, [jobId, onRescan]);
+  }, [jobId, attachStream, onRescan]);
 
   const handleRetry = useCallback(async () => {
     if (!jobId) return;
@@ -2211,6 +2237,8 @@ export function CompressView({
   const resetRun = useCallback(() => {
     abortRef.current?.abort();
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    stoppingRef.current = false;
+    setStopping(false);
     finalizedRef.current = false;
     setRunStatus("idle");
     setProgress(new Map());
@@ -2558,17 +2586,19 @@ export function CompressView({
             <button
               className="compress-btn"
               onClick={handleEnqueue}
-              disabled={runnableCount === 0 || (outputMode === "folder" && !outputDir.trim())}
+              disabled={stopping || runnableCount === 0 || (outputMode === "folder" && !outputDir.trim())}
               title={
-                runnableCount === 0
+                stopping
+                  ? "Wait for the active compression processes to stop"
+                  : runnableCount === 0
                   ? "Select files to queue"
                   : `Queue ${runnableCount.toLocaleString()} file(s) to start after the current job`
               }
             >
               <Icon name="file-zip" size={13} /> Add to queue {runnableCount > 0 ? `(${runnableCount.toLocaleString()})` : ""}
             </button>
-            <button className="compress-btn danger" onClick={() => void handleStop()}>
-              <Icon name="stop-fill" size={13} /> Stop
+            <button className="compress-btn danger" onClick={() => void handleStop()} disabled={stopping}>
+              <Icon name="stop-fill" size={13} /> {stopping ? "Stopping…" : "Stop"}
             </button>
           </>
         )}

@@ -91,6 +91,7 @@ export interface V2DuplicateResult {
   scanned: number;
   hashing: number;
   cancelled: boolean;
+  reviewToken: string;
 }
 
 export interface V2DuplicateRequest {
@@ -109,6 +110,8 @@ export interface NativeDragResponse {
 }
 
 const pageCache = new V2PageCache<V2NodePage>();
+let duplicateRequestSequence = 0;
+let activeDuplicateRequestId: string | null = null;
 
 export function isTauriV2(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -295,25 +298,33 @@ export async function v2MemoryStats(): Promise<V2MemoryStats> {
 
 export async function runV2DuplicateScan(
   request: V2DuplicateRequest,
+  protectedPaths: string[],
   onProgress: (value: V2DuplicateProgress) => void,
   signal?: AbortSignal,
 ): Promise<V2DuplicateResult> {
+  const requestId = `duplicates-${Date.now().toString(36)}-${(++duplicateRequestSequence).toString(36)}`;
+  activeDuplicateRequestId = requestId;
   const channel = new Channel<V2DuplicateProgress>();
   channel.onmessage = onProgress;
-  const abort = () => { void invoke("duplicates_cancel"); };
+  const abort = () => { void invoke("duplicates_cancel", { requestId }); };
   signal?.addEventListener("abort", abort, { once: true });
   try {
     return await invoke<V2DuplicateResult>("duplicates_scan", {
+      requestId,
       request,
+      protectedPaths,
       onProgress: channel,
     });
   } finally {
     signal?.removeEventListener("abort", abort);
+    if (activeDuplicateRequestId === requestId) activeDuplicateRequestId = null;
   }
 }
 
 export async function cancelV2DuplicateScan(): Promise<void> {
-  await invoke("duplicates_cancel");
+  const requestId = activeDuplicateRequestId;
+  if (!requestId) return;
+  await invoke("duplicates_cancel", { requestId });
 }
 
 export function releaseV2ScanPages(scanId: string): void {
