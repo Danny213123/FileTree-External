@@ -382,6 +382,7 @@ fn duplicates_bucket(
         None,
         None,
         threads,
+        None,
     );
     for (_hash, idxs) in &groups {
         if idxs.len() < 2 {

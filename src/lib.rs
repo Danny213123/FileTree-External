@@ -155,6 +155,7 @@ pub fn transfer_verified_duplicate(
 pub fn replace_duplicate_paths_with_links(
     pairs: Vec<(String, String)>,
     symbolic: bool,
+    permanent: bool,
 ) -> Vec<String> {
     let pairs = pairs
         .into_iter()
@@ -165,7 +166,7 @@ pub fn replace_duplicate_paths_with_links(
             )
         })
         .collect::<Vec<_>>();
-    dupes::action_link(&pairs, symbolic)
+    dupes::action_link(&pairs, symbolic, permanent)
 }
 
 pub fn verified_duplicate_pair(original: &str, duplicate: &str) -> Result<bool, String> {

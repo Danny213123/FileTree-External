@@ -136,6 +136,34 @@ describe("v2 bounded client queries", () => {
       reviewToken: "review-1",
       pairs: [{ original: "C:\\Library\\master.bin", link: "C:\\Downloads\\copy.bin" }],
       mode: "hardlink",
+      permanent: false,
+    });
+  });
+
+  it("forwards permanent link replacement through Tauri", async () => {
+    vi.mocked(invoke).mockResolvedValue({
+      ok: true,
+      errors: [],
+      succeeded: ["C:\\Downloads\\copy.bin"],
+    });
+
+    await expect(hardlinkPairs(
+      [{ original: "C:\\Library\\master.bin", link: "C:\\Downloads\\copy.bin" }],
+      "symlink",
+      ["C:\\Library"],
+      "review-1",
+      true,
+    )).resolves.toEqual({
+      ok: true,
+      errors: [],
+      succeeded: ["C:\\Downloads\\copy.bin"],
+    });
+
+    expect(invoke).toHaveBeenCalledWith("duplicates_link", {
+      reviewToken: "review-1",
+      pairs: [{ original: "C:\\Library\\master.bin", link: "C:\\Downloads\\copy.bin" }],
+      mode: "symlink",
+      permanent: true,
     });
   });
 

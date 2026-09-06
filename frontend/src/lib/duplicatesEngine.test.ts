@@ -5,7 +5,9 @@ import {
   actionableDuplicatePaths,
   applyProtectedLocations,
   buildContentGroups,
+  minimalScanTargets,
   normalizeForKey,
+  scopeStateForPath,
   type CandidateMeta,
 } from "./duplicatesEngine";
 
@@ -114,5 +116,28 @@ describe("duplicate protection policy", () => {
     );
 
     expect(updated.files.find((file) => file.ref)?.path).toBe("D:\\Backup\\notes.txt");
+  });
+
+  it("uses the nearest folder rule so a child can override its parent", () => {
+    const rules = [
+      { path: "C:\\", state: "normal" as const },
+      { path: "C:\\Library", state: "reference" as const },
+      { path: "C:\\Library\\Scratch", state: "normal" as const },
+      { path: "C:\\Library\\Scratch\\Generated", state: "excluded" as const },
+    ];
+
+    expect(scopeStateForPath("C:\\Library\\master.bin", rules)).toBe("reference");
+    expect(scopeStateForPath("C:\\Library\\Scratch\\draft.bin", rules)).toBe("normal");
+    expect(scopeStateForPath("C:\\Library\\Scratch\\Generated\\tmp.bin", rules)).toBe("excluded");
+  });
+
+  it("stages overlapping selected folders through their shallowest scan root once", () => {
+    expect(minimalScanTargets([
+      "C:\\",
+      "C:\\Library",
+      "c:\\library\\Photos",
+      "D:\\Archive",
+      "D:\\Archive",
+    ])).toEqual(["C:\\", "D:\\Archive"]);
   });
 });

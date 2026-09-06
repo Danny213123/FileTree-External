@@ -27,7 +27,7 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::dupes::{HashInput, hash_candidate_groups, next_hash_cache_seq};
+use crate::dupes::{HashCandidateProgress, HashInput, hash_candidate_groups, next_hash_cache_seq};
 use crate::model::HashCacheEntry;
 
 pub const TREE_PAGE_DEFAULT: usize = 500;
@@ -440,12 +440,21 @@ pub struct DuplicateSource {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicatePathRule {
+    pub path: String,
+    pub excluded: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DuplicateScanRequest {
     pub sources: Vec<DuplicateSource>,
     pub min_size: u64,
     pub max_size: Option<u64>,
     pub extensions: Vec<String>,
+    pub excluded_paths: Vec<String>,
+    pub path_rules: Vec<DuplicatePathRule>,
     pub include_hidden: bool,
     pub threads: usize,
 }
@@ -457,6 +466,8 @@ impl Default for DuplicateScanRequest {
             min_size: 1,
             max_size: None,
             extensions: Vec::new(),
+            excluded_paths: Vec::new(),
+            path_rules: Vec::new(),
             include_hidden: true,
             threads: 4,
         }
@@ -994,7 +1005,7 @@ impl V2Store {
         progress: F,
     ) -> Result<DuplicateScanResult, String>
     where
-        F: Fn(DuplicateProgress),
+        F: Fn(DuplicateProgress) + Sync,
     {
         if request.sources.is_empty() || request.sources.len() > 16 {
             return Err("Select between 1 and 16 duplicate scan targets".to_string());
@@ -1009,6 +1020,77 @@ impl V2Store {
             .collect();
         request.extensions.sort();
         request.extensions.dedup();
+        if request.excluded_paths.len() > 256
+            || request
+                .excluded_paths
+                .iter()
+                .any(|path| path.len() > 32_768)
+            || request.path_rules.len() > 1_000
+            || request
+                .path_rules
+                .iter()
+                .any(|rule| rule.path.len() > 32_768)
+        {
+            return Err("Duplicate folder-state policy exceeds scan limits".to_string());
+        }
+        request.excluded_paths = request
+            .excluded_paths
+            .into_iter()
+            .map(|path| duplicate_query_path(path.trim()))
+            .filter(|path| !path.is_empty())
+            .collect();
+        request
+            .excluded_paths
+            .sort_by_key(|path| normalized_path_text(path));
+        request
+            .excluded_paths
+            .dedup_by(|left, right| normalized_path_text(left) == normalized_path_text(right));
+        request.path_rules = request
+            .path_rules
+            .into_iter()
+            .filter_map(|mut rule| {
+                rule.path = duplicate_query_path(rule.path.trim());
+                (!rule.path.is_empty()).then_some(rule)
+            })
+            .collect();
+        request
+            .path_rules
+            .extend(
+                request
+                    .excluded_paths
+                    .iter()
+                    .cloned()
+                    .map(|path| DuplicatePathRule {
+                        path,
+                        excluded: true,
+                    }),
+            );
+        request.path_rules.sort_by(|left, right| {
+            normalized_path_text(&right.path)
+                .len()
+                .cmp(&normalized_path_text(&left.path).len())
+                .then_with(|| {
+                    normalized_path_text(&left.path).cmp(&normalized_path_text(&right.path))
+                })
+        });
+        let mut folder_states = HashMap::<String, bool>::new();
+        let mut conflicting_folder_state = false;
+        request.path_rules.retain(|rule| {
+            let key = normalized_path_text(&rule.path);
+            match folder_states.get(&key) {
+                Some(state) => {
+                    conflicting_folder_state |= *state != rule.excluded;
+                    false
+                }
+                None => {
+                    folder_states.insert(key, rule.excluded);
+                    true
+                }
+            }
+        });
+        if conflicting_folder_state {
+            return Err("A duplicate folder can have only one state".to_string());
+        }
 
         let work_path = self.scans_dir.join(format!(
             ".duplicate-work-{}-{}.db",
@@ -1021,7 +1103,7 @@ impl V2Store {
             "CREATE TABLE candidates(\
                path TEXT PRIMARY KEY COLLATE NOCASE,name TEXT NOT NULL,\
                size INTEGER NOT NULL,modified_ms INTEGER NOT NULL\
-             );",
+             ) WITHOUT ROWID;",
         )
         .map_err(|error| error.to_string())?;
 
@@ -1032,9 +1114,8 @@ impl V2Store {
             hashing: 0,
             hashed: 0,
         });
-        let mut last_index_progress = Instant::now();
 
-        for source in &request.sources {
+        for (source_index, source) in request.sources.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(DuplicateScanResult {
                     groups: Vec::new(),
@@ -1064,19 +1145,57 @@ impl V2Store {
                     source.scan_id
                 ));
             }
-            let scan = open_scan_connection(&scan_path).map_err(|error| error.to_string())?;
+            let schema = format!("duplicate_source_{source_index}");
+            work.execute(
+                &format!("ATTACH DATABASE ?1 AS {schema}"),
+                params![scan_path.to_string_lossy()],
+            )
+            .map_err(|error| error.to_string())?;
+            let max_node_id = work
+                .query_row(
+                    &format!("SELECT COALESCE(MAX(id),0) FROM {schema}.nodes"),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| error.to_string())?
+                .max(0);
             let path_expr = "CASE WHEN p.dir_path IS NULL OR p.dir_path='' THEN n.name WHEN substr(p.dir_path,-1,1) IN ('\\','/') THEN p.dir_path || n.name ELSE p.dir_path || '\\' || n.name END";
+            let query_dir_path = duplicate_query_dir_path_sql();
             let mut clauses = vec![
                 "n.is_dir=0".to_string(),
                 "n.size>=?".to_string(),
-                "(p.dir_path=? OR p.dir_path LIKE ? ESCAPE '!')".to_string(),
+                format!(
+                    "({query_dir_path}=? COLLATE NOCASE OR {query_dir_path} LIKE ? ESCAPE '!')"
+                ),
             ];
-            let target = source.target_path.trim_end_matches(['\\', '/']).to_string();
+            let target = duplicate_query_path(&source.target_path);
             let mut values = vec![
                 Value::Integer(as_sql_i64(request.min_size)),
                 Value::Text(target.clone()),
-                Value::Text(format!("{}\\%", escape_duplicate_like(&target))),
+                Value::Text(duplicate_descendant_pattern(&target)),
             ];
+            let relevant_rules = request
+                .path_rules
+                .iter()
+                .filter(|rule| {
+                    path_is_within_text(&rule.path, &source.target_path)
+                        || path_is_within_text(&source.target_path, &rule.path)
+                })
+                .collect::<Vec<_>>();
+            if !relevant_rules.is_empty() {
+                let mut scope_case = "CASE ".to_string();
+                for rule in relevant_rules {
+                    scope_case.push_str(&format!(
+                        "WHEN ({query_dir_path}=? COLLATE NOCASE OR {query_dir_path} LIKE ? ESCAPE '!') THEN {} ",
+                        if rule.excluded { 0 } else { 1 },
+                    ));
+                    let path = duplicate_query_path(&rule.path);
+                    values.push(Value::Text(path.clone()));
+                    values.push(Value::Text(duplicate_descendant_pattern(&path)));
+                }
+                scope_case.push_str("ELSE 1 END=1");
+                clauses.push(scope_case);
+            }
             if let Some(max_size) = request.max_size {
                 clauses.push("n.size<=?".to_string());
                 values.push(Value::Integer(as_sql_i64(max_size)));
@@ -1093,56 +1212,40 @@ impl V2Store {
                 ));
                 values.extend(request.extensions.iter().cloned().map(Value::Text));
             }
+            clauses.push("n.id>?".to_string());
+            clauses.push("n.id<=?".to_string());
             let sql = format!(
-                "SELECT {path_expr},n.name,n.size,n.modified_ms FROM nodes n \
-                 LEFT JOIN nodes p ON p.id=n.parent_id WHERE {} ORDER BY n.id",
+                "INSERT OR IGNORE INTO candidates(path,name,size,modified_ms) \
+                 SELECT {path_expr},n.name,n.size,n.modified_ms FROM {schema}.nodes n \
+                 LEFT JOIN {schema}.nodes p ON p.id=n.parent_id WHERE {} ORDER BY n.id",
                 clauses.join(" AND ")
             );
-            let mut stmt = scan.prepare(&sql).map_err(|error| error.to_string())?;
-            let rows = stmt
-                .query_map(params_from_iter(values.iter()), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?.max(0) as u64,
-                        row.get::<_, i64>(3)?.max(0) as u64,
-                    ))
-                })
-                .map_err(|error| error.to_string())?;
             let tx = work.transaction().map_err(|error| error.to_string())?;
-            {
-                let mut insert = tx
-                    .prepare_cached(
-                        "INSERT OR IGNORE INTO candidates(path,name,size,modified_ms) VALUES(?1,?2,?3,?4)",
-                    )
-                    .map_err(|error| error.to_string())?;
-                for row in rows {
-                    if cancel.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let (path, name, size, modified_ms) = row.map_err(|error| error.to_string())?;
-                    scanned = scanned.saturating_add(
-                        insert
-                            .execute(params![
-                                path,
-                                name,
-                                as_sql_i64(size),
-                                as_sql_i64(modified_ms)
-                            ])
-                            .map_err(|error| error.to_string())? as u64,
-                    );
-                    if last_index_progress.elapsed() >= Duration::from_millis(250) {
-                        progress(DuplicateProgress {
-                            phase: "indexing".to_string(),
-                            scanned,
-                            hashing: 0,
-                            hashed: 0,
-                        });
-                        last_index_progress = Instant::now();
-                    }
+            const INDEX_BATCH_IDS: i64 = 50_000;
+            let mut lower_id = 0i64;
+            while lower_id < max_node_id {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
                 }
+                let upper_id = lower_id.saturating_add(INDEX_BATCH_IDS).min(max_node_id);
+                let mut batch_values = values.clone();
+                batch_values.push(Value::Integer(lower_id));
+                batch_values.push(Value::Integer(upper_id));
+                let inserted = tx
+                    .execute(&sql, params_from_iter(batch_values.iter()))
+                    .map_err(|error| error.to_string())?;
+                scanned = scanned.saturating_add(inserted as u64);
+                progress(DuplicateProgress {
+                    phase: "indexing".to_string(),
+                    scanned,
+                    hashing: 0,
+                    hashed: 0,
+                });
+                lower_id = upper_id;
             }
             tx.commit().map_err(|error| error.to_string())?;
+            work.execute_batch(&format!("DETACH DATABASE {schema}"))
+                .map_err(|error| error.to_string())?;
             progress(DuplicateProgress {
                 phase: "indexing".to_string(),
                 scanned,
@@ -1234,6 +1337,17 @@ impl V2Store {
             let cached = load_duplicate_hash_cache(&state, &inputs)?;
             let existing_cache_paths = cached.keys().cloned().collect::<HashSet<_>>();
             let cache = Mutex::new(cached);
+            let hashed_before_batch = hashed;
+            let report_batch_progress = |batch_progress: HashCandidateProgress| {
+                progress(DuplicateProgress {
+                    phase: batch_progress.stage.to_string(),
+                    scanned,
+                    hashing,
+                    hashed: hashed_before_batch
+                        .saturating_add(batch_progress.completed.min(batch_progress.total) as u64)
+                        .min(hashing),
+                });
+            };
             let (bucket_groups, bucket_errors) = hash_candidate_groups(
                 &inputs,
                 // A full-file hash is sufficient for discovery. Every move,
@@ -1247,6 +1361,7 @@ impl V2Store {
                 None,
                 Some(&cancel),
                 request.threads,
+                Some(&report_batch_progress),
             );
             errors.extend(
                 bucket_errors
@@ -2997,6 +3112,37 @@ fn escape_duplicate_like(value: &str) -> String {
         .replace('_', "!_")
 }
 
+fn duplicate_query_path(value: &str) -> String {
+    let normalized = if cfg!(windows) {
+        value.replace('\\', "/")
+    } else {
+        value.to_string()
+    };
+    let trimmed = normalized.trim().trim_end_matches('/');
+    if trimmed.is_empty() && normalized.trim().starts_with('/') {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn duplicate_query_dir_path_sql() -> &'static str {
+    if cfg!(windows) {
+        "replace(p.dir_path,'\\','/')"
+    } else {
+        "p.dir_path"
+    }
+}
+
+fn duplicate_descendant_pattern(value: &str) -> String {
+    let value = duplicate_query_path(value);
+    if value == "/" {
+        "/%".to_string()
+    } else {
+        format!("{}/%", escape_duplicate_like(&value))
+    }
+}
+
 const SUBTREE_FILE_SELECT_SQL: &str = r#"WITH RECURSIVE directories(id,dir_path) AS (
     SELECT id,dir_path FROM nodes WHERE id=?1 AND is_dir=1
     UNION ALL
@@ -4013,7 +4159,7 @@ mod tests {
             .unwrap();
         drop(state);
         let repeated = store
-            .find_exact_duplicates(request, Arc::new(AtomicBool::new(false)), |_| {})
+            .find_exact_duplicates(request.clone(), Arc::new(AtomicBool::new(false)), |_| {})
             .unwrap();
         assert_eq!(repeated.groups.len(), 1);
         let state = store.open_state().unwrap();
@@ -4027,6 +4173,97 @@ mod tests {
                 .unwrap(),
             2
         );
+
+        let excluded = store
+            .find_exact_duplicates(
+                DuplicateScanRequest {
+                    excluded_paths: vec![source.join("nested").to_string_lossy().into_owned()],
+                    ..request
+                },
+                Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+        assert!(
+            excluded.groups.is_empty(),
+            "files under an explicitly excluded child folder must not be candidates"
+        );
+    }
+
+    #[test]
+    fn duplicate_scan_uses_deepest_scope_rule_with_normalized_separators() {
+        let store = temp_store("duplicate-scope-rules");
+        let source = store.data_root().join("fixture");
+        let excluded = source.join("excluded");
+        let included = excluded.join("included");
+        fs::create_dir_all(&included).unwrap();
+        fs::write(source.join("root.bin"), b"scope duplicate").unwrap();
+        fs::write(excluded.join("blocked.bin"), b"scope duplicate").unwrap();
+        fs::write(included.join("included.bin"), b"scope duplicate").unwrap();
+        let handle = store
+            .start_scan(
+                ScanRequest {
+                    root: source.to_string_lossy().into_owned(),
+                    threads: 2,
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
+        for _ in 0..200 {
+            let status = store.scan_status(&handle.scan_id).unwrap();
+            if status.status != "scanning" {
+                assert_eq!(status.status, "done");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let query_path = |path: &Path| {
+            let value = path.to_string_lossy().into_owned();
+            if cfg!(windows) {
+                value.replace('\\', "/")
+            } else {
+                value
+            }
+        };
+
+        let result = store
+            .find_exact_duplicates(
+                DuplicateScanRequest {
+                    sources: vec![DuplicateSource {
+                        scan_id: handle.scan_id,
+                        target_path: query_path(&source),
+                    }],
+                    min_size: 1,
+                    threads: 2,
+                    path_rules: vec![
+                        DuplicatePathRule {
+                            path: query_path(&source),
+                            excluded: false,
+                        },
+                        DuplicatePathRule {
+                            path: query_path(&excluded),
+                            excluded: true,
+                        },
+                        DuplicatePathRule {
+                            path: query_path(&included),
+                            excluded: false,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(result.groups.len(), 1);
+        let names = result.groups[0]
+            .files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(names, HashSet::from(["root.bin", "included.bin"]));
     }
 
     #[test]

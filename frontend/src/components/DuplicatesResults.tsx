@@ -5,16 +5,19 @@ import type { DuplicatesController, KeepStrategy } from "../hooks/useDuplicates"
 import { formatBytes } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
 import { openPath, revealPath } from "../api/client";
+import { promptDialog } from "../lib/dialogs";
+import { hashingDeterminate, hashingPercent, hashingTitle } from "../lib/duplicatesScanUi";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
 import { FixedDropdown } from "./ConfigureColumnsMenu";
+import { DuplicateDeletionDialog } from "./DuplicateDeletionDialog";
 import { DupeGroupPreview } from "./DupeGroupPreview";
 
-const ROW_HEIGHT = 30;
-const GUTTER = 42;
+const ROW_HEIGHT = 22;
+const GUTTER = 26;
 const MIN_COL_WIDTH = 56;
 
-type DupeColKey = "name" | "match" | "dname" | "dsize" | "ddate" | "content" | "size" | "modified" | "folder";
+type DupeColKey = "name" | "folder" | "size" | "modified" | "match" | "content";
 type SortKey = DupeColKey | "waste";
 type ReviewFilter = "all" | "selected" | "needs-review" | "protected";
 
@@ -23,19 +26,32 @@ interface DupeCol {
   label: string;
   width: number;
   align: "left" | "right" | "center";
-  delta?: boolean;
 }
 
+/** Column order mirrors dupeGuru's results table (Filename, Folder, Size, Match %). */
 const COLUMNS: DupeCol[] = [
-  { key: "name",     label: "Name",     width: 260, align: "left" },
-  { key: "match",    label: "Evidence", width: 112, align: "center" },
-  { key: "dname",    label: "Name Δ",   width: 70,  align: "center", delta: true },
-  { key: "dsize",    label: "Size Δ",   width: 88,  align: "right",  delta: true },
-  { key: "ddate",    label: "Date Δ",   width: 88,  align: "right",  delta: true },
-  { key: "content",  label: "Content",  width: 72,  align: "center", delta: true },
+  { key: "name",     label: "Filename", width: 300, align: "left" },
+  { key: "folder",   label: "Folder",   width: 300, align: "left" },
   { key: "size",     label: "Size",     width: 92,  align: "right" },
-  { key: "modified", label: "Modified", width: 134, align: "right" },
-  { key: "folder",   label: "Folder",   width: 320, align: "left" },
+  { key: "modified", label: "Modified", width: 132, align: "right" },
+  { key: "match",    label: "Match %",  width: 74,  align: "right" },
+  { key: "content",  label: "Content",  width: 74,  align: "center" },
+];
+
+const REVIEW_FILTERS: { value: ReviewFilter; label: string }[] = [
+  { value: "all",          label: "All groups" },
+  { value: "selected",     label: "Marked" },
+  { value: "needs-review", label: "Unverified" },
+  { value: "protected",    label: "Reference folders" },
+];
+
+const KEEP_RULES: { value: KeepStrategy; label: string }[] = [
+  { value: "newest",       label: "Newest modified" },
+  { value: "oldest",       label: "Oldest modified" },
+  { value: "largest",      label: "Largest file" },
+  { value: "smallest",     label: "Smallest file" },
+  { value: "shortestPath", label: "Shortest path" },
+  { value: "longestPath",  label: "Longest path" },
 ];
 
 function folderOf(path: string): string {
@@ -43,7 +59,7 @@ function folderOf(path: string): string {
   return idx >= 0 ? path.slice(0, idx) : "";
 }
 
-/** Signed, human duration for a seconds delta (Date Δ in "delta values" mode). */
+/** Signed, human duration for a seconds difference in "Delta Values" mode. */
 function fmtDuration(sec: number): string {
   const a = Math.abs(sec);
   if (a < 1) return "0";
@@ -54,9 +70,15 @@ function fmtDuration(sec: number): string {
   return `${sign}${Math.round(a / 86400)}d`;
 }
 
-type FlatRow =
-  | { kind: "group"; key: string; group: DupeGroupV2 }
-  | { kind: "file"; key: string; group: DupeGroupV2; file: DupeFileV2 };
+/** One table row. The first file of a group is its reference and acts as the
+ *  group's parent row, so there is no separate group header (as in dupeGuru). */
+interface FlatRow {
+  key: string;
+  gkey: string;
+  group: DupeGroupV2;
+  file: DupeFileV2;
+  leader: boolean;
+}
 
 function groupKey(g: DupeGroupV2): string {
   return g.files[0]?.path ?? "g";
@@ -68,7 +90,13 @@ function isVerifiedGroup(group: DupeGroupV2): boolean {
     .every((file) => (file.match?.content ?? 0) >= 100);
 }
 
-export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
+export function DuplicatesResults({
+  ctrl,
+  onOpenSetup,
+}: {
+  ctrl: DuplicatesController;
+  onOpenSetup?: () => void;
+}) {
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -82,11 +110,17 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
   const [reviewFilter, setReviewFilter] = useState<ReviewFilter>("all");
   const [dupesOnly, setDupesOnly] = useState(false);
   const [deltaValues, setDeltaValues] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [actionsMenuOpen, setActionsMenuOpen] = useState(false);
+  const actionsBtnRef = useRef<HTMLDivElement>(null);
   const [colsMenuOpen, setColsMenuOpen] = useState(false);
   const colsBtnRef = useRef<HTMLDivElement>(null);
-  const [linkMode, setLinkMode] = useState<"hardlink" | "symlink">("hardlink");
   const [previewGroup, setPreviewGroup] = useState<DupeGroupV2 | null>(null);
   const [activeRowKey, setActiveRowKey] = useState<string | null>(null);
+  const [deletion, setDeletion] = useState<{ open: boolean; permanent: boolean }>({
+    open: false,
+    permanent: false,
+  });
 
   // Drive letters present across all groups (for the "keep on drive" strategy).
   const driveLetters = useMemo(() => {
@@ -99,14 +133,6 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
     }
     return [...set].sort();
   }, [ctrl.groups]);
-
-  // #24: apply an auto-pick strategy from the dropdown, then reset it to the
-  // placeholder (it's an action, not a persistent mode).
-  const onStrategy = useCallback((value: string) => {
-    if (!value) return;
-    if (value.startsWith("drive:")) ctrl.keepStrategy("drive", value.slice("drive:".length));
-    else ctrl.keepStrategy(value as KeepStrategy);
-  }, [ctrl]);
 
   const widthOf = useCallback((c: DupeCol) => widths[c.key] ?? c.width, [widths]);
   const cols = useMemo(() => COLUMNS.filter((c) => c.key === "name" || visibleCols.has(c.key)), [visibleCols]);
@@ -163,9 +189,6 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
       case "name": return f.name.toLowerCase();
       case "folder": return folderOf(f.path).toLowerCase();
       case "match": return f.score ?? 0;
-      case "dname": return f.match?.name ?? 0;
-      case "dsize": return f.match?.size ?? 0;
-      case "ddate": return f.match?.date ?? 0;
       case "content": return f.match?.content ?? 0;
       case "size": return f.size;
       case "modified": return f.modified;
@@ -214,22 +237,27 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
   const flatRows = useMemo(() => {
     const rows: FlatRow[] = [];
     for (const g of displayGroups) {
-      const key = groupKey(g);
-      rows.push({ kind: "group", key, group: g });
-      if (ctrl.collapsed.has(key)) continue;
-      for (const f of g.files) {
-        if (dupesOnly && f.ref) continue;
-        rows.push({ kind: "file", key: `${key}|${f.path}`, group: g, file: f });
-      }
+      const gkey = groupKey(g);
+      const collapsed = ctrl.collapsed.has(gkey);
+      g.files.forEach((file, index) => {
+        const leader = index === 0;
+        // "Dupes Only" drops the reference rows and flattens the tree.
+        if (leader && dupesOnly) return;
+        if (!leader && collapsed && !dupesOnly) return;
+        rows.push({ key: `${gkey}|${file.path}`, gkey, group: g, file, leader: leader && !dupesOnly });
+      });
     }
     return rows;
   }, [displayGroups, ctrl.collapsed, dupesOnly]);
+  const activeRow = flatRows.find((row) => row.key === activeRowKey) ?? null;
+  const activeGroup = activeRow?.group ?? null;
+  const activeFile = activeRow?.file ?? null;
 
   const virtualizer = useVirtualizer({
     count: flatRows.length,
     getScrollElement: () => scrollEl,
     estimateSize: () => ROW_HEIGHT,
-    overscan: 14,
+    overscan: 24,
   });
 
   const activeRowIndex = Math.max(
@@ -283,9 +311,9 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
   const someChecked = !allChecked && visibleDupPaths.some((p) => ctrl.selected.has(p));
   const visibleSelectedCount = visibleDupPaths.filter((path) => ctrl.selected.has(path)).length;
   const hiddenSelectedCount = Math.max(0, ctrl.selectedCount - visibleSelectedCount);
-  const visibleWaste = useMemo(
-    () => displayGroups.reduce((sum, group) => sum + group.waste, 0),
-    [displayGroups],
+  const duplicateCount = useMemo(
+    () => ctrl.groups.reduce((sum, group) => sum + Math.max(0, group.files.length - 1), 0),
+    [ctrl.groups],
   );
   const protectedCopies = useMemo(
     () => ctrl.groups.reduce(
@@ -294,143 +322,346 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
     ),
     [ctrl.groups],
   );
+  const selectedFiles = useMemo(
+    () => ctrl.groups.flatMap((group) => group.files.filter((file) => ctrl.selected.has(file.path))),
+    [ctrl.groups, ctrl.selected],
+  );
+  const unverifiedSelectedCount = selectedFiles.filter((file) => (file.match?.content ?? 0) < 100).length;
+  const linkEligible = ctrl.selectedCount > 0 && unverifiedSelectedCount === 0;
 
-  const renderCell = (f: DupeFileV2, g: DupeGroupV2, key: DupeColKey) => {
+  const renderCell = (f: DupeFileV2, g: DupeGroupV2, key: DupeColKey, leader: boolean) => {
     const ref = g.files.find((file) => file.ref) ?? g.files[0];
     switch (key) {
       case "name":
         return (
-          <span className="df-file-name" title={f.path} onDoubleClick={() => void openPath(f.path)}>
-            <span className="df-file-icon">
-              {f.protected
-                ? <Icon name="bookmark" size={11} />
-                : f.ref
-                  ? <Icon name="star-fill" size={11} />
-                  : <Icon name="duplicates" size={11} />}
-            </span>
-            <span className={`df-file-role${f.protected ? " protected" : f.ref ? " keeper" : ""}`}>
-              {f.protected ? "Protected" : f.ref ? "Keeper" : "Copy"}
-            </span>
-            <span className="df-file-name-text">{f.name}</span>
+          <span className="dg-name" title={f.path} onDoubleClick={() => void openPath(f.path)}>
+            {f.protected && <Icon name="bookmark" size={10} className="dg-name-flag" />}
+            {f.name}
           </span>
         );
-      case "match":
-        if (f.ref) return <span className="df-evidence keeper">Kept copy</span>;
-        if ((f.match?.content ?? 0) >= 100) {
-          return <span className="df-evidence verified"><Icon name="check" size={11} /> Verified</span>;
+      case "folder":
+        return <span className="dg-ellipsis" title={f.path}>{folderOf(f.path)}</span>;
+      case "size":
+        if (deltaValues && !leader) {
+          const delta = f.size - ref.size;
+          return <span className={delta === 0 ? "dg-zero" : "dg-delta"}>{delta === 0 ? "0" : `${delta > 0 ? "+" : "−"}${formatBytes(Math.abs(delta), "auto")}`}</span>;
         }
-        return <MatchBar pct={f.score ?? 0} />;
-      case "dname":
-        return f.ref ? <span className="df-dim">—</span> : <MatchBar pct={f.match?.name ?? 0} />;
-      case "dsize":
-        if (f.ref) return <span className="df-dim">—</span>;
-        return deltaValues
-          ? <span className={f.size === ref.size ? "df-dim" : "df-delta"}>{f.size === ref.size ? "0" : `${f.size > ref.size ? "+" : "−"}${formatBytes(Math.abs(f.size - ref.size), "auto")}`}</span>
-          : <MatchBar pct={f.match?.size ?? 0} />;
-      case "ddate":
-        if (f.ref) return <span className="df-dim">—</span>;
-        return deltaValues
-          ? <span className={f.modified === ref.modified ? "df-dim" : "df-delta"}>{fmtDuration(f.modified - ref.modified)}</span>
-          : <MatchBar pct={f.match?.date ?? 0} />;
+        return <span>{formatBytes(f.size, "auto")}</span>;
+      case "modified":
+        if (deltaValues && !leader) {
+          const delta = f.modified - ref.modified;
+          return <span className={delta === 0 ? "dg-zero" : "dg-delta"}>{fmtDuration(delta)}</span>;
+        }
+        return <span>{f.modified > 0 ? formatDate(f.modified * 1000) : "—"}</span>;
+      case "match": {
+        if (leader) return <span className="dg-zero">—</span>;
+        const pct = Math.round(f.score ?? 0);
+        return <span className={pct >= 100 ? "dg-match-full" : "dg-match-partial"}>{pct}</span>;
+      }
       case "content":
-        if (f.ref) return <span className="df-dim">—</span>;
+        if (leader) return <span className="dg-zero">—</span>;
         return (f.match?.content ?? 0) >= 100
-          ? <span className="df-content-yes" title="Full-content hash match; rechecked byte-for-byte before file changes"><Icon name="check" size={12} /> Yes</span>
-          : <span className="df-evidence possible" title="Not content-hash verified">Review</span>;
-      case "size": return <span>{formatBytes(f.size, "auto")}</span>;
-      case "modified": return <span>{f.modified > 0 ? formatDate(f.modified * 1000) : "—"}</span>;
-      case "folder": return <span className="df-file-folder" title={f.path}>{folderOf(f.path)}</span>;
+          ? <span className="dg-yes" title="Full-content hash match; rechecked byte-for-byte before any file changes">Yes</span>
+          : <span className="dg-no" title="Not content-hash verified">Review</span>;
     }
   };
 
   const scanning = ctrl.scanState === "scanning";
+  const hashedPct = hashingPercent(ctrl.progress);
+  const hashingTitleText = hashingTitle(ctrl.phase, ctrl.progress);
+  const hashingBarDeterminate = hashingDeterminate(ctrl.phase, ctrl.progress);
   const toggleableCols = COLUMNS.filter((c) => c.key !== "name");
-  const needsReviewCount = ctrl.groups.filter((group) => !isVerifiedGroup(group)).length;
-  const protectedGroupCount = ctrl.groups.filter((group) =>
-    group.files.some((file) => file.protected),
-  ).length;
+  const openDeletion = useCallback((permanent = false) => {
+    if (!ctrl.selectedCount || ctrl.actionPending) return;
+    setDeletion({ open: true, permanent });
+  }, [ctrl.actionPending, ctrl.selectedCount]);
+
+  const transferMarked = useCallback(async (mode: "move" | "copy") => {
+    if (!ctrl.selectedCount || ctrl.actionPending) return;
+    const dest = await promptDialog({
+      title: mode === "move" ? "Move marked files" : "Copy marked files",
+      label: "Destination folder",
+      message: `${ctrl.selectedCount} marked file${ctrl.selectedCount === 1 ? "" : "s"} will be ${mode === "move" ? "moved" : "copied"} there.`,
+      initialValue: ctrl.destPath,
+      placeholder: "D:\\quarantine",
+      confirmLabel: mode === "move" ? "Move" : "Copy",
+    });
+    if (!dest) return;
+    ctrl.setDestPath(dest);
+    if (mode === "move") await ctrl.moveSelected(dest);
+    else await ctrl.copySelected(dest);
+  }, [ctrl]);
+
+  const onResultsShortcut = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!event.ctrlKey || ctrl.actionPending) return;
+    const key = event.key.toLowerCase();
+    if (key === "a") {
+      event.preventDefault();
+      if (event.shiftKey) ctrl.invertSelection(visibleDupPaths);
+      else ctrl.selectAll(visibleDupPaths);
+      return;
+    }
+    if (key === "d" && ctrl.selectedCount > 0) {
+      event.preventDefault();
+      openDeletion(false);
+      return;
+    }
+    if (key === "delete" && ctrl.selectedCount > 0) {
+      event.preventDefault();
+      openDeletion(true);
+      return;
+    }
+    if (key === "m" && ctrl.selectedCount > 0) {
+      event.preventDefault();
+      void transferMarked(event.shiftKey ? "copy" : "move");
+      return;
+    }
+    if (key === "r" && ctrl.selectedCount > 0) {
+      event.preventDefault();
+      ctrl.removeSelectedFromResults();
+      return;
+    }
+    if (key === " " && activeGroup && activeFile && !activeFile.ref && !activeFile.protected) {
+      event.preventDefault();
+      event.stopPropagation();
+      ctrl.makeRef(activeGroup, activeFile.path);
+      return;
+    }
+    if (key === "o" && activeFile) {
+      event.preventDefault();
+      if (event.shiftKey) void revealPath(activeFile.path);
+      else void openPath(activeFile.path);
+    }
+  }, [activeFile, activeGroup, ctrl, openDeletion, transferMarked, visibleDupPaths]);
 
   return (
-    <div className="df-results-root" aria-busy={ctrl.actionPending}>
-      <header className="df-overview">
-        <div className="df-overview-copy">
-          <div className="df-overview-eyebrow">Storage cleanup</div>
-          <h1>Duplicate files</h1>
-          <p>
-            {ctrl.criteria.content.enabled
-              ? "Content matches use full-file hashes and are rechecked byte-for-byte before cleanup."
-              : "Custom metadata matches need manual review before cleanup."}
-          </p>
-        </div>
-        {ctrl.scanState === "done" && (
-          <div className="df-overview-stats" aria-label="Duplicate scan summary">
-            <span><strong>{ctrl.groups.length.toLocaleString()}</strong> groups</span>
-            <span><strong>{ctrl.totalFiles.toLocaleString()}</strong> files</span>
-            <span className="reclaimable"><strong>{formatBytes(ctrl.totalWaste, "auto")}</strong> reclaimable</span>
-            {protectedCopies > 0 && (
-              <span className="protected"><Icon name="bookmark" size={11} /><strong>{protectedCopies}</strong> protected</span>
-            )}
-          </div>
-        )}
-      </header>
-
-      {/* Review and display controls stay stable; file actions appear contextually below. */}
-      <div className="df-toolbar">
-        <div className="df-review-filters" aria-label="Review filters">
-          {([
-            ["all", "All", ctrl.groups.length],
-            ["selected", "Selected", ctrl.selectedGroups],
-            ["needs-review", "Needs review", needsReviewCount],
-            ["protected", "Protected", protectedGroupCount],
-          ] as const).map(([value, label, count]) => (
+    <div className="dg-page dg-results" aria-busy={ctrl.actionPending}>
+      {/* Single dupeGuru-style toolbar: menu, view toggles, search. */}
+      <div className="dg-toolbar">
+        <div className="rb-dropdown-wrap" ref={actionsBtnRef}>
+          <button
+            type="button"
+            className={`dg-btn${actionsMenuOpen ? " dg-btn-on" : ""}`}
+            onClick={() => setActionsMenuOpen((open) => !open)}
+            aria-expanded={actionsMenuOpen}
+          >
+            Actions <Icon name="caret-down" size={8} />
+          </button>
+          <FixedDropdown
+            anchorRef={actionsBtnRef}
+            open={actionsMenuOpen}
+            onClose={() => setActionsMenuOpen(false)}
+          >
+            <div className="rb-dd-section">Mark</div>
             <button
-              key={value}
-              className={`df-review-filter${reviewFilter === value ? " active" : ""}`}
-              onClick={() => setReviewFilter(value)}
-              aria-pressed={reviewFilter === value}
+              className="rb-col-row df-action-menu-row"
+              disabled={!visibleDupPaths.length || ctrl.actionPending}
+              onClick={() => { ctrl.selectAll(visibleDupPaths); setActionsMenuOpen(false); }}
             >
-              {label}<span>{count}</span>
+              <span>Mark All</span><kbd>Ctrl+A</kbd>
             </button>
-          ))}
+            <button
+              className="rb-col-row df-action-menu-row"
+              disabled={!visibleDupPaths.length || ctrl.actionPending}
+              onClick={() => { ctrl.invertSelection(visibleDupPaths); setActionsMenuOpen(false); }}
+            >
+              <span>Invert Marks</span><kbd>Ctrl+Shift+A</kbd>
+            </button>
+            <button
+              className="rb-col-row df-action-menu-row"
+              disabled={!ctrl.selectedCount || ctrl.actionPending}
+              onClick={() => { ctrl.unselectAll(); setActionsMenuOpen(false); }}
+            >
+              <span>Mark None</span>
+            </button>
+            <div className="rb-dropdown-sep" />
+            <div className="rb-dd-section">Re-prioritize &mdash; keep</div>
+            {KEEP_RULES.map((rule) => (
+              <button
+                key={rule.value}
+                className="rb-col-row df-action-menu-row"
+                disabled={!ctrl.groups.length || ctrl.actionPending}
+                onClick={() => { ctrl.keepStrategy(rule.value); setActionsMenuOpen(false); }}
+              >
+                <span>{rule.label}</span>
+              </button>
+            ))}
+            {driveLetters.map((drive) => (
+              <button
+                key={drive}
+                className="rb-col-row df-action-menu-row"
+                disabled={!ctrl.groups.length || ctrl.actionPending}
+                onClick={() => { ctrl.keepStrategy("drive", drive); setActionsMenuOpen(false); }}
+              >
+                <span>Copy on {drive}:</span>
+              </button>
+            ))}
+            <div className="rb-dropdown-sep" />
+            <div className="rb-dd-section">Marked files</div>
+            <button
+              className="rb-col-row df-action-menu-row"
+              disabled={!ctrl.selectedCount || ctrl.actionPending}
+              onClick={() => { setActionsMenuOpen(false); openDeletion(false); }}
+            >
+              <span>Send Marked to Recycle Bin&hellip;</span><kbd>Ctrl+D</kbd>
+            </button>
+            <button
+              className="rb-col-row df-action-menu-row df-action-menu-danger"
+              disabled={!ctrl.selectedCount || ctrl.actionPending}
+              onClick={() => { setActionsMenuOpen(false); openDeletion(true); }}
+            >
+              <span>Delete Marked Permanently&hellip;</span><kbd>Ctrl+Del</kbd>
+            </button>
+            <button
+              className="rb-col-row df-action-menu-row"
+              disabled={!ctrl.selectedCount || ctrl.actionPending}
+              onClick={() => { setActionsMenuOpen(false); void transferMarked("move"); }}
+            >
+              <span>Move Marked to&hellip;</span><kbd>Ctrl+M</kbd>
+            </button>
+            <button
+              className="rb-col-row df-action-menu-row"
+              disabled={!ctrl.selectedCount || ctrl.actionPending}
+              onClick={() => { setActionsMenuOpen(false); void transferMarked("copy"); }}
+            >
+              <span>Copy Marked to&hellip;</span><kbd>Ctrl+Shift+M</kbd>
+            </button>
+            <button
+              className="rb-col-row df-action-menu-row"
+              disabled={!ctrl.selectedCount || ctrl.actionPending}
+              onClick={() => { setActionsMenuOpen(false); ctrl.removeSelectedFromResults(); }}
+            >
+              <span>Remove Marked from Results</span><kbd>Ctrl+R</kbd>
+            </button>
+            <div className="rb-dropdown-sep" />
+            <div className="rb-dd-section">Selected</div>
+            <button
+              className="rb-col-row df-action-menu-row"
+              disabled={
+                !activeFile
+                || activeFile.ref
+                || activeFile.protected
+                || !!activeGroup?.files.some((file) => file.protected)
+                || ctrl.actionPending
+              }
+              onClick={() => {
+                if (activeGroup && activeFile) ctrl.makeRef(activeGroup, activeFile.path);
+                setActionsMenuOpen(false);
+              }}
+            >
+              <span>Make Selected into Reference</span><kbd>Ctrl+Space</kbd>
+            </button>
+            <button
+              className="rb-col-row df-action-menu-row"
+              disabled={!activeFile}
+              onClick={() => {
+                if (activeFile) void openPath(activeFile.path);
+                setActionsMenuOpen(false);
+              }}
+            >
+              <span>Open Selected</span><kbd>Ctrl+O</kbd>
+            </button>
+            <button
+              className="rb-col-row df-action-menu-row"
+              disabled={!activeFile}
+              onClick={() => {
+                if (activeFile) void revealPath(activeFile.path);
+                setActionsMenuOpen(false);
+              }}
+            >
+              <span>Open Containing Folder</span><kbd>Ctrl+Shift+O</kbd>
+            </button>
+            <button
+              className="rb-col-row df-action-menu-row"
+              disabled={!activeGroup || ctrl.actionPending}
+              onClick={() => {
+                if (activeGroup) ctrl.ignoreGroup(activeGroup);
+                setActionsMenuOpen(false);
+              }}
+            >
+              <span>Ignore Selected Group</span>
+            </button>
+            <button
+              className="rb-col-row df-action-menu-row"
+              disabled={!activeGroup}
+              onClick={() => { setPreviewGroup(activeGroup); setActionsMenuOpen(false); }}
+            >
+              <span>Preview Selected Group</span>
+            </button>
+            <div className="rb-dropdown-sep" />
+            <div className="rb-dd-section">Export</div>
+            <button className="rb-col-row df-action-menu-row" disabled={!ctrl.groups.length} onClick={() => { ctrl.exportCsv(); setActionsMenuOpen(false); }}>
+              <span>Export to CSV</span>
+            </button>
+            <button className="rb-col-row df-action-menu-row" disabled={!ctrl.groups.length} onClick={() => { ctrl.exportJson(); setActionsMenuOpen(false); }}>
+              <span>Export to JSON</span>
+            </button>
+            {ctrl.ignoredCount > 0 && (
+              <button className="rb-col-row df-action-menu-row" onClick={() => { ctrl.restoreIgnoredGroups(); setActionsMenuOpen(false); }}>
+                <span>Restore {ctrl.ignoredCount} Ignored Group{ctrl.ignoredCount === 1 ? "" : "s"}</span>
+              </button>
+            )}
+          </FixedDropdown>
         </div>
 
-        <div className="df-toolbar-spacer" />
+        <button
+          type="button"
+          className="dg-btn"
+          disabled={!ctrl.selectedCount || ctrl.actionPending}
+          onClick={() => openDeletion(false)}
+        >
+          <Icon name="trash" size={11} />
+          {ctrl.actionPending ? "Working…" : "Delete Marked…"}
+        </button>
 
-        <div className="df-search">
-          <Icon name="search" size={12} />
+        <span className="dg-toolbar-sep" />
+
+        <button
+          type="button"
+          className={`dg-btn${detailsOpen ? " dg-btn-on" : ""}`}
+          aria-pressed={detailsOpen}
+          onClick={() => setDetailsOpen((open) => !open)}
+        >
+          Details
+        </button>
+        <label className="dg-check dg-check-inline">
           <input
-            value={search}
-            aria-label="Search duplicate results"
-            placeholder="Search name or path"
-            spellCheck={false}
-            onChange={(e) => setSearch(e.target.value)}
+            type="checkbox"
+            className="df-checkbox"
+            checked={dupesOnly}
+            onChange={(event) => setDupesOnly(event.target.checked)}
           />
-          {search && <button className="df-search-clear" onClick={() => setSearch("")} title="Clear search" aria-label="Clear search"><Icon name="x" size={11} /></button>}
-        </div>
-        <button
-          className={`df-tool-btn df-toggle${dupesOnly ? " df-toggle-on" : ""}`}
-          onClick={() => setDupesOnly((v) => !v)}
-          aria-pressed={dupesOnly}
-          title="Hide keeper rows"
-        >
-          Copies only
-        </button>
-        <button
-          className={`df-tool-btn df-toggle${deltaValues ? " df-toggle-on" : ""}`}
-          onClick={() => setDeltaValues((v) => !v)}
-          aria-pressed={deltaValues}
-          title="Show raw size and date differences"
-        >
-          Differences
-        </button>
+          <span>Dupes Only</span>
+        </label>
+        <label className="dg-check dg-check-inline">
+          <input
+            type="checkbox"
+            className="df-checkbox"
+            checked={deltaValues}
+            onChange={(event) => setDeltaValues(event.target.checked)}
+          />
+          <span>Delta Values</span>
+        </label>
+        <label className="dg-field dg-field-inline">
+          <span>Show:</span>
+          <select
+            className="dg-select"
+            value={reviewFilter}
+            onChange={(event) => setReviewFilter(event.target.value as ReviewFilter)}
+          >
+            {REVIEW_FILTERS.map((filter) => (
+              <option key={filter.value} value={filter.value}>{filter.label}</option>
+            ))}
+          </select>
+        </label>
         <div className="rb-dropdown-wrap" ref={colsBtnRef}>
           <button
-            className={`df-tool-btn${colsMenuOpen ? " df-toggle-on" : ""}`}
+            type="button"
+            className={`dg-btn${colsMenuOpen ? " dg-btn-on" : ""}`}
             onClick={() => setColsMenuOpen((o) => !o)}
             aria-expanded={colsMenuOpen}
-            title="Configure columns"
           >
-            <Icon name="columns" size={13} /> Columns
+            Columns <Icon name="caret-down" size={8} />
           </button>
           <FixedDropdown anchorRef={colsBtnRef} open={colsMenuOpen} onClose={() => setColsMenuOpen(false)}>
             <div className="rb-dd-section">Columns</div>
@@ -446,124 +677,37 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
             ))}
           </FixedDropdown>
         </div>
-        <button className="df-tool-btn" onClick={ctrl.exportCsv} disabled={!ctrl.groups.length}>CSV</button>
-        <button className="df-tool-btn" onClick={ctrl.exportJson} disabled={!ctrl.groups.length}>JSON</button>
+
+        <div className="dg-spacer" />
+
+        <div className="dg-search">
+          <Icon name="search" size={11} />
+          <input
+            value={search}
+            aria-label="Search duplicate results"
+            placeholder="Search"
+            spellCheck={false}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          {search && (
+            <button className="dg-search-clear" onClick={() => setSearch("")} title="Clear search" aria-label="Clear search">
+              <Icon name="x" size={10} />
+            </button>
+          )}
+        </div>
       </div>
 
-      {ctrl.groups.length > 0 && (
-        <div className="df-marking-bar">
-          <div className="df-toolbar-group">
-            <button
-              className="df-tool-btn"
-              onClick={() => ctrl.selectAll(visibleDupPaths)}
-              disabled={!visibleDupPaths.length || ctrl.actionPending}
-            >
-              Select visible copies
-            </button>
-            <button
-              className="df-tool-btn"
-              onClick={() => ctrl.invertSelection(visibleDupPaths)}
-              disabled={!visibleDupPaths.length || ctrl.actionPending}
-            >
-              Invert visible
-            </button>
-            <button className="df-tool-btn" onClick={() => ctrl.unselectAll()} disabled={!ctrl.selectedCount || ctrl.actionPending}>Clear selection</button>
-          </div>
-          <div className="df-toolbar-spacer" />
-          <label className="df-keeper-rule">
-            <span>Choose files to keep</span>
-            <select
-              className="df-select df-select-sm"
-              value=""
-              disabled={ctrl.actionPending}
-              onChange={(e) => { onStrategy(e.target.value); e.target.value = ""; }}
-              title="Choose one keeper per group and select the remaining actionable copies"
-            >
-              <option value="" disabled>Apply a rule…</option>
-              <option value="first">Current keeper</option>
-              <option value="newest">Newest modified</option>
-              <option value="oldest">Oldest modified</option>
-              <option value="largest">Largest file</option>
-              <option value="smallest">Smallest file</option>
-              <option value="shortestPath">Shortest path</option>
-              <option value="longestPath">Longest path</option>
-              {driveLetters.map((drive) => (
-                <option key={drive} value={`drive:${drive}`}>Copy on {drive}:</option>
-              ))}
-            </select>
-          </label>
-        </div>
-      )}
-
-      {ctrl.selectedCount > 0 && (
-        <div className="df-selection-bar" role="region" aria-label="Actions for selected copies">
-          <div className="df-selection-summary" role="status">
-            <strong>{ctrl.selectedCount} selected</strong>
-            <span>{formatBytes(ctrl.selectedBytes, "auto")} across {ctrl.selectedGroups} group{ctrl.selectedGroups !== 1 ? "s" : ""}</span>
-            {hiddenSelectedCount > 0 && <span className="df-hidden-selection">{hiddenSelectedCount} hidden by filters</span>}
-          </div>
-          <label className="df-destination">
-            <span>Destination <small>inside a scanned location</small></span>
-            <input
-              className="df-filter-input"
-              value={ctrl.destPath}
-              placeholder="Enter a scanned folder"
-              spellCheck={false}
-              disabled={ctrl.actionPending}
-              onChange={(event) => ctrl.setDestPath(event.target.value)}
-            />
-          </label>
-          <button className="df-tool-btn" onClick={() => void ctrl.moveSelected()} disabled={!ctrl.destPath.trim() || ctrl.actionPending}>Move</button>
-          <button className="df-tool-btn" onClick={() => void ctrl.copySelected()} disabled={!ctrl.destPath.trim() || ctrl.actionPending}>Copy</button>
-          <div className="df-toolbar-group">
-            <button className="df-tool-btn" onClick={() => void ctrl.linkSelected(linkMode)} disabled={ctrl.actionPending}>
-              <Icon name="link" size={12} /> Replace with link
-            </button>
-            <select
-              className="df-select df-select-sm"
-              value={linkMode}
-              disabled={ctrl.actionPending}
-              onChange={(e) => setLinkMode(e.target.value as "hardlink" | "symlink")}
-              aria-label="Link type"
-            >
-              <option value="hardlink">Hard link</option>
-              <option value="symlink">Symbolic link</option>
-            </select>
-          </div>
-          <div className="df-toolbar-group df-delete-action">
-            <select
-              className="df-select df-select-sm"
-              value={ctrl.deleteMode}
-              disabled={ctrl.actionPending}
-              onChange={(e) => ctrl.setDeleteMode(e.target.value as "recycle" | "permanent")}
-              aria-label="Delete method"
-            >
-              <option value="recycle">Recycle Bin</option>
-              <option value="permanent">Permanent</option>
-            </select>
-            <button
-              className={`df-tool-btn${ctrl.deleteMode === "permanent" ? " df-tool-btn-danger" : " df-tool-btn-primary"}`}
-              onClick={() => void ctrl.deleteSelected()}
-              disabled={ctrl.actionPending}
-            >
-              <Icon name="trash" size={12} />
-              {ctrl.actionPending ? "Working…" : ctrl.deleteMode === "permanent" ? "Delete permanently" : "Recycle selected"}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Table */}
       <div
-        className="df-table"
+        className="dg-grid dg-grid-flex"
         ref={(el) => { scrollRef.current = el; setScrollEl(el); }}
         role="treegrid"
-        aria-label="Duplicate file groups"
+        aria-label="Duplicate files"
         aria-rowcount={flatRows.length + 1}
         aria-multiselectable="true"
+        onKeyDownCapture={onResultsShortcut}
       >
-        <div className="df-thead" role="row" aria-rowindex={1} style={{ gridTemplateColumns: gridTemplate, minWidth: minTableWidth }}>
-          <div className="df-th df-th-gutter" role="columnheader">
+        <div className="dg-grid-head dg-grid-cols" role="row" aria-rowindex={1} style={{ gridTemplateColumns: gridTemplate, minWidth: minTableWidth }}>
+          <div className="dg-th dg-th-gutter" role="columnheader">
             <input
               type="checkbox"
               className="df-checkbox"
@@ -571,20 +715,20 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
               disabled={!visibleDupPaths.length || ctrl.actionPending}
               ref={(el) => { if (el) el.indeterminate = someChecked; }}
               onChange={() => (allChecked ? ctrl.unselectAll(visibleDupPaths) : ctrl.selectAll(visibleDupPaths))}
-              aria-label="Select or clear all visible actionable copies"
+              aria-label="Mark or unmark all visible duplicates"
             />
           </div>
           {cols.map((c) => (
             <div
               key={c.key}
-              className={`df-th df-th-${c.align}`}
+              className={`dg-th dg-th-${c.align}`}
               data-col={c.key}
               role="columnheader"
               aria-sort={sortKey === c.key ? (sortDir === 1 ? "ascending" : "descending") : "none"}
             >
               <button onClick={() => onSort(c.key)}>
                 {c.label}
-                {sortKey === c.key && <Icon name={sortDir === 1 ? "caret-up" : "caret-down"} size={9} className="sort-caret" />}
+                {sortKey === c.key && <Icon name={sortDir === 1 ? "caret-up" : "caret-down"} size={8} className="sort-caret" />}
               </button>
               <div
                 className="col-resizer"
@@ -605,28 +749,26 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
               />
             </div>
           ))}
-          <div className="df-th-filler" aria-hidden="true" />
+          <div className="dg-th-filler" aria-hidden="true" />
         </div>
 
         {/* States */}
         {ctrl.scanState === "idle" && !ctrl.groups.length && (
-          <DfEmpty icon="duplicates" title="Find duplicate files"
-            sub="Pick scan targets and criteria in the left panel, then run a scan. Open tabs are reused automatically." />
+          <EmptyState
+            icon="duplicates"
+            title="No results"
+            hint="Pick folders on the Directories tab, then press Scan."
+            action={onOpenSetup ? { label: "Open Directories", onClick: onOpenSetup } : undefined}
+          />
         )}
         {scanning && (
           <div className="df-empty" role="status" aria-live="polite" aria-atomic="true">
             <div className="df-scanning-spinner" aria-hidden="true" />
-            <div className="df-empty-title">
-              {ctrl.phase === "hashing"
-                ? ctrl.progress.hashing > 0 ? "Hashing candidate files…" : "Preparing candidate hashes…"
-                : ctrl.phase === "grouping"
-                  ? "Grouping matches…"
-                  : ctrl.progress.scanned > 0 ? "Collecting files…" : "Starting file scan…"}
-            </div>
+            <div className="df-empty-title">{hashingTitleText}</div>
             <div className="df-empty-sub">
               {ctrl.phase === "hashing"
                 ? ctrl.progress.hashing > 0
-                  ? `${ctrl.progress.hashed.toLocaleString()} / ${ctrl.progress.hashing.toLocaleString()} files read`
+                  ? `${ctrl.progress.hashing.toLocaleString()} candidates · ${hashedPct}%`
                   : "Finding files that share the same size"
                 : ctrl.progress.scanned > 0
                   ? `${ctrl.progress.scanned.toLocaleString()} items indexed`
@@ -641,28 +783,42 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
               aria-valuenow={ctrl.phase === "hashing" ? ctrl.progress.hashed : undefined}
               aria-valuetext={
                 ctrl.phase === "hashing" && ctrl.progress.hashing > 0
-                  ? `${ctrl.progress.hashed} of ${ctrl.progress.hashing} files read`
+                  ? `${hashedPct}% of ${ctrl.progress.hashing} candidates processed`
                   : ctrl.progress.scanned > 0
                     ? `${ctrl.progress.scanned} items indexed`
                     : "Starting scan"
               }
             >
-              <div className={`df-progress-bar ${ctrl.phase === "hashing" && ctrl.progress.hashing > 0 ? "df-progress-bar-determinate" : "df-progress-bar-sweep"}`}
-                style={ctrl.phase === "hashing" && ctrl.progress.hashing > 0 ? { width: `${Math.min(100, (ctrl.progress.hashed / ctrl.progress.hashing) * 100)}%` } : undefined} />
+              <div
+                className={`df-progress-bar ${hashingBarDeterminate ? "df-progress-bar-determinate" : "df-progress-bar-sweep"}`}
+                style={hashingBarDeterminate
+                  ? { width: `${Math.min(100, (ctrl.progress.hashed / ctrl.progress.hashing) * 100)}%` }
+                  : undefined}
+              />
             </div>
           </div>
         )}
         {ctrl.scanState === "error" && (
-          <DfEmpty icon="warning" title="Scan failed" sub={ctrl.errors[0] ?? "Could not scan the selected paths."} error />
+          <EmptyState icon="warning" title="Scan failed" hint={ctrl.errors[0] ?? "Could not scan the selected paths."} error />
         )}
         {ctrl.scanState === "canceled" && !ctrl.groups.length && (
-          <DfEmpty icon="duplicates" title="Scan stopped" sub="No files were changed. Adjust the scan settings or start again when you are ready." />
+          <EmptyState
+            icon="duplicates"
+            title="Scan stopped"
+            hint="No files were changed."
+            action={onOpenSetup ? { label: "Open Directories", onClick: onOpenSetup } : undefined}
+          />
         )}
         {ctrl.scanState === "done" && !ctrl.groups.length && (
-          <DfEmpty icon="check" title="No duplicates found" sub="No files matched your criteria and filters." />
+          <EmptyState
+            icon="check"
+            title="No duplicates found"
+            hint="No files matched the current scan type and filters."
+            action={onOpenSetup ? { label: "Open Directories", onClick: onOpenSetup } : undefined}
+          />
         )}
         {ctrl.groups.length > 0 && displayGroups.length === 0 && (
-          <DfEmpty icon="duplicates" title="No groups in this view" sub="Clear the search or choose a different review filter." />
+          <EmptyState icon="duplicates" title="Nothing matches this view" hint="Clear the search box or change the Show filter." />
         )}
 
         {/* Virtualized rows */}
@@ -671,133 +827,106 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
             {virtualizer.getVirtualItems().map((vi) => {
               const row = flatRows[vi.index];
               if (!row) return null;
-              const common = { position: "absolute" as const, top: vi.start, left: 0, right: 0, height: ROW_HEIGHT };
-              if (row.kind === "group") {
-                const g = row.group;
-                const eligible = g.files.filter((f) => !f.ref && !f.protected).map((f) => f.path);
-                const checked = eligible.length > 0 && eligible.every((p) => ctrl.selected.has(p));
-                const partial = !checked && eligible.some((p) => ctrl.selected.has(p));
-                const isCollapsed = ctrl.collapsed.has(row.key);
-                const refFile = g.files.find((file) => file.ref) ?? g.files[0];
-                const verified = isVerifiedGroup(g);
-                const hasProtected = g.files.some((file) => file.protected);
-                return (
-                  <div
-                    key={row.key}
-                    className={`df-grp-row${checked ? " df-checked" : ""}`}
-                    style={common}
-                    role="row"
-                    aria-level={1}
-                    aria-expanded={!isCollapsed}
-                    aria-rowindex={vi.index + 2}
-                    aria-selected={checked}
-                    data-dupe-row-index={vi.index}
-                    tabIndex={activeRowIndex === vi.index ? 0 : -1}
-                    onFocus={() => setActiveRowKey(row.key)}
-                    onKeyDown={(event) => {
-                      if (navigateRows(event, vi.index)) return;
-                      if (event.key === "ArrowRight" && !isCollapsed) {
-                        const child = flatRows[vi.index + 1];
-                        if (child?.kind === "file" && child.group === g) {
-                          event.preventDefault();
-                          focusRow(vi.index + 1);
-                          return;
-                        }
-                      }
-                      if (event.target !== event.currentTarget) return;
-                      if (event.key === " ") { event.preventDefault(); ctrl.toggleGroup(g); }
-                      if (event.key === "ArrowLeft" && !isCollapsed) { event.preventDefault(); ctrl.toggleCollapse(row.key); }
-                      if (event.key === "ArrowRight" && isCollapsed) { event.preventDefault(); ctrl.toggleCollapse(row.key); }
-                      if (event.key === "Enter") { event.preventDefault(); setPreviewGroup(g); }
-                    }}
-                  >
-                    <div className="df-grp-row-content" role="gridcell" aria-colspan={cols.length + 2}>
-                    <button
-                      className="df-twisty"
-                      onClick={() => ctrl.toggleCollapse(row.key)}
-                      aria-expanded={!isCollapsed}
-                      aria-label={`${isCollapsed ? "Expand" : "Collapse"} ${refFile?.name ?? "duplicate group"}`}
-                    >
-                      <Icon name={isCollapsed ? "chevron-right" : "chevron-down"} size={10} />
-                    </button>
-                    <input type="checkbox" className="df-checkbox" checked={checked}
-                      ref={(el) => { if (el) el.indeterminate = partial; }}
-                      onChange={() => ctrl.toggleGroup(g)}
-                      disabled={!eligible.length || ctrl.actionPending}
-                      aria-label={`Select actionable copies in ${refFile?.name ?? "group"}`}
-                    />
-                    <span className={`df-verification-badge ${verified ? "verified" : "possible"}`}>
-                      {verified ? <><Icon name="check" size={10} /> Content match</> : `Review · ${g.score}%`}
-                    </span>
-                    <span className="df-grp-name" title={refFile?.path}>{refFile?.name ?? "—"}</span>
-                    <span className="df-grp-count">{g.files.length} copies</span>
-                    {hasProtected && <span className="df-protected-badge"><Icon name="bookmark" size={10} /> Protected keeper</span>}
-                    <span className="df-grp-waste">{formatBytes(g.waste, "auto")} reclaimable</span>
-                    <button className="df-grp-action" title="Preview the files in this group" onClick={() => setPreviewGroup(g)}>
-                      <Icon name="image" size={11} /> Preview
-                    </button>
-                    <button className="df-grp-action" title="Hide this group from review" onClick={() => ctrl.ignoreGroup(g)} disabled={ctrl.actionPending}>
-                      <Icon name="x" size={11} /> Hide
-                    </button>
-                    </div>
-                  </div>
-                );
-              }
               const f = row.file;
+              const g = row.group;
               const isChecked = ctrl.selected.has(f.path);
+              const collapsed = ctrl.collapsed.has(row.gkey);
+              const markable = !f.ref && !f.protected;
+              const classes = [
+                "dg-row",
+                row.leader ? "dg-row-leader" : "dg-row-child",
+                isChecked ? "dg-row-marked" : "",
+                f.protected ? "dg-row-protected" : "",
+                activeRowKey === row.key ? "dg-row-active" : "",
+              ].filter(Boolean).join(" ");
               return (
                 <div
                   key={row.key}
-                  className={`df-file-row${isChecked ? " df-checked" : ""}${f.ref ? " df-is-ref" : ""}${f.protected ? " df-is-protected" : ""}`}
-                  style={{ ...common, display: "grid", gridTemplateColumns: gridTemplate }}
+                  className={classes}
+                  style={{
+                    position: "absolute",
+                    top: vi.start,
+                    left: 0,
+                    right: 0,
+                    height: ROW_HEIGHT,
+                    display: "grid",
+                    gridTemplateColumns: gridTemplate,
+                  }}
                   role="row"
-                  aria-level={2}
+                  aria-level={row.leader ? 1 : 2}
+                  aria-expanded={row.leader ? !collapsed : undefined}
                   aria-rowindex={vi.index + 2}
                   aria-selected={isChecked}
                   data-dupe-row-index={vi.index}
                   tabIndex={activeRowIndex === vi.index ? 0 : -1}
                   onFocus={() => setActiveRowKey(row.key)}
+                  onClick={() => setActiveRowKey(row.key)}
                   onKeyDown={(event) => {
                     if (navigateRows(event, vi.index)) return;
-                    if (event.key === "ArrowLeft") {
-                      for (let index = vi.index - 1; index >= 0; index -= 1) {
-                        if (flatRows[index]?.kind === "group") {
-                          event.preventDefault();
-                          focusRow(index);
-                          return;
-                        }
-                      }
-                    }
                     if (event.target !== event.currentTarget) return;
-                    if (event.key === " " && !f.ref && !f.protected) {
+                    if (event.key === " ") {
                       event.preventDefault();
-                      ctrl.toggleFile(f.path);
+                      if (row.leader) ctrl.toggleGroup(g);
+                      else if (markable) ctrl.toggleFile(f.path);
+                      return;
                     }
-                    if (event.key === "Enter") {
+                    if (event.key === "ArrowLeft") {
+                      if (row.leader && !collapsed) { event.preventDefault(); ctrl.toggleCollapse(row.gkey); return; }
+                      for (let index = vi.index - 1; index >= 0; index -= 1) {
+                        if (flatRows[index]?.leader) { event.preventDefault(); focusRow(index); return; }
+                      }
+                      return;
+                    }
+                    if (event.key === "ArrowRight" && row.leader && collapsed) {
                       event.preventDefault();
-                      setPreviewGroup(row.group);
+                      ctrl.toggleCollapse(row.gkey);
+                      return;
                     }
+                    if (event.key === "Enter") { event.preventDefault(); setPreviewGroup(g); }
                   }}
                   onContextMenu={(e) => { e.preventDefault(); void revealPath(f.path); }}
                 >
-                  <div className="df-cell df-cell-gutter" role="gridcell">
-                    <input
-                      type="checkbox"
-                      className="df-checkbox"
-                      checked={isChecked}
-                      disabled={f.ref || f.protected || ctrl.actionPending}
-                      onChange={() => ctrl.toggleFile(f.path)}
-                      aria-label={f.ref ? `${f.name} is the keeper` : f.protected ? `${f.name} is protected` : `Select ${f.name} for action`}
-                    />
+                  <div className="dg-cell dg-cell-gutter" role="gridcell">
+                    {row.leader ? (
+                      <button
+                        className="dg-twisty"
+                        onClick={(event) => { event.stopPropagation(); ctrl.toggleCollapse(row.gkey); }}
+                        tabIndex={-1}
+                        aria-label={`${collapsed ? "Expand" : "Collapse"} group ${f.name}`}
+                        title={collapsed ? "Expand group" : "Collapse group"}
+                      >
+                        <Icon name={collapsed ? "chevron-right" : "chevron-down"} size={9} />
+                      </button>
+                    ) : (
+                      <input
+                        type="checkbox"
+                        className="df-checkbox"
+                        checked={isChecked}
+                        disabled={!markable || ctrl.actionPending}
+                        onChange={() => ctrl.toggleFile(f.path)}
+                        onClick={(event) => event.stopPropagation()}
+                        aria-label={f.protected ? `${f.name} is in a reference folder` : `Mark ${f.name}`}
+                      />
+                    )}
                   </div>
                   {cols.map((c) => (
-                    <div key={c.key} className={`df-cell df-cell-${c.align}`} role="gridcell">{renderCell(f, row.group, c.key)}</div>
+                    <div key={c.key} className={`dg-cell dg-cell-${c.align}`} data-col={c.key} role="gridcell">
+                      {renderCell(f, g, c.key, row.leader)}
+                    </div>
                   ))}
-                  <div className="df-cell df-row-actions" role="gridcell">
-                    {!f.ref && !row.group.files.some((file) => file.protected) && (
-                      <button className="df-row-action" title="Keep this copy instead" onClick={() => ctrl.makeRef(row.group, f.path)} disabled={ctrl.actionPending}>Keep this</button>
-                    )}
-                    <button className="df-row-action" title="Reveal in Explorer" aria-label={`Reveal ${f.name} in Explorer`} onClick={() => void revealPath(f.path)}><Icon name="folder-open" size={12} /></button>
+                  <div className="dg-cell dg-row-tail" role="gridcell">
+                    {row.leader
+                      ? <span className="dg-tail-note">{g.files.length} files · {formatBytes(g.waste, "auto")}</span>
+                      : markable && (
+                        <button
+                          className="dg-row-action"
+                          title="Make this file the group reference"
+                          onClick={(event) => { event.stopPropagation(); ctrl.makeRef(g, f.path); }}
+                          disabled={ctrl.actionPending || g.files.some((file) => file.protected)}
+                        >
+                          Make reference
+                        </button>
+                      )}
                   </div>
                 </div>
               );
@@ -806,23 +935,39 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
         )}
       </div>
 
-      {/* Status bar */}
-      <div className="df-statusbar">
-        {ctrl.scanState === "done" && (
-          <>
-            <span>{displayGroups.length} of {ctrl.groups.length} group{ctrl.groups.length !== 1 ? "s" : ""}</span>
-            <span className="df-status-sep">·</span>
-            <span>{displayGroups.reduce((sum, group) => sum + group.files.length, 0)} visible files</span>
-            <span className="df-status-sep">·</span>
-            <span className="df-waste">{formatBytes(visibleWaste, "auto")} reclaimable in view</span>
-            {ctrl.selectedCount > 0 && (<><span className="df-status-sep">·</span><span>{ctrl.selectedCount} selected</span></>)}
-            {ctrl.ignoredCount > 0 && (<><span className="df-status-sep">·</span><span className="df-status-ignored">{ctrl.ignoredCount} hidden</span></>)}
-          </>
+      {detailsOpen && (
+        <DetailsPane file={activeFile} group={activeGroup} onPreview={() => setPreviewGroup(activeGroup)} />
+      )}
+
+      {/* dupeGuru status line: "1 / 937 (484 KB / 910 MB) duplicate marked" */}
+      <div className="dg-statusbar">
+        <span>
+          {ctrl.selectedCount.toLocaleString()} / {duplicateCount.toLocaleString()}
+          {" ("}{formatBytes(ctrl.selectedBytes, "auto")} / {formatBytes(ctrl.totalWaste, "auto")}{") "}
+          duplicate{duplicateCount === 1 ? "" : "s"} marked
+        </span>
+        <span className="dg-status-sep">·</span>
+        <span>{ctrl.groups.length.toLocaleString()} group{ctrl.groups.length === 1 ? "" : "s"}</span>
+        {displayGroups.length !== ctrl.groups.length && (
+          <><span className="dg-status-sep">·</span><span>{displayGroups.length.toLocaleString()} shown</span></>
         )}
-        {ctrl.scanState === "idle" && <span>Ready</span>}
-        {ctrl.scanState === "canceled" && <span>Scan stopped · no files changed</span>}
+        {protectedCopies > 0 && (
+          <><span className="dg-status-sep">·</span><span>{protectedCopies.toLocaleString()} in reference folders</span></>
+        )}
+        {hiddenSelectedCount > 0 && (
+          <><span className="dg-status-sep">·</span><span className="dg-status-warn">{hiddenSelectedCount} marked outside this view</span></>
+        )}
+        {ctrl.ignoredCount > 0 && (
+          <><span className="dg-status-sep">·</span><span>{ctrl.ignoredCount} ignored</span></>
+        )}
+        <div className="dg-spacer" />
         {scanning && <span>{ctrl.phase === "hashing" ? "Hashing…" : ctrl.phase === "grouping" ? "Grouping…" : "Scanning…"}</span>}
-        {ctrl.errors.length > 0 && <span className="df-status-errors">{ctrl.errors.length} error{ctrl.errors.length !== 1 ? "s" : ""}</span>}
+        {ctrl.scanState === "canceled" && <span>Scan stopped — no files changed</span>}
+        {ctrl.errors.length > 0 && (
+          <span className="dg-status-errors" title={ctrl.errors.slice(0, 8).join("\n")}>
+            {ctrl.errors.length} error{ctrl.errors.length === 1 ? "" : "s"}
+          </span>
+        )}
       </div>
 
       {previewGroup && (
@@ -838,22 +983,80 @@ export function DuplicatesResults({ ctrl }: { ctrl: DuplicatesController }) {
           onClose={() => setPreviewGroup(null)}
         />
       )}
+      {deletion.open && (
+        <DuplicateDeletionDialog
+          key={`${deletion.permanent ? "permanent" : "recycle"}-${ctrl.selectedCount}`}
+          fileCount={ctrl.selectedCount}
+          groupCount={ctrl.selectedGroups}
+          bytes={ctrl.selectedBytes}
+          linkEligible={linkEligible}
+          unverifiedCount={unverifiedSelectedCount}
+          pending={ctrl.actionPending}
+          initialPermanent={deletion.permanent}
+          onCancel={() => setDeletion({ open: false, permanent: false })}
+          onConfirm={(request) => {
+            void ctrl.executeDeletion(request).finally(() => {
+              setDeletion({ open: false, permanent: false });
+            });
+          }}
+        />
+      )}
     </div>
   );
 }
 
-function MatchBar({ pct }: { pct: number }) {
-  const v = Math.max(0, Math.min(100, Math.round(pct)));
+/** dupeGuru's Details panel: the selected file next to its group reference. */
+function DetailsPane({
+  file,
+  group,
+  onPreview,
+}: {
+  file: DupeFileV2 | null;
+  group: DupeGroupV2 | null;
+  onPreview: () => void;
+}) {
+  if (!file || !group) {
+    return (
+      <div className="dg-details" role="region" aria-label="File details">
+        <div className="dg-details-empty">Select a row to compare it with its reference.</div>
+      </div>
+    );
+  }
+  const ref = group.files.find((f) => f.ref) ?? group.files[0];
+  const isRef = ref === file;
+  const rows: { label: string; a: string; b: string }[] = [
+    { label: "Filename", a: file.name, b: ref.name },
+    { label: "Folder", a: folderOf(file.path), b: folderOf(ref.path) },
+    { label: "Size", a: formatBytes(file.size, "auto"), b: formatBytes(ref.size, "auto") },
+    { label: "Modified", a: file.modified > 0 ? formatDate(file.modified * 1000) : "—", b: ref.modified > 0 ? formatDate(ref.modified * 1000) : "—" },
+    { label: "Match %", a: isRef ? "—" : `${Math.round(file.score ?? 0)}`, b: "—" },
+    { label: "Content verified", a: isRef ? "—" : (file.match?.content ?? 0) >= 100 ? "Yes" : "No", b: "—" },
+    { label: "State", a: file.protected ? "Reference folder" : isRef ? "Reference" : "Duplicate", b: ref.protected ? "Reference folder" : "Reference" },
+  ];
   return (
-    <span className="df-pct" title={`${v}% similarity`} aria-label={`${v}% similarity`}>
-      <span className="df-pct-bar" style={{ width: `${v}%` }} aria-hidden="true" />
-      <span className="df-pct-num">{v}%</span>
-    </span>
+    <div className="dg-details" role="region" aria-label="File details">
+      <div className="dg-details-head">
+        <span>Details</span>
+        <button type="button" className="dg-btn" onClick={onPreview}>Preview group</button>
+      </div>
+      <table className="dg-details-table">
+        <thead>
+          <tr>
+            <th scope="col">Attribute</th>
+            <th scope="col">Selected</th>
+            <th scope="col">Reference</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.label} className={row.a !== row.b ? "dg-details-diff" : undefined}>
+              <th scope="row">{row.label}</th>
+              <td title={row.a}>{row.a}</td>
+              <td title={row.b}>{row.b}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
-}
-
-function DfEmpty({ icon, title, sub, error }: { icon: "duplicates" | "warning" | "check"; title: string; sub: string; error?: boolean }) {
-  // Thin wrapper over the shared EmptyState so the duplicates view and the rest
-  // of the app share one empty-state treatment.
-  return <EmptyState icon={icon} title={title} hint={sub} error={error} />;
 }

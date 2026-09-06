@@ -161,6 +161,15 @@ export interface DupeFilter {
 
 export type DupeScanMode = "exact" | "filename" | "audio";
 
+/** dupeGuru-compatible scan-folder policy. The nearest configured ancestor
+ * wins, so a child folder can override its drive or parent folder. */
+export type DupeScopeState = "normal" | "reference" | "excluded";
+
+export interface DupeScopeRule {
+  path: string;
+  state: DupeScopeState;
+}
+
 /** Per-file match breakdown vs the group's reference file (files[0]). Each
  *  field is a 0-100 score; the reference scores 100 on every axis. */
 export interface DupeMatch {

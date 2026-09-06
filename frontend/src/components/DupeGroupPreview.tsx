@@ -111,9 +111,9 @@ export function DupeGroupPreview({
   }, []);
 
   return (
-    <div className="dgp-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div className="dgp-overlay dgp-drawer-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div
-        className="dgp-panel"
+        className="dgp-panel dgp-drawer"
         ref={panelRef}
         role="dialog"
         aria-modal="true"
@@ -136,7 +136,7 @@ export function DupeGroupPreview({
               <MemberThumb file={f} />
               <div className="dgp-meta">
                 <div className={`dgp-role${f.protected ? " protected" : f.ref ? " keeper" : " copy"}`}>
-                  {f.protected ? <><Icon name="bookmark" size={10} /> Protected</> : f.ref ? <><Icon name="star-fill" size={10} /> Keeper</> : "Actionable copy"}
+                  {f.protected ? <><Icon name="bookmark" size={10} /> Reference folder</> : f.ref ? <><Icon name="star-fill" size={10} /> Reference</> : "Duplicate"}
                 </div>
                 <div className="dgp-name" title={f.path}>
                   {f.name}
@@ -157,7 +157,7 @@ export function DupeGroupPreview({
                         disabled={disabled}
                         onChange={() => onToggle(f.path)}
                       />
-                      Select for action
+                      Mark for action
                     </label>
                   )}
                 </div>

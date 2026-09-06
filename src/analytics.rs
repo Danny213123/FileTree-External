@@ -139,7 +139,7 @@ pub(crate) fn write_duplicates_full_json<W: Write>(
         })
         .collect();
     let (hash_groups, hash_errors) =
-        hash_candidate_groups(&inputs, false, cache, cache_path, None, None, threads);
+        hash_candidate_groups(&inputs, false, cache, cache_path, None, None, threads, None);
 
     // Reconstructed absolute path for input index `k` (used for emission and the
     // directional prefix tests).
@@ -286,7 +286,7 @@ pub(crate) fn exact_duplicates_json(
         })
         .collect();
     let (hash_groups, hash_errors) =
-        hash_candidate_groups(&inputs, false, cache, cache_path, None, None, threads);
+        hash_candidate_groups(&inputs, false, cache, cache_path, None, None, threads, None);
 
     // Map input indices back to node ids for the response.
     let mut groups: Vec<(u64, u64, Vec<usize>)> = Vec::new();

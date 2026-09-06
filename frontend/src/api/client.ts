@@ -520,6 +520,25 @@ export async function fetchConfig(): Promise<Config> {
   return getJson<Config>("/api/config");
 }
 
+/** One immediate subfolder from {@link browseDirectories}. */
+export interface BrowseDirectoryEntry {
+  name: string;
+  path: string;
+  hidden: boolean;
+}
+
+/**
+ * Immediate subfolders of `path`, name-sorted, for the folder pickers (duplicate
+ * scan targets, move/copy destinations). Unlike the `directory_snapshot`
+ * command this works on any folder — a picker has to walk down from a drive
+ * letter before anything has been scanned. Browser/server builds have no route
+ * route, so they degrade to a non-expandable list rather than throwing.
+ */
+export async function browseDirectories(path: string): Promise<BrowseDirectoryEntry[]> {
+  if (!isTauriV2()) return [];
+  return invoke<BrowseDirectoryEntry[]>("browse_directories", { path });
+}
+
 function buildDupeParams(filter: import("./types").DupeFilter): URLSearchParams {
   return new URLSearchParams({
     minSize: String(filter.minSize),
@@ -1791,6 +1810,7 @@ export async function hardlinkPairs(
   mode: "hardlink" | "symlink",
   protectedPaths: string[] = [],
   reviewToken?: string,
+  permanent = false,
 ): Promise<DupeActionResult> {
   if (isTauriV2()) {
     if (!reviewToken) {
@@ -1805,6 +1825,7 @@ export async function hardlinkPairs(
           reviewToken,
           pairs: pairs.slice(offset, offset + 1_000),
           mode,
+          permanent,
         });
         if (!result || !Array.isArray(result.errors) || !Array.isArray(result.succeeded)) {
           throw new Error("Invalid duplicate link response");
@@ -1824,7 +1845,13 @@ export async function hardlinkPairs(
       ...(requiresRescan ? { requiresRescan: true } : {}),
     };
   }
-  const r = await postMutation("/api/hardlink", { mode, pairs, protectedPaths, reviewToken: reviewToken ?? "" });
+  const r = await postMutation("/api/hardlink", {
+    mode,
+    pairs,
+    protectedPaths,
+    reviewToken: reviewToken ?? "",
+    permanent,
+  });
   if (!r.ok) return { ok: false, errors: [mutateErrorText(r)], succeeded: [], requiresRescan: true };
   const d = (r.data ?? {}) as { ok?: boolean; errors?: string[]; succeeded?: string[] };
   return {

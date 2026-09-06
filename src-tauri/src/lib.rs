@@ -1,7 +1,8 @@
 use filetree_core::v2::{
-    BOOKMARKS_JSON_MAX_BYTES, DuplicateProgress, DuplicateScanRequest, DuplicateScanResult,
-    MemoryStats, NodePage, NodePageItem, SETTINGS_JSON_MAX_BYTES, ScanHandle, ScanProgress,
-    ScanQuery, ScanRequest, SubtreeFileItem, SubtreeFilePage, SubtreeFilesQuery, V2Store,
+    BOOKMARKS_JSON_MAX_BYTES, DuplicatePathRule, DuplicateProgress, DuplicateScanRequest,
+    DuplicateScanResult, MemoryStats, NodePage, NodePageItem, SETTINGS_JSON_MAX_BYTES, ScanHandle,
+    ScanProgress, ScanQuery, ScanRequest, SubtreeFileItem, SubtreeFilePage, SubtreeFilesQuery,
+    V2Store,
 };
 use filetree_core::{
     CompressionEligibility, CompressionFilesRequest, CompressionStartRequest,
@@ -51,7 +52,28 @@ struct DuplicateReviewState {
     active_by_group: HashMap<u64, HashSet<String>>,
     in_flight: HashSet<String>,
     authorized_roots: Vec<PathBuf>,
-    protected_roots: Vec<PathBuf>,
+    scope_rules: Vec<CanonicalDuplicateScopeRule>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum DuplicateScopeState {
+    Normal,
+    Reference,
+    Excluded,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateScopeRule {
+    path: String,
+    state: DuplicateScopeState,
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalDuplicateScopeRule {
+    path: PathBuf,
+    state: DuplicateScopeState,
 }
 
 struct DuplicateMemberSnapshot {
@@ -384,6 +406,9 @@ fn fs_watch_stop(registry: State<'_, FsWatchRegistry>, watch_id: u64) -> Result<
 }
 
 const DIRECTORY_SNAPSHOT_LIMIT: usize = 50_000;
+/// Subdirectories returned for one folder-picker expansion. Well past any real
+/// folder while keeping a pathological directory from flooding the renderer.
+const DIRECTORY_BROWSE_LIMIT: usize = 5_000;
 
 #[derive(Default)]
 struct DirectoryAggregate {
@@ -634,13 +659,78 @@ async fn directory_snapshot(
     .map_err(|error| format!("Folder snapshot worker failed: {error}"))?
 }
 
+/// One immediate subdirectory returned by [`browse_directories`].
+#[derive(Serialize)]
+struct BrowseDirectoryEntry {
+    name: String,
+    path: String,
+    hidden: bool,
+}
+
+/// Immediate subdirectories of `path`, name-sorted, for the folder pickers
+/// (duplicate scan targets, move/copy destinations).
+///
+/// Unlike [`directory_snapshot`] this is deliberately NOT limited to scanned
+/// roots: a folder picker has to walk down from a drive letter before anything
+/// has been scanned. The capability it grants — directory *names* one level
+/// deep — is the same one `drives`/`special_folders` already expose without a
+/// grant, and it reads no file content, sizes or metadata beyond the hidden
+/// attribute. Unreadable entries are skipped rather than failing the listing so
+/// system folders (`System Volume Information`, per-user profiles) don't break
+/// browsing a drive root.
+fn browse_directory_entries(path: &Path) -> Result<Vec<BrowseDirectoryEntry>, String> {
+    let entries = fs::read_dir(path)
+        .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    let mut dirs = Vec::new();
+    for entry in entries.flatten() {
+        if dirs.len() >= DIRECTORY_BROWSE_LIMIT {
+            break;
+        }
+        let entry_path = entry.path();
+        // file_type() answers from the directory entry itself on Windows, so the
+        // common case costs no extra stat. Symlinked folders need the follow.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_dir = if file_type.is_symlink() {
+            fs::metadata(&entry_path).map(|meta| meta.is_dir()).unwrap_or(false)
+        } else {
+            file_type.is_dir()
+        };
+        if !is_dir {
+            continue;
+        }
+        let hidden = fs::symlink_metadata(&entry_path)
+            .map(|meta| metadata_attributes(&meta) & 0x2 != 0)
+            .unwrap_or(false);
+        dirs.push(BrowseDirectoryEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path: entry_path.to_string_lossy().into_owned(),
+            hidden,
+        });
+    }
+    dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(dirs)
+}
+
+#[tauri::command]
+async fn browse_directories(path: String) -> Result<Vec<BrowseDirectoryEntry>, String> {
+    if path.trim().is_empty() || path.len() > 32_768 {
+        return Err("Invalid folder path".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || browse_directory_entries(Path::new(&path)))
+        .await
+        .map_err(|error| format!("Folder browse worker failed: {error}"))?
+}
+
 #[cfg(test)]
 mod desktop_tests {
     use super::{
-        DuplicateActionItem, DuplicateReviewState, ExternalCopyGrants, ExternalTransferKind,
+        CanonicalDuplicateScopeRule, DuplicateActionItem, DuplicateReviewState,
+        DuplicateScopeState, ExternalCopyGrants, ExternalTransferKind, browse_directory_entries,
         collapse_changed_directories, directory_snapshot_rows, duplicate_member_snapshot,
-        normalize_icon_extension, normalized_review_path, validate_duplicate_plan_and_reserve,
-        watch_directories_for_paths,
+        duplicate_scope_state, normalize_icon_extension, normalized_review_path,
+        validate_duplicate_plan_and_reserve, watch_directories_for_paths,
     };
     use std::collections::{HashMap, HashSet};
     use std::fs;
@@ -763,6 +853,31 @@ mod desktop_tests {
     }
 
     #[test]
+    fn browse_directories_lists_only_sorted_subfolders() {
+        let root = std::env::temp_dir().join(format!(
+            "filetree_desktop_browse_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("zeta")).expect("create zeta folder");
+        fs::create_dir_all(root.join("Alpha")).expect("create Alpha folder");
+        fs::write(root.join("notes.txt"), b"skip me").expect("write loose file");
+
+        let entries = browse_directory_entries(&root).expect("browse listing");
+        let names = entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Alpha", "zeta"]);
+        assert_eq!(entries[0].path, root.join("Alpha").to_string_lossy());
+
+        fs::remove_dir_all(root).expect("remove browse test root");
+    }
+
+    #[test]
     fn watcher_batches_remove_duplicates_but_keep_nested_directories() {
         let collapsed = collapse_changed_directories(vec![
             r"E:\Downloads\Videos\Finished".to_string(),
@@ -859,7 +974,10 @@ mod desktop_tests {
                 HashSet::from([keeper_key.clone(), duplicate_key.clone()]),
             )]),
             authorized_roots: vec![fs::canonicalize(&root).expect("canonical root")],
-            protected_roots: vec![fs::canonicalize(&protected).expect("canonical protected root")],
+            scope_rules: vec![CanonicalDuplicateScopeRule {
+                path: fs::canonicalize(&protected).expect("canonical protected root"),
+                state: DuplicateScopeState::Reference,
+            }],
             ..DuplicateReviewState::default()
         };
         let plan = [DuplicateActionItem {
@@ -870,7 +988,7 @@ mod desktop_tests {
         assert!(validate_duplicate_plan_and_reserve(&review, "stale-token", &plan).is_err());
         assert!(validate_duplicate_plan_and_reserve(&review, "review-token", &plan).is_err());
 
-        review.protected_roots.clear();
+        review.scope_rules.clear();
         assert_eq!(
             validate_duplicate_plan_and_reserve(&review, "review-token", &plan)
                 .expect("valid plan")
@@ -881,6 +999,42 @@ mod desktop_tests {
         assert!(validate_duplicate_plan_and_reserve(&review, "review-token", &plan).is_err());
 
         fs::remove_dir_all(root).expect("remove duplicate review test root");
+    }
+
+    #[test]
+    fn duplicate_scope_uses_the_deepest_folder_rule() {
+        let root = std::env::temp_dir().join(format!(
+            "filetree_desktop_duplicate_scope_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let child = root.join("scratch");
+        fs::create_dir_all(&child).expect("create scope folders");
+        let canonical_root = fs::canonicalize(&root).expect("canonical root");
+        let canonical_child = fs::canonicalize(&child).expect("canonical child");
+        let rules = vec![
+            CanonicalDuplicateScopeRule {
+                path: canonical_root.clone(),
+                state: DuplicateScopeState::Reference,
+            },
+            CanonicalDuplicateScopeRule {
+                path: canonical_child.clone(),
+                state: DuplicateScopeState::Normal,
+            },
+        ];
+
+        assert_eq!(
+            duplicate_scope_state(&canonical_root.join("master.bin"), &rules),
+            Some(DuplicateScopeState::Reference)
+        );
+        assert_eq!(
+            duplicate_scope_state(&canonical_child.join("draft.bin"), &rules),
+            Some(DuplicateScopeState::Normal)
+        );
+        fs::remove_dir_all(root).expect("remove duplicate scope test root");
     }
 }
 
@@ -1147,16 +1301,28 @@ async fn duplicates_scan(
     state: State<'_, Arc<V2Store>>,
     registry: State<'_, DuplicateScanRegistry>,
     request_id: String,
-    request: DuplicateScanRequest,
-    protected_paths: Vec<String>,
+    mut request: DuplicateScanRequest,
+    scope_rules: Vec<DuplicateScopeRule>,
     on_progress: Channel<DuplicateProgress>,
 ) -> Result<DesktopDuplicateScanResult, String> {
     if request_id.is_empty() || request_id.len() > 128 {
         return Err("Invalid duplicate scan request id".to_string());
     }
-    if protected_paths.len() > 1_000 || protected_paths.iter().any(|path| path.len() > 32_768) {
-        return Err("Protected-location policy exceeds desktop limits".to_string());
+    if scope_rules.len() > 1_000 || scope_rules.iter().any(|rule| rule.path.len() > 32_768) {
+        return Err("Duplicate folder-state policy exceeds desktop limits".to_string());
     }
+    request.excluded_paths = scope_rules
+        .iter()
+        .filter(|rule| rule.state == DuplicateScopeState::Excluded)
+        .map(|rule| rule.path.clone())
+        .collect();
+    request.path_rules = scope_rules
+        .iter()
+        .map(|rule| DuplicatePathRule {
+            path: rule.path.clone(),
+            excluded: rule.state == DuplicateScopeState::Excluded,
+        })
+        .collect();
     let mut authorized_roots = request
         .sources
         .iter()
@@ -1166,21 +1332,40 @@ async fn duplicates_scan(
     authorized_roots.dedup_by(|left, right| {
         normalized_canonical_path(left) == normalized_canonical_path(right)
     });
-    let mut protected_roots = protected_paths
-        .iter()
-        .map(|path| canonical_directory(path))
-        .collect::<Result<Vec<_>, _>>()?;
-    if protected_roots.iter().any(|path| {
-        !authorized_roots
-            .iter()
-            .any(|root| review_path_is_within(path, root) || review_path_is_within(root, path))
+
+    let mut canonical_scope_rules = scope_rules
+        .into_iter()
+        .map(|rule| {
+            Ok(CanonicalDuplicateScopeRule {
+                path: canonical_directory(&rule.path)?,
+                state: rule.state,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if canonical_scope_rules.iter().any(|rule| {
+        !authorized_roots.iter().any(|root| {
+            review_path_is_within(&rule.path, root) || review_path_is_within(root, &rule.path)
+        })
     }) {
-        return Err("Protected locations must be inside selected scan targets".to_string());
+        return Err("Folder states must apply to selected scan targets".to_string());
     }
-    protected_roots.sort_by_key(|path| normalized_canonical_path(path));
-    protected_roots.dedup_by(|left, right| {
-        normalized_canonical_path(left) == normalized_canonical_path(right)
-    });
+    canonical_scope_rules.sort_by_key(|rule| normalized_canonical_path(&rule.path));
+    let mut seen_scope_paths = HashSet::new();
+    if canonical_scope_rules
+        .iter()
+        .any(|rule| !seen_scope_paths.insert(normalized_canonical_path(&rule.path)))
+    {
+        return Err("A duplicate folder can have only one state".to_string());
+    }
+    if authorized_roots.iter().any(|root| {
+        !canonical_scope_rules.iter().any(|rule| {
+            rule.state != DuplicateScopeState::Excluded
+                && (review_path_is_within(root, &rule.path)
+                    || review_path_is_within(&rule.path, root))
+        })
+    }) {
+        return Err("Every scan target needs a Normal or Reference folder state".to_string());
+    }
 
     {
         let mut review = registry
@@ -1238,7 +1423,7 @@ async fn duplicates_scan(
     let mut review = DuplicateReviewState {
         token: Some(review_token.clone()),
         authorized_roots,
-        protected_roots,
+        scope_rules: canonical_scope_rules,
         ..DuplicateReviewState::default()
     };
     for (group_index, group) in result.groups.iter().enumerate() {
@@ -1364,6 +1549,17 @@ fn review_path_is_within(candidate: &Path, root: &Path) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+fn duplicate_scope_state(
+    path: &Path,
+    rules: &[CanonicalDuplicateScopeRule],
+) -> Option<DuplicateScopeState> {
+    rules
+        .iter()
+        .filter(|rule| review_path_is_within(path, &rule.path))
+        .max_by_key(|rule| normalized_canonical_path(&rule.path).len())
+        .map(|rule| rule.state)
+}
+
 fn canonical_location_without_following_entry(path: &str) -> Result<PathBuf, String> {
     let normalized = normalized_review_path(path)?;
     let value = Path::new(path);
@@ -1484,13 +1680,12 @@ fn validate_duplicate_plan_and_reserve(
             ));
         }
         let protected_location = canonical_location_without_following_entry(&item.path)?;
-        if review
-            .protected_roots
-            .iter()
-            .any(|root| review_path_is_within(&protected_location, root))
-        {
+        if matches!(
+            duplicate_scope_state(&protected_location, &review.scope_rules),
+            Some(DuplicateScopeState::Reference | DuplicateScopeState::Excluded)
+        ) {
             return Err(format!(
-                "{}: file is inside a protected duplicate location",
+                "{}: file is inside a non-actionable duplicate location",
                 item.path
             ));
         }
@@ -1664,6 +1859,7 @@ async fn duplicates_link(
     review_token: String,
     pairs: Vec<DuplicateLinkPair>,
     mode: String,
+    permanent: Option<bool>,
 ) -> Result<DuplicateActionResponse, String> {
     if pairs.is_empty() || pairs.len() > 1_000 {
         return Err("Select between 1 and 1,000 duplicate files".to_string());
@@ -1709,6 +1905,7 @@ async fn duplicates_link(
             let item_errors = filetree_core::replace_duplicate_paths_with_links(
                 vec![(keeper, path)],
                 mode == "symlink",
+                permanent.unwrap_or(false),
             );
             if item_errors.is_empty() {
                 succeeded.push(requested_path);
@@ -2490,6 +2687,7 @@ pub fn run() {
             fs_watch_start,
             fs_watch_stop,
             directory_snapshot,
+            browse_directories,
             file_icon,
             file_icons,
             file_thumbnail,

@@ -1,24 +1,32 @@
-import { useState, useMemo, useEffect, useRef, useLayoutEffect } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { useState, useMemo, useEffect, type ReactNode } from "react";
 import type { ViewId } from "./ActivityBar";
 import type { DriveEntry, NodeRecord, ScanResult, SpecialFolder, Unit, TagEntry, SmartFolder } from "../api/types";
 import { BookmarksTab } from "./BookmarksTab";
 import { ErrorsTab } from "./ErrorsTab";
 import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
-import { DuplicatesConfigPanel } from "./DuplicatesConfigPanel";
 import { DriveCapacityBar } from "./DriveCapacityBar";
+import { PathPicker, splitPath } from "./PathPicker";
 import type { DuplicatesController } from "../hooks/useDuplicates";
 import {
-  searchNodesAdvanced, compileNameMatcher, makeFilterPredicate, filtersActive,
+  DUPLICATE_SCAN_STEPS,
+  activeScanStep,
+  hashingDeterminate,
+  hashingPercent,
+  hashingTitle,
+  scanStepStatus,
+} from "../lib/duplicatesScanUi";
+import {
+  compileNameMatcher, makeFilterPredicate, filtersActive,
   EMPTY_FILTERS, FILE_CATEGORIES, AGE_PRESETS,
   type SearchFilters, type FileCategory, type AgePreset,
 } from "../lib/search";
 import { getAllCached } from "../lib/scanCache";
 import { exportResults } from "../lib/exportRows";
-import { revealPath } from "../api/client";
-import { compareNodes, isNodeOpen } from "../hooks/useTreeState";
+import { revealPath, copyText, shellContextMenu } from "../api/client";
+import { compareNodes } from "../hooks/useTreeState";
 import { loadPresets, addPreset, removePreset, type ScanPreset } from "../lib/scanPresets";
+import { loadRecentPaths } from "./RibbonBar";
 import { promptDialog } from "../lib/dialogs";
 import { toast } from "../lib/toast";
 
@@ -30,6 +38,60 @@ const VIEW_TITLES: Record<ViewId, string> = {
   bookmarks: "Bookmarks",
   errors: "Problems",
 };
+
+/** Label on the side bar's primary action, per view. */
+const SCAN_LABELS: Partial<Record<ViewId, string>> = {
+  explorer: "Scan",
+  compress: "Scan",
+  duplicates: "Index",
+};
+
+// ── Shared side-bar primitives ───────────────────────────────────────────────
+// One collapsible group heading and one row shape, so Explorer, Compress and
+// Duplicates all read as the same panel instead of three different ones.
+
+function SideSection({
+  label, defaultOpen = true, open: openProp, onToggle, children,
+}: {
+  label: string;
+  defaultOpen?: boolean;
+  /** Set both to drive the section from outside (the folder tree needs the
+   *  open flag to size its virtualizer). Omit for a self-managed section. */
+  open?: boolean;
+  onToggle?: (open: boolean) => void;
+  children: ReactNode;
+}) {
+  const [openLocal, setOpenLocal] = useState(defaultOpen);
+  const open = openProp ?? openLocal;
+  return (
+    <>
+      <button
+        type="button"
+        className={`sb-section${open ? "" : " collapsed"}`}
+        aria-expanded={open}
+        onClick={() => (onToggle ? onToggle(!open) : setOpenLocal(!open))}
+      >
+        <span className="sb-section-chev"><Icon name="chevron-down" size={9} /></span>
+        <span className="sb-section-label">{label}</span>
+      </button>
+      {open && children}
+    </>
+  );
+}
+
+function Stat({ value, label }: { value: string; label: string }) {
+  return (
+    <div className="sb-stat">
+      <span className="sb-stat-value">{value}</span>
+      <span className="sb-stat-label">{label}</span>
+    </div>
+  );
+}
+
+/** Last path segment, for chips and compact labels. */
+function leafName(path: string): string {
+  return splitPath(path).name || path;
+}
 
 function fmtSize(bytes: number): string {
   if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`;
@@ -49,16 +111,18 @@ export interface SideBarProps {
   // searchQuery so the sidebar list and the main-area results table stay in sync.
   searchQuery: string;
   onSearchQueryChange: (q: string) => void;
-  // Inline filters + regex toggle (#31), cross-scan toggle (#32), history (#33),
-  // and select-all results (#35). All lifted in App so the pane's flat results
-  // table stays in sync with what this sidebar Search view shows.
+  // Inline filters + regex toggle (#31), history (#33), and select-all results
+  // (#35). All lifted in App so the pane's flat results table stays in sync
+  // with what this sidebar Search view shows.
   searchFilters: SearchFilters;
   onSearchFiltersChange: (f: SearchFilters) => void;
-  searchGlobal: boolean;
-  onSearchGlobalChange: (v: boolean) => void;
   searchHistory: string[];
   onClearSearchHistory: () => void;
   onSelectAllSearchResults: (paths: string[]) => void;
+  /** Every OPEN tab's scan, so Search spans all of them and not just the
+   *  focused pane. Separate from the 60s scanCache, which expires too fast to
+   *  answer "search everything I've scanned". */
+  getOpenScans: () => { root: string; nodes: Iterable<NodeRecord> }[];
   onNavigate: (id: number) => void;
   // explorer: scan controls
   scanPath: string;
@@ -101,7 +165,9 @@ export interface SideBarProps {
   onApplySmartFolder: (sf: SmartFolder) => void;
   onSaveSmartFolder: () => void;
   onDeleteSmartFolder: (id: string) => void;
-  // duplicates page controller (shared with the app-level results view)
+  // Duplicates controller, shared with the main-area results view. Only the
+  // scope summary and scan lifecycle are surfaced here; the criteria editor
+  // stays in the Directories tab of DuplicatesView.
   dupes?: DuplicatesController;
   // exclude patterns (#12): the persisted scan-exclude list (parsed from the
   // comma-separated AppSettings.exclude) plus remove/clear actions and a rescan.
@@ -109,8 +175,6 @@ export interface SideBarProps {
   onRemoveExclude?: (pattern: string) => void;
   onClearExcludes?: () => void;
 }
-
-const SIDEBAR_FOLDER_ROW_H = 22; // keep in sync with .folder-row height in global.css
 
 // ── Tags list (F4) ───────────────────────────────────────────────────────────
 // Aggregates every tag across the persisted tag entries into a name → {count,
@@ -123,7 +187,6 @@ function TagsSection({
   activeTagFilter: string | null;
   onSelectTag: (tag: string | null) => void;
 }) {
-  const [open, setOpen] = useState(true);
   const tags = useMemo(() => {
     const m = new Map<string, { count: number; color?: string }>();
     for (const e of tagEntries) {
@@ -140,110 +203,81 @@ function TagsSection({
   if (tags.length === 0) return null;
 
   return (
-    <>
-      <div className={`explorer-section-title${open ? "" : " collapsed"}`} onClick={() => setOpen((v) => !v)}>
-        <span className="chev"><Icon name="chevron-down" size={11} /></span> Tags
-      </div>
-      {open && (
-        <div className="tag-list">
-          {activeTagFilter && (
-            <button className="tag-list-clear" onClick={() => onSelectTag(null)}>
-              <Icon name="x" size={11} /> Clear tag filter
-            </button>
-          )}
-          {tags.map(([tag, info]) => (
-            <button
-              key={tag}
-              className={`tag-list-item${activeTagFilter === tag ? " active" : ""}`}
-              title={`${info.count} item${info.count === 1 ? "" : "s"} tagged \u201C${tag}\u201D`}
-              onClick={() => onSelectTag(activeTagFilter === tag ? null : tag)}
-            >
-              <span className="tag-list-dot" style={{ background: info.color || "var(--accent, #61afef)" }} />
-              <span className="tag-list-name">{tag}</span>
-              <span className="tag-list-count">{info.count}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </>
-  );
-}
-
-// ── Smart folders list (F7) ──────────────────────────────────────────────────
-// Lists saved searches/filters; the first row saves the CURRENT search query +
-// active filter rules as a new smart folder, and each entry re-applies its query.
-function describeSmartFolder(sf: SmartFolder): string {
-  const parts: string[] = [];
-  if (sf.query.text) parts.push(`search “${sf.query.text}”`);
-  if (sf.query.rules?.length) parts.push(`${sf.query.rules.length} filter rule${sf.query.rules.length === 1 ? "" : "s"}`);
-  return parts.length ? `Apply ${parts.join(" + ")}` : "Apply smart folder";
-}
-
-function SmartFoldersSection({
-  smartFolders, onApply, onSave, onDelete,
-}: {
-  smartFolders: SmartFolder[];
-  onApply: (sf: SmartFolder) => void;
-  onSave: () => void;
-  onDelete: (id: string) => void;
-}) {
-  const [open, setOpen] = useState(true);
-  return (
-    <>
-      <div className={`explorer-section-title${open ? "" : " collapsed"}`} onClick={() => setOpen((v) => !v)}>
-        <span className="chev"><Icon name="chevron-down" size={11} /></span> Smart Folders
-      </div>
-      {open && (
-        <div className="smartfolder-list">
-          <button className="smartfolder-save" title="Save the current search and filter rules as a smart folder" onClick={onSave}>
-            <Icon name="plus" size={11} /> Save current search…
+    <SideSection label="Tags">
+      <div className="sb-list">
+        {tags.map(([tag, info]) => (
+          <button
+            key={tag}
+            type="button"
+            className={`sb-row${activeTagFilter === tag ? " selected" : ""}`}
+            title={`${info.count} item${info.count === 1 ? "" : "s"} tagged \u201C${tag}\u201D`}
+            onClick={() => onSelectTag(activeTagFilter === tag ? null : tag)}
+          >
+            <span className="sb-dot" style={{ background: info.color || "var(--accent)" }} />
+            <span className="sb-row-label">{tag}</span>
+            <span className="sb-row-meta">{info.count}</span>
           </button>
-          {smartFolders.length === 0 && (
-            <div className="smartfolder-empty">No smart folders yet.</div>
-          )}
-          {smartFolders.map((sf) => (
-            <div key={sf.id} className="smartfolder-item">
-              <button className="smartfolder-open" title={describeSmartFolder(sf)} onClick={() => onApply(sf)}>
-                <Icon name="funnel" size={12} />
-                <span className="smartfolder-name">{sf.name}</span>
-              </button>
-              <button className="smartfolder-del" title="Delete smart folder" onClick={() => onDelete(sf.id)}>
-                <Icon name="x" size={10} />
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-    </>
+        ))}
+        {activeTagFilter && (
+          <button type="button" className="sb-link muted" onClick={() => onSelectTag(null)}>
+            <Icon name="x" size={11} /> Clear tag filter
+          </button>
+        )}
+      </div>
+    </SideSection>
   );
 }
 
-// ── Quick scan presets (#13) ─────────────────────────────────────────────────
-// Compact one-click scan targets: "This PC", each fixed drive, the special
-// folders, and user-saved named presets (localStorage). The backend scan takes
-// a SINGLE root, so "This PC" is scoped to the primary/system drive (flagged in
-// its tooltip) and multi-path presets scan their first path.
-function QuickScanSection({
-  drives, specialFolders, scanPath, onOpenLocation,
+// ── Recent scans ─────────────────────────────────────────────────────────────
+// The drive/folder chips that used to live here duplicated both the Locations
+// list and the target picker, so this section now only carries history: the
+// paths actually scanned, most recent first.
+function RecentSection({
+  recent, onOpenLocation,
 }: {
-  drives: DriveEntry[];
-  specialFolders: SpecialFolder[];
+  recent: string[];
+  onOpenLocation: (path: string) => void;
+}) {
+  if (recent.length === 0) return null;
+  return (
+    <SideSection label="Recent">
+      <div className="sb-list">
+        {recent.slice(0, 8).map((path) => (
+          <button
+            key={path}
+            type="button"
+            className="sb-row"
+            title={path}
+            onClick={() => onOpenLocation(path)}
+          >
+            <Icon name="clock-history" size={13} />
+            <span className="sb-row-label">{leafName(path)}</span>
+            <span className="sb-row-meta">{splitPath(path).parent}</span>
+          </button>
+        ))}
+      </div>
+    </SideSection>
+  );
+}
+
+// ── Saved scans (#13) ────────────────────────────────────────────────────────
+// User-named scan targets kept in localStorage. Multi-path presets scan their
+// first path, since the backend scan takes a SINGLE root.
+function SavedScansSection({
+  scanPath, onOpenLocation,
+}: {
   scanPath: string;
   onOpenLocation: (path: string) => void;
 }) {
-  const [open, setOpen] = useState(true);
   const [presets, setPresets] = useState<ScanPreset[]>(() => loadPresets());
-
-  // "This PC" can't be a single backend root, so scan the primary/system drive.
-  const systemDrive = drives[0]?.root;
 
   const saveCurrent = async () => {
     const path = scanPath.trim();
-    if (!path) { toast.info("Enter or scan a folder first, then save it as a preset."); return; }
+    if (!path) { toast.info("Choose or scan a folder first, then save it."); return; }
     const name = await promptDialog({
       title: "Save scan preset",
       label: "Preset name",
-      initialValue: path.split(/[/\\]/).filter(Boolean).pop() || path,
+      initialValue: leafName(path),
       placeholder: "My preset",
       confirmLabel: "Save",
     });
@@ -253,68 +287,40 @@ function QuickScanSection({
   };
 
   return (
-    <>
-      <div className={`explorer-section-title${open ? "" : " collapsed"}`} onClick={() => setOpen((v) => !v)}>
-        <span className="chev"><Icon name="chevron-down" size={11} /></span> Quick Scan
-      </div>
-      {open && (
-        <div className="quickscan-list">
-          <div className="quickscan-targets">
-            {systemDrive && (
-              <button
-                className="quickscan-chip"
-                title={`Scan this PC — scoped to the system drive (${systemDrive}); multi-drive scanning isn't supported by the scan API.`}
-                onClick={() => onOpenLocation(systemDrive)}
-              >
-                <Icon name="hdd" size={12} /> This PC
-              </button>
-            )}
-            {drives.map((d) => (
-              <button
-                key={d.root}
-                className="quickscan-chip"
-                title={`Scan ${d.label || d.root}`}
-                onClick={() => onOpenLocation(d.root)}
-              >
-                <Icon name="hdd" size={12} /> {d.root.replace(/\\$/, "")}
-              </button>
-            ))}
-            {specialFolders.slice(0, 6).map((f) => (
-              <button
-                key={f.path}
-                className="quickscan-chip"
-                title={`Scan ${f.path}`}
-                onClick={() => onOpenLocation(f.path)}
-              >
-                <Icon name="folder" size={12} /> {f.label}
-              </button>
-            ))}
+    // Collapsed until something is saved, so an unused group is one quiet
+    // header row rather than a heading over an empty list.
+    <SideSection label="Saved" defaultOpen={presets.length > 0}>
+      <div className="sb-list">
+        {presets.map((preset) => (
+          <div
+            key={preset.id}
+            className="sb-row"
+            title={`Scan ${preset.paths.join(", ")}`}
+            onClick={() => onOpenLocation(preset.paths[0])}
+          >
+            <Icon name="star-fill" size={12} className="sb-row-star" />
+            <span className="sb-row-label">{preset.name}</span>
+            <button
+              type="button"
+              className="sb-row-act"
+              title="Delete preset"
+              aria-label={`Delete preset ${preset.name}`}
+              onClick={(event) => { event.stopPropagation(); setPresets(removePreset(preset.id)); }}
+            >
+              <Icon name="x" size={10} />
+            </button>
           </div>
-          <button className="quickscan-save" title="Save the current scan path as a named preset" onClick={() => { void saveCurrent(); }}>
-            <Icon name="plus" size={11} /> Save current path…
-          </button>
-          {presets.map((p) => (
-            <div key={p.id} className="quickscan-preset">
-              <button
-                className="quickscan-preset-open"
-                title={`Scan ${p.paths.join(", ")}`}
-                onClick={() => onOpenLocation(p.paths[0])}
-              >
-                <Icon name="star-fill" size={11} />
-                <span className="quickscan-preset-name">{p.name}</span>
-              </button>
-              <button
-                className="quickscan-preset-del"
-                title="Delete preset"
-                onClick={() => setPresets(removePreset(p.id))}
-              >
-                <Icon name="x" size={10} />
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-    </>
+        ))}
+        <button
+          type="button"
+          className="sb-link"
+          title="Save the current target as a named preset"
+          onClick={() => { void saveCurrent(); }}
+        >
+          <Icon name="plus" size={11} /> Save current target…
+        </button>
+      </div>
+    </SideSection>
   );
 }
 
@@ -329,133 +335,280 @@ function ExcludesSection({
   onRemove: (pattern: string) => void;
   onClear: () => void;
 }) {
-  const [open, setOpen] = useState(true);
   if (patterns.length === 0) return null;
   return (
-    <>
-      <div className={`explorer-section-title${open ? "" : " collapsed"}`} onClick={() => setOpen((v) => !v)}>
-        <span className="chev"><Icon name="chevron-down" size={11} /></span> Excluded From Scans
+    <SideSection label="Excluded">
+      <div className="sb-list">
+        {patterns.map((pattern) => (
+          <div key={pattern} className="sb-row" title={pattern}>
+            <Icon name="funnel" size={12} />
+            <span className="sb-row-label mono">{pattern}</span>
+            <button
+              type="button"
+              className="sb-row-act"
+              title="Remove this exclude"
+              aria-label={`Stop excluding ${pattern}`}
+              onClick={() => onRemove(pattern)}
+            >
+              <Icon name="x" size={10} />
+            </button>
+          </div>
+        ))}
+        <button type="button" className="sb-link muted" onClick={onClear}>
+          <Icon name="x" size={11} /> Clear all excludes
+        </button>
       </div>
-      {open && (
-        <div className="excludes-list">
-          {patterns.map((p) => (
-            <div key={p} className="exclude-item" title={p}>
-              <Icon name="funnel" size={11} />
-              <span className="exclude-name">{p}</span>
-              <button className="exclude-del" title="Remove this exclude" onClick={() => onRemove(p)}>
-                <Icon name="x" size={10} />
-              </button>
-            </div>
-          ))}
-          <button className="excludes-clear" onClick={onClear}>
-            <Icon name="x" size={11} /> Clear all excludes
-          </button>
-        </div>
-      )}
-    </>
+    </SideSection>
   );
 }
 
-function ExplorerView(props: SideBarProps) {
-  const [locOpen, setLocOpen] = useState(true);
-  const [foldersOpen, setFoldersOpen] = useState(true);
-  // Directory rows for the side-bar tree. Memoized so it isn't refiltered on
-  // every virtualizer re-render (each scroll tick) — only when the tree changes.
-  const folderRows = useMemo(
-    () => props.treeRows.filter((r) => r.dir && r.id >= 0),
-    [props.treeRows],
-  );
-  const hasScan = props.data !== null;
+// ── Per-view context cards ───────────────────────────────────────────────────
+// Each of the three browsing views gets one card above the shared location
+// lists, carrying the state and primary action that view actually cares about.
 
-  // Virtualize the folder tree against the shared side-bar scroll container so
-  // an "Expand All" with thousands of folders renders only the visible window
-  // rather than every row (replaces the old hard 800-row cap). scrollMargin
-  // offsets the list past the path box + Locations section so the whole side
-  // bar still scrolls as one unit.
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const folderTreeRef = useRef<HTMLDivElement>(null);
-  const [scrollMargin, setScrollMargin] = useState(0);
-  const folderVirtualizer = useVirtualizer({
-    count: foldersOpen ? folderRows.length : 0,
-    getScrollElement: () => scrollRef.current,
-    estimateSize: () => SIDEBAR_FOLDER_ROW_H,
-    overscan: 15,
-    scrollMargin,
-  });
-  // Re-measure the folder list's offset within the scroll container whenever the
-  // content above it changes height (Locations toggled, drive/bookmark counts,
-  // first scan). Runs before paint so row positions are never visibly off.
-  useLayoutEffect(() => {
-    const scrollEl = scrollRef.current;
-    const treeEl = folderTreeRef.current;
-    if (!scrollEl || !treeEl) return;
-    const margin = treeEl.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top + scrollEl.scrollTop;
-    setScrollMargin((prev) => (Math.abs(prev - margin) > 0.5 ? margin : prev));
-  }, [locOpen, foldersOpen, hasScan, props.drives.length, props.specialFolders.length, props.bookmarkList.length]);
+/** Deepest-first walk isn't needed: the scan root is the only depth-0 node. */
+function findRoot(nodeById: Map<number, NodeRecord>): NodeRecord | undefined {
+  for (const node of nodeById.values()) {
+    if (node.depth === 0 && node.id >= 0) return node;
+  }
+  return undefined;
+}
+
+/** What Compress will read from: the folder selected in the tree, else the root. */
+function CompressScopeCard({
+  data, nodeById, selectedNode, scanning, onScan,
+}: {
+  data: ScanResult | null;
+  nodeById: Map<number, NodeRecord>;
+  selectedNode: NodeRecord | undefined;
+  scanning: boolean;
+  onScan: () => void;
+}) {
+  const root = useMemo(() => findRoot(nodeById), [nodeById]);
+  const scope = selectedNode?.dir ? selectedNode : root;
+
+  if (!data || !scope) {
+    return (
+      <div className="sb-card">
+        <div className="sb-card-head">
+          <Icon name="file-zip" size={13} />
+          <span className="sb-card-title">Nothing to compress yet</span>
+        </div>
+        <p className="sb-card-note">
+          Pick a drive or folder above and scan it — the candidate list is built from
+          the scanned tree.
+        </p>
+        <div className="sb-card-actions">
+          <button type="button" className="sb-btn primary" disabled={scanning} onClick={onScan}>
+            {scanning ? "Scanning…" : "Scan now"}
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="sidebar-content" ref={scrollRef}>
-      <div className="explorer-path">
-        <input
-          value={props.scanPath}
-          spellCheck={false}
-          placeholder="Folder or drive to scan..."
-          onChange={(e) => props.onScanPathInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") props.onScan(); }}
-        />
-        {props.scanning ? (
-          <button className="explorer-btn" onClick={props.onCancel}>Stop</button>
-        ) : (
-          <button className="explorer-btn" onClick={props.onScan}>Scan</button>
+    <div className="sb-card">
+      <div className="sb-card-head">
+        <Icon name="file-zip" size={13} />
+        <span className="sb-card-title" title={scope.path}>{scope.name}</span>
+      </div>
+      <div className="sb-stat-grid">
+        <Stat value={fmtSize(scope.size)} label="In scope" />
+        <Stat value={scope.files.toLocaleString()} label="Files" />
+      </div>
+      <p className="sb-card-note">
+        {scope.id === root?.id
+          ? "Whole scan is in scope. Select a folder below to narrow it."
+          : "Scoped to the selected folder."}
+      </p>
+    </div>
+  );
+}
+
+/** Duplicate scan scope + lifecycle. The full criteria editor stays in the
+ *  main panel's Directories tab; this is the at-a-glance version. */
+function DuplicatesScanCard({ ctrl }: { ctrl: DuplicatesController }) {
+  const scanning = ctrl.scanState === "scanning";
+  const activeStep = activeScanStep(ctrl.phase, ctrl.progress.stage);
+  const determinate = hashingDeterminate(ctrl.phase, ctrl.progress);
+  const hashedPct = hashingPercent(ctrl.progress);
+  const shown = ctrl.selectedPaths.slice(0, 4);
+  const extra = ctrl.selectedPaths.length - shown.length;
+
+  return (
+    <div className="sb-card">
+      <div className="sb-card-head">
+        <Icon name="duplicates" size={13} />
+        <span className="sb-card-title">
+          {scanning ? "Scanning for duplicates" : "Duplicate scan"}
+        </span>
+        {!scanning && ctrl.groups.length > 0 && (
+          <span className="sb-row-meta">{ctrl.groups.length.toLocaleString()} groups</span>
         )}
       </div>
 
-      <div
-        className={`explorer-section-title${locOpen ? "" : " collapsed"}`}
-        onClick={() => setLocOpen((v) => !v)}
-      >
-        <span className="chev"><Icon name="chevron-down" size={11} /></span> Locations
-      </div>
-      {locOpen && (
-        <div className="loc-list">
-          {props.drives.map((d) => (
-            // Capacity/used bar (Explorer + TreeSize parity). total === 0 means
-            // the volume couldn't be queried (e.g. empty CD) → DriveCapacityBar
-            // renders nothing and only the name shows.
+      {scanning ? (
+        <div className="sb-progress" role="status" aria-live="polite">
+          <div className="sb-steps">
+            {DUPLICATE_SCAN_STEPS.map((step) => (
+              <span key={step.id} className={`sb-step ${scanStepStatus(step.id, activeStep)}`}>
+                {step.label}
+              </span>
+            ))}
+          </div>
+          <div className="sb-progress-line">
+            <b>{hashingTitle(ctrl.phase, ctrl.progress)}</b>
+            <span>
+              {ctrl.phase === "hashing" && ctrl.progress.hashing > 0
+                ? `${hashedPct}%`
+                : ctrl.progress.scanned > 0
+                  ? `${ctrl.progress.scanned.toLocaleString()} indexed`
+                  : "starting"}
+            </span>
+          </div>
+          <div
+            className="sb-progress-track"
+            role="progressbar"
+            aria-label="Duplicate scan progress"
+            aria-valuemin={0}
+            aria-valuemax={determinate ? 100 : undefined}
+            aria-valuenow={determinate ? hashedPct : undefined}
+          >
             <div
-              key={d.root}
-              className="loc-item loc-drive"
-              title={d.total > 0 ? `${d.label || d.root} — ${fmtSize(d.free)} free of ${fmtSize(d.total)}` : d.root}
-              onClick={() => props.onOpenLocation(d.root)}
-            >
-              <div className="loc-drive-row">
-                <span className="loc-ico"><Icon name="hdd" size={14} /></span>
-                <span className="loc-name">{d.label || d.root}</span>
-              </div>
-              <DriveCapacityBar total={d.total} free={d.free} root={d.root} />
-            </div>
+              className={`sb-progress-fill${determinate ? "" : " sweep"}`}
+              style={determinate ? { width: `${hashedPct}%` } : undefined}
+            />
+          </div>
+        </div>
+      ) : ctrl.selectedPaths.length === 0 ? (
+        <p className="sb-card-note">
+          No folders in scope. Add a target above, or set folder states in the
+          Directories tab.
+        </p>
+      ) : (
+        <div className="sb-chips">
+          {shown.map((path) => (
+            <span key={path} className="sb-chip on" title={path}>{leafName(path)}</span>
           ))}
-          {props.specialFolders.map((f) => (
-            <div key={f.path} className="loc-item" title={f.path} onClick={() => props.onOpenLocation(f.path)}>
-              <span className="loc-ico"><Icon name="folder" size={14} /></span>
-              <span className="loc-name">{f.label}</span>
-            </div>
-          ))}
-          {props.bookmarkList.map((b) => (
-            <div key={b} className="loc-item" title={b} onClick={() => props.onOpenLocation(b)}>
-              <span className="loc-ico loc-ico-star"><Icon name="star-fill" size={13} /></span>
-              <span className="loc-name">{b.split(/[/\\]/).filter(Boolean).pop() || b}</span>
-            </div>
-          ))}
+          {extra > 0 && <span className="sb-chip">+{extra} more</span>}
         </div>
       )}
 
-      <QuickScanSection
-        drives={props.drives}
-        specialFolders={props.specialFolders}
-        scanPath={props.scanPath}
-        onOpenLocation={props.onOpenLocation}
-      />
+      <div className="sb-card-actions">
+        {scanning ? (
+          <button type="button" className="sb-btn danger" onClick={ctrl.stopScan}>Stop scan</button>
+        ) : (
+          <button
+            type="button"
+            className="sb-btn primary"
+            disabled={!ctrl.canScan || ctrl.actionPending}
+            onClick={ctrl.startScan}
+          >
+            {ctrl.groups.length > 0 ? "Scan again" : "Scan for duplicates"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LocationsView(props: SideBarProps) {
+  const [locOpen, setLocOpen] = useState(true);
+
+  // Recent targets feed the picker's own "Recent" group as well as the
+  // side-bar section, so both stay in step after a scan.
+  const [recentPaths, setRecentPaths] = useState<string[]>(() => loadRecentPaths());
+  useEffect(() => { setRecentPaths(loadRecentPaths()); }, [props.scanPath]);
+
+  const scanLabel = SCAN_LABELS[props.view] ?? "Scan";
+
+  return (
+    <div className="sidebar-content">
+      <div className="sb-target">
+        <PathPicker
+          value={props.scanPath}
+          onChange={props.onScanPathInput}
+          onCommit={props.onOpenLocation}
+          drives={props.drives}
+          specialFolders={props.specialFolders}
+          bookmarks={props.bookmarkList}
+          recent={recentPaths}
+          disabled={props.scanning}
+          ariaLabel="Drive or folder to scan"
+        />
+        {props.scanning ? (
+          <button type="button" className="sb-go danger" onClick={props.onCancel}>Stop</button>
+        ) : (
+          <button
+            type="button"
+            className="sb-go"
+            disabled={!props.scanPath.trim()}
+            onClick={props.onScan}
+          >
+            {scanLabel}
+          </button>
+        )}
+      </div>
+
+      {props.view === "duplicates" && props.dupes && <DuplicatesScanCard ctrl={props.dupes} />}
+      {props.view === "compress" && (
+        <CompressScopeCard
+          data={props.data}
+          nodeById={props.nodeById}
+          selectedNode={props.selectedNode}
+          scanning={props.scanning}
+          onScan={props.onScan}
+        />
+      )}
+      <SideSection label="Locations" open={locOpen} onToggle={setLocOpen}>
+        <div className="sb-list">
+          {props.drives.map((d) => (
+            // total === 0 means the volume couldn't be queried (e.g. an empty
+            // optical drive) → DriveCapacityBar renders nothing and only the
+            // name shows. Used/free and the fill-up forecast are in the tooltip.
+            <button
+              key={d.root}
+              type="button"
+              className="sb-row"
+              title={d.total > 0 ? `${d.label || d.root} — ${fmtSize(d.free)} free of ${fmtSize(d.total)}` : d.root}
+              onClick={() => props.onOpenLocation(d.root)}
+            >
+              <Icon name="hdd" size={13} />
+              <span className="sb-row-label">{d.label || d.root}</span>
+              <DriveCapacityBar total={d.total} free={d.free} root={d.root} compact />
+            </button>
+          ))}
+          {props.specialFolders.map((f) => (
+            <button
+              key={f.path}
+              type="button"
+              className="sb-row"
+              title={f.path}
+              onClick={() => props.onOpenLocation(f.path)}
+            >
+              <Icon name="folder" size={13} />
+              <span className="sb-row-label">{f.label}</span>
+            </button>
+          ))}
+          {props.bookmarkList.map((b) => (
+            <button
+              key={b}
+              type="button"
+              className="sb-row"
+              title={b}
+              onClick={() => props.onOpenLocation(b)}
+            >
+              <Icon name="star-fill" size={12} className="sb-row-star" />
+              <span className="sb-row-label">{leafName(b)}</span>
+            </button>
+          ))}
+        </div>
+      </SideSection>
+
+      <RecentSection recent={recentPaths} onOpenLocation={props.onOpenLocation} />
+
+      <SavedScansSection scanPath={props.scanPath} onOpenLocation={props.onOpenLocation} />
 
       <ExcludesSection
         patterns={props.excludePatterns ?? []}
@@ -463,70 +616,10 @@ function ExplorerView(props: SideBarProps) {
         onClear={() => props.onClearExcludes?.()}
       />
 
-      {hasScan && (
-        <>
-          <div
-            className={`explorer-section-title${foldersOpen ? "" : " collapsed"}`}
-            onClick={() => setFoldersOpen((v) => !v)}
-          >
-            <span className="chev"><Icon name="chevron-down" size={11} /></span> Folders
-          </div>
-          {foldersOpen && (
-            <div
-              className="folder-tree"
-              ref={folderTreeRef}
-              style={{ height: folderVirtualizer.getTotalSize(), position: "relative" }}
-            >
-              {folderVirtualizer.getVirtualItems().map((vItem) => {
-                const row = folderRows[vItem.index];
-                const node = props.nodeById.get(row.id);
-                const hasChildren = !!node && node.children.some((cid) => props.nodeById.get(cid)?.dir);
-                const isOpen = isNodeOpen(
-                  row.id,
-                  props.expanded,
-                  props.expandedAll,
-                  props.collapsedOverrides,
-                );
-                return (
-                  <div
-                    key={row.id}
-                    className={`folder-row${row.id === props.selectedId ? " selected" : ""}`}
-                    style={{ position: "absolute", top: vItem.start - scrollMargin, left: 0, right: 0, height: SIDEBAR_FOLDER_ROW_H }}
-                    onClick={() => props.onSelectFolder(row.id)}
-                  >
-                    {row.depth > 0 && (
-                      <span className="indent" aria-hidden="true">
-                        {Array.from({ length: row.depth }).map((_, i) => (
-                          <span key={i} className="indent-guide" />
-                        ))}
-                      </span>
-                    )}
-                    <span
-                      className="twisty"
-                      onClick={(e) => { e.stopPropagation(); if (hasChildren) props.onToggleExpand(row.id); }}
-                    >
-                      {hasChildren && <Icon name={isOpen ? "chevron-down" : "chevron-right"} size={10} />}
-                    </span>
-                    <span className="fname">{row.name}</span>
-                    <span className="fsize">{fmtSize(row.size)}</span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </>
-      )}
-
       <TagsSection
         tagEntries={props.tagEntries}
         activeTagFilter={props.activeTagFilter}
         onSelectTag={props.onSelectTag}
-      />
-      <SmartFoldersSection
-        smartFolders={props.smartFolders}
-        onApply={props.onApplySmartFolder}
-        onSave={props.onSaveSmartFolder}
-        onDelete={props.onDeleteSmartFolder}
       />
     </div>
   );
@@ -657,8 +750,7 @@ function SearchView(props: SideBarProps) {
   const [query, setQuery] = useState("");
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const hasScan = props.data !== null;
-  const { searchFilters, searchGlobal } = props;
+  const { searchFilters } = props;
 
   // Input is controlled by App's lifted searchQuery; debounce a local copy so
   // the shared matcher doesn't re-walk the node map on every keystroke.
@@ -675,18 +767,12 @@ function SearchView(props: SideBarProps) {
   const anyFilter = filtersActive(searchFilters);
   const active = query.length >= 2 || anyFilter;
 
-  // Local (current-scan) results via the shared advanced matcher, largest-first
-  // to mirror the main table. Skipped when global search is on (handled below).
-  const localResults = useMemo(
-    () => (searchGlobal ? [] : searchNodesAdvanced(props.nodeById, query, searchFilters, "size", -1, SEARCH_RESULT_CAP)),
-    [searchGlobal, props.nodeById, query, searchFilters],
-  );
-
-  // Cross-scan / global results (#32): match across EVERY cached scan plus the
-  // focused pane's live tree, tagging each hit with its root. SAFE scope — this
-  // searches only already-scanned trees (no filesystem-wide index).
-  const globalResults = useMemo<SearchHit[]>(() => {
-    if (!searchGlobal || (!active || matcher.invalid)) return [];
+  // Results span the focused pane, every other OPEN tab, and any scan still in
+  // the short-lived cache — tagged with the root each hit came from. Scoping
+  // this to the focused tab silently hid matches the user had already scanned
+  // elsewhere. SAFE scope: only already-scanned trees, never a filesystem walk.
+  const results = useMemo<SearchHit[]>(() => {
+    if (!active || matcher.invalid) return [];
     const predicate = makeFilterPredicate(searchFilters);
     const nameMatchAll = query.length < 2;
     const currentRoot = props.data?.rootPath ?? "";
@@ -700,11 +786,17 @@ function SearchView(props: SideBarProps) {
       hits.push({ node, root, isCurrent });
     };
 
-    // Focused pane's live tree first.
+    // Focused pane's live tree first, so its hits keep their navigable ids.
     if (currentRoot) seenRoots.add(normRoot(currentRoot));
     for (const node of props.nodeById.values()) consider(node, currentRoot, true);
 
-    // Then every other cached scan (skip the one we already walked live).
+    // Then the other open tabs, then whatever is left in the scan cache. Each
+    // root is walked once; the first source to claim it wins.
+    for (const { root, nodes } of props.getOpenScans()) {
+      if (seenRoots.has(normRoot(root))) continue;
+      seenRoots.add(normRoot(root));
+      for (const node of nodes) consider(node, root, false);
+    }
     for (const { path, result } of getAllCached()) {
       const root = result.rootPath || path;
       if (seenRoots.has(normRoot(root))) continue;
@@ -714,11 +806,7 @@ function SearchView(props: SideBarProps) {
 
     hits.sort((a, b) => compareNodes(a.node, b.node, "size", -1));
     return hits.slice(0, SEARCH_RESULT_CAP);
-  }, [searchGlobal, active, matcher, searchFilters, query, props.nodeById, props.data]);
-
-  const results: SearchHit[] = searchGlobal
-    ? globalResults
-    : localResults.map((node) => ({ node, root: props.data?.rootPath ?? "", isCurrent: true }));
+  }, [active, matcher, searchFilters, query, props.nodeById, props.data, props.getOpenScans]);
 
   const allPaths = useMemo(() => results.map((r) => r.node.path).filter(Boolean), [results]);
 
@@ -732,6 +820,20 @@ function SearchView(props: SideBarProps) {
     }
   };
 
+  /** The folder a hit lives in, i.e. what "open location" should scan. */
+  const containerOf = (hit: SearchHit): string =>
+    hit.node.dir ? hit.node.path : splitPath(hit.node.path).parent || hit.root;
+
+  // Right-click hands the path to the Windows shell menu, the same one the
+  // main tree uses, so search hits get Open / Open with / Properties / Delete.
+  const handleResultMenu = (hit: SearchHit, e: React.MouseEvent) => {
+    e.preventDefault();
+    if (!hit.node.path) return;
+    void shellContextMenu([hit.node.path], e.clientX, e.clientY).catch((error: unknown) => {
+      toast.error(error instanceof Error ? error.message : String(error));
+    });
+  };
+
   return (
     <div className="sidebar-content search-view">
       <div className={`search-box${regexInvalid ? " invalid" : ""}`}>
@@ -740,7 +842,7 @@ function SearchView(props: SideBarProps) {
           autoFocus
           value={props.searchQuery}
           spellCheck={false}
-          placeholder={hasScan ? "Search files and folders…" : "Run a scan first…"}
+          placeholder="Search every scan…"
           onChange={(e) => props.onSearchQueryChange(e.target.value)}
         />
         <button
@@ -793,21 +895,13 @@ function SearchView(props: SideBarProps) {
         <SearchFiltersPanel filters={searchFilters} onChange={props.onSearchFiltersChange} />
       )}
 
-      <div className="search-options">
-        <label className="search-global-toggle" title="Search across every scan cached this session (multiple roots), not just the current one. This is not a filesystem-wide index.">
-          <input
-            type="checkbox"
-            checked={searchGlobal}
-            onChange={(e) => props.onSearchGlobalChange(e.target.checked)}
-          />
-          Search all cached scans
-        </label>
-        {props.searchQuery && (
+      {props.searchQuery && (
+        <div className="search-options">
           <button className="search-link" title="Save this search as a smart folder" onClick={props.onSaveSmartFolder}>
             Save
           </button>
-        )}
-      </div>
+        </div>
+      )}
 
       {active && (
         <div className="search-count">
@@ -824,26 +918,63 @@ function SearchView(props: SideBarProps) {
 
       <div className="search-results">
         {results.map((hit, i) => (
-          <button
+          <div
             key={`${hit.root}:${hit.node.id}:${i}`}
-            className="search-result"
-            title={hit.isCurrent ? hit.node.path : `${hit.node.path}\n(in ${hit.root} — opens in File Explorer)`}
-            onClick={() => handleClickResult(hit)}
+            className="sr-item"
+            onContextMenu={(e) => handleResultMenu(hit, e)}
           >
-            <FileIcon ext={hit.node.extension ?? ""} isDir={hit.node.dir} isBundle={false} />
-            <span className="sr-name">{hit.node.name}</span>
-            <span className="sr-size">{fmtSize(hit.node.size)}</span>
-            <span className="sr-path">{hit.node.path}</span>
-            {searchGlobal && (
-              <span className={`sr-root${hit.isCurrent ? " current" : ""}`} title={hit.root}>{rootLabel(hit.root)}</span>
-            )}
-          </button>
+            <button
+              type="button"
+              className="search-result"
+              title={hit.isCurrent ? hit.node.path : `${hit.node.path}\n(in ${hit.root} — opens in File Explorer)`}
+              onClick={() => handleClickResult(hit)}
+            >
+              <FileIcon ext={hit.node.extension ?? ""} isDir={hit.node.dir} isBundle={false} />
+              <span className="sr-name">{hit.node.name}</span>
+              <span className="sr-size">{fmtSize(hit.node.size)}</span>
+              <span className="sr-path">{hit.node.path}</span>
+              {/* Only foreign hits need the tag: they come from another scan
+                  and behave differently on click. */}
+              {!hit.isCurrent && (
+                <span className="sr-root" title={hit.root}>{rootLabel(hit.root)}</span>
+              )}
+            </button>
+            <span className="sr-actions">
+              <button
+                type="button"
+                className="sr-act"
+                title="Scan this folder"
+                aria-label={`Scan the folder containing ${hit.node.name}`}
+                onClick={() => props.onOpenLocation(containerOf(hit))}
+              >
+                <Icon name="folder-open" size={12} />
+              </button>
+              <button
+                type="button"
+                className="sr-act"
+                title="Reveal in File Explorer"
+                aria-label={`Reveal ${hit.node.name} in File Explorer`}
+                onClick={() => { revealPath(hit.node.path).catch(() => {}); }}
+              >
+                <Icon name="search" size={12} />
+              </button>
+              <button
+                type="button"
+                className="sr-act"
+                title="Copy path"
+                aria-label={`Copy the path of ${hit.node.name}`}
+                onClick={() => { void copyText(hit.node.path); }}
+              >
+                <Icon name="copy" size={11} />
+              </button>
+            </span>
+          </div>
         ))}
         {active && results.length === 0 && (
-          <div className="empty">{regexInvalid ? "Invalid regular expression." : `No matches${hasScan || searchGlobal ? "" : " — run a scan first"}.`}</div>
+          <div className="empty">{regexInvalid ? "Invalid regular expression." : "No matches."}</div>
         )}
         {!active && (
-          <div className="empty">Type at least 2 characters{searchGlobal ? "" : " to search the current scan"}, or set a filter.</div>
+          <div className="empty">Type at least 2 characters, or set a filter.</div>
         )}
       </div>
     </div>
@@ -852,31 +983,28 @@ function SearchView(props: SideBarProps) {
 
 export function SideBar(props: SideBarProps) {
   const { view } = props;
-  // Compression reuses Explorer controls while its main panel is shown.
-  const showExplorerBody = view === "explorer" || view === "compress";
-  const showFolderActions = showExplorerBody;
+  // Explorer, Compress and Duplicates share one browsing body — the target
+  // picker, the location lists and the folder tree — and differ only in the
+  // context card at the top and the label on the primary action.
+  const showLocationsBody = view === "explorer" || view === "compress" || view === "duplicates";
 
   return (
     <div className="sidebar">
       <div className="sidebar-header">
         <span className="title">{VIEW_TITLES[view]}</span>
-        {showFolderActions && (
+        {showLocationsBody && (
           <div className="actions">
-            <button title="New folder" onClick={props.onNewFolder}><Icon name="folder-plus" size={15} /></button>
-            <button title="Refresh" onClick={props.onRefresh}><Icon name="refresh" size={14} /></button>
-            <button title="Up one level" onClick={props.onUp}><Icon name="arrow-up" size={14} /></button>
-            <button title="Collapse all" onClick={props.onCollapseAll}><Icon name="collapse" size={14} /></button>
+            <button type="button" title="New folder" onClick={props.onNewFolder}><Icon name="folder-plus" size={14} /></button>
+            <button type="button" title="Refresh" onClick={props.onRefresh}><Icon name="refresh" size={13} /></button>
+            <button type="button" title="Up one level" onClick={props.onUp}><Icon name="arrow-up" size={13} /></button>
+            <button type="button" title="Collapse all" onClick={props.onCollapseAll}><Icon name="collapse" size={13} /></button>
           </div>
         )}
       </div>
 
-      {showExplorerBody && <ExplorerView {...props} />}
+      {showLocationsBody && <LocationsView {...props} />}
 
       {view === "search" && <SearchView {...props} />}
-
-      {view === "duplicates" && props.dupes && (
-        <DuplicatesConfigPanel ctrl={props.dupes} drives={props.drives} specialFolders={props.specialFolders} />
-      )}
 
       {view === "bookmarks" && (
         <div className="sidebar-content">

@@ -74,7 +74,7 @@ const ChatPanel = lazy(() => import("./components/ChatPanel").then((m) => ({ def
 // bundle) for the command-palette → chat controller handle.
 import type { ChatPanelController } from "./components/ChatPanel";
 const TerminalPanel = lazy(() => import("./components/TerminalPanel").then((m) => ({ default: m.TerminalPanel })));
-const DuplicatesResults = lazy(() => import("./components/DuplicatesResults").then((m) => ({ default: m.DuplicatesResults })));
+const DuplicatesView = lazy(() => import("./components/DuplicatesView").then((m) => ({ default: m.DuplicatesView })));
 
 const SETTINGS_DEBOUNCE_MS = 700;
 const CLOSE_FLUSH_TIMEOUT_MS = 1_500;
@@ -320,11 +320,10 @@ export default function App() {
     const t = setTimeout(() => setDebouncedSearchQuery(searchQuery), 80);
     return () => clearTimeout(t);
   }, [searchQuery]);
-  // Inline search filters + regex toggle (#31) and cross-scan toggle (#32),
-  // lifted alongside searchQuery so BOTH the sidebar Search view and each
-  // pane's flat results table apply the same narrowing predicates.
+  // Inline search filters + regex toggle (#31), lifted alongside searchQuery so
+  // BOTH the sidebar Search view and each pane's flat results table apply the
+  // same narrowing predicates.
   const [searchFilters, setSearchFilters] = useState<SearchFilters>(EMPTY_FILTERS);
-  const [searchGlobal, setSearchGlobal] = useState(false);
   // Search history (#33): committed queries (localStorage, deduped, capped).
   const [searchHistory, setSearchHistory] = useState<string[]>(() => loadSearchHistory());
   // Record a query in history once it settles (debounced via committed query),
@@ -1029,6 +1028,21 @@ export default function App() {
     if (n === 0) toast.info("None of these results are in the focused scan.");
     else toast.success(`Selected ${n} result${n === 1 ? "" : "s"} in the focused pane.`);
   }, [getActiveRef]);
+
+  // Every open tab's scan, for the side bar's search. The client scanCache
+  // expires after 60s, so it can't be the source of truth for "search
+  // everything I've scanned" — the tabs themselves hold their trees for as long
+  // as they're open. Nodes are handed over as the live map's values (no copy).
+  const getOpenScans = useCallback((): { root: string; nodes: Iterable<NodeRecord> }[] => {
+    const out: { root: string; nodes: Iterable<NodeRecord> }[] = [];
+    for (const tab of tabsRef.current) {
+      const handle = tab.ref.current;
+      const root = handle?.getData()?.rootPath;
+      if (!handle || !root) continue;
+      out.push({ root, nodes: handle.getNodeById().values() });
+    }
+    return out;
+  }, []);
 
   // ── Low-space monitor + alerts (F9) ───────────────────────────────────────
   // Poll drive free space on an interval while enabled and raise ONE native
@@ -1999,7 +2013,6 @@ export default function App() {
       { id: "search-select-all", title: "Search: Select All Results", hint: "Search", keywords: "filter results selection select-all", run: () => { getActiveRef()?.doSelectSearchResults(); } },
       { id: "search-export-csv", title: "Search: Export Results (CSV)", hint: "Search", keywords: "filter results download export csv", run: () => { getActiveRef()?.doExportSearchResults("csv"); } },
       { id: "search-export-json", title: "Search: Export Results (JSON)", hint: "Search", keywords: "filter results download export json", run: () => { getActiveRef()?.doExportSearchResults("json"); } },
-      { id: "search-global", title: "Search: Toggle Cross-scan (all cached scans)", hint: "Search", keywords: "filter global multi root cross scan", run: () => setSearchGlobal((v) => !v) },
       { id: "sidebar", title: "Toggle Side Bar", hint: "Ctrl+B", keywords: "panel", run: () => handleToggleSidebar() },
       { id: "assistant", title: "Toggle AI Assistant", hint: "Ctrl+Alt+B", keywords: "chat", run: () => handleToggleChat() },
       { id: "chat-new", title: "Chat: New Session", keywords: "ai assistant conversation start", run: () => handleNewAgentSession() },
@@ -2078,16 +2091,14 @@ export default function App() {
                 specialFolders={specialFolders}
                 bookmarkList={bookmarkList}
                 onRemoveBookmark={handleToggleBookmark}
-                dupes={dupes}
                 searchQuery={searchQuery}
                 onSearchQueryChange={setSearchQuery}
                 searchFilters={searchFilters}
                 onSearchFiltersChange={setSearchFilters}
-                searchGlobal={searchGlobal}
-                onSearchGlobalChange={setSearchGlobal}
                 searchHistory={searchHistory}
                 onClearSearchHistory={handleClearSearchHistory}
                 onSelectAllSearchResults={handleSelectAllSearchResults}
+                getOpenScans={getOpenScans}
                 tagEntries={tagEntries}
                 activeTagFilter={activeTagFilter}
                 onSelectTag={handleSelectTag}
@@ -2095,6 +2106,7 @@ export default function App() {
                 onApplySmartFolder={handleApplySmartFolder}
                 onSaveSmartFolder={handleSaveSmartFolder}
                 onDeleteSmartFolder={handleDeleteSmartFolder}
+                dupes={dupes}
                 excludePatterns={excludePatterns}
                 onRemoveExclude={handleRemoveExclude}
                 onClearExcludes={handleClearExcludes}
@@ -2199,7 +2211,7 @@ export default function App() {
         {activeView === "duplicates" && (
           <div className="dupes-editor">
             <LazyView>
-              <DuplicatesResults ctrl={dupes} />
+              <DuplicatesView ctrl={dupes} drives={drives} specialFolders={specialFolders} />
             </LazyView>
           </div>
         )}
@@ -2358,12 +2370,13 @@ export default function App() {
 // App and only change when App itself re-renders.
 
 function WorkbenchSideBar({
-  store, view, drives, specialFolders, bookmarkList, onRemoveBookmark, dupes,
+  store, view, drives, specialFolders, bookmarkList, onRemoveBookmark,
   searchQuery, onSearchQueryChange,
-  searchFilters, onSearchFiltersChange, searchGlobal, onSearchGlobalChange,
-  searchHistory, onClearSearchHistory, onSelectAllSearchResults,
+  searchFilters, onSearchFiltersChange,
+  searchHistory, onClearSearchHistory, onSelectAllSearchResults, getOpenScans,
   tagEntries, activeTagFilter, onSelectTag,
   smartFolders, onApplySmartFolder, onSaveSmartFolder, onDeleteSmartFolder,
+  dupes,
   excludePatterns, onRemoveExclude, onClearExcludes,
 }: {
   store: WorkbenchStore;
@@ -2372,16 +2385,14 @@ function WorkbenchSideBar({
   specialFolders: SpecialFolder[];
   bookmarkList: string[];
   onRemoveBookmark: (path: string) => void;
-  dupes: DuplicatesController;
   searchQuery: string;
   onSearchQueryChange: (q: string) => void;
   searchFilters: SearchFilters;
   onSearchFiltersChange: (f: SearchFilters) => void;
-  searchGlobal: boolean;
-  onSearchGlobalChange: (v: boolean) => void;
   searchHistory: string[];
   onClearSearchHistory: () => void;
   onSelectAllSearchResults: (paths: string[]) => void;
+  getOpenScans: () => { root: string; nodes: Iterable<NodeRecord> }[];
   tagEntries: TagEntry[];
   activeTagFilter: string | null;
   onSelectTag: (tag: string | null) => void;
@@ -2389,6 +2400,7 @@ function WorkbenchSideBar({
   onApplySmartFolder: (sf: SmartFolder) => void;
   onSaveSmartFolder: () => void;
   onDeleteSmartFolder: (id: string) => void;
+  dupes: DuplicatesController;
   excludePatterns: string[];
   onRemoveExclude: (pattern: string) => void;
   onClearExcludes: () => void;
@@ -2404,11 +2416,10 @@ function WorkbenchSideBar({
       onSearchQueryChange={onSearchQueryChange}
       searchFilters={searchFilters}
       onSearchFiltersChange={onSearchFiltersChange}
-      searchGlobal={searchGlobal}
-      onSearchGlobalChange={onSearchGlobalChange}
       searchHistory={searchHistory}
       onClearSearchHistory={onClearSearchHistory}
       onSelectAllSearchResults={onSelectAllSearchResults}
+      getOpenScans={getOpenScans}
       tagEntries={tagEntries}
       activeTagFilter={activeTagFilter}
       onSelectTag={onSelectTag}
@@ -2416,6 +2427,7 @@ function WorkbenchSideBar({
       onApplySmartFolder={onApplySmartFolder}
       onSaveSmartFolder={onSaveSmartFolder}
       onDeleteSmartFolder={onDeleteSmartFolder}
+      dupes={dupes}
       onNavigate={m.onNavigate}
       scanPath={m.scanPath}
       scanning={m.scanning}
@@ -2443,7 +2455,6 @@ function WorkbenchSideBar({
       onCopyPath={m.onCopyPath}
       onScanPath={m.onScanPath}
       onRemoveBookmark={onRemoveBookmark}
-      dupes={dupes}
       excludePatterns={excludePatterns}
       onRemoveExclude={onRemoveExclude}
       onClearExcludes={onClearExcludes}

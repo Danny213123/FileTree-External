@@ -25,9 +25,13 @@ interface DriveCapacityBarProps {
    *  free-space samples and shows a subtle "~X days until full" forecast (#15)
    *  once the trend is clearly declining. Omit to disable the forecast. */
   root?: string;
+  /** Side-bar variant: a hairline track plus the used percentage on one line,
+   *  with the used/free split and the forecast moved into the tooltip. Keeps
+   *  drive rows the same height as every other row in the panel. */
+  compact?: boolean;
 }
 
-export function DriveCapacityBar({ total, free, root }: DriveCapacityBarProps) {
+export function DriveCapacityBar({ total, free, root, compact = false }: DriveCapacityBarProps) {
   // Sample this drive's free space whenever the value changes (i.e. when the
   // drive list refreshes). The store throttles to one point per ~30 min so the
   // series spans real elapsed time across sessions.
@@ -49,6 +53,21 @@ export function DriveCapacityBar({ total, free, root }: DriveCapacityBarProps) {
   const level = pct >= 90 ? "crit" : pct >= 75 ? "warn" : "";
   const fillClass = ["drive-cap-fill", level].filter(Boolean).join(" ");
   const forecastText = trend ? formatForecast(trend) : "";
+
+  if (compact) {
+    const detail = [`${fmtSize(used)} used · ${fmtSize(free)} free`, forecastText]
+      .filter(Boolean)
+      .join(" · ");
+    return (
+      <span className="drive-cap-compact" title={detail}>
+        <span className="drive-cap-track">
+          <span className={fillClass} style={{ width: `${pct}%`, display: "block" }} />
+        </span>
+        <span className={`drive-cap-pct${level ? ` ${level}` : ""}`}>{Math.round(pct)}%</span>
+      </span>
+    );
+  }
+
   return (
     <div className="drive-cap">
       <div className="drive-cap-track">

@@ -1,5 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { NodeRecord, ScanResult } from "./types";
+import type { DupeScopeRule, NodeRecord, ScanResult } from "./types";
 import type { ScanOptions } from "./client";
 import { V2PageCache } from "../lib/v2PageCache";
 
@@ -67,7 +67,7 @@ export interface V2DuplicateSource {
 }
 
 export interface V2DuplicateProgress {
-  phase: "indexing" | "hashing" | "done" | string;
+  phase: "indexing" | "fingerprinting" | "sampling" | "hashing" | "finalizing" | "done" | string;
   scanned: number;
   hashing: number;
   hashed: number;
@@ -99,6 +99,7 @@ export interface V2DuplicateRequest {
   minSize: number;
   maxSize?: number | null;
   extensions: string[];
+  excludedPaths: string[];
   includeHidden: boolean;
   threads: number;
 }
@@ -298,7 +299,7 @@ export async function v2MemoryStats(): Promise<V2MemoryStats> {
 
 export async function runV2DuplicateScan(
   request: V2DuplicateRequest,
-  protectedPaths: string[],
+  scopeRules: DupeScopeRule[],
   onProgress: (value: V2DuplicateProgress) => void,
   signal?: AbortSignal,
 ): Promise<V2DuplicateResult> {
@@ -312,7 +313,7 @@ export async function runV2DuplicateScan(
     return await invoke<V2DuplicateResult>("duplicates_scan", {
       requestId,
       request,
-      protectedPaths,
+      scopeRules,
       onProgress: channel,
     });
   } finally {

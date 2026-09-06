@@ -3,6 +3,8 @@ import type {
   DupeCriteria,
   DupeCriterionKey,
   DupeGroupV2,
+  DupeScopeRule,
+  DupeScopeState,
   ReprioritizeCriterion,
   ScanResult,
 } from "../api/types";
@@ -25,7 +27,6 @@ import {
   runV2Scan,
 } from "../api/v2";
 import { getCached, invalidate, setCached } from "../lib/scanCache";
-import { confirmDialog } from "../lib/dialogs";
 import { toast } from "../lib/toast";
 import {
   actionableDuplicatePaths,
@@ -38,10 +39,12 @@ import {
   dedupeCandidates,
   groupSignature,
   isUnder,
+  minimalScanTargets,
   normalizeForKey,
   passesFilters,
   pruneGroups,
   rebuildWithReference,
+  scopeStateForPath,
   sortGroupsByWaste,
   type CandidateMeta,
   type DupeFilters,
@@ -60,6 +63,12 @@ export type KeepStrategy =
   | "shortestPath"
   | "longestPath"
   | "drive";
+
+/** Options collected by the unified deletion dialog. */
+export interface DuplicateDeletionRequest {
+  permanent: boolean;
+  replaceWithLink?: "hardlink" | "symlink";
+}
 
 /** Uppercase drive letter of a Windows path (e.g. "C"), or "" when none. */
 function driveLetterOf(p: string): string {
@@ -103,6 +112,7 @@ export interface DupeProgress {
   scanned: number;
   hashing: number;
   hashed: number;
+  stage?: string;
 }
 
 export interface UseDuplicatesArgs {
@@ -130,6 +140,7 @@ interface DuplicatePreferences {
   selectedPaths: string[];
   customPaths: string[];
   protectedPaths: string[];
+  excludedPaths: string[];
   ignoredSignatures: string[];
   criteria: DupeCriteria;
   minSizeKb: number;
@@ -150,8 +161,25 @@ function loadDuplicatePreferences(): Partial<DuplicatePreferences> {
   }
 }
 
-function protectedPolicyKey(paths: string[]): string {
-  return paths.map(normalizeForKey).sort().join("|");
+function scopePolicyKey(rules: DupeScopeRule[]): string {
+  return rules
+    .map((rule) => `${normalizeForKey(rule.path)}=${rule.state}`)
+    .sort()
+    .join("|");
+}
+
+function hasPath(paths: string[], path: string): boolean {
+  const key = normalizeForKey(path);
+  return paths.some((item) => normalizeForKey(item) === key);
+}
+
+function addPath(paths: string[], path: string): string[] {
+  return hasPath(paths, path) ? paths : [...paths, path];
+}
+
+function dropPath(paths: string[], path: string): string[] {
+  const key = normalizeForKey(path);
+  return paths.filter((item) => normalizeForKey(item) !== key);
 }
 
 function downloadReport(filename: string, type: string, text: string): void {
@@ -168,6 +196,10 @@ export interface DuplicatesController {
   selectedPaths: string[];
   customPaths: string[];
   protectedPaths: string[];
+  excludedPaths: string[];
+  scopeRules: DupeScopeRule[];
+  pathState: (p: string) => DupeScopeState;
+  setPathState: (p: string, state: DupeScopeState) => void;
   togglePath: (p: string) => void;
   addCustomPath: (p: string) => void;
   removeCustomPath: (p: string) => void;
@@ -235,11 +267,14 @@ export interface DuplicatesController {
 
   // File actions
   actionPending: boolean;
-  deleteSelected: () => Promise<void>;
-  moveSelected: () => Promise<void>;
-  copySelected: () => Promise<void>;
+  deleteSelected: (permanentOverride?: boolean) => Promise<void>;
+  moveSelected: (dest?: string) => Promise<void>;
+  copySelected: (dest?: string) => Promise<void>;
+  removeSelectedFromResults: () => void;
   /** #26: replace the checked duplicates with hard/symlinks to their reference. */
-  linkSelected: (mode: "hardlink" | "symlink") => Promise<void>;
+  linkSelected: (mode: "hardlink" | "symlink", permanent?: boolean) => Promise<void>;
+  /** Recycle/permanent delete, optionally replacing each path with a link. */
+  executeDeletion: (request: DuplicateDeletionRequest) => Promise<void>;
   exportCsv: () => void;
   exportJson: () => void;
 
@@ -264,6 +299,9 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
   );
   const [protectedPaths, setProtectedPaths] = useState<string[]>(() =>
     Array.isArray(initialPreferences.protectedPaths) ? initialPreferences.protectedPaths : [],
+  );
+  const [excludedPaths, setExcludedPaths] = useState<string[]>(() =>
+    Array.isArray(initialPreferences.excludedPaths) ? initialPreferences.excludedPaths : [],
   );
   const [criteria, setCriteria] = useState<DupeCriteria>(() =>
     initialPreferences.criteria ?? defaultCriteria(),
@@ -305,8 +343,17 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
   useEffect(() => { criteriaRef.current = criteria; }, [criteria]);
   const repriRef = useRef(repriCriterion);
   useEffect(() => { repriRef.current = repriCriterion; }, [repriCriterion]);
-  const protectedPathsRef = useRef(protectedPaths);
-  useEffect(() => { protectedPathsRef.current = protectedPaths; }, [protectedPaths]);
+  const excludedPathsRef = useRef(excludedPaths);
+  useEffect(() => { excludedPathsRef.current = excludedPaths; }, [excludedPaths]);
+  const normalPaths = useMemo(() => {
+    const references = new Set(protectedPaths.map(normalizeForKey));
+    return selectedPaths.filter((path) => !references.has(normalizeForKey(path)));
+  }, [protectedPaths, selectedPaths]);
+  const scopeRules = useMemo<DupeScopeRule[]>(() => [
+    ...normalPaths.map((path) => ({ path, state: "normal" as const })),
+    ...protectedPaths.map((path) => ({ path, state: "reference" as const })),
+    ...excludedPaths.map((path) => ({ path, state: "excluded" as const })),
+  ], [excludedPaths, normalPaths, protectedPaths]);
   const contentVerifiedRef = useRef(false);
   const actionPendingRef = useRef(false);
   const beginAction = useCallback(() => {
@@ -325,6 +372,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
       selectedPaths,
       customPaths,
       protectedPaths,
+      excludedPaths,
       ignoredSignatures,
       criteria,
       minSizeKb,
@@ -346,6 +394,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     deleteMode,
     destPath,
     extensions,
+    excludedPaths,
     includeHidden,
     ignoredSignatures,
     maxSizeKb,
@@ -359,44 +408,69 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     if (phase !== "hashing" || isTauriV2()) return;
     const id = setInterval(async () => {
       const p = await fetchDupesProgress();
-      setProgress((prev) => ({ scanned: prev.scanned, hashing: p.filesHashing, hashed: p.filesHashed }));
+      setProgress((prev) => ({
+        scanned: prev.scanned,
+        hashing: p.filesHashing,
+        hashed: p.filesHashed,
+        stage: "hashing",
+      }));
     }, 400);
     return () => clearInterval(id);
   }, [phase]);
 
-  const togglePath = useCallback((p: string) => {
-    if (actionPendingRef.current) return;
-    setSelectedPaths((prev) => (prev.includes(p) ? prev.filter((x) => x !== p) : [...prev, p]));
-  }, []);
-  const addCustomPath = useCallback((p: string) => {
-    if (actionPendingRef.current) return;
-    const v = p.trim();
-    if (!v) return;
-    setCustomPaths((prev) => (prev.includes(v) ? prev : [...prev, v]));
-    setSelectedPaths((prev) => (prev.includes(v) ? prev : [...prev, v]));
-  }, []);
-  const removeCustomPath = useCallback((p: string) => {
-    if (actionPendingRef.current) return;
-    setCustomPaths((prev) => prev.filter((x) => x !== p));
-    setSelectedPaths((prev) => prev.filter((x) => x !== p));
-    setProtectedPaths((prev) => prev.filter((x) => normalizeForKey(x) !== normalizeForKey(p)));
-  }, []);
-  const toggleProtectedPath = useCallback((p: string) => {
+  const pathState = useCallback((p: string): DupeScopeState => {
+    if (hasPath(protectedPaths, p)) return "reference";
+    if (hasPath(selectedPaths, p)) return "normal";
+    return "excluded";
+  }, [protectedPaths, selectedPaths]);
+
+  const setPathState = useCallback((p: string, state: DupeScopeState) => {
     if (actionPendingRef.current) {
       toast.warn("Wait for the current file action to finish.");
       return;
     }
     if (scanState === "scanning") {
-      toast.warn("Stop the scan before changing protected locations.");
+      toast.warn("Stop the scan before changing folder states.");
       return;
     }
-    setProtectedPaths((prev) => {
-      const key = normalizeForKey(p);
-      return prev.some((path) => normalizeForKey(path) === key)
-        ? prev.filter((path) => normalizeForKey(path) !== key)
-        : [...prev, p];
-    });
+    const path = p.trim();
+    if (!path) return;
+    if (state === "excluded") {
+      setSelectedPaths((prev) => dropPath(prev, path));
+      setProtectedPaths((prev) => dropPath(prev, path));
+      setExcludedPaths((prev) => addPath(prev, path));
+      return;
+    }
+    setSelectedPaths((prev) => addPath(prev, path));
+    setExcludedPaths((prev) => dropPath(prev, path));
+    setProtectedPaths((prev) =>
+      state === "reference" ? addPath(prev, path) : dropPath(prev, path),
+    );
   }, [scanState]);
+
+  const togglePath = useCallback((p: string) => {
+    setPathState(p, pathState(p) === "excluded" ? "normal" : "excluded");
+  }, [pathState, setPathState]);
+
+  const addCustomPath = useCallback((p: string) => {
+    if (actionPendingRef.current) return;
+    const v = p.trim();
+    if (!v) return;
+    setCustomPaths((prev) => addPath(prev, v));
+    setSelectedPaths((prev) => addPath(prev, v));
+    setProtectedPaths((prev) => dropPath(prev, v));
+    setExcludedPaths((prev) => dropPath(prev, v));
+  }, []);
+  const removeCustomPath = useCallback((p: string) => {
+    if (actionPendingRef.current) return;
+    setCustomPaths((prev) => dropPath(prev, p));
+    setSelectedPaths((prev) => dropPath(prev, p));
+    setProtectedPaths((prev) => dropPath(prev, p));
+    setExcludedPaths((prev) => dropPath(prev, p));
+  }, []);
+  const toggleProtectedPath = useCallback((p: string) => {
+    setPathState(p, pathState(p) === "reference" ? "normal" : "reference");
+  }, [pathState, setPathState]);
 
   const setCriterion = useCallback<DuplicatesController["setCriterion"]>((key, patch) => {
     setCriteria((prev) => ({ ...prev, [key]: { ...prev[key], ...patch } }));
@@ -420,16 +494,25 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
 
   const runScan = useCallback(async () => {
     if (actionPendingRef.current) return;
-    const targets = selectedPaths.filter(Boolean);
+    const targets = minimalScanTargets(selectedPaths);
     if (targets.length === 0) {
       setScanState("error");
       setErrors(["Select one or more drives or folders to scan."]);
       return;
     }
-    const scanProtectedPaths = protectedPathsRef.current.filter((path) =>
+    const scanScopeRules = scopeRules.filter((rule) =>
+      targets.some((target) => isUnder(rule.path, target) || isUnder(target, rule.path)),
+    );
+    const scanProtectedPaths = scanScopeRules
+      .filter((rule) => rule.state === "reference")
+      .map((rule) => rule.path);
+    const scanNormalPaths = scanScopeRules
+      .filter((rule) => rule.state === "normal")
+      .map((rule) => rule.path);
+    const scanExcludedPaths = excludedPathsRef.current.filter((path) =>
       targets.some((target) => isUnder(path, target) || isUnder(target, path)),
     );
-    const scanProtectionKey = protectedPolicyKey(protectedPathsRef.current);
+    const scanProtectionKey = scopePolicyKey(scanScopeRules);
     abortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -500,13 +583,19 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
             minSize: filters.minSize,
             maxSize: filters.maxSize ?? null,
             extensions: filters.extensions,
+            excludedPaths: scanExcludedPaths,
             includeHidden: filters.includeHidden,
             threads,
           },
-          scanProtectedPaths,
+          scanScopeRules,
           (event) => {
             setPhase(event.phase === "indexing" ? "aggregating" : "hashing");
-            setProgress({ scanned: event.scanned, hashing: event.hashing, hashed: event.hashed });
+            setProgress({
+              scanned: event.scanned,
+              hashing: event.hashing,
+              hashed: event.hashed,
+              stage: event.phase,
+            });
           },
           signal,
         );
@@ -537,10 +626,11 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
         result = result.filter((group) => !ignoredRef.current.has(groupSignature(group)));
         result = applyProtectedLocations(
           result,
-          protectedPathsRef.current,
+          scanProtectedPaths,
           criteria,
           repriCriterion,
           criteria.content.enabled,
+          scanNormalPaths,
         );
         result = sortGroupsByWaste(result);
         setGroups(result);
@@ -579,7 +669,9 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
         candidates.push(...candidatesFromScan(src, target));
       }
 
-      candidates = dedupeCandidates(candidates).filter((c) => passesFilters(c, filters));
+      candidates = dedupeCandidates(candidates)
+        .filter((candidate) => passesFilters(candidate, filters))
+        .filter((candidate) => scopeStateForPath(candidate.path, scanScopeRules) !== "excluded");
       setProgress((prev) => ({ ...prev, scanned: candidates.length }));
 
       const byPath = new Map<string, CandidateMeta>();
@@ -618,10 +710,11 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
       result = result.filter((g) => !ignoredRef.current.has(groupSignature(g)));
       result = applyProtectedLocations(
         result,
-        protectedPathsRef.current,
+        scanProtectedPaths,
         criteria,
         repriCriterion,
         criteria.content.enabled,
+        scanNormalPaths,
       );
       result = sortGroupsByWaste(result);
 
@@ -642,7 +735,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     } finally {
       if (abortRef.current === ctrl) abortRef.current = null;
     }
-  }, [selectedPaths, buildFilters, getScanResults, includeHidden, threads, criteria, repriCriterion, protectedPaths]);
+  }, [selectedPaths, buildFilters, getScanResults, includeHidden, threads, criteria, repriCriterion, scopeRules]);
 
   const startScan = useCallback(() => { void runScan(); }, [runScan]);
 
@@ -658,10 +751,13 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     setPhase("idle");
   }, []);
 
-  // Protection is part of the native review capability. Changing it retires
-  // the old result so UI markings and backend authorization cannot diverge.
+  // Folder state is part of the native review capability. Changing any rule
+  // retires the old result so UI markings and backend authorization cannot diverge.
   useEffect(() => {
-    if (activeProtectionKey === null || activeProtectionKey === protectedPolicyKey(protectedPaths)) return;
+    const currentRules = scopeRules.filter((rule) =>
+      selectedPaths.some((target) => isUnder(rule.path, target) || isUnder(target, rule.path)),
+    );
+    if (activeProtectionKey === null || activeProtectionKey === scopePolicyKey(currentRules)) return;
     if (isTauriV2()) void cancelV2DuplicateScan();
     setReviewToken(null);
     setActiveProtectionKey(null);
@@ -673,8 +769,8 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     setErrors([]);
     setScanState("idle");
     setPhase("idle");
-    toast.info("Protected locations changed. Run a new scan to apply the policy.");
-  }, [activeProtectionKey, protectedPaths]);
+    toast.info("Folder states changed. Run a new scan to apply the policy.");
+  }, [activeProtectionKey, scopeRules, selectedPaths]);
 
   // ── Selection ──────────────────────────────────────────────────────────────
   const allDupPaths = useMemo(
@@ -778,6 +874,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
         ),
       ),
       protectedPaths,
+      normalPaths,
     );
     const sel = new Set<string>();
     for (const g of rebuilt) {
@@ -787,7 +884,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     }
     setGroups(sortGroupsByWaste(rebuilt));
     setSelected(sel);
-  }, [groups, protectedPaths]);
+  }, [groups, normalPaths, protectedPaths]);
   const keepFirst = useCallback(() => keepStrategy("first"), [keepStrategy]);
 
   // ── Group actions ───────────────────────────────────────────────────────────
@@ -810,14 +907,14 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
         criteriaRef.current,
         contentVerifiedRef.current,
       );
-      return annotateProtectedLocations([rebuilt], protectedPaths)[0];
+      return annotateProtectedLocations([rebuilt], protectedPaths, normalPaths)[0];
     })));
     setSelected((prev) => {
       const next = new Set(prev);
       next.delete(refPath);
       return next;
     });
-  }, [protectedPaths]);
+  }, [normalPaths, protectedPaths]);
 
   const ignoreGroup = useCallback((group: DupeGroupV2) => {
     if (actionPendingRef.current) return;
@@ -850,6 +947,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
           criteriaRef.current,
           repriRef.current,
           contentVerifiedRef.current,
+          normalPaths,
         ),
       );
     });
@@ -858,7 +956,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     if (requiresRescan) {
       toast.info("Persistent hidden matches were restored. Run the scan again to show them.");
     }
-  }, [ignoredGroups, ignoredSignatures, protectedPaths]);
+  }, [ignoredGroups, ignoredSignatures, normalPaths, protectedPaths]);
   const clearIgnoreList = restoreIgnoredGroups;
 
   const reprioritizeApply = useCallback(() => {
@@ -871,10 +969,11 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
           criteriaRef.current,
           repriRef.current,
           contentVerifiedRef.current,
+          normalPaths,
         ),
       ),
     );
-  }, [protectedPaths]);
+  }, [normalPaths, protectedPaths]);
 
   // ── File actions ─────────────────────────────────────────────────────────────
   const invalidateAffected = useCallback((paths: string[], dest?: string) => {
@@ -900,31 +999,10 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     toast.warn("Some file outcomes could not be confirmed. Run a new scan before continuing.");
   }, [invalidateAffected]);
 
-  const deleteSelected = useCallback(async () => {
+  const deleteSelected = useCallback(async (permanentOverride?: boolean) => {
     const paths = safeSelectedPaths;
     if (!paths.length) return;
-    const permanent = deleteMode === "permanent";
-    const verb = permanent ? "permanently delete" : "send to Recycle Bin";
-    const bytes = groups.reduce(
-      (sum, group) => sum + group.files
-        .filter((file) => paths.includes(file.path))
-        .reduce((subtotal, file) => subtotal + file.size, 0),
-      0,
-    );
-    const affectedGroups = groups.filter((group) =>
-      group.files.some((file) => paths.includes(file.path)),
-    ).length;
-    const proceed = await confirmDialog({
-      title: permanent ? "Permanently delete" : "Delete",
-      message:
-        `${verb} ${paths.length} file${paths.length > 1 ? "s" : ""} ` +
-        `from ${affectedGroups} group${affectedGroups !== 1 ? "s" : ""} ` +
-        `(${Math.max(0, bytes).toLocaleString()} bytes)?` +
-        `${permanent ? "\n\nThis can\u2019t be undone." : ""}`,
-      confirmLabel: permanent ? "Delete permanently" : "Move to Recycle Bin",
-      danger: permanent,
-    });
-    if (!proceed) return;
+    const permanent = permanentOverride ?? deleteMode === "permanent";
     if (!beginAction()) return;
     let res: Awaited<ReturnType<typeof dupeAction>>;
     try {
@@ -954,15 +1032,17 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
         criteriaRef.current,
         repriRef.current,
         contentVerifiedRef.current,
+        normalPaths,
       )),
     );
     setSelected((prev) => new Set([...prev].filter((path) => !res.succeeded.includes(path))));
     invalidateAffected(res.succeeded);
-  }, [safeSelectedPaths, selectedActionItems, deleteMode, groups, invalidateAffected, protectedPaths, reviewToken, retireAmbiguousReview, beginAction, endAction]);
+  }, [safeSelectedPaths, selectedActionItems, deleteMode, groups, invalidateAffected, normalPaths, protectedPaths, reviewToken, retireAmbiguousReview, beginAction, endAction]);
 
-  const moveSelected = useCallback(async () => {
+  const moveSelected = useCallback(async (destOverride?: string) => {
     const paths = safeSelectedPaths;
-    if (!paths.length || !destPath.trim()) {
+    const dest = (destOverride ?? destPath).trim();
+    if (!paths.length || !dest) {
       toast.warn("Select files and set a destination folder.");
       return;
     }
@@ -970,7 +1050,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     let res: Awaited<ReturnType<typeof dupeAction>>;
     try {
       res = await dupeAction("move", paths, {
-        dest: destPath.trim(),
+        dest,
         protectedPaths,
         items: selectedActionItems,
         reviewToken: reviewToken ?? undefined,
@@ -983,7 +1063,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     }
     if (res.errors.length) toast.error(`Some files could not be moved:\n${res.errors.join("\n")}`);
     if (res.requiresRescan) {
-      retireAmbiguousReview(paths, destPath.trim());
+      retireAmbiguousReview(paths, dest);
       return;
     }
     if (!res.succeeded.length) return;
@@ -995,15 +1075,17 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
         criteriaRef.current,
         repriRef.current,
         contentVerifiedRef.current,
+        normalPaths,
       )),
     );
     setSelected((prev) => new Set([...prev].filter((path) => !res.succeeded.includes(path))));
-    invalidateAffected(res.succeeded, destPath.trim());
-  }, [safeSelectedPaths, selectedActionItems, destPath, invalidateAffected, protectedPaths, reviewToken, retireAmbiguousReview, beginAction, endAction]);
+    invalidateAffected(res.succeeded, dest);
+  }, [safeSelectedPaths, selectedActionItems, destPath, invalidateAffected, normalPaths, protectedPaths, reviewToken, retireAmbiguousReview, beginAction, endAction]);
 
-  const copySelected = useCallback(async () => {
+  const copySelected = useCallback(async (destOverride?: string) => {
     const paths = safeSelectedPaths;
-    if (!paths.length || !destPath.trim()) {
+    const dest = (destOverride ?? destPath).trim();
+    if (!paths.length || !dest) {
       toast.warn("Select files and set a destination folder.");
       return;
     }
@@ -1011,7 +1093,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     let res: Awaited<ReturnType<typeof dupeAction>>;
     try {
       res = await dupeAction("copy", paths, {
-        dest: destPath.trim(),
+        dest,
         protectedPaths,
         items: selectedActionItems,
         reviewToken: reviewToken ?? undefined,
@@ -1024,13 +1106,29 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     }
     if (res.errors.length) toast.error(`Some files could not be copied:\n${res.errors.join("\n")}`);
     if (res.requiresRescan) {
-      retireAmbiguousReview(paths, destPath.trim());
+      retireAmbiguousReview(paths, dest);
       return;
     }
-    if (res.succeeded.length) invalidateAffected([], destPath.trim());
+    if (res.succeeded.length) invalidateAffected([], dest);
   }, [safeSelectedPaths, selectedActionItems, destPath, invalidateAffected, protectedPaths, reviewToken, retireAmbiguousReview, beginAction, endAction]);
 
-  const linkSelected = useCallback(async (mode: "hardlink" | "symlink") => {
+  const removeSelectedFromResults = useCallback(() => {
+    if (actionPendingRef.current || safeSelectedPaths.length === 0) return;
+    const removed = new Set(safeSelectedPaths.map(normalizeForKey));
+    setGroups((prev) =>
+      sortGroupsByWaste(applyProtectedLocations(
+        pruneGroups(prev, removed, criteriaRef.current, repriRef.current, contentVerifiedRef.current),
+        protectedPaths,
+        criteriaRef.current,
+        repriRef.current,
+        contentVerifiedRef.current,
+        normalPaths,
+      )),
+    );
+    setSelected(new Set());
+  }, [normalPaths, protectedPaths, safeSelectedPaths]);
+
+  const linkSelected = useCallback(async (mode: "hardlink" | "symlink", permanent = false) => {
     const paths = safeSelectedPaths;
     if (!paths.length) return;
     // Map each checked duplicate to the reference (kept original) of its group.
@@ -1051,22 +1149,10 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
       toast.warn("Link replacement is available only for content-hash matches. Review or clear the unverified selection first.");
       return;
     }
-    const proceed = await confirmDialog({
-      title: mode === "symlink" ? "Replace with symlinks" : "Replace with hard links",
-      message:
-        `Replace ${pairs.length} duplicate file${pairs.length > 1 ? "s" : ""} with a ` +
-        `${mode === "symlink" ? "symbolic" : "hard"} link to the kept original?\n\n` +
-        `This modifies files: each duplicate is sent to the Recycle Bin and replaced by a link, ` +
-        `reclaiming its space while keeping the file accessible.` +
-        (mode === "symlink" ? "\n\nSymlinks may require Developer Mode or elevation on Windows." : ""),
-      confirmLabel: mode === "symlink" ? "Create symlinks" : "Create hard links",
-      danger: true,
-    });
-    if (!proceed) return;
     if (!beginAction()) return;
     let res: Awaited<ReturnType<typeof hardlinkPairs>>;
     try {
-      res = await hardlinkPairs(pairs, mode, protectedPaths, reviewToken ?? undefined);
+      res = await hardlinkPairs(pairs, mode, protectedPaths, reviewToken ?? undefined, permanent);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
       return;
@@ -1088,22 +1174,31 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
           criteriaRef.current,
           repriRef.current,
           contentVerifiedRef.current,
+          normalPaths,
         )),
       );
       setSelected((prev) => new Set([...prev].filter((path) => !res.succeeded.includes(path))));
       invalidateAffected(res.succeeded);
       if (res.ok) toast.success(`Replaced ${pairs.length} duplicate${pairs.length > 1 ? "s" : ""} with link${pairs.length > 1 ? "s" : ""}.`);
     }
-  }, [safeSelectedPaths, selected, groups, invalidateAffected, protectedPaths, reviewToken, retireAmbiguousReview, beginAction, endAction]);
+  }, [safeSelectedPaths, selected, groups, invalidateAffected, normalPaths, protectedPaths, reviewToken, retireAmbiguousReview, beginAction, endAction]);
+
+  const executeDeletion = useCallback(async (request: DuplicateDeletionRequest) => {
+    if (request.replaceWithLink) {
+      await linkSelected(request.replaceWithLink, request.permanent);
+      return;
+    }
+    await deleteSelected(request.permanent);
+  }, [deleteSelected, linkSelected]);
 
   const exportCsv = useCallback(() => {
     const esc = (s: string) => `"${s.replace(/"/g, '""')}"`;
-    const lines = ["Role,Protected,Verification,Name,Folder,Size,Last Modified,Match %"];
+    const lines = ["Role,Reference Folder,Verification,Name,Folder,Size,Last Modified,Match %"];
     for (const g of groups) {
       for (const f of g.files) {
         lines.push(
           [
-            f.ref ? "Keeper" : "Copy",
+            f.ref ? "Reference" : "Duplicate",
             f.protected ? "Yes" : "No",
             (f.match?.content ?? 0) >= 100 ? "Full content hash match" : "Possible match",
             esc(f.name),
@@ -1132,7 +1227,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
           extensions: extensions.split(",").map((value) => value.trim()).filter(Boolean),
           includeHidden,
         },
-        protectedPaths,
+        folderStates: scopeRules,
         summary: {
           groups: groups.length,
           files: groups.reduce((sum, group) => sum + group.files.length, 0),
@@ -1141,7 +1236,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
         groups,
       }, null, 2),
     );
-  }, [criteria, extensions, groups, includeHidden, maxSizeKb, minSizeKb, protectedPaths]);
+  }, [criteria, extensions, groups, includeHidden, maxSizeKb, minSizeKb, scopeRules]);
 
   const totalWaste = useMemo(() => groups.reduce((s, g) => s + g.waste, 0), [groups]);
   const totalFiles = useMemo(() => groups.reduce((s, g) => s + g.files.length, 0), [groups]);
@@ -1163,8 +1258,8 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
   const canScan = selectedPaths.length > 0;
 
   return {
-    selectedPaths, customPaths, protectedPaths,
-    togglePath, addCustomPath, removeCustomPath, toggleProtectedPath,
+    selectedPaths, customPaths, protectedPaths, excludedPaths, scopeRules,
+    pathState, setPathState, togglePath, addCustomPath, removeCustomPath, toggleProtectedPath,
     criteria, setCriterion, setNameFuzzy, setNameThreshold, setDateToleranceSec,
     minSizeKb, setMinSizeKb, maxSizeKb, setMaxSizeKb, extensions, setExtensions,
     includeHidden, setIncludeHidden,
@@ -1174,7 +1269,8 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     selected, collapsed, toggleFile, toggleGroup, toggleCollapse,
     selectAll, unselectAll, invertSelection, keepFirst, keepStrategy,
     makeRef, ignoreGroup, clearIgnoreList, restoreIgnoredGroups, reprioritizeApply,
-    actionPending, deleteSelected, moveSelected, copySelected, linkSelected, exportCsv, exportJson,
+    actionPending, deleteSelected, moveSelected, copySelected, removeSelectedFromResults,
+    linkSelected, executeDeletion, exportCsv, exportJson,
     totalWaste, totalFiles, selectedCount, selectedBytes, selectedGroups, canScan,
   };
 }

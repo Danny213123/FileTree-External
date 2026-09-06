@@ -8,6 +8,8 @@ import type {
   DupeFileV2,
   DupeGroupV2,
   DupeMatch,
+  DupeScopeRule,
+  DupeScopeState,
   NodeRecord,
   ReprioritizeCriterion,
   ScanResult,
@@ -52,9 +54,54 @@ export function isUnder(child: string, parent: string): boolean {
   return c === p || c.startsWith(p + "/");
 }
 
-/** True when a file belongs to one of the user-designated protected locations. */
-export function isProtectedPath(path: string, protectedPaths: string[]): boolean {
-  return protectedPaths.some((root) => root.trim() !== "" && isUnder(path, root));
+/** Collapse overlapping selections to the shallowest roots that cover them.
+ * Nested entries remain in the scope policy, but must not make the same cached
+ * subtree get staged and hashed more than once. */
+export function minimalScanTargets(paths: string[]): string[] {
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const path of paths) {
+    const value = path.trim();
+    const key = normalizePath(value);
+    if (!value || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(value);
+  }
+  return unique.filter((path, index) =>
+    !unique.some((root, rootIndex) => rootIndex !== index && isUnder(path, root)),
+  );
+}
+
+/** Resolve dupeGuru-style inherited folder state. The deepest explicit folder
+ * rule wins, allowing a child folder to override a drive or parent rule. */
+export function scopeStateForPath(
+  path: string,
+  rules: DupeScopeRule[],
+): DupeScopeState | undefined {
+  let match: DupeScopeRule | undefined;
+  let matchLength = -1;
+  for (const rule of rules) {
+    if (!rule.path.trim() || !isUnder(path, rule.path)) continue;
+    const length = normalizePath(rule.path).length;
+    if (length > matchLength) {
+      match = rule;
+      matchLength = length;
+    }
+  }
+  return match?.state;
+}
+
+/** True when a file resolves to Reference after inherited folder rules. */
+export function isProtectedPath(
+  path: string,
+  protectedPaths: string[],
+  normalPaths: string[] = [],
+): boolean {
+  const rules: DupeScopeRule[] = [
+    ...normalPaths.map((root) => ({ path: root, state: "normal" as const })),
+    ...protectedPaths.map((root) => ({ path: root, state: "reference" as const })),
+  ];
+  return scopeStateForPath(path, rules) === "reference";
 }
 
 /**
@@ -373,11 +420,12 @@ export function applyProtectedLocations(
   criteria: DupeCriteria,
   repri: ReprioritizeCriterion,
   contentVerified: boolean,
+  normalPaths: string[] = [],
 ): DupeGroupV2[] {
   return groups.map((group) => {
     const candidates = group.files.map(dupeFileToCandidate);
     const protectedMembers = candidates
-      .filter((file) => isProtectedPath(file.path, protectedPaths))
+      .filter((file) => isProtectedPath(file.path, protectedPaths, normalPaths))
       .sort((a, b) => normalizePath(a.path).localeCompare(normalizePath(b.path)));
     const currentKeeper = group.files.find((file) => file.ref);
     const currentKeeperIsProtected = currentKeeper
@@ -397,7 +445,7 @@ export function applyProtectedLocations(
     const rebuilt = keeper
       ? rebuildWithReference(group, keeper.path, criteria, contentVerified)
       : group;
-    return annotateProtectedLocations([rebuilt], protectedPaths)[0];
+    return annotateProtectedLocations([rebuilt], protectedPaths, normalPaths)[0];
   });
 }
 
@@ -409,11 +457,12 @@ export function applyProtectedLocations(
 export function annotateProtectedLocations(
   groups: DupeGroupV2[],
   protectedPaths: string[],
+  normalPaths: string[] = [],
 ): DupeGroupV2[] {
   return groups.map((group) => {
     const files = group.files.map((file) => ({
       ...file,
-      protected: isProtectedPath(file.path, protectedPaths),
+      protected: isProtectedPath(file.path, protectedPaths, normalPaths),
     }));
     const waste = files
       .filter((file) => !file.ref && !file.protected)
