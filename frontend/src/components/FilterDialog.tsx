@@ -2,7 +2,6 @@ import { useState, useEffect, useRef } from "react";
 import {
   type FilterRule,
   type FilterField,
-  type FilterOperator,
   type FilterJoin,
   type SizeUnit,
   FIELD_LABELS,
@@ -13,6 +12,7 @@ import {
   operatorsForField,
   ruleForField,
 } from "../hooks/useFilterRules";
+import { Select } from "./Select";
 
 const FIELDS: FilterField[] = [
   "name", "path", "parentFolder", "anyParentFolder",
@@ -118,26 +118,25 @@ export function FilterDialog({ initialRules, onApply, onClose }: FilterDialogPro
               />
 
               {/* Field dropdown */}
-              <select
+              <Select
                 className="fd-select fd-field"
                 value={rule.field}
-                onChange={(e) => changeField(rule.id, e.target.value as FilterField)}
-              >
-                {FIELDS.map((f) => (
-                  <option key={f} value={f}>{FIELD_LABELS[f]}</option>
-                ))}
-              </select>
+                options={FIELDS.map((field) => ({ value: field, label: FIELD_LABELS[field] }))}
+                aria-label={`Field for rule ${idx + 1}`}
+                onChange={(field) => changeField(rule.id, field)}
+              />
 
               {/* Operator dropdown — options depend on the field's kind */}
-              <select
+              <Select
                 className="fd-select fd-op"
                 value={rule.operator}
-                onChange={(e) => updateRule(rule.id, { operator: e.target.value as FilterOperator })}
-              >
-                {operatorsForField(rule.field).map((op) => (
-                  <option key={op} value={op}>{OPERATOR_LABELS[op]}</option>
-                ))}
-              </select>
+                options={operatorsForField(rule.field).map((operator) => ({
+                  value: operator,
+                  label: OPERATOR_LABELS[operator],
+                }))}
+                aria-label={`Operator for rule ${idx + 1}`}
+                onChange={(operator) => updateRule(rule.id, { operator })}
+              />
 
               {/* Value input(s) — text/type get a text box; size gets number(s)
                   + unit; date gets date picker(s). "between" adds a second box. */}
@@ -233,15 +232,13 @@ function RuleValue({
             />
           </>
         )}
-        <select
+        <Select
           className="fd-select fd-unit"
           value={rule.sizeUnit ?? "mb"}
-          onChange={(e) => onChange({ sizeUnit: e.target.value as SizeUnit })}
-        >
-          {SIZE_UNITS.map((u) => (
-            <option key={u} value={u}>{SIZE_UNIT_LABELS[u]}</option>
-          ))}
-        </select>
+          options={SIZE_UNITS.map((unit) => ({ value: unit, label: SIZE_UNIT_LABELS[unit] }))}
+          aria-label="Size unit"
+          onChange={(sizeUnit) => onChange({ sizeUnit })}
+        />
       </div>
     );
   }
@@ -317,7 +314,7 @@ function JoinSelect({
         style={{ cursor: isFirst ? "default" : "pointer" }}
       >
         {isFirst ? "And" : value === "and" ? "And" : "Or"}
-        {!isFirst && <span className="fd-join-arrow">▾</span>}
+        {!isFirst && <span className="fd-join-arrow">{open ? "▴" : "▾"}</span>}
       </button>
       {open && !isFirst && (
         <div className="fd-join-menu">

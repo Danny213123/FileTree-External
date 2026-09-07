@@ -340,7 +340,7 @@ export function TerminalPanel({
             title="Select shell"
             onClick={() => setMenuOpen((v) => !v)}
           >
-            <Icon name="chevron-down" size={11} />
+            <Icon name="chevron-down" size={11} className={menuOpen ? "flip-y" : undefined} />
           </button>
           {menuOpen && (
             <div className="terminal-profile-menu" onMouseLeave={() => setMenuOpen(false)}>

@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { Metric, Unit, DriveEntry, SpecialFolder, SortKey } from "../api/types";
 import { exitApp } from "../api/client";
+import { localRect } from "../lib/overlay";
+import { FixedDropdown } from "./ConfigureColumnsMenu";
 
 type RibbonTab = "home" | "scan" | "view" | "duplicates" | "treemapChart" | "options";
 
@@ -431,7 +433,7 @@ function ScanDropdown({
     <div className="rb-dropdown-wrap" ref={ref}>
       <RbBtn
         icon={<IcoFolderOpen />}
-        label="Select Directory ▾"
+        label={`Select Directory ${open ? "▴" : "▾"}`}
         wide
         onClick={handleOpen}
         disabled={scanning}
@@ -529,7 +531,7 @@ function ExpandDropdown({ onExpand }: { onExpand: (level: number) => void }) {
     <div className="rb-dropdown-wrap" ref={ref}>
       <RbBtn
         icon={<IcoExpand />}
-        label="Expand ▾"
+        label={`Expand ${open ? "▴" : "▾"}`}
         onClick={() => setOpen((o) => !o)}
       />
       <FixedDropdown anchorRef={ref} open={open} onClose={close}>
@@ -556,41 +558,6 @@ const UNIT_OPTIONS: { v: Unit; l: string }[] = [
   { v: "bytes", l: "Values in Byte" },
 ];
 
-/** Renders a fixed-position dropdown anchored below its trigger button.
- *  Uses getBoundingClientRect so the menu escapes overflow:hidden parents. */
-function FixedDropdown({
-  anchorRef,
-  open,
-  onClose,
-  children,
-}: {
-  anchorRef: React.RefObject<HTMLElement | null>;
-  open: boolean;
-  onClose: () => void;
-  children: React.ReactNode;
-}) {
-  useEffect(() => {
-    if (!open) return;
-    const close = (e: MouseEvent) => {
-      if (anchorRef.current && anchorRef.current.contains(e.target as Node)) return;
-      onClose();
-    };
-    document.addEventListener("mousedown", close);
-    return () => document.removeEventListener("mousedown", close);
-  }, [open, anchorRef, onClose]);
-
-  if (!open || !anchorRef.current) return null;
-  const rect = anchorRef.current.getBoundingClientRect();
-  return (
-    <div
-      className="rb-dropdown-menu"
-      style={{ position: "fixed", top: rect.bottom, left: rect.left, zIndex: 9999 }}
-    >
-      {children}
-    </div>
-  );
-}
-
 const UNIT_ABBREV: Record<Unit, string> = {
   auto: "Auto", tb: "TB", gb: "GB", mb: "MB", kb: "KB", bytes: "B",
 };
@@ -604,7 +571,7 @@ function UnitDropdown({ unit, onUnitChange }: { unit: Unit; onUnitChange: (u: Un
     <div className="rb-dropdown-wrap" ref={ref}>
       <RbBtn
         icon={<IcoAutoUnits />}
-        label={`${UNIT_ABBREV[unit]} ▾`}
+        label={`${UNIT_ABBREV[unit]} ${open ? "▴" : "▾"}`}
         active={unit !== "auto"}
         onClick={() => setOpen((o) => !o)}
         title={`Units (current: ${UNIT_ABBREV[unit]})`}
@@ -700,7 +667,7 @@ function ExportDropdown({ onExport, disabled }: { onExport: (f: "csv" | "json") 
   const ref = useRef<HTMLDivElement>(null);
   return (
     <div className="rb-dropdown-wrap" ref={ref}>
-      <RbBtn icon={<IcoFolder />} label="Export ▾" disabled={disabled} onClick={() => setOpen((o) => !o)} />
+      <RbBtn icon={<IcoFolder />} label={`Export ${open ? "▴" : "▾"}`} disabled={disabled} onClick={() => setOpen((o) => !o)} />
       <FixedDropdown anchorRef={ref} open={open} onClose={() => setOpen(false)}>
         <div className="rb-dd-section">Export scan as</div>
         <button onClick={() => { onExport("csv"); setOpen(false); }}>
@@ -875,6 +842,7 @@ const SORT_COLUMNS: { key: SortKey; label: string }[] = [
   { key: "modified",    label: "Last Modified" },
   { key: "created",     label: "Creation Date" },
   { key: "accessed",    label: "Last Accessed" },
+  { key: "lastFileCreated", label: "Last File Added" },
   { key: "avgFileSize", label: "Avg. File Size" },
   { key: "pathLength",  label: "Path Length" },
   { key: "dirLevel",    label: "Dir Level" },
@@ -904,6 +872,7 @@ const COL_GROUPS: ColGroup[] = [
       { key: "created",  label: "Creation Date" },
       { key: "accessed", label: "Last Accessed" },
       { key: "modified", label: "Last Modified" },
+      { key: "lastFileCreated", label: "Last File Added" },
     ],
   },
   {
@@ -922,7 +891,7 @@ function DecimalsDropdown({ decimals, onDecimalsChange }: { decimals: number; on
   const close = useCallback(() => setOpen(false), []);
   return (
     <div className="rb-dropdown-wrap" ref={ref}>
-      <RbBtn icon={<IcoDecimals />} label={`Decimals ▾`} onClick={() => setOpen((o) => !o)} title={`${decimals} decimal places`} />
+      <RbBtn icon={<IcoDecimals />} label={`Decimals ${open ? "▴" : "▾"}`} onClick={() => setOpen((o) => !o)} title={`${decimals} decimal places`} />
       <FixedDropdown anchorRef={ref} open={open} onClose={close}>
         {[0,1,2,3,4,5].map((d) => (
           <button key={d} className={decimals === d ? "rb-active" : ""} onClick={() => { onDecimalsChange(d); close(); }}>
@@ -948,7 +917,7 @@ function ConfigureColumnsDropdown({ visibleColumns, onVisibleColumnsChange }: { 
   };
   return (
     <div className="rb-dropdown-wrap" ref={ref}>
-      <RbBtn icon={<IcoColumns />} label="Configure columns ▾" onClick={() => setOpen((o) => !o)} />
+      <RbBtn icon={<IcoColumns />} label={`Configure columns ${open ? "▴" : "▾"}`} onClick={() => setOpen((o) => !o)} />
       <FixedDropdown anchorRef={ref} open={open} onClose={close}>
         {COL_GROUPS.map((group) => (
           <div key={group.label}>
@@ -987,7 +956,7 @@ function SortDropdown({ sortKey, sortDir, onSortChange }: { sortKey: string; sor
   const close = useCallback(() => setOpen(false), []);
   return (
     <div className="rb-dropdown-wrap" ref={ref}>
-      <RbBtn icon={<IcoSort />} label="Sort ▾" onClick={() => setOpen((o) => !o)} />
+      <RbBtn icon={<IcoSort />} label={`Sort ${open ? "▴" : "▾"}`} onClick={() => setOpen((o) => !o)} />
       <FixedDropdown anchorRef={ref} open={open} onClose={close}>
         {SORT_COLUMNS.map((col) => (
           <button key={col.key} className={sortKey === col.key ? "rb-active" : ""} onClick={() => { onSortChange(col.key, sortDir); close(); }}>
@@ -1306,8 +1275,9 @@ function FileMenu({
   const doExit = () => { close(); exitApp().catch(() => {}); };
   const doNewInstance = () => { close(); window.open(window.location.href, "_blank"); };
 
-  // anchor position
-  const getAnchorRect = () => ref.current?.getBoundingClientRect() ?? new DOMRect();
+  // Anchor position in local (zoom-relative) pixels, since it is written back
+  // out as an inline offset. See lib/overlay.ts.
+  const getAnchorRect = () => (ref.current ? localRect(ref.current) : null);
 
   return (
     <div ref={ref} className="file-menu-wrap">
@@ -1320,6 +1290,7 @@ function FileMenu({
 
       {open && (() => {
         const rect = getAnchorRect();
+        if (!rect) return null;
         return (
           <div
             className="file-menu-panel"

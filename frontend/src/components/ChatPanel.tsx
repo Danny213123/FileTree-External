@@ -26,6 +26,7 @@ import { readNdjsonStream } from "../hooks/useScan";
 import type { NodeRecord, ScanResult, ExtensionStat } from "../api/types";
 import { Icon, type IconName } from "./Icon";
 import { Markdown } from "./Markdown";
+import { Select } from "./Select";
 
 // Imperative handle the command palette uses to drive the chat (Chat: Stop /
 // Clear / Switch session) from outside the panel.
@@ -1815,7 +1816,7 @@ function AllowMenu({ callId, tool, label, onAllowlist, onApproveAll }: {
   return (
     <div className="approval-allow" ref={ref}>
       <button className="agent-btn-ghost approval-allow-trigger" onClick={() => setOpen((v) => !v)} title="More approval options">
-        Allow <Icon name="chevron-down" size={10} />
+        Allow <Icon name="chevron-down" size={10} className={open ? "flip-y" : undefined} />
       </button>
       {open && (
         <div className="approval-allow-menu" role="menu">
@@ -2474,7 +2475,7 @@ const ModelPicker = forwardRef<ModelPickerHandle, {
     <div className="model-picker" ref={ref}>
       <button type="button" className="model-picker-btn" disabled={disabled} onClick={() => setOpen((v) => !v)} title={model || "Select model"}>
         <span className="model-picker-label">{model || "Select model"}</span>
-        <Icon name="chevron-down" size={11} />
+        <Icon name="chevron-down" size={11} className={open ? "flip-y" : undefined} />
       </button>
       {open && (
         <div className="model-picker-menu" role="listbox">
@@ -2610,10 +2611,15 @@ function McpServersEditor({ servers, onChange }: { servers: McpServerConfig[]; o
               <label className="mcp-row-top" title="Enable this server">
                 <input type="checkbox" checked={s.enabled} onChange={(e) => update(s.id, { enabled: e.target.checked })} />
                 <input className="mcp-name" value={s.name} placeholder="Name" onChange={(e) => update(s.id, { name: e.target.value })} />
-                <select value={s.transport} onChange={(e) => update(s.id, { transport: e.target.value as "stdio" | "http" })}>
-                  <option value="stdio">stdio</option>
-                  <option value="http">http</option>
-                </select>
+                <Select
+                  value={s.transport}
+                  options={[
+                    { value: "stdio", label: "stdio" },
+                    { value: "http", label: "http" },
+                  ]}
+                  aria-label={`Transport for ${s.name}`}
+                  onChange={(transport) => update(s.id, { transport })}
+                />
                 <button className="icon" onClick={() => remove(s.id)} title="Remove"><Icon name="x" size={11} /></button>
               </label>
               {s.transport === "stdio" ? (

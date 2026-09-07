@@ -72,6 +72,16 @@ const drives = [
   { root: "D:\\", label: "Archive", total: 2_000, free: 1_000 },
 ];
 
+/**
+ * The dropdowns are the app's own `Select`, not a native one, so they are
+ * driven the way a user does: open the trigger, then click an option out of
+ * the portalled listbox.
+ */
+function pick(trigger: HTMLElement, option: string) {
+  fireEvent.click(trigger);
+  fireEvent.click(screen.getByRole("option", { name: option }));
+}
+
 afterEach(cleanup);
 beforeEach(() => {
   browseDirectories.mockReset();
@@ -83,13 +93,11 @@ describe("DuplicatesConfigPanel directory list", () => {
     const ctrl = controller();
     render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
 
-    expect(screen.getByRole("combobox", { name: "State for C:\\" })).toHaveValue("normal");
-    expect(screen.getByRole("combobox", { name: "State for D:\\" })).toHaveValue("excluded");
-    expect(screen.getByRole("combobox", { name: "State for C:\\Library" })).toHaveValue("reference");
+    expect(screen.getByRole("combobox", { name: "State for C:\\" })).toHaveAttribute("data-value", "normal");
+    expect(screen.getByRole("combobox", { name: "State for D:\\" })).toHaveAttribute("data-value", "excluded");
+    expect(screen.getByRole("combobox", { name: "State for C:\\Library" })).toHaveAttribute("data-value", "reference");
 
-    fireEvent.change(screen.getByRole("combobox", { name: "State for D:\\" }), {
-      target: { value: "reference" },
-    });
+    pick(screen.getByRole("combobox", { name: "State for D:\\" }), "Reference");
     expect(ctrl.value.setPathState).toHaveBeenCalledWith("D:\\", "reference");
   });
 
@@ -106,10 +114,10 @@ describe("DuplicatesConfigPanel directory list", () => {
 
     // C:\ is Normal, so an unconfigured subfolder shows Normal too.
     const child = await screen.findByRole("combobox", { name: "State for C:\\Games" });
-    expect(child).toHaveValue("normal");
-    expect(screen.getByRole("combobox", { name: "State for C:\\Temp" })).toHaveValue("normal");
+    expect(child).toHaveAttribute("data-value", "normal");
+    expect(screen.getByRole("combobox", { name: "State for C:\\Temp" })).toHaveAttribute("data-value", "normal");
 
-    fireEvent.change(child, { target: { value: "excluded" } });
+    pick(child, "Excluded");
     expect(ctrl.value.setPathState).toHaveBeenCalledWith("C:\\Games", "excluded");
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse C:\\" }));
@@ -140,10 +148,10 @@ describe("DuplicatesConfigPanel directory list", () => {
     const ctrl = controller();
     render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
 
-    const scanType = screen.getByRole("combobox", { name: "Scan type:" });
-    expect(scanType).toHaveValue("contents");
+    const scanType = screen.getByRole("combobox", { name: "Scan type" });
+    expect(scanType).toHaveAttribute("data-value", "contents");
 
-    fireEvent.change(scanType, { target: { value: "contents-name" } });
+    pick(scanType, "Contents + filename");
     expect(ctrl.value.setCriterion).toHaveBeenCalledWith("name", { enabled: true, required: true });
     expect(ctrl.value.setCriterion).toHaveBeenCalledWith("date", { enabled: true, required: false });
   });

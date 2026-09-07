@@ -9,6 +9,7 @@
 
 import { useMemo, useState } from "react";
 import type { NodeRecord } from "../api/types";
+import { Select } from "./Select";
 
 export type AttrChange = "keep" | "set" | "clear";
 
@@ -42,11 +43,17 @@ function TriState({ label, value, onChange }: { label: string; value: AttrChange
   return (
     <div className="attr-row">
       <span className="attr-label">{label}</span>
-      <select className="attr-select" value={value} onChange={(e) => onChange(e.target.value as AttrChange)}>
-        <option value="keep">Leave unchanged</option>
-        <option value="set">Set</option>
-        <option value="clear">Clear</option>
-      </select>
+      <Select
+        className="attr-select"
+        value={value}
+        options={[
+          { value: "keep", label: "Leave unchanged" },
+          { value: "set", label: "Set" },
+          { value: "clear", label: "Clear" },
+        ]}
+        aria-label={label}
+        onChange={onChange}
+      />
     </div>
   );
 }

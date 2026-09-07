@@ -180,6 +180,10 @@ export function compareNodes(
       left = a.accessed ?? 0;
       right = b.accessed ?? 0;
       break;
+    case "lastFileCreated":
+      left = a.lastFileCreated ?? 0;
+      right = b.lastFileCreated ?? 0;
+      break;
     case "avgFileSize":
       left = a.files > 0 ? a.size / a.files : 0;
       right = b.files > 0 ? b.size / b.files : 0;
@@ -1036,6 +1040,9 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       while (cur) {
         let size = 0, allocated = 0, files = 0, folders = 0, errors = 0;
         let modified = cur.modified;
+        // Only files date a folder's last addition, so a directory contributes
+        // whatever it already rolled up rather than its own creation date.
+        let lastFileCreated = 0;
         for (const cid of cur.children) {
           const child = byId.get(cid);
           if (!child) continue;
@@ -1044,6 +1051,8 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
           folders += child.folders + (child.dir ? 1 : 0);
           errors += child.errors;
           modified = Math.max(modified, child.modified);
+          const added = child.dir ? (child.lastFileCreated ?? 0) : (child.created ?? 0);
+          lastFileCreated = Math.max(lastFileCreated, added);
         }
         // update in-place (safe since we own these objects from the spread)
         (cur as NodeRecord).size = size;
@@ -1052,6 +1061,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
         (cur as NodeRecord).folders = folders;
         (cur as NodeRecord).errors = errors;
         (cur as NodeRecord).modified = modified;
+        (cur as NodeRecord).lastFileCreated = lastFileCreated;
         cur = cur.parent != null ? byId.get(cur.parent) : null;
       }
 

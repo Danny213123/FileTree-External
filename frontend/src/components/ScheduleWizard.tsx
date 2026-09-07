@@ -12,6 +12,7 @@ import {
   removeAlertConfig,
   type GrowthAlertConfig,
 } from "../lib/autoSnapshot";
+import { Select } from "./Select";
 
 interface ScheduleWizardProps {
   /** Active tab's scanned path, used to prefill the scan target. */
@@ -172,15 +173,24 @@ export function ScheduleWizard({ initialPath, onClose }: ScheduleWizardProps) {
             <div className="sched-row">
               <span className="sched-label">Schedule</span>
               <div className="sched-inline">
-                <select className="fd-select" value={schedule}
-                  onChange={(e) => setSchedule(e.target.value as "daily" | "weekly")}>
-                  <option value="daily">Daily</option>
-                  <option value="weekly">Weekly</option>
-                </select>
+                <Select
+                  className="fd-select"
+                  value={schedule}
+                  options={[
+                    { value: "daily", label: "Daily" },
+                    { value: "weekly", label: "Weekly" },
+                  ]}
+                  aria-label="Schedule frequency"
+                  onChange={setSchedule}
+                />
                 {schedule === "weekly" && (
-                  <select className="fd-select" value={day} onChange={(e) => setDay(e.target.value)}>
-                    {WEEKDAYS.map((d) => <option key={d} value={d}>{d}</option>)}
-                  </select>
+                  <Select
+                    className="fd-select"
+                    value={day}
+                    options={WEEKDAYS.map((weekday) => ({ value: weekday, label: weekday }))}
+                    aria-label="Day of week"
+                    onChange={setDay}
+                  />
                 )}
                 <span className="sched-at">at</span>
                 <input className="fd-value sched-time" type="time" value={time}
@@ -190,10 +200,16 @@ export function ScheduleWizard({ initialPath, onClose }: ScheduleWizardProps) {
 
             <div className="sched-row">
               <span className="sched-label">Format</span>
-              <select className="fd-select" value={format}
-                onChange={(e) => setFormat(e.target.value as ScheduleFormat)}>
-                {FORMATS.map((f) => <option key={f} value={f}>{f.toUpperCase()}</option>)}
-              </select>
+              <Select
+                className="fd-select"
+                value={format}
+                options={FORMATS.map((nextFormat) => ({
+                  value: nextFormat,
+                  label: nextFormat.toUpperCase(),
+                }))}
+                aria-label="Report format"
+                onChange={setFormat}
+              />
             </div>
 
             <div className="sched-row">

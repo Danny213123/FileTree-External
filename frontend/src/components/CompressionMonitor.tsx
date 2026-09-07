@@ -36,6 +36,7 @@ import {
 } from "../api/client";
 import { formatBytes } from "../utils/formatBytes";
 import { toast } from "../lib/toast";
+import { localDelta, localRect } from "../lib/overlay";
 import {
   addProgressSample,
   estimateRemainingFromPercent,
@@ -46,6 +47,7 @@ import {
   type ProgressSample,
 } from "../lib/compressionMetrics";
 import { Icon } from "./Icon";
+import { Select } from "./Select";
 
 const PAGE_SIZE = 250;
 const PAGE_CACHE_LIMIT = 12;
@@ -543,7 +545,9 @@ export function CompressionMonitor({ focusJobId }: Props) {
     document.body.style.cursor = cursor;
     document.body.style.userSelect = "none";
     const handlePointerMove = (move: PointerEvent) => {
-      applyDelta(move.clientX - startX, move.clientY - startY);
+      // Screen-space drag distance, converted to the units the pane sizes are
+      // written in — otherwise the divider outruns the cursor under UI scale.
+      applyDelta(localDelta(move.clientX - startX), localDelta(move.clientY - startY));
     };
     const cleanup = () => {
       window.removeEventListener("pointermove", handlePointerMove);
@@ -559,12 +563,13 @@ export function CompressionMonitor({ focusJobId }: Props) {
     window.addEventListener("pointercancel", cleanup);
   }, []);
 
+  // Compared against pane widths, so measured in those same units.
   const runsWidthMax = () => {
-    const width = monitorRef.current?.getBoundingClientRect().width ?? 0;
+    const width = monitorRef.current ? localRect(monitorRef.current).width : 0;
     return width > 0 ? Math.max(220, Math.min(480, width - 460)) : 480;
   };
   const inspectorWidthMax = () => {
-    const width = monitorRef.current?.getBoundingClientRect().width ?? 0;
+    const width = monitorRef.current ? localRect(monitorRef.current).width : 0;
     return width > 0 ? Math.max(280, Math.min(560, width - 360)) : 560;
   };
   const resizeRuns = (event: ReactPointerEvent<HTMLElement>) => {
@@ -907,8 +912,28 @@ export function CompressionMonitor({ focusJobId }: Props) {
                   {filterCount > 0 && <span className="cm-icon-badge">{filterCount}</span>}
                 </button>
                 {openMenu === "filters" && <div id="compression-filter-menu" className="cm-popover cm-filter-menu" role="group" aria-label="File filters">
-                  <label>Type<select aria-label="Filter by file type" value={layout.kind} onChange={(event) => setLayout((current) => ({ ...current, kind: event.target.value }))}><option value="">All types</option><option value="video">Video</option><option value="image">Images</option><option value="other">Other</option></select></label>
-                  <label>Original<select aria-label="Filter by original disposition" value={layout.disposition} onChange={(event) => setLayout((current) => ({ ...current, disposition: event.target.value }))}><option value="">Any disposition</option><option value="recycled">Recycled</option><option value="deleted">Deleted</option><option value="kept">Kept</option></select></label>
+                  <label>Type<Select
+                    aria-label="Filter by file type"
+                    value={layout.kind}
+                    options={[
+                      { value: "", label: "All types" },
+                      { value: "video", label: "Video" },
+                      { value: "image", label: "Images" },
+                      { value: "other", label: "Other" },
+                    ]}
+                    onChange={(kind) => setLayout((current) => ({ ...current, kind }))}
+                  /></label>
+                  <label>Original<Select
+                    aria-label="Filter by original disposition"
+                    value={layout.disposition}
+                    options={[
+                      { value: "", label: "Any disposition" },
+                      { value: "recycled", label: "Recycled" },
+                      { value: "deleted", label: "Deleted" },
+                      { value: "kept", label: "Kept" },
+                    ]}
+                    onChange={(disposition) => setLayout((current) => ({ ...current, disposition }))}
+                  /></label>
                   {filterCount > 0 && <button type="button" className="cm-menu-reset" onClick={() => setLayout((current) => ({ ...current, kind: "", disposition: "" }))}>Clear filters</button>}
                 </div>}
               </div>
@@ -925,9 +950,25 @@ export function CompressionMonitor({ focusJobId }: Props) {
                   <Icon name="arrow-up" size={14} className={layout.direction === "desc" ? "flip-y" : ""} />
                 </button>
                 {openMenu === "sort" && <div id="compression-sort-menu" className="cm-popover cm-sort-menu" role="group" aria-label="Sort files">
-                  <label>Sort by<select aria-label="Sort files" value={layout.sort} onChange={(event) => setLayout((current) => ({ ...current, sort: event.target.value as SortKey }))}>
-                    <option value="activity">Activity</option><option value="queue">Queue position</option><option value="name">Name</option><option value="size">Size</option><option value="progress">Progress</option><option value="elapsed">Elapsed</option><option value="eta">ETA</option><option value="speed">Speed</option><option value="savings">Savings</option><option value="result">Result</option><option value="start">Start time</option><option value="finish">Finish time</option>
-                  </select></label>
+                  <label>Sort by<Select
+                    aria-label="Sort files"
+                    value={layout.sort}
+                    options={[
+                      { value: "activity", label: "Activity" },
+                      { value: "queue", label: "Queue position" },
+                      { value: "name", label: "Name" },
+                      { value: "size", label: "Size" },
+                      { value: "progress", label: "Progress" },
+                      { value: "elapsed", label: "Elapsed" },
+                      { value: "eta", label: "ETA" },
+                      { value: "speed", label: "Speed" },
+                      { value: "savings", label: "Savings" },
+                      { value: "result", label: "Result" },
+                      { value: "start", label: "Start time" },
+                      { value: "finish", label: "Finish time" },
+                    ]}
+                    onChange={(sort) => setLayout((current) => ({ ...current, sort }))}
+                  /></label>
                   <button type="button" className="cm-sort-direction" onClick={() => setLayout((current) => ({ ...current, direction: current.direction === "asc" ? "desc" : "asc" }))}>
                     <Icon name="arrow-up" size={13} className={layout.direction === "desc" ? "flip-y" : ""} />
                     {layout.direction === "asc" ? "Ascending" : "Descending"}

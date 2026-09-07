@@ -118,7 +118,7 @@ export function Breadcrumb({ path, scanning, canBack, canForward, canUp, onNavig
             aria-expanded={recentOpen}
             onClick={() => (recentOpen ? setRecentOpen(false) : openRecents())}
           >
-            <Icon name="caret-down" size={12} />
+            <Icon name={recentOpen ? "caret-up" : "caret-down"} size={12} />
           </button>
           {recentOpen && (
             <>

@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { SortKey, Unit } from "../api/types";
 import { ALL_COLUMNS, DEFAULT_VISIBLE_COLUMNS, type ColumnDef } from "./TreeTable";
+import { localRect, localViewport } from "../lib/overlay";
 import { Icon } from "./Icon";
 
 // Groups derive from ALL_COLUMNS (single source of truth) so the menu never
@@ -24,10 +25,22 @@ const COL_GROUPS = GROUP_ORDER.map((group) => ({
 // ALL_COLUMNS / SortKey — only then can it be toggled here.
 const DEFERRED_COLUMNS = ["Author", "File Version", "Description", "Permissions"];
 
+/** Breathing room between the menu and its trigger, and the window edge. */
+const GAP = 2;
+const EDGE = 6;
+/** One menu row; never force a minimum larger than the available viewport. */
+const MIN_MENU_H = 24;
+
 /**
- * Fixed-position dropdown anchored under its trigger. Escapes overflow:hidden
- * parents (getBoundingClientRect + position:fixed). Closes on outside mousedown
- * or Escape.
+ * Fixed-position dropdown anchored to its trigger. Escapes `overflow: hidden`
+ * parents (getBoundingClientRect + position: fixed).
+ *
+ * Placement is measured rather than assumed: a menu taller than the room under
+ * its trigger flips above it, and one near the right edge is pulled back inside
+ * the window. Anchoring blindly at `rect.bottom` is what pushed the taller
+ * menus (columns, sort) off the bottom of the screen. Because the height needed
+ * depends on the caller's children, the menu is rendered hidden for one frame,
+ * measured, then shown — so there is no visible jump into place.
  */
 export function FixedDropdown({
   anchorRef,
@@ -40,6 +53,9 @@ export function FixedDropdown({
   onClose: () => void;
   children: React.ReactNode;
 }) {
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ top: number; left: number; maxHeight: number; flipped: boolean } | null>(null);
+
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
@@ -55,12 +71,79 @@ export function FixedDropdown({
     };
   }, [open, anchorRef, onClose]);
 
+  useLayoutEffect(() => {
+    if (!open) { setPos(null); return; }
+    const place = () => {
+      const anchor = anchorRef.current;
+      const menu = menuRef.current;
+      if (!anchor || !menu) return;
+      // Local (zoom-relative) space throughout, matching the units that
+      // `scrollHeight`/`offsetWidth` and inline lengths use. See lib/overlay.ts.
+      const rect = localRect(anchor);
+      const view = localViewport();
+      const below = view.height - rect.bottom - GAP - EDGE;
+      const above = rect.top - GAP - EDGE;
+      // Measure the content with the cap lifted. The menu is a flex column, so
+      // an applied max-height makes the rows shrink to fit rather than overflow
+      // — reading scrollHeight through the cap returns that shrunken height, and
+      // since the ResizeObserver below re-places on every height change, each
+      // pass would ratchet the cap down until the menu collapsed to MIN_MENU_H.
+      const capped = menu.style.maxHeight;
+      menu.style.maxHeight = "none";
+      const natural = menu.scrollHeight;
+      menu.style.maxHeight = capped;
+      const flipped = natural > below && above > below;
+      const room = flipped ? above : below;
+      const maxHeight = Math.max(MIN_MENU_H, Math.min(natural, Math.max(0, room)));
+      const next = {
+        top: flipped ? Math.max(EDGE, rect.top - maxHeight - GAP) : rect.bottom + GAP,
+        left: Math.max(EDGE, Math.min(rect.left, view.width - menu.offsetWidth - EDGE)),
+        maxHeight,
+        flipped,
+      };
+      // Returning the previous object lets React bail out, so a re-place that
+      // changes nothing can't feed the observer another layout pass.
+      setPos((prev) => (
+        prev
+        && prev.top === next.top
+        && prev.left === next.left
+        && prev.maxHeight === next.maxHeight
+        && prev.flipped === next.flipped
+          ? prev
+          : next
+      ));
+    };
+    place();
+    // Menus whose contents change while open (filtered lists) need re-placing.
+    let observer: ResizeObserver | undefined;
+    if (typeof ResizeObserver !== "undefined" && menuRef.current) {
+      observer = new ResizeObserver(place);
+      observer.observe(menuRef.current);
+    }
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open, anchorRef]);
+
   if (!open || !anchorRef.current) return null;
-  const rect = anchorRef.current.getBoundingClientRect();
   return (
     <div
-      className="rb-dropdown-menu"
-      style={{ position: "fixed", top: rect.bottom, left: rect.left, zIndex: 9999, maxHeight: "72vh", overflowY: "auto" }}
+      ref={menuRef}
+      className={`rb-dropdown-menu${pos?.flipped ? " flipped" : ""}`}
+      style={{
+        position: "fixed",
+        top: pos?.top ?? 0,
+        left: pos?.left ?? 0,
+        maxHeight: pos?.maxHeight ?? "72vh",
+        zIndex: 9999,
+        overflowY: "auto",
+        // Hidden only for the measuring frame, before `pos` exists.
+        visibility: pos ? undefined : "hidden",
+      }}
     >
       {children}
     </div>

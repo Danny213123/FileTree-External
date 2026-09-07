@@ -9,6 +9,7 @@ import { Icon } from "./Icon";
 import { eqPath, isNoOpMove } from "../lib/agent";
 import { attributeLetters, attributeList } from "../lib/attributes";
 import { isImage, isVideo, pickLargestFolderFile } from "../lib/thumbs";
+import { localPoint } from "../lib/overlay";
 import { isTauriV2, startNativeDrag, type NativeDragResponse } from "../api/v2";
 import { loadShellThumbnail } from "../lib/shellImages";
 import { fetchFolderPreview } from "../api/client";
@@ -44,6 +45,7 @@ export const ALL_COLUMNS: ColumnDef[] = [
   { key: "created",         label: "Creation Date", width: 132, align: "right",  group: "date" },
   { key: "accessed",        label: "Last Accessed", width: 132, align: "right",  group: "date" },
   { key: "modified",        label: "Last Modified", width: 132, align: "right",  group: "date" },
+  { key: "lastFileCreated", label: "Last File Added", width: 138, align: "right", group: "date" },
   { key: "owner",           label: "Owner",         width: 160, align: "left",   group: "extended" },
   { key: "avgFileSize",     label: "Avg. File Size",width: 104, align: "right",  group: "extended" },
   { key: "pathLength",      label: "Path Length",   width: 90,  align: "right",  group: "extended" },
@@ -494,6 +496,14 @@ function TreeTableInner({
         case "created":         content = (node.created ?? 0) > 0 ? formatDate(node.created) : "—"; break;
         case "accessed":        content = (node.accessed ?? 0) > 0 ? formatDate(node.accessed) : "—"; break;
         case "modified":        content = node.modified ? formatDate(node.modified) : ""; break;
+        // Newest file birth date in the subtree. A folder holding no files at
+        // all has nothing to report, which is different from a date of zero.
+        case "lastFileCreated": {
+          const added = node.lastFileCreated ?? 0;
+          content = added > 0 ? formatDate(added) : "—";
+          title = added > 0 ? "Newest file creation date in this folder" : undefined;
+          break;
+        }
         case "avgFileSize":     content = node.files > 0 ? formatBytes(Math.round(node.size / node.files), unit, decimals) : "—"; break;
         case "pathLength":      content = node.path.length; break;
         case "dirLevel":        content = node.depth; break;
@@ -1288,8 +1298,11 @@ function TreeTableInner({
       {dropTargetId != null && dropPillPos && (() => {
         const target = nodeById.get(dropTargetId);
         if (!target || !target.dir) return null;
+        // The cursor position is a viewport coordinate; the pill's offsets are
+        // read in the zoomed shell's own units. See lib/overlay.ts.
+        const at = localPoint(dropPillPos.x, dropPillPos.y);
         return (
-          <div className="drop-move-pill" style={{ left: dropPillPos.x + 14, top: dropPillPos.y + 18 }}>
+          <div className="drop-move-pill" style={{ left: at.x + 14, top: at.y + 18 }}>
             <Icon name="folder" size={12} />
             <span>Move to <strong>{target.name}</strong></span>
           </div>

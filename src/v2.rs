@@ -262,6 +262,10 @@ pub struct NodePageItem {
     pub extension: String,
     pub owner: String,
     pub attributes: u32,
+    /// Newest creation date of any file in this subtree; 0 when it holds none.
+    /// Kept apart from `created_ms` so rewriting a file — recompressing it, say
+    /// — cannot move the date a folder reports for its last addition.
+    pub newest_created_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -629,7 +633,8 @@ impl V2Store {
                     Ok(nodes) if cancel.load(Ordering::Relaxed) => ("cancelled", nodes, None),
                     Ok(nodes) => ("done", nodes, None),
                     Err(error) => {
-                        let _ = write_scan_metadata(&db_path, "error", 0, elapsed_ms, Some(&error));
+                        let _ =
+                            write_scan_metadata(&db_path, "error", 0, elapsed_ms, Some(&error), None);
                         ("error", 0, Some(error))
                     }
                 };
@@ -710,8 +715,50 @@ impl V2Store {
         if !Path::new(&handle.database_path).is_file() {
             return None;
         }
+
+        // A cached scan is only worth reopening if it can be proven current.
+        // The change journal answers that in the time it takes to read the
+        // records written since the scan; anything it can't vouch for returns
+        // None here, which sends the caller down the normal scan path.
+        let mut handle = handle;
+        let db_path = PathBuf::from(&handle.database_path);
+        let root = PathBuf::from(&handle.root_path);
+        if let Err(error) = migrate_scan_database(&db_path) {
+            eprintln!("[v2] {}: {error} — rescanning", handle.root_path);
+            return None;
+        }
+        match crate::refresh::refresh_scan(&db_path, &root) {
+            crate::refresh::Refresh::Current => {}
+            crate::refresh::Refresh::Updated { applied } => {
+                eprintln!("[usn] {}: replayed {applied} changes", handle.root_path);
+                if let Some(count) = crate::refresh::node_count(&db_path) {
+                    handle.node_count = count;
+                    self.set_scan_node_count(&handle.scan_id, count).ok();
+                }
+            }
+            // No journal to consult. Serve the cache exactly as this code did
+            // before the journal existed rather than punishing every unelevated
+            // reopen with a full rescan.
+            crate::refresh::Refresh::Unverifiable(_) => {}
+            crate::refresh::Refresh::Rescan(reason) => {
+                eprintln!("[usn] {}: {reason} — rescanning", handle.root_path);
+                return None;
+            }
+        }
+
         self.touch_scan(&handle.scan_id).ok();
         Some(handle)
+    }
+
+    /// Keep the catalog's node count in step after an incremental refresh.
+    fn set_scan_node_count(&self, scan_id: &str, count: u64) -> Result<(), String> {
+        let conn = self.open_state().map_err(|error| error.to_string())?;
+        conn.execute(
+            "UPDATE scan_catalog SET node_count=?2 WHERE scan_id=?1",
+            params![scan_id, as_sql_i64(count)],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn query_nodes(&self, mut query: ScanQuery) -> Result<NodePage, String> {
@@ -799,7 +846,8 @@ impl V2Store {
                     WHEN substr(p.dir_path,-1,1) IN ('\','/') THEN p.dir_path || n.name
                     ELSE p.dir_path || '\' || n.name END,
                n.is_dir,n.is_link,n.hidden,n.readonly,n.size,n.allocated,n.files,n.folders,
-               n.modified_ms,n.created_ms,n.accessed_ms,n.depth,n.errors,n.extension,n.owner,n.attributes
+               n.modified_ms,n.created_ms,n.accessed_ms,n.depth,n.errors,n.extension,n.owner,n.attributes,
+               n.newest_created_ms
                FROM nodes n LEFT JOIN nodes p ON p.id=n.parent_id
                WHERE {where_sql} ORDER BY {order} {direction}, n.id ASC LIMIT ? OFFSET ?"#
         );
@@ -1466,7 +1514,8 @@ impl V2Store {
                     WHEN substr(p.dir_path,-1,1) IN ('\','/') THEN p.dir_path || n.name
                     ELSE p.dir_path || '\' || n.name END,
                n.is_dir,n.is_link,n.hidden,n.readonly,n.size,n.allocated,n.files,n.folders,
-               n.modified_ms,n.created_ms,n.accessed_ms,n.depth,n.errors,n.extension,n.owner,n.attributes
+               n.modified_ms,n.created_ms,n.accessed_ms,n.depth,n.errors,n.extension,n.owner,n.attributes,
+               n.newest_created_ms
                FROM nodes n LEFT JOIN nodes p ON p.id=n.parent_id
                WHERE n.parent_id=?1 ORDER BY n.id ASC LIMIT ?2"#;
         let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
@@ -2330,12 +2379,20 @@ fn run_bounded_scan(
         remove_database_family(db_path);
     }
     let started = Instant::now();
+    // Taken before a single entry is enumerated. Anything written while the scan
+    // runs then lands past this mark and replays as a normal change; taking it
+    // afterwards would silently swallow every edit made during the scan.
+    let checkpoint = capture_scan_checkpoint(root);
     let (row_tx, row_rx) = std::sync::mpsc::sync_channel::<ScanRow>(SCAN_CHANNEL_CAPACITY);
     let writer_path = db_path.to_path_buf();
     let root_text = root.to_string_lossy().into_owned();
+    // Directories the walker was refused. Collected here rather than counted so
+    // each one can be attributed to the folder it happened in.
+    let unreadable = Arc::new(Mutex::new(Vec::<i64>::new()));
+    let writer_unreadable = Arc::clone(&unreadable);
     let writer = std::thread::Builder::new()
         .name(format!("scan-writer-{scan_id}"))
-        .spawn(move || write_scan_rows(&writer_path, &root_text, row_rx))
+        .spawn(move || write_scan_rows(&writer_path, &root_text, row_rx, writer_unreadable))
         .map_err(|error| error.to_string())?;
 
     let next_id = Arc::new(AtomicI64::new(1));
@@ -2362,7 +2419,34 @@ fn run_bounded_scan(
         elapsed_ms: started.elapsed().as_millis() as u64,
     });
     let last_progress_ms = Arc::new(AtomicU64::new(0));
-    let threads = request.threads.clamp(1, 16);
+
+    // NTFS fast path. Reading the volume's Master File Table sequentially beats
+    // walking directories by an order of magnitude, because a walk pays a small
+    // random metadata read per directory plus a kernel transition per entry.
+    // Returns false whenever the volume, the request, or our privileges rule it
+    // out, in which case the directory walk below runs exactly as before.
+    // Records the scan root's own MFT reference, which the walker can't know.
+    // Journal replay needs it to recognise changes made directly in the root.
+    let root_frn = Arc::new(AtomicU64::new(0));
+    let used_mft = try_mft_scan(
+        scan_id,
+        root,
+        request,
+        cancel,
+        &progress,
+        &row_tx,
+        &next_id,
+        &node_count,
+        started,
+        &root_frn,
+    );
+
+    // The fast path already emitted every row; leave the walker unstaffed.
+    let threads = if used_mft {
+        0
+    } else {
+        request.threads.clamp(1, 16)
+    };
     let mut workers = Vec::with_capacity(threads);
     for worker_id in 0..threads {
         let tx = row_tx.clone();
@@ -2376,6 +2460,7 @@ fn run_bounded_scan(
         let started = started;
         let visited = Arc::clone(&visited);
         let last_progress_ms = Arc::clone(&last_progress_ms);
+        let unreadable = Arc::clone(&unreadable);
         workers.push(
             std::thread::Builder::new()
                 .name(format!("scan-enumerator-{worker_id}"))
@@ -2408,7 +2493,12 @@ fn run_bounded_scan(
                                 let is_dir = file_type.is_dir()
                                     || (is_link && request.follow_links && path.is_dir());
                                 let id = next_id.fetch_add(1, Ordering::Relaxed);
-                                let row = scan_row(
+                                // Free on Windows (served from the enumeration
+                                // buffer). Symlinks fall through to a path query
+                                // so the row keeps describing the TARGET, as it
+                                // did before this became a cached read.
+                                let cached = if is_link { None } else { entry.metadata().ok() };
+                                let row = scan_row_with_metadata(
                                     id,
                                     Some(task.id),
                                     &path,
@@ -2416,6 +2506,7 @@ fn run_bounded_scan(
                                     task.depth.saturating_add(1),
                                     is_dir,
                                     is_link,
+                                    cached,
                                 );
                                 if tx.send(row).is_err() {
                                     cancel.store(true, Ordering::Relaxed);
@@ -2462,6 +2553,10 @@ fn run_bounded_scan(
                                     });
                                 }
                             }
+                        } else {
+                            // A folder the walker was refused. Attributed to
+                            // that folder so the total rolls up with the rest.
+                            unreadable.lock_unpoisoned().push(task.id);
                         }
                         queue.finish();
                     }
@@ -2484,14 +2579,46 @@ fn run_bounded_scan(
     } else {
         "done"
     };
+    // Only an MFT-backed scan carries the file reference numbers a journal
+    // replay matches against, so only that path earns a checkpoint. Recording
+    // one for a walker scan would promise an incremental refresh that could
+    // never actually be applied.
+    let refresh = checkpoint.filter(|_| used_mft).map(|checkpoint| ScanRefresh {
+        checkpoint,
+        root_frn: root_frn.load(Ordering::Relaxed),
+    });
     write_scan_metadata(
         db_path,
         status,
         rows,
         started.elapsed().as_millis() as u64,
         None,
+        refresh.as_ref(),
     )?;
     Ok(rows)
+}
+
+/// What a completed scan needs to remember to be caught up later instead of
+/// redone: where the volume's change journal stood when it began, and the MFT
+/// reference of the root it was rooted at.
+#[derive(Clone, Copy, Debug)]
+struct ScanRefresh {
+    checkpoint: crate::usn::Checkpoint,
+    root_frn: u64,
+}
+
+/// The volume journal mark a scan of `root` should resume from, or `None` when
+/// the volume has no usable journal (non-NTFS, unelevated, network path). A
+/// `None` here simply means this scan can only ever be refreshed by rescanning.
+fn capture_scan_checkpoint(root: &Path) -> Option<crate::usn::Checkpoint> {
+    let letter = crate::mft::volume_letter(root)?;
+    match crate::usn::capture_checkpoint(letter) {
+        Ok(checkpoint) => Some(checkpoint),
+        Err(error) => {
+            eprintln!("[usn] {letter}: {error} — scan will not be incrementally refreshable");
+            None
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2588,6 +2715,10 @@ struct ScanRow {
     extension: String,
     owner: String,
     attributes: u32,
+    /// NTFS file reference number, or 0 when the row came from the directory
+    /// walker. This is the key a USN journal record is matched against, so a
+    /// scan without it can only ever be refreshed by rescanning.
+    frn: u64,
 }
 
 fn scan_row(
@@ -2599,7 +2730,33 @@ fn scan_row(
     is_dir: bool,
     is_link: bool,
 ) -> ScanRow {
-    let metadata = fs::metadata(path).ok();
+    scan_row_with_metadata(id, parent_id, path, dir_path, depth, is_dir, is_link, None)
+}
+
+/// As [`scan_row`], but reuses metadata the caller already holds.
+///
+/// Windows returns size, timestamps and attributes as part of directory
+/// enumeration, and `DirEntry::metadata()` serves them from that buffer without
+/// a syscall. Re-querying by path with `fs::metadata` instead cost one extra
+/// syscall per file and replaced a sequential directory-index read with a random
+/// per-file metadata lookup — the dominant cost of a large scan. `cached` is
+/// therefore the enumeration's own metadata; `None` falls back to a path query
+/// (the scan root, and symlinks when the target's metadata is wanted).
+#[allow(clippy::too_many_arguments)]
+fn scan_row_with_metadata(
+    id: i64,
+    parent_id: Option<i64>,
+    path: &Path,
+    dir_path: &Path,
+    depth: u32,
+    is_dir: bool,
+    is_link: bool,
+    cached: Option<fs::Metadata>,
+) -> ScanRow {
+    let metadata = match cached {
+        Some(metadata) => Some(metadata),
+        None => fs::metadata(path).ok(),
+    };
     let size = if is_dir {
         0
     } else {
@@ -2657,13 +2814,253 @@ fn scan_row(
         extension,
         owner: String::new(),
         attributes: 0,
+        // The walker never learns a file's MFT reference; only the MFT path
+        // fills this in, which is why incremental refresh needs that path.
+        frn: 0,
     }
+}
+
+// ── NTFS Master File Table fast path ────────────────────────────────────────
+
+/// How eagerly to use the MFT reader.
+///
+/// Overridable with `FILETREE_MFT` (`0`/`off`/`never`, `1`/`on`/`always`,
+/// anything else = auto) so both scan paths can be measured against each other
+/// on the same machine without a rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MftMode {
+    Never,
+    Auto,
+    Always,
+}
+
+/// Read per scan rather than cached, so the two paths can be compared inside a
+/// single process (a scan is far too coarse for one env lookup to matter).
+fn mft_mode() -> MftMode {
+    match std::env::var("FILETREE_MFT")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("0" | "off" | "never" | "false") => MftMode::Never,
+        Some("1" | "on" | "always" | "true") => MftMode::Always,
+        _ => MftMode::Auto,
+    }
+}
+
+fn join_child_path(parent: &str, name: &str) -> String {
+    let mut out = String::with_capacity(parent.len() + 1 + name.len());
+    out.push_str(parent);
+    if !out.ends_with('\\') && !out.ends_with('/') {
+        out.push('\\');
+    }
+    out.push_str(name);
+    out
+}
+
+/// One scan row from a parsed MFT entry.
+///
+/// `hidden` deliberately keeps the walker's dotfile rule rather than reading
+/// Windows' HIDDEN attribute, so the two scan paths agree on which entries
+/// `include_hidden` filters. The raw attribute bitmask still travels in
+/// `attributes`, which the walker leaves at 0.
+fn mft_row(
+    id: i64,
+    parent_id: i64,
+    entry: &crate::mft::MftEntry,
+    path: &str,
+    depth: u32,
+    record: u32,
+) -> ScanRow {
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+    let is_dir = entry.is_dir;
+    ScanRow {
+        id,
+        parent_id: Some(parent_id),
+        name: entry.name.clone(),
+        // Interned exactly as the walker does it: directories carry their path,
+        // files inherit theirs from the parent row.
+        dir_path: if is_dir {
+            path.to_string()
+        } else {
+            String::new()
+        },
+        is_dir,
+        is_link: entry.is_reparse,
+        hidden: is_hidden_name(&entry.name),
+        readonly: entry.attributes & FILE_ATTRIBUTE_READONLY != 0,
+        size: entry.size,
+        // Resident content has no clusters of its own; report the logical size
+        // so a tiny file never shows as occupying nothing.
+        allocated: if entry.allocated > 0 {
+            entry.allocated
+        } else {
+            entry.size
+        },
+        files: u64::from(!is_dir),
+        folders: 0,
+        modified_ms: entry.modified_ms,
+        created_ms: entry.created_ms,
+        accessed_ms: entry.accessed_ms,
+        depth,
+        errors: 0,
+        extension: if is_dir {
+            String::new()
+        } else {
+            Path::new(&entry.name)
+                .extension()
+                .map(|value| value.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default()
+        },
+        owner: String::new(),
+        attributes: entry.attributes,
+        frn: u64::from(record),
+    }
+}
+
+/// Scan by reading the volume's MFT instead of walking directories.
+///
+/// Returns true when the fast path owns the scan (rows emitted, or cancelled),
+/// false when the caller must fall back to the directory walk. Every rejection
+/// is expected and silent-ish: non-NTFS volumes, unelevated processes, network
+/// paths and link-following requests all simply walk.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn try_mft_scan(
+    scan_id: &str,
+    root: &Path,
+    request: &ScanRequest,
+    cancel: &Arc<AtomicBool>,
+    progress: &Arc<dyn Fn(ScanProgress) + Send + Sync>,
+    row_tx: &std::sync::mpsc::SyncSender<ScanRow>,
+    next_id: &AtomicI64,
+    node_count: &AtomicU64,
+    started: Instant,
+    root_frn: &AtomicU64,
+) -> bool {
+    let mode = mft_mode();
+    if mode == MftMode::Never {
+        return false;
+    }
+    // Following links resolves mount points into other volumes, which one
+    // volume's table cannot answer.
+    if request.follow_links {
+        return false;
+    }
+    let Some(letter) = crate::mft::volume_letter(root) else {
+        return false; // UNC path: no volume to read
+    };
+    // Auto sticks to whole volumes. Streaming a multi-hundred-MiB table to
+    // answer a small subtree would be slower than just walking it.
+    if mode == MftMode::Auto && !crate::mft::is_volume_root(root) {
+        return false;
+    }
+
+    let report = |node_count: u64| {
+        progress(ScanProgress {
+            scan_id: scan_id.to_string(),
+            stage: "scanning".to_string(),
+            node_count,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        });
+    };
+
+    let index = match crate::mft::read_index(letter, cancel, report) {
+        Ok(index) => index,
+        // Already stopping; don't start the walker just to have it stop too.
+        Err(crate::mft::MftError::Cancelled) => return true,
+        Err(error) => {
+            eprintln!("[mft] {letter}: {error} — falling back to directory walk");
+            return false;
+        }
+    };
+
+    let children = index.children_map();
+    let components = crate::mft::components_below_root(root);
+    let Some(target) = index.resolve(&children, &components) else {
+        eprintln!("[mft] {}: not found in table — falling back", root.display());
+        return false;
+    };
+    if !index.get(target).is_some_and(|entry| entry.is_dir) {
+        return false;
+    }
+    // The root row was emitted before this path was chosen, so its own MFT
+    // reference is reported out of band rather than carried on the row.
+    root_frn.store(u64::from(target), Ordering::Relaxed);
+
+    // Breadth-first from the target so each directory's children land in one
+    // contiguous id block, matching the walker's id layout.
+    let mut queue: VecDeque<(u32, i64, String, u32)> = VecDeque::new();
+    queue.push_back((target, 0, root.to_string_lossy().into_owned(), 0));
+
+    while let Some((dir_record, dir_id, dir_path, depth)) = queue.pop_front() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(entries) = children.get(dir_record as usize) else {
+            continue;
+        };
+        for &record in entries {
+            let Some(entry) = index.get(record) else {
+                continue;
+            };
+            if !request.include_hidden && is_hidden_name(&entry.name) {
+                continue;
+            }
+            let child_path = join_child_path(&dir_path, &entry.name);
+            if request.exclude_patterns.iter().any(|pattern| {
+                wildcard_match(pattern, &entry.name) || wildcard_match(pattern, &child_path)
+            }) {
+                continue;
+            }
+
+            let id = next_id.fetch_add(1, Ordering::Relaxed);
+            let row = mft_row(id, dir_id, entry, &child_path, depth.saturating_add(1), record);
+            if row_tx.send(row).is_err() {
+                cancel.store(true, Ordering::Relaxed);
+                return true;
+            }
+            let count = node_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if count % 4_096 == 0 {
+                report(count);
+            }
+
+            // Reparse points are recorded but never descended into — the target
+            // may live on another volume entirely.
+            if entry.is_dir && !entry.is_reparse {
+                queue.push_back((record, id, child_path, depth.saturating_add(1)));
+            }
+        }
+    }
+
+    report(node_count.load(Ordering::Relaxed));
+    true
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::too_many_arguments)]
+fn try_mft_scan(
+    _scan_id: &str,
+    _root: &Path,
+    _request: &ScanRequest,
+    _cancel: &Arc<AtomicBool>,
+    _progress: &Arc<dyn Fn(ScanProgress) + Send + Sync>,
+    _row_tx: &std::sync::mpsc::SyncSender<ScanRow>,
+    _next_id: &AtomicI64,
+    _node_count: &AtomicU64,
+    _started: Instant,
+    _root_frn: &AtomicU64,
+) -> bool {
+    false
 }
 
 fn write_scan_rows(
     db_path: &Path,
     root_path: &str,
     receiver: std::sync::mpsc::Receiver<ScanRow>,
+    unreadable: Arc<Mutex<Vec<i64>>>,
 ) -> Result<u64, String> {
     let mut conn = Connection::open(db_path).map_err(|error| error.to_string())?;
     configure_connection(&conn).map_err(|error| error.to_string())?;
@@ -2686,6 +3083,25 @@ fn write_scan_rows(
     if !batch.is_empty() {
         insert_scan_batch(&mut conn, &batch).map_err(|error| error.to_string())?;
         total += batch.len() as u64;
+    }
+    // Every worker has dropped its sender by the time the loop above ends, so
+    // this list is complete. Marking the folders before aggregating lets the
+    // ordinary rollup carry the count to the root.
+    {
+        let mut failures = unreadable.lock_unpoisoned();
+        if !failures.is_empty() {
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            {
+                let mut stmt = tx
+                    .prepare_cached("UPDATE nodes SET errors=1 WHERE id=?1")
+                    .map_err(|error| error.to_string())?;
+                for id in failures.iter() {
+                    stmt.execute(params![id]).map_err(|error| error.to_string())?;
+                }
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            failures.clear();
+        }
     }
     aggregate_scan(&conn).map_err(|error| error.to_string())?;
     Ok(total)
@@ -2974,16 +3390,55 @@ fn create_scan_schema(conn: &Connection) -> rusqlite::Result<()> {
            is_dir INTEGER NOT NULL,is_link INTEGER NOT NULL,hidden INTEGER NOT NULL,readonly INTEGER NOT NULL,\
            size INTEGER NOT NULL,allocated INTEGER NOT NULL,files INTEGER NOT NULL,folders INTEGER NOT NULL,\
            modified_ms INTEGER NOT NULL,created_ms INTEGER NOT NULL,accessed_ms INTEGER NOT NULL,\
-           depth INTEGER NOT NULL,errors INTEGER NOT NULL,extension TEXT NOT NULL,owner TEXT NOT NULL,attributes INTEGER NOT NULL\
+           depth INTEGER NOT NULL,errors INTEGER NOT NULL,extension TEXT NOT NULL,owner TEXT NOT NULL,attributes INTEGER NOT NULL,\
+           frn INTEGER NOT NULL DEFAULT 0,newest_created_ms INTEGER NOT NULL DEFAULT 0\
          );\
          CREATE INDEX nodes_parent ON nodes(parent_id,id);\
          CREATE INDEX nodes_parent_kind ON nodes(parent_id,is_dir,id);\
          CREATE INDEX nodes_parent_size ON nodes(parent_id,size DESC,id);\
          CREATE INDEX nodes_parent_name ON nodes(parent_id,name COLLATE NOCASE,id);\
          CREATE INDEX nodes_extension ON nodes(extension,id);\
-         CREATE INDEX nodes_depth ON nodes(depth,is_dir,id);"
+         CREATE INDEX nodes_depth ON nodes(depth,is_dir,id);\
+         CREATE INDEX nodes_frn ON nodes(frn) WHERE frn<>0;"
     )?;
     Ok(())
+}
+
+/// Bring a scan database written by an older build up to the current column
+/// set. Cache files outlive the build that wrote them, so reopening one is only
+/// worth it if it can answer the queries this build makes. Back-filled columns
+/// read as zero, which every consumer already renders as "unknown".
+fn migrate_scan_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let mut columns = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(nodes)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            columns.insert(row.get::<_, String>(1)?);
+        }
+    }
+    if columns.is_empty() {
+        return Ok(()); // a database still being created
+    }
+    for (column, statement) in [
+        (
+            "frn",
+            "ALTER TABLE nodes ADD COLUMN frn INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "newest_created_ms",
+            "ALTER TABLE nodes ADD COLUMN newest_created_ms INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if !columns.contains(column) {
+            conn.execute_batch(statement)?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_scan_database(path: &Path) -> rusqlite::Result<()> {
+    migrate_scan_schema(&Connection::open(path)?)
 }
 
 fn insert_scan_batch(conn: &mut Connection, batch: &[ScanRow]) -> rusqlite::Result<()> {
@@ -2991,8 +3446,8 @@ fn insert_scan_batch(conn: &mut Connection, batch: &[ScanRow]) -> rusqlite::Resu
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO nodes(id,parent_id,name,dir_path,is_dir,is_link,hidden,readonly,size,allocated,files,folders,\
-             modified_ms,created_ms,accessed_ms,depth,errors,extension,owner,attributes)\
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)"
+             modified_ms,created_ms,accessed_ms,depth,errors,extension,owner,attributes,frn,newest_created_ms)\
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)"
         )?;
         for row in batch {
             stmt.execute(params![
@@ -3016,6 +3471,11 @@ fn insert_scan_batch(conn: &mut Connection, batch: &[ScanRow]) -> rusqlite::Resu
                 row.extension,
                 row.owner,
                 row.attributes as i64,
+                as_sql_i64(row.frn),
+                // Seeded from files only. A directory's own birth date says
+                // nothing about when something was last put inside it, so it
+                // starts empty and is filled in by the rollup below.
+                as_sql_i64(if row.is_dir { 0 } else { row.created_ms }),
             ])?;
         }
     }
@@ -3033,8 +3493,9 @@ fn aggregate_scan(conn: &Connection) -> rusqlite::Result<()> {
                allocated=COALESCE((SELECT SUM(child.allocated) FROM nodes child WHERE child.parent_id=parent.id),0),\
                files=COALESCE((SELECT SUM(child.files) FROM nodes child WHERE child.parent_id=parent.id),0),\
                folders=COALESCE((SELECT SUM(child.folders + child.is_dir) FROM nodes child WHERE child.parent_id=parent.id),0),\
-               errors=COALESCE((SELECT SUM(child.errors) FROM nodes child WHERE child.parent_id=parent.id),0),\
-               modified_ms=MAX(modified_ms,COALESCE((SELECT MAX(child.modified_ms) FROM nodes child WHERE child.parent_id=parent.id),0))\
+               errors=errors+COALESCE((SELECT SUM(child.errors) FROM nodes child WHERE child.parent_id=parent.id),0),\
+               modified_ms=MAX(modified_ms,COALESCE((SELECT MAX(child.modified_ms) FROM nodes child WHERE child.parent_id=parent.id),0)),\
+               newest_created_ms=COALESCE((SELECT MAX(child.newest_created_ms) FROM nodes child WHERE child.parent_id=parent.id),0)\
              WHERE parent.is_dir=1 AND parent.depth=?1",
             params![depth],
         )?;
@@ -3049,14 +3510,25 @@ fn write_scan_metadata(
     nodes: u64,
     elapsed_ms: u64,
     error: Option<&str>,
+    refresh: Option<&ScanRefresh>,
 ) -> Result<(), String> {
     let conn = open_scan_connection(db_path).map_err(|value| value.to_string())?;
+    // Absent for a walker scan; the reader treats a zeroed checkpoint as "not
+    // incrementally refreshable" and rescans.
+    let refresh = refresh.copied().unwrap_or(ScanRefresh {
+        checkpoint: crate::usn::Checkpoint::default(),
+        root_frn: 0,
+    });
     for (key, value) in [
         ("status", status.to_string()),
         ("nodeCount", nodes.to_string()),
         ("elapsedMs", elapsed_ms.to_string()),
         ("scannedAt", now_ms().to_string()),
         ("error", error.unwrap_or("").to_string()),
+        ("volumeSerial", refresh.checkpoint.volume_serial.to_string()),
+        ("journalId", refresh.checkpoint.journal_id.to_string()),
+        ("journalUsn", refresh.checkpoint.next_usn.to_string()),
+        ("rootFrn", refresh.root_frn.to_string()),
     ] {
         conn.execute(
             "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,?2)",
@@ -3209,6 +3681,7 @@ fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodePageItem> {
         extension: row.get(17)?,
         owner: row.get(18)?,
         attributes: row.get::<_, i64>(19)?.max(0) as u32,
+        newest_created_ms: row.get::<_, i64>(20)?.max(0) as u64,
     })
 }
 
@@ -3220,6 +3693,7 @@ fn sort_column(value: &str) -> &'static str {
         "folders" => "n.folders",
         "modified" | "modifiedms" => "n.modified_ms",
         "created" | "createdms" => "n.created_ms",
+        "lastfilecreated" | "newestcreated" | "newestcreatedms" => "n.newest_created_ms",
         "accessed" | "accessedms" => "n.accessed_ms",
         "extension" => "n.extension COLLATE NOCASE",
         "depth" => "n.depth",
@@ -3675,6 +4149,135 @@ mod tests {
         V2Store::open(root).expect("open v2 store")
     }
 
+    /// One file per directory, each with a distinct creation and modification
+    /// time, so a rollup that confuses the two is visible in the assertions.
+    fn tree_with_creation_dates() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_scan_schema(&conn).expect("schema");
+        let mut conn = conn;
+        let row = |id: i64, parent: Option<i64>, name: &str, is_dir: bool, created: u64| ScanRow {
+            id,
+            parent_id: parent,
+            name: name.to_string(),
+            dir_path: if is_dir { name.to_string() } else { String::new() },
+            is_dir,
+            is_link: false,
+            hidden: false,
+            readonly: false,
+            size: 10,
+            allocated: 10,
+            files: u64::from(!is_dir),
+            folders: 0,
+            modified_ms: 9_000,
+            created_ms: created,
+            accessed_ms: 0,
+            depth: if parent.is_none() { 0 } else { 1 },
+            errors: 0,
+            extension: String::new(),
+            owner: String::new(),
+            attributes: 0,
+            frn: 0,
+        };
+        insert_scan_batch(
+            &mut conn,
+            &[
+                // The root's own birth date is later than anything inside it.
+                row(0, None, "C:\\", true, 8_000),
+                row(1, Some(0), "old.txt", false, 1_000),
+                row(2, Some(0), "new.txt", false, 5_000),
+            ],
+        )
+        .expect("insert");
+        aggregate_scan(&conn).expect("aggregate");
+        conn
+    }
+
+    fn newest_created(conn: &Connection, id: i64) -> i64 {
+        conn.query_row(
+            "SELECT newest_created_ms FROM nodes WHERE id=?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_folder_reports_the_newest_creation_date_beneath_it() {
+        let conn = tree_with_creation_dates();
+        assert_eq!(newest_created(&conn, 0), 5_000);
+    }
+
+    #[test]
+    fn a_folders_own_birth_date_never_counts_as_a_file_arriving() {
+        let conn = tree_with_creation_dates();
+        // 8_000 is the directory's own created_ms; only the files may date it.
+        assert_ne!(newest_created(&conn, 0), 8_000);
+        assert_eq!(
+            newest_created(&conn, 1),
+            1_000,
+            "a file dates itself by its own creation"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_folder_is_counted_at_every_level_above_it() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_scan_schema(&conn).expect("schema");
+        let mut conn = conn;
+        let dir = |id: i64, parent: Option<i64>, depth: u32| ScanRow {
+            id,
+            parent_id: parent,
+            name: format!("d{id}"),
+            dir_path: format!("d{id}"),
+            is_dir: true,
+            is_link: false,
+            hidden: false,
+            readonly: false,
+            size: 0,
+            allocated: 0,
+            files: 0,
+            folders: 0,
+            modified_ms: 0,
+            created_ms: 0,
+            accessed_ms: 0,
+            depth,
+            errors: 0,
+            extension: String::new(),
+            owner: String::new(),
+            attributes: 0,
+            frn: 0,
+        };
+        insert_scan_batch(&mut conn, &[dir(0, None, 0), dir(1, Some(0), 1)]).expect("insert");
+        // What the walker does when a folder refuses to be read.
+        conn.execute("UPDATE nodes SET errors=1 WHERE id=1", [])
+            .expect("mark");
+        aggregate_scan(&conn).expect("aggregate");
+
+        let errors = |id: i64| -> i64 {
+            conn.query_row("SELECT errors FROM nodes WHERE id=?1", params![id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(errors(1), 1, "the folder keeps its own failure");
+        assert_eq!(errors(0), 1, "and the root reports it exactly once");
+    }
+
+    #[test]
+    fn an_older_scan_database_gains_the_columns_this_build_reads() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE nodes(id INTEGER PRIMARY KEY,parent_id INTEGER,name TEXT NOT NULL);",
+        )
+        .expect("legacy schema");
+        migrate_scan_schema(&conn).expect("migrate");
+        // Running twice must be harmless: every reopen goes through this path.
+        migrate_scan_schema(&conn).expect("migrate again");
+        conn.execute("INSERT INTO nodes(id,name) VALUES(1,'a.txt')", [])
+            .expect("insert");
+        assert_eq!(newest_created(&conn, 1), 0, "back-filled as unknown");
+    }
+
     #[test]
     fn wildcard_matching_is_case_insensitive() {
         assert!(wildcard_match("*.MP4", "folder/test.mp4"));
@@ -3903,6 +4506,161 @@ mod tests {
             .expect("nested aggregate");
         assert_eq!(nested.size, 20);
         assert_eq!(nested.files, 1);
+    }
+
+    fn mft_entry(name: &str) -> crate::mft::MftEntry {
+        crate::mft::MftEntry {
+            name: name.to_string(),
+            present: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mft_file_rows_match_the_walker_row_shape() {
+        let entry = crate::mft::MftEntry {
+            parent: 5,
+            size: 4096,
+            allocated: 8192,
+            created_ms: 111,
+            modified_ms: 222,
+            accessed_ms: 333,
+            attributes: 0x21, // READONLY | ARCHIVE
+            ..mft_entry("Report.PDF")
+        };
+        let row = mft_row(7, 3, &entry, "C:\\docs\\Report.PDF", 2, 91);
+
+        assert_eq!(row.id, 7);
+        assert_eq!(row.parent_id, Some(3));
+        assert_eq!(row.name, "Report.PDF");
+        assert_eq!(
+            row.dir_path, "",
+            "file rows intern their path through the parent row"
+        );
+        assert_eq!(row.extension, "pdf", "extensions are lowercased");
+        assert_eq!(row.size, 4096);
+        assert_eq!(row.allocated, 8192);
+        assert!(row.readonly, "READONLY comes out of the attribute bitmask");
+        assert_eq!(row.files, 1);
+        assert_eq!(row.depth, 2);
+        assert_eq!(row.attributes, 0x21);
+        assert_eq!(
+            row.frn, 91,
+            "the MFT record number is what journal replay matches on"
+        );
+    }
+
+    #[test]
+    fn mft_directory_rows_carry_their_own_path() {
+        let entry = crate::mft::MftEntry {
+            is_dir: true,
+            ..mft_entry("docs")
+        };
+        let row = mft_row(3, 0, &entry, "C:\\docs", 1, 42);
+        assert_eq!(row.dir_path, "C:\\docs");
+        assert_eq!(row.extension, "");
+        assert_eq!(row.files, 0, "a directory is not itself a file");
+        assert_eq!(row.size, 0, "directory size arrives via aggregation");
+    }
+
+    #[test]
+    fn mft_resident_files_report_a_nonzero_allocation() {
+        let entry = crate::mft::MftEntry {
+            size: 64,
+            allocated: 0, // content lives inside the MFT record
+            ..mft_entry("tiny.txt")
+        };
+        assert_eq!(mft_row(1, 0, &entry, "C:\\tiny.txt", 1, 17).allocated, 64);
+    }
+
+    #[test]
+    fn join_child_path_inserts_exactly_one_separator() {
+        assert_eq!(join_child_path("C:\\", "Users"), "C:\\Users");
+        assert_eq!(join_child_path("C:\\Users", "dan"), "C:\\Users\\alex");
+        assert_eq!(join_child_path("C:/Users", "dan"), "C:/Users\\alex");
+    }
+
+    /// End-to-end equivalence: the fast path must be invisible in the results.
+    ///
+    /// Ignored by default because it sets a process-wide env var that would
+    /// leak into tests running in parallel, and because forcing the MFT path at
+    /// a subtree streams the whole volume table. Run it deliberately, from an
+    /// ELEVATED shell on an NTFS volume — the only configuration where the fast
+    /// path actually engages rather than falling back:
+    ///
+    /// ```text
+    /// cargo test --lib mft_scan_matches_the_directory_walk -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "sets FILETREE_MFT process-wide; needs elevation to exercise the reader"]
+    fn mft_scan_matches_the_directory_walk() {
+        let store = temp_store("mft-equivalence");
+        let source = store.data_root().join("fixture");
+        fs::create_dir_all(source.join("nested").join("deeper")).unwrap();
+        fs::write(source.join("a.bin"), vec![1u8; 10]).unwrap();
+        fs::write(source.join("nested").join("b.bin"), vec![2u8; 20]).unwrap();
+        fs::write(
+            source.join("nested").join("deeper").join("c.txt"),
+            vec![3u8; 30],
+        )
+        .unwrap();
+
+        let run = |mode: &str| {
+            // SAFETY: single-threaded section of this test; no other test reads
+            // FILETREE_MFT.
+            unsafe { std::env::set_var("FILETREE_MFT", mode) };
+            let started = Instant::now();
+            let handle = store
+                .start_scan(
+                    ScanRequest {
+                        root: source.to_string_lossy().into_owned(),
+                        threads: 4,
+                        ..Default::default()
+                    },
+                    |_| {},
+                )
+                .unwrap();
+            let mut status = store.scan_status(&handle.scan_id).unwrap();
+            for _ in 0..6_000 {
+                if status.status != "scanning" {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                status = store.scan_status(&handle.scan_id).unwrap();
+            }
+            assert_eq!(status.status, "done", "{mode} scan should finish");
+            let elapsed = started.elapsed();
+
+            let root = store
+                .query_nodes(ScanQuery {
+                    scan_id: handle.scan_id.clone(),
+                    parent_id: None,
+                    limit: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut tree = store
+                .query_snapshot_children(&handle.scan_id, 0, 50_000)
+                .unwrap()
+                .into_iter()
+                .map(|item| (item.name, item.size, item.files))
+                .collect::<Vec<_>>();
+            tree.sort();
+            println!(
+                "FILETREE_MFT={mode}: {} nodes, {} bytes, {:?}",
+                status.node_count, root.items[0].size, elapsed
+            );
+            (status.node_count, root.items[0].size, tree)
+        };
+
+        let walked = run("never");
+        let fast = run("always");
+        unsafe { std::env::remove_var("FILETREE_MFT") };
+
+        assert_eq!(walked.0, fast.0, "node counts must match");
+        assert_eq!(walked.1, fast.1, "total sizes must match");
+        assert_eq!(walked.2, fast.2, "the trees themselves must match");
+        assert_eq!(walked.1, 60, "fixture holds 10 + 20 + 30 bytes");
     }
 
     #[test]

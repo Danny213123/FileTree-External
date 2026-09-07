@@ -7,6 +7,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { TagEntry } from "../api/types";
+import { localPoint, localViewport } from "../lib/overlay";
 import { Icon } from "./Icon";
 
 export interface TagPopoverProps {
@@ -59,9 +60,12 @@ export function TagPopover({ path, x, y, entry, onApply, onClose }: TagPopoverPr
   const removeTag = (t: string) => apply(tags.filter((x) => x !== t), color);
   const pickColor = (c: string | undefined) => apply(tags, c);
 
-  // Clamp the popover to the viewport (≈ 250×220 box).
-  const left = Math.min(x, window.innerWidth - 260);
-  const top = Math.min(y, window.innerHeight - 230);
+  // Clamp the popover to the viewport (≈ 250×220 box). Local (zoom-relative)
+  // space, since these become inline offsets. See lib/overlay.ts.
+  const view = localViewport();
+  const at = localPoint(x, y);
+  const left = Math.min(at.x, view.width - 260);
+  const top = Math.min(at.y, view.height - 230);
 
   return (
     <div ref={ref} className="tag-popover" style={{ left: Math.max(8, left), top: Math.max(8, top) }} role="dialog" aria-label="Edit tags">

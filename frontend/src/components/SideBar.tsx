@@ -1,10 +1,11 @@
-import { useState, useMemo, useEffect, type ReactNode } from "react";
+import { useState, useMemo, useEffect, useRef, type ReactNode } from "react";
 import type { ViewId } from "./ActivityBar";
 import type { DriveEntry, NodeRecord, ScanResult, SpecialFolder, Unit, TagEntry, SmartFolder } from "../api/types";
 import { BookmarksTab } from "./BookmarksTab";
 import { ErrorsTab } from "./ErrorsTab";
 import { FileIcon } from "./FileIcon";
 import { Icon } from "./Icon";
+import { Select } from "./Select";
 import { DriveCapacityBar } from "./DriveCapacityBar";
 import { PathPicker, splitPath } from "./PathPicker";
 import type { DuplicatesController } from "../hooks/useDuplicates";
@@ -17,13 +18,13 @@ import {
   scanStepStatus,
 } from "../lib/duplicatesScanUi";
 import {
-  compileNameMatcher, makeFilterPredicate, filtersActive,
+  compileNameMatcher, makeFilterPredicate, filtersActive, toServerSearchParams,
   EMPTY_FILTERS, FILE_CATEGORIES, AGE_PRESETS,
-  type SearchFilters, type FileCategory, type AgePreset,
+  type SearchFilters,
 } from "../lib/search";
 import { getAllCached } from "../lib/scanCache";
 import { exportResults } from "../lib/exportRows";
-import { revealPath, copyText, shellContextMenu } from "../api/client";
+import { revealPath, copyText, shellContextMenu, fetchServerSearch } from "../api/client";
 import { compareNodes } from "../hooks/useTreeState";
 import { loadPresets, addPreset, removePreset, type ScanPreset } from "../lib/scanPresets";
 import { loadRecentPaths } from "./RibbonBar";
@@ -625,7 +626,9 @@ function LocationsView(props: SideBarProps) {
   );
 }
 
-const SEARCH_RESULT_CAP = 300;
+// Matches the backend's per-page maximum (TREE_PAGE_MAX), so the sidebar and the
+// main results table report the same count for the same query.
+const SEARCH_RESULT_CAP = 500;
 
 // Bytes for a size value entered in a unit (used by the size filter inputs).
 const SIZE_UNIT_BYTES: Record<string, number> = { KB: 1024, MB: 1024 * 1024, GB: 1024 * 1024 * 1024 };
@@ -636,10 +639,10 @@ interface SearchHit {
   node: NodeRecord;
   root: string;
   isCurrent: boolean;
-}
-
-function rootLabel(root: string): string {
-  return root.split(/[/\\]/).filter(Boolean).pop() || root;
+  /** Whether the id resolves in the focused pane's tree. Index-backed hits from
+   *  the current scan are `isCurrent` but not navigable until their ancestors
+   *  load, so selecting the id would land on nothing. */
+  navigable: boolean;
 }
 
 function normRoot(p: string): string {
@@ -686,21 +689,26 @@ function SearchFiltersPanel({
           value={bytesToUnit(filters.maxSize)}
           onChange={(e) => set({ maxSize: unitToBytes(e.target.value) })}
         />
-        <select value={sizeUnit} onChange={(e) => setSizeUnit(e.target.value as keyof typeof SIZE_UNIT_BYTES)}>
-          <option value="KB">KB</option>
-          <option value="MB">MB</option>
-          <option value="GB">GB</option>
-        </select>
+        <Select
+          value={sizeUnit}
+          options={[
+            { value: "KB", label: "KB" },
+            { value: "MB", label: "MB" },
+            { value: "GB", label: "GB" },
+          ]}
+          aria-label="Size unit"
+          onChange={setSizeUnit}
+        />
       </div>
 
       <div className="search-filter-row">
         <label className="search-filter-label">Modified</label>
-        <select
+        <Select
           value={filters.agePreset}
-          onChange={(e) => set({ agePreset: e.target.value as AgePreset })}
-        >
-          {AGE_PRESETS.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
-        </select>
+          options={AGE_PRESETS}
+          aria-label="Modified date"
+          onChange={(agePreset) => set({ agePreset })}
+        />
       </div>
 
       <div className="search-filter-row">
@@ -720,12 +728,12 @@ function SearchFiltersPanel({
 
       <div className="search-filter-row">
         <label className="search-filter-label">Type</label>
-        <select
+        <Select
           value={filters.category}
-          onChange={(e) => set({ category: e.target.value as FileCategory })}
-        >
-          {FILE_CATEGORIES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
-        </select>
+          options={FILE_CATEGORIES}
+          aria-label="File type"
+          onChange={(category) => set({ category })}
+        />
         <input
           type="text" spellCheck={false} placeholder="ext: jpg, png…"
           className="search-filter-ext"
@@ -767,6 +775,43 @@ function SearchView(props: SideBarProps) {
   const anyFilter = filtersActive(searchFilters);
   const active = query.length >= 2 || anyFilter;
 
+  // The focused scan's matches come from the backend whenever the scan is
+  // lazy — which, on the desktop build, is always. `nodeById` then holds only
+  // the folders the user has actually expanded, so walking it answered "what
+  // have I loaded?" instead of "what did I scan?": a search for "node" over a
+  // freshly scanned tree found 2 matches while the main results table, which
+  // queries the scan's on-disk index, found hundreds. This asks that same index.
+  const lazyScan = props.data?.lazy ? props.data : null;
+  const serverKey = lazyScan && active
+    ? JSON.stringify([lazyScan.scanId ?? lazyScan.rootPath, query, searchFilters])
+    : "";
+  const [serverHits, setServerHits] = useState<{ key: string; matches: NodeRecord[] }>({ key: "", matches: [] });
+
+  // Read through a ref so one request is issued per distinct query rather than
+  // per render: `searchFilters` is an object, and a new identity carrying the
+  // same values is already folded into `serverKey`.
+  const serverInputs = useRef({ lazyScan, query, searchFilters });
+  serverInputs.current = { lazyScan, query, searchFilters };
+
+  useEffect(() => {
+    if (!serverKey) return;
+    const { lazyScan: scan, query: q, searchFilters: filters } = serverInputs.current;
+    if (!scan) return;
+    const controller = new AbortController();
+    fetchServerSearch({
+      rootPath: scan.rootPath,
+      scanId: scan.scanId,
+      query: q,
+      limit: SEARCH_RESULT_CAP,
+      signal: controller.signal,
+      ...toServerSearchParams(filters),
+    })
+      .then((res) => setServerHits({ key: serverKey, matches: res.matches }))
+      // An aborted or failed query leaves the in-memory hits below in place.
+      .catch(() => { /* ignore */ });
+    return () => controller.abort();
+  }, [serverKey]);
+
   // Results span the focused pane, every other OPEN tab, and any scan still in
   // the short-lived cache — tagged with the root each hit came from. Scoping
   // this to the focused tab silently hid matches the user had already scanned
@@ -783,12 +828,19 @@ function SearchView(props: SideBarProps) {
       if (node.id < 0) return;
       if (!nameMatchAll && !matcher.test(node.name, node.path || "", node)) return;
       if (!predicate(node)) return;
-      hits.push({ node, root, isCurrent });
+      hits.push({ node, root, isCurrent, navigable: isCurrent });
     };
 
-    // Focused pane's live tree first, so its hits keep their navigable ids.
+    // Focused pane's tree first, so its hits keep their navigable ids.
     if (currentRoot) seenRoots.add(normRoot(currentRoot));
-    for (const node of props.nodeById.values()) consider(node, currentRoot, true);
+    if (serverKey && serverHits.key === serverKey) {
+      // The backend already applied the query and every filter.
+      for (const node of serverHits.matches) {
+        hits.push({ node, root: currentRoot, isCurrent: true, navigable: props.nodeById.has(node.id) });
+      }
+    } else {
+      for (const node of props.nodeById.values()) consider(node, currentRoot, true);
+    }
 
     // Then the other open tabs, then whatever is left in the scan cache. Each
     // root is walked once; the first source to claim it wins.
@@ -806,23 +858,29 @@ function SearchView(props: SideBarProps) {
 
     hits.sort((a, b) => compareNodes(a.node, b.node, "size", -1));
     return hits.slice(0, SEARCH_RESULT_CAP);
-  }, [active, matcher, searchFilters, query, props.nodeById, props.data, props.getOpenScans]);
+  }, [active, matcher, searchFilters, query, props.nodeById, props.data, props.getOpenScans,
+      serverKey, serverHits]);
 
   const allPaths = useMemo(() => results.map((r) => r.node.path).filter(Boolean), [results]);
 
+  /** The folder a hit lives in, i.e. what "open location" should scan. */
+  const containerOf = (hit: SearchHit): string =>
+    hit.node.dir ? hit.node.path : splitPath(hit.node.path).parent || hit.root;
+
   const handleClickResult = (hit: SearchHit) => {
-    if (hit.isCurrent) {
+    if (hit.navigable) {
       props.onNavigate(hit.node.id);
+    } else if (hit.isCurrent) {
+      // Same scan, but this hit came from the index and its ancestors aren't
+      // loaded — selecting the id would land on nothing. Open its folder, which
+      // loads that branch and puts the file on screen.
+      props.onOpenLocation(containerOf(hit));
     } else {
       // Foreign scan: ids aren't valid in the focused pane, so reveal the file
       // in File Explorer (always correct) — see FLAG in the search header note.
       revealPath(hit.node.path).catch(() => {});
     }
   };
-
-  /** The folder a hit lives in, i.e. what "open location" should scan. */
-  const containerOf = (hit: SearchHit): string =>
-    hit.node.dir ? hit.node.path : splitPath(hit.node.path).parent || hit.root;
 
   // Right-click hands the path to the Windows shell menu, the same one the
   // main tree uses, so search hits get Open / Open with / Properties / Delete.
@@ -860,7 +918,7 @@ function SearchView(props: SideBarProps) {
             className={`search-tool${historyOpen ? " open" : ""}`}
             title="Recent searches"
             onClick={() => setHistoryOpen((v) => !v)}
-          ><Icon name="chevron-down" size={12} /></button>
+          ><Icon name="chevron-down" size={12} className={historyOpen ? "flip-y" : undefined} /></button>
         )}
         {props.searchQuery && (
           <button className="search-tool" title="Clear" onClick={() => props.onSearchQueryChange("")}>
@@ -926,18 +984,22 @@ function SearchView(props: SideBarProps) {
             <button
               type="button"
               className="search-result"
-              title={hit.isCurrent ? hit.node.path : `${hit.node.path}\n(in ${hit.root} — opens in File Explorer)`}
+              title={
+                hit.navigable
+                  ? hit.node.path
+                  : hit.isCurrent
+                    ? `${hit.node.path}\n(opens the containing folder)`
+                    : `${hit.node.path}\n(in ${hit.root} — opens in File Explorer)`
+              }
               onClick={() => handleClickResult(hit)}
             >
               <FileIcon ext={hit.node.extension ?? ""} isDir={hit.node.dir} isBundle={false} />
               <span className="sr-name">{hit.node.name}</span>
-              <span className="sr-size">{fmtSize(hit.node.size)}</span>
+              {/* The path already begins with the scan root, so a separate root
+                  badge only repeated it and cost a third row. Which scan a
+                  foreign hit came from stays in the row's tooltip. */}
               <span className="sr-path">{hit.node.path}</span>
-              {/* Only foreign hits need the tag: they come from another scan
-                  and behave differently on click. */}
-              {!hit.isCurrent && (
-                <span className="sr-root" title={hit.root}>{rootLabel(hit.root)}</span>
-              )}
+              <span className="sr-size">{fmtSize(hit.node.size)}</span>
             </button>
             <span className="sr-actions">
               <button

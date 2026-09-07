@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { fetchAiModels, streamAiChat } from "../api/client";
 import type { NodeRecord } from "../api/types";
+import { Select } from "./Select";
 
 interface AiChatTabProps {
   scanPath: string;
@@ -142,14 +143,14 @@ export function AiChatTab({ scanPath, nodeById }: AiChatTabProps) {
   return (
     <div className="ai-chat-tab">
       <div className="ai-chat-toolbar">
-        <select
+        <Select
           className="ai-model-select"
           value={selectedModel}
-          onChange={(e) => setSelectedModel(e.target.value)}
+          options={models.map((model) => ({ value: model, label: model }))}
+          aria-label="AI model"
+          onChange={setSelectedModel}
           disabled={streaming}
-        >
-          {models.map((m) => <option key={m} value={m}>{m}</option>)}
-        </select>
+        />
         <button
           className="ai-clear-btn"
           onClick={() => setMessages([])}

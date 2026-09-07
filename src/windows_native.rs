@@ -893,14 +893,18 @@ pub(crate) fn shell_context_menu(
         RemoveWindowSubclass, SHBindToParent, SHParseDisplayName, SetWindowSubclass,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, HMENU, PostMessageW,
-        SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
-        WM_NULL, WS_EX_TOOLWINDOW, WS_POPUP,
+        AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, HMENU,
+        MF_SEPARATOR, MF_STRING, PostMessageW, SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_NULL, WS_EX_TOOLWINDOW, WS_POPUP,
     };
     use windows::core::{Interface, PCSTR, PCWSTR, PSTR, w};
 
     const MENU_ID_FIRST: u32 = 1;
     const MENU_ID_LAST: u32 = 0x7fff;
+    // Shell verbs own MENU_ID_FIRST..=MENU_ID_LAST. FileTree's explicit
+    // Explorer action sits outside that range so it can never be mistaken for
+    // an IContextMenu ordinal.
+    const MENU_ID_OPEN_IN_EXPLORER: u32 = 0x8000;
     const SUBCLASS_ID: usize = 0x4654_434d;
     const CMIC_MASK_UNICODE: u32 = 0x0000_4000;
 
@@ -1052,6 +1056,22 @@ pub(crate) fn shell_context_menu(
         )
     }
     .map_err(|error| format!("Windows could not populate the context menu: {error}"))?;
+    // Explorer's classic menu is extension-defined and does not reliably
+    // expose "Open file location" for every item type or Windows version.
+    // Always append one FileTree-owned action: files are selected in their
+    // containing folder, while directories are opened directly.
+    unsafe {
+        AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null())
+            .and_then(|_| {
+                AppendMenuW(
+                    menu.0,
+                    MF_STRING,
+                    MENU_ID_OPEN_IN_EXPLORER as usize,
+                    w!("Open in File Explorer"),
+                )
+            })
+    }
+    .map_err(|error| format!("Windows could not add the Explorer menu item: {error}"))?;
 
     let bridge = Box::new(ShellMenuMessageBridge {
         menu3: context.cast::<IContextMenu3>().ok(),
@@ -1096,6 +1116,19 @@ pub(crate) fn shell_context_menu(
         drop(proxy);
         drop(bridge);
         return Ok(None);
+    }
+    if command == MENU_ID_OPEN_IN_EXPLORER {
+        let target = &existing[0];
+        let open_result = if Path::new(target).is_dir() {
+            crate::io::open_path(target)
+        } else {
+            crate::io::reveal_path(target)
+        };
+        drop(proxy);
+        drop(bridge);
+        open_result
+            .map_err(|error| format!("Windows could not open File Explorer: {error}"))?;
+        return Ok(Some("filetree_open_in_explorer".to_string()));
     }
     let command_offset = command - MENU_ID_FIRST;
     let mut verb_buffer = [0u16; 260];

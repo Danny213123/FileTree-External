@@ -27,6 +27,10 @@ export interface NodeRecord {
   /** True when directory aggregate fields came from the scan index or a live
    *  recursive summary. False means this is an unresolved live placeholder. */
   aggregateKnown?: boolean;
+  /** Newest creation date of any file in this subtree; 0 when it holds none.
+   *  Distinct from `created` so rewriting a file — recompressing it, say —
+   *  cannot change the date a folder reports for its last addition. */
+  lastFileCreated?: number;
 }
 
 export interface ExtensionStat {
@@ -238,7 +242,7 @@ export type SortKey =
   | "name" | "path" | "folderPath" | "type"
   | "size" | "allocated" | "files" | "folders" | "percent"
   | "attributes" | "owner"
-  | "modified" | "created" | "accessed"
+  | "modified" | "created" | "accessed" | "lastFileCreated"
   | "avgFileSize" | "pathLength" | "dirLevel" | "compressionRate";
 export type Metric = "size" | "allocated" | "files" | "folders";
 export type Unit = "auto" | "tb" | "gb" | "mb" | "kb" | "bytes";

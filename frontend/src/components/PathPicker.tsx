@@ -14,6 +14,7 @@ import {
 import { createPortal } from "react-dom";
 import { browseDirectories, type BrowseDirectoryEntry } from "../api/client";
 import type { DriveEntry, SpecialFolder } from "../api/types";
+import { localRect, localViewport } from "../lib/overlay";
 import { Icon, type IconName } from "./Icon";
 
 /** Subfolders rendered per expansion before the list is truncated. */
@@ -351,15 +352,18 @@ export function PathPicker({
     const place = () => {
       const anchor = anchorRef.current;
       if (!anchor) return;
-      const rect = anchor.getBoundingClientRect();
+      // Local (zoom-relative) space, so the result can be used as an inline
+      // length under the UI-scale zoom on <body>. See lib/overlay.ts.
+      const rect = localRect(anchor);
+      const view = localViewport();
       const width = Math.max(rect.width, MIN_MENU_W);
-      const below = window.innerHeight - rect.bottom - GAP * 2;
+      const below = view.height - rect.bottom - GAP * 2;
       const above = rect.top - GAP * 2;
       const flip = below < Math.min(MAX_MENU_H, 240) && above > below;
       const maxHeight = Math.max(160, Math.min(MAX_MENU_H, flip ? above : below));
       setPos({
         top: flip ? Math.max(GAP, rect.top - maxHeight - GAP) : rect.bottom + GAP,
-        left: Math.max(GAP, Math.min(rect.left, window.innerWidth - width - GAP)),
+        left: Math.max(GAP, Math.min(rect.left, view.width - width - GAP)),
         width,
         maxHeight,
       });
@@ -472,7 +476,7 @@ export function PathPicker({
             <span className="sb-picker-name placeholder">{placeholder}</span>
           )}
         </span>
-        <Icon name="chevron-down" size={9} />
+        <Icon name="chevron-down" size={9} className={open ? "flip-y" : undefined} />
       </button>
 
       {open && pos && createPortal(

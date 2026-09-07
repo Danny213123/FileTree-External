@@ -723,6 +723,46 @@ async fn browse_directories(path: String) -> Result<Vec<BrowseDirectoryEntry>, S
         .map_err(|error| format!("Folder browse worker failed: {error}"))?
 }
 
+/// One dropped path classified by [`stat_dropped_paths`].
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DroppedPathInfo {
+    path: String,
+    is_dir: bool,
+    size: u64,
+}
+
+/// Classify paths dropped in from the shell.
+///
+/// A shell drop arrives as bare paths (Tauri's drag-drop payload carries no
+/// metadata), but the UI needs to know folder-vs-file to route each item and
+/// needs a size to display files. Paths that no longer exist are dropped from
+/// the result rather than failing the batch, since a drag can outlive its
+/// source.
+#[tauri::command]
+async fn stat_dropped_paths(paths: Vec<String>) -> Result<Vec<DroppedPathInfo>, String> {
+    if paths.len() > 65_536 {
+        return Err("Too many dropped paths".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .filter(|path| !path.trim().is_empty() && path.len() <= 32_768)
+            .filter_map(|path| {
+                let meta = std::fs::metadata(&path).ok()?;
+                let is_dir = meta.is_dir();
+                Some(DroppedPathInfo {
+                    path,
+                    is_dir,
+                    size: if is_dir { 0 } else { meta.len() },
+                })
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| format!("Path stat worker failed: {error}"))
+}
+
 #[cfg(test)]
 mod desktop_tests {
     use super::{
@@ -1060,8 +1100,18 @@ fn scan_status(state: State<'_, Arc<V2Store>>, scan_id: String) -> Option<ScanHa
 }
 
 #[tauri::command]
-fn scan_find(state: State<'_, Arc<V2Store>>, root_path: String) -> Option<ScanHandle> {
-    state.find_completed_scan(&root_path)
+async fn scan_find(app: tauri::AppHandle, root_path: String) -> Option<ScanHandle> {
+    // Looking up a cached scan reads the volume's change journal and replays it
+    // into SQLite. That is blocking work on a raw device handle, so it must not
+    // sit on the command thread every time a tab opens. Taking the store from an
+    // owned `AppHandle` rather than `State<'_, _>` keeps this returning a plain
+    // `Option`: an async command with a borrowed input is forced to return a
+    // `Result`, and a rejected promise here would read as a scan failure instead
+    // of a cache miss.
+    let store = Arc::clone(&*app.state::<Arc<V2Store>>());
+    tauri::async_runtime::spawn_blocking(move || store.find_completed_scan(&root_path))
+        .await
+        .unwrap_or(None)
 }
 
 #[tauri::command]
@@ -1968,6 +2018,14 @@ fn app_version() -> Value {
     serde_json::json!({ "version": filetree_core::app_version() })
 }
 
+/// Quit the whole app. Closing the window only tears down the webview, so the
+/// Exit menu and the renderer's close watchdog both come through here: a wedged
+/// teardown can then never leave behind a window the user is unable to close.
+#[tauri::command]
+fn app_exit(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[tauri::command]
 fn app_config() -> Result<Value, String> {
     json_value(filetree_core::app_config_json())
@@ -1981,6 +2039,18 @@ fn drives() -> Result<Value, String> {
 #[tauri::command]
 fn special_folders() -> Result<Value, String> {
     json_value(filetree_core::special_folders_json())
+}
+
+#[tauri::command]
+async fn volume_info(path: String) -> Result<Value, String> {
+    // Querying a volume can stall for seconds on a disconnected network share,
+    // and a tab footer polls this on a timer. Keep it off the command thread so
+    // an unreachable drive can never freeze the window.
+    tauri::async_runtime::spawn_blocking(move || {
+        json_value(filetree_core::volume_info_json(&path))
+    })
+    .await
+    .map_err(|error| format!("Volume query worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -2666,9 +2736,11 @@ pub fn run() {
         .manage(Arc::new(terminal::TerminalRegistry::default()))
         .invoke_handler(tauri::generate_handler![
             app_version,
+            app_exit,
             app_config,
             drives,
             special_folders,
+            volume_info,
             app_settings_get,
             app_settings_set,
             bookmarks_get,
@@ -2688,6 +2760,7 @@ pub fn run() {
             fs_watch_stop,
             directory_snapshot,
             browse_directories,
+            stat_dropped_paths,
             file_icon,
             file_icons,
             file_thumbnail,

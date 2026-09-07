@@ -38,11 +38,14 @@ import {
   type CompressionSource,
 } from "../api/client";
 import { invalidateAll as invalidateAllScanCache } from "../lib/scanCache";
+import { isPathDrag, readDroppedEntries, resolveDroppedPaths } from "../lib/dropPaths";
+import { registerDropZone } from "../lib/dropZones";
 import { formatBytes } from "../utils/formatBytes";
 import { toast } from "../lib/toast";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
 import { CompressionMonitor } from "./CompressionMonitor";
+import { Select } from "./Select";
 
 // Compression page (media re-encode + zip, with live jobs).
 //
@@ -1641,59 +1644,56 @@ export function CompressView({
     [nodeById, extraFiles],
   );
 
-  // Read dropped items synchronously (DataTransfer entries are invalidated once
-  // the event handler returns), resolving each to an absolute path via the
-  // Electron `getPathForFile` bridge and a directory flag via the entries API.
   const onZoneDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
       e.stopPropagation();
       dragDepthRef.current = 0;
       setDragActive(false);
-      const dt = e.dataTransfer;
-      if (!dt) return;
-      const getPathForFile = (window as unknown as { electronAPI?: { getPathForFile?: (f: File) => string } })
-        .electronAPI?.getPathForFile;
-      const entries: { path: string; isDir: boolean; size: number }[] = [];
-      const items = dt.items ? Array.from(dt.items) : [];
-      const fileList = dt.files ? Array.from(dt.files) : [];
-      const count = Math.max(items.length, fileList.length);
-      for (let i = 0; i < count; i++) {
-        const item = items[i];
-        const file = item?.getAsFile?.() ?? fileList[i] ?? null;
-        if (!file) continue;
-        let path = "";
-        try { path = getPathForFile?.(file) || (file as unknown as { path?: string }).path || ""; }
-        catch { path = (file as unknown as { path?: string }).path || ""; }
-        if (!path) continue;
-        // A directory entry reports isDirectory via the entries API; fall back to
-        // the heuristic that Explorer folders arrive as a 0-byte, type-less File.
-        let isDir = false;
-        const entry = item?.webkitGetAsEntry?.();
-        if (entry) isDir = entry.isDirectory;
-        else isDir = file.size === 0 && file.type === "";
-        entries.push({ path, isDir, size: file.size });
-      }
-      addDroppedEntries(entries);
+      addDroppedEntries(readDroppedEntries(e.dataTransfer));
     },
     [addDroppedEntries],
   );
 
+  // Shell drags never reach the webview's drop handlers (Tauri consumes them
+  // first), so the body registers as a native drop zone too. The HTML5 handlers
+  // here still cover drags that start inside the app, which do reach us.
+  // Read through a ref so the zone registers once and survives re-renders.
+  const nativeDropRef = useRef<(paths: string[]) => void>(() => {});
+  nativeDropRef.current = (paths: string[]) => {
+    resolveDroppedPaths(paths)
+      .then(addDroppedEntries)
+      .catch(() => { /* nothing resolvable in the drop */ });
+  };
+
+  useEffect(() => {
+    if (!scrollEl) return;
+    return registerDropZone(scrollEl, {
+      onOver: () => setDragActive(true),
+      onLeave: () => { dragDepthRef.current = 0; setDragActive(false); },
+      onDrop: (paths) => {
+        dragDepthRef.current = 0;
+        setDragActive(false);
+        nativeDropRef.current(paths);
+      },
+    });
+  }, [scrollEl]);
+
   const onZoneDragEnter = useCallback((e: React.DragEvent) => {
-    if (!Array.from(e.dataTransfer?.types ?? []).includes("Files")) return;
+    if (!isPathDrag(e.dataTransfer)) return;
     e.preventDefault();
     dragDepthRef.current += 1;
     setDragActive(true);
   }, []);
 
   const onZoneDragOver = useCallback((e: React.DragEvent) => {
-    if (!Array.from(e.dataTransfer?.types ?? []).includes("Files")) return;
+    if (!isPathDrag(e.dataTransfer)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
   }, []);
 
   const onZoneDragLeave = useCallback((e: React.DragEvent) => {
-    if (!Array.from(e.dataTransfer?.types ?? []).includes("Files")) return;
+    if (!isPathDrag(e.dataTransfer)) return;
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDragActive(false);
   }, []);
@@ -2409,31 +2409,26 @@ export function CompressView({
         {!perf.hidePresets && (
         <div className="compress-group" aria-label="Quality preset">
           <span className="compress-group-label">Preset</span>
-          <select
+          <Select
             className="compress-custom-select"
             aria-label="Quality preset"
             value={selectedId}
-            onChange={(e) => selectPreset(e.target.value)}
+            options={[
+              ...PRESETS.filter((preset) => preset.id !== "custom").map((preset) => ({
+                value: preset.id,
+                label: preset.label,
+                hint: "Preset",
+              })),
+              ...userPresets.map((preset) => ({
+                value: preset.id,
+                label: preset.name,
+                hint: "Saved",
+              })),
+              { value: "custom", label: "Custom" },
+            ]}
+            onChange={selectPreset}
             disabled={inRun}
-          >
-            <optgroup label="Presets">
-              {PRESETS.filter((p) => p.id !== "custom").map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.label}
-                </option>
-              ))}
-            </optgroup>
-            {userPresets.length > 0 && (
-              <optgroup label="Saved">
-                {userPresets.map((u) => (
-                  <option key={u.id} value={u.id}>
-                    {u.name}
-                  </option>
-                ))}
-              </optgroup>
-            )}
-            <option value="custom">Custom</option>
-          </select>
+          />
           <button
             className="compress-btn"
             onClick={() => setManagerOpen(true)}
@@ -2453,6 +2448,7 @@ export function CompressView({
           </button>
         </div>
         )}
+        {!perf.hidePresets && <span className="compress-toolbar-divider" aria-hidden="true" />}
         <div
           className="compress-group"
           role="radiogroup"
@@ -2475,41 +2471,39 @@ export function CompressView({
             </button>
           ))}
         </div>
-        <label className="compress-toggle">
-          <input
-            type="checkbox"
-            checked={tagFilename}
-            disabled={inRun}
-            onChange={(e) => setTagFilename(e.target.checked)}
-          />
-          Add [COMPRESSED] tag
-        </label>
+        <span className="compress-toolbar-divider" aria-hidden="true" />
+        {/* The [COMPRESSED] tag renames the output, so it belongs with the other
+            output settings rather than floating unlabelled between the groups. */}
         <div
           className="compress-group"
-          role="radiogroup"
+          role="group"
           aria-label="Where to write compressed outputs"
         >
           <span className="compress-group-label">Output</span>
-          <button
-            role="radio"
-            aria-checked={outputMode === "inplace"}
-            className={`compress-chip${outputMode === "inplace" ? " active" : ""}`}
-            onClick={() => setOutputMode("inplace")}
-            disabled={inRun}
-            title="Write each compressed file beside its original, then dispose of the original per the Original setting."
-          >
-            In place
-          </button>
-          <button
-            role="radio"
-            aria-checked={outputMode === "folder"}
-            className={`compress-chip${outputMode === "folder" ? " active" : ""}`}
-            onClick={() => setOutputMode("folder")}
-            disabled={inRun}
-            title="Write every compressed copy into a chosen folder, leaving originals untouched."
-          >
-            Output to folder
-          </button>
+          {/* The destination is a radio set, but the tag checkbox below shares
+              the group — so the radios keep their own radiogroup. */}
+          <span className="compress-group-radios" role="radiogroup" aria-label="Output destination">
+            <button
+              role="radio"
+              aria-checked={outputMode === "inplace"}
+              className={`compress-chip${outputMode === "inplace" ? " active" : ""}`}
+              onClick={() => setOutputMode("inplace")}
+              disabled={inRun}
+              title="Write each compressed file beside its original, then dispose of the original per the Original setting."
+            >
+              In place
+            </button>
+            <button
+              role="radio"
+              aria-checked={outputMode === "folder"}
+              className={`compress-chip${outputMode === "folder" ? " active" : ""}`}
+              onClick={() => setOutputMode("folder")}
+              disabled={inRun}
+              title="Write every compressed copy into a chosen folder, leaving originals untouched."
+            >
+              Output to folder
+            </button>
+          </span>
           {outputMode === "folder" && (
             <input
               type="text"
@@ -2522,7 +2516,17 @@ export function CompressView({
               spellCheck={false}
             />
           )}
+          <label className="compress-toggle">
+            <input
+              type="checkbox"
+              checked={tagFilename}
+              disabled={inRun}
+              onChange={(e) => setTagFilename(e.target.checked)}
+            />
+            Add [COMPRESSED] tag
+          </label>
         </div>
+        <span className="compress-toolbar-divider" aria-hidden="true" />
         <button
           className={`compress-btn${showPerf ? " active" : ""}`}
           onClick={() => setShowPerf((v) => !v)}
@@ -2618,18 +2622,17 @@ export function CompressView({
         <div className="compress-options" aria-label="Compression options">
           <div className="compress-perf-field">
             <label htmlFor="cv-resolution">Resolution</label>
-            <select
-              id="cv-resolution"
-              value={perf.customMaxHeight}
-              onChange={(e) => changeResolution(Number(e.target.value))}
+            <Select
+              className="compress-custom-select"
+              aria-label="Resolution"
+              value={String(perf.customMaxHeight)}
+              options={CUSTOM_HEIGHT_OPTIONS.map((option) => ({
+                value: String(option.value),
+                label: option.label,
+              }))}
+              onChange={(value) => changeResolution(Number(value))}
               disabled={inRun}
-            >
-              {CUSTOM_HEIGHT_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
+            />
           </div>
           <div className="compress-perf-field compress-perf-field-wide">
             <label htmlFor="cv-quality">
@@ -2650,38 +2653,45 @@ export function CompressView({
           </div>
           <div className="compress-perf-field">
             <label htmlFor="cv-encoder">Video encoder</label>
-            <select
-              id="cv-encoder"
+            <Select
+              className="compress-custom-select"
+              aria-label="Video encoder"
               value={perf.encoder}
               disabled={inRun}
-              onChange={(e) => changeEncoder(e.target.value as CompressEncoder)}
-            >
-              {ENCODER_OPTIONS.map((o) => {
+              onChange={changeEncoder}
+              options={ENCODER_OPTIONS.map((o) => {
                 const avail = encoderAvailable(o.id, tools, perf.codec);
-                return (
-                  <option key={o.id} value={o.id} disabled={!avail}>
-                    {o.label}{!avail ? " — unavailable" : ""}
-                  </option>
-                );
+                return {
+                  value: o.id,
+                  label: o.label,
+                  hint: avail ? undefined : "Unavailable",
+                  disabled: !avail,
+                };
               })}
-            </select>
+            />
           </div>
           <div className="compress-perf-field">
             <label htmlFor="cv-codec">Codec</label>
-            <select
-              id="cv-codec"
+            <Select
+              className="compress-custom-select"
+              aria-label="Codec"
               value={perf.codec}
               disabled={inRun}
-              onChange={(e) => changeCodec(e.target.value as CompressCodec)}
-            >
-              <option value="h264">H.264 (compatible)</option>
-              <option value="h265" disabled={!!tools && !tools.caps?.nvencH265 && !tools.caps?.qsvH265 && !tools.caps?.vceH265}>
-                H.265 (smaller)
-              </option>
-              <option value="av1" disabled={!!tools && !tools.caps?.nvencAv1 && !tools.caps?.qsvAv1 && !tools.caps?.vceAv1}>
-                AV1 (hardware only)
-              </option>
-            </select>
+              onChange={changeCodec}
+              options={[
+                { value: "h264", label: "H.264 (compatible)" },
+                {
+                  value: "h265",
+                  label: "H.265 (smaller)",
+                  disabled: !!tools && !tools.caps?.nvencH265 && !tools.caps?.qsvH265 && !tools.caps?.vceH265,
+                },
+                {
+                  value: "av1",
+                  label: "AV1 (hardware only)",
+                  disabled: !!tools && !tools.caps?.nvencAv1 && !tools.caps?.qsvAv1 && !tools.caps?.vceAv1,
+                },
+              ]}
+            />
           </div>
         </div>
       )}
@@ -3959,15 +3969,39 @@ function CompressHistory({
           <Icon name="search" size={13} />
           <input aria-label="Search compression history" placeholder="Search files, paths, outcomes..." value={historySearch} onChange={(event) => setHistorySearch(event.target.value)} />
         </div>
-        <select aria-label="History date" value={historyDate} onChange={(event) => setHistoryDate(event.target.value)}>
-          <option value="all">All dates</option><option value="today">Last 24 hours</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>
-        </select>
-        <select aria-label="History status" value={historyStatus} onChange={(event) => setHistoryStatus(event.target.value)}>
-          <option value="">All statuses</option><option value="success">Successful</option><option value="skipped">Skipped</option><option value="error">Failed</option>
-        </select>
-        <select aria-label="History type" value={historyKind} onChange={(event) => setHistoryKind(event.target.value)}>
-          <option value="">All types</option><option value="video">Video</option><option value="image">Images</option><option value="other">Other</option>
-        </select>
+        <Select
+          aria-label="History date"
+          value={historyDate}
+          options={[
+            { value: "all", label: "All dates" },
+            { value: "today", label: "Last 24 hours" },
+            { value: "7d", label: "Last 7 days" },
+            { value: "30d", label: "Last 30 days" },
+          ]}
+          onChange={setHistoryDate}
+        />
+        <Select
+          aria-label="History status"
+          value={historyStatus}
+          options={[
+            { value: "", label: "All statuses" },
+            { value: "success", label: "Successful" },
+            { value: "skipped", label: "Skipped" },
+            { value: "error", label: "Failed" },
+          ]}
+          onChange={setHistoryStatus}
+        />
+        <Select
+          aria-label="History type"
+          value={historyKind}
+          options={[
+            { value: "", label: "All types" },
+            { value: "video", label: "Video" },
+            { value: "image", label: "Images" },
+            { value: "other", label: "Other" },
+          ]}
+          onChange={setHistoryKind}
+        />
         <input className="compress-history-encoder" aria-label="Filter encoder" placeholder="Encoder / tool" value={historyEncoder} onChange={(event) => setHistoryEncoder(event.target.value)} />
         <span>{display.length.toLocaleString()} matching</span>
       </div>
@@ -4044,23 +4078,24 @@ function CompressHistory({
                       </span>
                       <span className="clog-ts" title={r.ts}>{formatTs(r.ts)}</span>
                       <span className="clog-act" onClick={(e) => e.stopPropagation()}>
-                        <select
+                        <Select
                           className="clog-again"
                           value=""
+                          options={[
+                            { value: "", label: "Compress again…" },
+                            { value: "current", label: "Current preset" },
+                            ...PRESETS.filter((preset) => preset.id !== "custom").map((preset) => ({
+                              value: preset.id,
+                              label: preset.label,
+                            })),
+                          ]}
                           title="Re-compress this file (current preset, or pick one)"
-                          onChange={(e) => {
-                            const v = e.target.value;
-                            e.currentTarget.value = "";
+                          aria-label={`Compress ${r.name || r.path} again`}
+                          onChange={(v) => {
                             if (!v) return;
                             onCompressAgain(r.path, v === "current" ? undefined : v);
                           }}
-                        >
-                          <option value="">Compress again…</option>
-                          <option value="current">Current preset</option>
-                          {PRESETS.filter((p) => p.id !== "custom").map((p) => (
-                            <option key={p.id} value={p.id}>{p.label}</option>
-                          ))}
-                        </select>
+                        />
                       </span>
                     </div>
                   );

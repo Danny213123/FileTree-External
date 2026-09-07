@@ -4,12 +4,13 @@ import type { DupeFileV2, DupeGroupV2 } from "../api/types";
 import type { DuplicatesController, KeepStrategy } from "../hooks/useDuplicates";
 import { formatBytes } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
-import { openPath, revealPath } from "../api/client";
+import { openPath, revealPath, shellContextMenu } from "../api/client";
 import { promptDialog } from "../lib/dialogs";
 import { hashingDeterminate, hashingPercent, hashingTitle } from "../lib/duplicatesScanUi";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
 import { FixedDropdown } from "./ConfigureColumnsMenu";
+import { Select, type SelectOption } from "./Select";
 import { DuplicateDeletionDialog } from "./DuplicateDeletionDialog";
 import { DupeGroupPreview } from "./DupeGroupPreview";
 
@@ -38,7 +39,7 @@ const COLUMNS: DupeCol[] = [
   { key: "content",  label: "Content",  width: 74,  align: "center" },
 ];
 
-const REVIEW_FILTERS: { value: ReviewFilter; label: string }[] = [
+const REVIEW_FILTERS: SelectOption<ReviewFilter>[] = [
   { value: "all",          label: "All groups" },
   { value: "selected",     label: "Marked" },
   { value: "needs-review", label: "Unverified" },
@@ -445,7 +446,7 @@ export function DuplicatesResults({
             onClick={() => setActionsMenuOpen((open) => !open)}
             aria-expanded={actionsMenuOpen}
           >
-            Actions <Icon name="caret-down" size={8} />
+            Actions <Icon name={actionsMenuOpen ? "caret-up" : "caret-down"} size={8} />
           </button>
           <FixedDropdown
             anchorRef={actionsBtnRef}
@@ -644,15 +645,13 @@ export function DuplicatesResults({
         </label>
         <label className="dg-field dg-field-inline">
           <span>Show:</span>
-          <select
+          <Select
             className="dg-select"
             value={reviewFilter}
-            onChange={(event) => setReviewFilter(event.target.value as ReviewFilter)}
-          >
-            {REVIEW_FILTERS.map((filter) => (
-              <option key={filter.value} value={filter.value}>{filter.label}</option>
-            ))}
-          </select>
+            options={REVIEW_FILTERS}
+            aria-label="Show"
+            onChange={setReviewFilter}
+          />
         </label>
         <div className="rb-dropdown-wrap" ref={colsBtnRef}>
           <button
@@ -661,7 +660,7 @@ export function DuplicatesResults({
             onClick={() => setColsMenuOpen((o) => !o)}
             aria-expanded={colsMenuOpen}
           >
-            Columns <Icon name="caret-down" size={8} />
+            Columns <Icon name={colsMenuOpen ? "caret-up" : "caret-down"} size={8} />
           </button>
           <FixedDropdown anchorRef={colsBtnRef} open={colsMenuOpen} onClose={() => setColsMenuOpen(false)}>
             <div className="rb-dd-section">Columns</div>
@@ -884,7 +883,10 @@ export function DuplicatesResults({
                     }
                     if (event.key === "Enter") { event.preventDefault(); setPreviewGroup(g); }
                   }}
-                  onContextMenu={(e) => { e.preventDefault(); void revealPath(f.path); }}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    void shellContextMenu([f.path], e.clientX, e.clientY);
+                  }}
                 >
                   <div className="dg-cell dg-cell-gutter" role="gridcell">
                     {row.leader ? (

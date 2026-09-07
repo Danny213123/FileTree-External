@@ -29,6 +29,7 @@ import { formatDate } from "../utils/formatDate";
 import { toast, type ToastAction } from "../lib/toast";
 import { promptDialog } from "../lib/dialogs";
 import { TreeTable } from "./TreeTable";
+import { TabFooter } from "./TabFooter";
 import { BulkRenameDialog } from "./BulkRenameDialog";
 import { TagPopover } from "./TagPopover";
 import { ConfigureColumnsMenu } from "./ConfigureColumnsMenu";
@@ -41,6 +42,7 @@ import { getRecentDestinations, recordRecentDestination, removeRecentDestination
 import { FilterDialog } from "./FilterDialog";
 import { Breadcrumb } from "./Breadcrumb";
 import { Icon } from "./Icon";
+import { Select } from "./Select";
 import type { ScanStatus, ProgressStore } from "../hooks/useScan";
 import type { ScanResult, Metric, Unit } from "../api/types";
 import {
@@ -2690,23 +2692,33 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             <div className="editor-toolbar">
               <label>
                 Size
-                <select value={tree.metric} onChange={(e) => tree.setMetric(e.target.value as Metric)}>
-                  <option value="size">Size</option>
-                  <option value="allocated">Allocated</option>
-                  <option value="files">Files</option>
-                  <option value="folders">Folders</option>
-                </select>
+                <Select
+                  value={tree.metric}
+                  options={[
+                    { value: "size", label: "Size" },
+                    { value: "allocated", label: "Allocated" },
+                    { value: "files", label: "Files" },
+                    { value: "folders", label: "Folders" },
+                  ]}
+                  aria-label="Size metric"
+                  onChange={tree.setMetric}
+                />
               </label>
               <label>
                 Unit
-                <select value={tree.unit} onChange={(e) => tree.setUnit(e.target.value as Unit)}>
-                  <option value="auto">Auto</option>
-                  <option value="tb">TB</option>
-                  <option value="gb">GB</option>
-                  <option value="mb">MB</option>
-                  <option value="kb">KB</option>
-                  <option value="bytes">Bytes</option>
-                </select>
+                <Select
+                  value={tree.unit}
+                  options={[
+                    { value: "auto", label: "Auto" },
+                    { value: "tb", label: "TB" },
+                    { value: "gb", label: "GB" },
+                    { value: "mb", label: "MB" },
+                    { value: "kb", label: "KB" },
+                    { value: "bytes", label: "Bytes" },
+                  ]}
+                  aria-label="Display unit"
+                  onChange={tree.setUnit}
+                />
               </label>
               <span className="sep" />
               <label>
@@ -2846,6 +2858,13 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             )}
           </div>
         </div>
+        <TabFooter
+          scanResult={data}
+          root={tree.nodeById.get(0) ?? null}
+          scanPath={scanPath}
+          unit={tree.unit}
+          decimals={decimals}
+        />
       </div>
 
       {filterDialogOpen && (

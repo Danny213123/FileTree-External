@@ -3,6 +3,7 @@ import type { NodeRecord, Unit } from "../api/types";
 import { formatBytes, formatCount } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
 import { isImage, isVideo } from "../lib/thumbs";
+import { localPoint, localRect, localViewport } from "../lib/overlay";
 import { ShellThumbnail } from "./ShellThumbnail";
 
 interface Props {
@@ -36,13 +37,16 @@ export function NodeTooltip({ node, unit, anchorX, anchorY, thumbPath }: Props) 
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    const rect = el.getBoundingClientRect();
-    let left = anchorX + 16;
-    let top = anchorY + 8;
-    if (left + rect.width > vw - 8) left = anchorX - rect.width - 8;
-    if (top + rect.height > vh - 8) top = anchorY - rect.height - 8;
+    // Local (zoom-relative) space: the cursor and the measured box arrive in
+    // viewport pixels, but `pos` is applied as an inline offset inside the
+    // zoomed shell. See lib/overlay.ts.
+    const view = localViewport();
+    const rect = localRect(el);
+    const { x: ax, y: ay } = localPoint(anchorX, anchorY);
+    let left = ax + 16;
+    let top = ay + 8;
+    if (left + rect.width > view.width - 8) left = ax - rect.width - 8;
+    if (top + rect.height > view.height - 8) top = ay - rect.height - 8;
     setPos({ left, top });
   }, [anchorX, anchorY, thumbLoaded, thumbError]);
 

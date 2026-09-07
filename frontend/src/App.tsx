@@ -16,6 +16,7 @@ import {
   fetchCompressTools,
   claimExternalPaths,
   notify,
+  exitApp,
 } from "./api/client";
 import type { AppSettings, AppTabSettings, CompressionSource } from "./api/client";
 import { isTauriV2 } from "./api/v2";
@@ -52,6 +53,7 @@ import {
   initAppearance,
   loadAccent,
   loadScale,
+  nativeZoom,
 } from "./lib/appearance";
 import { ActivityBar, type ViewId } from "./components/ActivityBar";
 import { SideBar } from "./components/SideBar";
@@ -61,6 +63,8 @@ import { InspectorPane } from "./components/InspectorPane";
 import { ScheduleWizard } from "./components/ScheduleWizard";
 import { LazyView } from "./components/LazyView";
 import { CompressView } from "./components/CompressView";
+import { localDelta, localViewport } from "./lib/overlay";
+import { dropZoneAt, type DropZone } from "./lib/dropZones";
 import { recordSample as recordDriveSample } from "./lib/driveForecast";
 import { newestSessionSettings, writeSessionShadow } from "./lib/sessionState";
 
@@ -78,6 +82,8 @@ const DuplicatesView = lazy(() => import("./components/DuplicatesView").then((m)
 
 const SETTINGS_DEBOUNCE_MS = 700;
 const CLOSE_FLUSH_TIMEOUT_MS = 1_500;
+/** Deadline for a close to finish on its own before the process is killed. */
+const CLOSE_HARD_EXIT_MS = 4_000;
 
 // Views that take over the whole editor area (replacing the workspace tabs),
 // each rendered from its own dedicated editor block below.
@@ -572,6 +578,18 @@ export default function App() {
   const flushSettingsRef = useRef(flushSettings);
   flushSettingsRef.current = flushSettings;
 
+  // Menu-driven quit. It saves and exits directly rather than going through the
+  // window, because a webview's own `window.close()` is a no-op on WebView2.
+  const handleExit = useCallback(() => {
+    void (async () => {
+      await Promise.race([
+        flushSettingsRef.current().catch(() => {}),
+        new Promise<void>((resolve) => setTimeout(resolve, CLOSE_FLUSH_TIMEOUT_MS)),
+      ]);
+      await exitApp().catch(() => {});
+    })();
+  }, []);
+
   useEffect(() => { persist(); },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [darkMode, threads, includeHidden, followLinks, collectOwners, exclude, tabs, groups, focusedGroupId, tick,
@@ -589,13 +607,25 @@ export default function App() {
     let disposed = false;
     let unlistenClose: (() => void) | undefined;
     let closing = false;
+    // Quits the process outright. `destroy()` only tears down the window and
+    // can reject or hang; this cannot, because it is a plain fire-and-forget
+    // command that the backend answers by ending its own event loop.
+    const forceQuit = () => { void exitApp().catch(() => {}); };
     if (isTauriV2()) {
       void import("@tauri-apps/api/window").then(async ({ getCurrentWindow }) => {
         const appWindow = getCurrentWindow();
         const unlisten = await appWindow.onCloseRequested(async (event) => {
-          event.preventDefault();
-          if (closing) return;
+          // Cancelling the native close means the app can only quit if the rest
+          // of this handler succeeds, so every later step needs an escape hatch.
+          // Without one, a rejected `destroy()` left the window unclosable.
+          if (closing) {
+            // The first attempt is stuck. Let this one close natively and quit.
+            forceQuit();
+            return;
+          }
           closing = true;
+          event.preventDefault();
+          const watchdog = setTimeout(forceQuit, CLOSE_HARD_EXIT_MS);
           try {
             // A close must not be held hostage by a blocked SQLite/IPC write.
             // The synchronous session shadow has already captured the state.
@@ -605,8 +635,12 @@ export default function App() {
             ]);
           } catch {
             // The local shadow was written before the durable save attempt.
-          } finally {
+          }
+          try {
             await appWindow.destroy();
+          } catch {
+            clearTimeout(watchdog);
+            forceQuit();
           }
         });
         if (disposed) unlisten();
@@ -1153,6 +1187,10 @@ export default function App() {
     setFocusedGroupId(groupId);
   }, []);
 
+  // Dashed app-wide target shown while a shell drag hovers somewhere with no
+  // more specific drop target of its own.
+  const [shellDragHint, setShellDragHint] = useState(false);
+
   useEffect(() => {
     type ElectronAPI = {
       onExternalDrop?: (cb: (paths: string[]) => void) => void | (() => void);
@@ -1200,8 +1238,15 @@ export default function App() {
       if (!Array.from(e.dataTransfer.types).includes("Files")) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "copy";
+      setShellDragHint(!dropZoneAt(e.clientX, e.clientY));
+    };
+    // relatedTarget is null only when the pointer leaves the window entirely,
+    // as opposed to crossing between elements inside it.
+    const onDragLeave = (e: DragEvent) => {
+      if (e.relatedTarget === null) setShellDragHint(false);
     };
     const onDrop = (e: DragEvent) => {
+      setShellDragHint(false);
       if (!e.dataTransfer?.files?.length) return;
       e.preventDefault();
       const paths = Array.from(e.dataTransfer.files).map(pathForFile).filter(Boolean);
@@ -1217,6 +1262,20 @@ export default function App() {
     const clearNativeDropTarget = () => {
       nativeDropTarget?.classList.remove("native-drop-target");
       nativeDropTarget = null;
+    };
+    // A view that registered itself as a drop zone (see lib/dropZones) claims
+    // the drag outright, so it can show its own affordance and handle the paths
+    // itself instead of them falling through to "open each in a new tab".
+    let activeZone: { el: HTMLElement; zone: DropZone } | null = null;
+    const clearZoneTarget = () => {
+      activeZone?.zone.onLeave?.();
+      activeZone = null;
+    };
+    const markZoneTarget = (next: { el: HTMLElement; zone: DropZone }) => {
+      if (activeZone?.el === next.el) return;
+      clearZoneTarget();
+      activeZone = next;
+      next.zone.onOver?.();
     };
     const markNativeDropTarget = (clientX: number, clientY: number) => {
       const next = (document.elementFromPoint(clientX, clientY) as HTMLElement | null)
@@ -1236,15 +1295,37 @@ export default function App() {
           const payload = event.payload;
           if (payload.type === "leave") {
             clearNativeDropTarget();
+            clearZoneTarget();
+            setShellDragHint(false);
             return;
           }
-          const logical = payload.position.toLogical(scaleFactor);
+          // The payload reports window pixels; native zoom rescales the CSS
+          // pixel, so divide to land where the cursor actually is on the page.
+          const z = nativeZoom() || 1;
+          const raw = payload.position.toLogical(scaleFactor);
+          const logical = { x: raw.x / z, y: raw.y / z };
+          const zone = dropZoneAt(logical.x, logical.y);
           if (payload.type === "enter" || payload.type === "over") {
-            markNativeDropTarget(logical.x, logical.y);
+            if (zone) {
+              clearNativeDropTarget();
+              markZoneTarget(zone);
+            } else {
+              clearZoneTarget();
+              markNativeDropTarget(logical.x, logical.y);
+            }
+            // A folder row is its own drop target (it highlights), so the
+            // app-wide box would only add noise on top of it.
+            setShellDragHint(!zone && !nativeDropTarget);
             return;
           }
           clearNativeDropTarget();
+          clearZoneTarget();
+          setShellDragHint(false);
           if ((window as unknown as { __FILETREE_NATIVE_DRAG_ACTIVE__?: boolean }).__FILETREE_NATIVE_DRAG_ACTIVE__) {
+            return;
+          }
+          if (zone) {
+            zone.zone.onDrop(payload.paths);
             return;
           }
           handleExternalPaths(payload.paths, logical.x, logical.y, true);
@@ -1253,12 +1334,16 @@ export default function App() {
       }).catch((error) => console.warn("Tauri drag/drop listener failed", error));
     }
     window.addEventListener("dragover", onDragOver);
+    window.addEventListener("dragleave", onDragLeave);
     window.addEventListener("drop", onDrop);
     return () => {
       disposed = true;
       clearNativeDropTarget();
+      clearZoneTarget();
+      setShellDragHint(false);
       tauriUnlisten?.();
       window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("dragleave", onDragLeave);
       window.removeEventListener("drop", onDrop);
       unsubExternalDrop?.();
     };
@@ -1581,7 +1666,7 @@ export default function App() {
     const startX = e.clientX;
     const startW = groupsRef.current.find((g) => g.id === groupId)?.width ?? DEFAULT_GROUP_WIDTH;
     const onMove = (ev: MouseEvent) => {
-      const w = Math.max(MIN_GROUP_WIDTH, Math.min(1600, startW + (ev.clientX - startX)));
+      const w = Math.max(MIN_GROUP_WIDTH, Math.min(1600, startW + localDelta(ev.clientX - startX)));
       setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, width: w } : g)));
     };
     const onUp = () => {
@@ -1649,7 +1734,7 @@ export default function App() {
     const startX = e.clientX;
     const startW = sidebarWidth;
     const onMove = (ev: MouseEvent) => {
-      const w = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, startW + (ev.clientX - startX)));
+      const w = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, startW + localDelta(ev.clientX - startX)));
       setSidebarWidth(w);
     };
     const onUp = () => {
@@ -1669,7 +1754,7 @@ export default function App() {
     const startX = e.clientX;
     const startW = chatWidth;
     const onMove = (ev: MouseEvent) => {
-      const delta = startX - ev.clientX; // drag left = wider chat
+      const delta = localDelta(startX - ev.clientX); // drag left = wider chat
       setChatWidth(Math.max(260, Math.min(620, startW + delta)));
     };
     const onUp = () => {
@@ -1690,7 +1775,7 @@ export default function App() {
     const startX = e.clientX;
     const startW = inspectorWidth;
     const onMove = (ev: MouseEvent) => {
-      const delta = startX - ev.clientX; // drag left = wider inspector
+      const delta = localDelta(startX - ev.clientX); // drag left = wider inspector
       setInspectorWidth(Math.max(240, Math.min(640, startW + delta)));
     };
     const onUp = () => {
@@ -1719,8 +1804,8 @@ export default function App() {
     const startY = e.clientY;
     const startH = terminalHeight;
     const onMove = (ev: MouseEvent) => {
-      const delta = startY - ev.clientY; // drag up = taller
-      setTerminalHeight(Math.max(120, Math.min(window.innerHeight - 220, startH + delta)));
+      const delta = localDelta(startY - ev.clientY); // drag up = taller
+      setTerminalHeight(Math.max(120, Math.min(localViewport().height - 220, startH + delta)));
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
@@ -1739,8 +1824,8 @@ export default function App() {
     const startY = e.clientY;
     const startH = panelHeight;
     const onMove = (ev: MouseEvent) => {
-      const delta = startY - ev.clientY;
-      setPanelHeight(Math.max(120, Math.min(window.innerHeight - 220, startH + delta)));
+      const delta = localDelta(startY - ev.clientY);
+      setPanelHeight(Math.max(120, Math.min(localViewport().height - 220, startH + delta)));
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
@@ -1817,7 +1902,7 @@ export default function App() {
         { separator: true },
         { label: "Scheduled Scans…", onClick: handleOpenSchedule },
         { separator: true },
-        { label: "Exit", onClick: () => window.close() },
+        { label: "Exit", onClick: handleExit },
       ],
     },
     {
@@ -2352,6 +2437,17 @@ export default function App() {
           onToggleDark={handleToggleDark}
           onClose={() => setAppearanceOpen(false)}
         />
+      )}
+
+      {/* Shell-drag affordance. Only shown when no view claimed the drag — a
+          registered drop zone draws its own, more specific target instead. */}
+      {shellDragHint && (
+        <div className="shell-drop-overlay" aria-hidden="true">
+          <div className="shell-drop-box">
+            <Icon name="folder-plus" size={22} />
+            <span>Drop to open in FileTree</span>
+          </div>
+        </div>
       )}
 
       {/* App-wide overlays: themed confirm/prompt modals + the toast stack. */}

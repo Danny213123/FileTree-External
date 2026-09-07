@@ -8,6 +8,7 @@ import { confirmDialog } from "../lib/dialogs";
 import { toast } from "../lib/toast";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
+import { Select } from "./Select";
 import { isAutoSnapshot } from "../lib/autoSnapshot";
 import { SnapshotTrend } from "./SnapshotTrend";
 
@@ -221,18 +222,24 @@ export function SnapshotsView({ data, nodeById, onNavigate }: SnapshotsViewProps
         <div className="snap-pick">
           <label>
             <span>Base</span>
-            <select value={aId} onChange={(e) => setAId(e.target.value)} disabled={busy}>
-              {options.length === 0 && <option value="">No snapshots yet</option>}
-              {options.map((o) => <option key={`a-${o.value}`} value={o.value}>{o.label}</option>)}
-            </select>
+            <Select
+              value={aId}
+              options={options.length ? options : [{ value: "", label: "No snapshots yet" }]}
+              aria-label="Base snapshot"
+              onChange={setAId}
+              disabled={busy}
+            />
           </label>
           <Icon name="chevron-right" size={14} className="snap-arrow" />
           <label>
             <span>Compare to</span>
-            <select value={bId} onChange={(e) => setBId(e.target.value)} disabled={busy}>
-              {options.length === 0 && <option value="">No snapshots yet</option>}
-              {options.map((o) => <option key={`b-${o.value}`} value={o.value}>{o.label}</option>)}
-            </select>
+            <Select
+              value={bId}
+              options={options.length ? options : [{ value: "", label: "No snapshots yet" }]}
+              aria-label="Comparison snapshot"
+              onChange={setBId}
+              disabled={busy}
+            />
           </label>
           <button className="snap-btn primary" onClick={() => void handleCompare()} disabled={busy || !aId || !bId}>
             {busy ? "Comparing…" : "Compare"}

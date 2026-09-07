@@ -16,6 +16,7 @@ import type { BulkRenameOp } from "../api/types";
 import { pushUndo, parentDir } from "../lib/undo";
 import { toast, type ToastAction } from "../lib/toast";
 import { Icon } from "./Icon";
+import { Select } from "./Select";
 
 type CaseMode = "none" | "upper" | "lower" | "title";
 
@@ -232,12 +233,17 @@ export function BulkRenameDialog({ nodes, onClose, onApplied, undoAction }: Bulk
             </label>
             <label className="brn-field">
               <span>Case</span>
-              <select value={caseMode} onChange={(e) => setCaseMode(e.target.value as CaseMode)}>
-                <option value="none">No change</option>
-                <option value="upper">UPPERCASE</option>
-                <option value="lower">lowercase</option>
-                <option value="title">Title Case</option>
-              </select>
+              <Select
+                value={caseMode}
+                options={[
+                  { value: "none", label: "No change" },
+                  { value: "upper", label: "UPPERCASE" },
+                  { value: "lower", label: "lowercase" },
+                  { value: "title", label: "Title Case" },
+                ]}
+                aria-label="Case transformation"
+                onChange={setCaseMode}
+              />
             </label>
           </div>
           <div className="brn-row brn-row-opts">
@@ -257,10 +263,16 @@ export function BulkRenameDialog({ nodes, onClose, onApplied, undoAction }: Bulk
               <input value={sep} disabled={!numEnabled} maxLength={4} onChange={(e) => setSep(e.target.value)} />
             </label>
             <label className="brn-field"><span>Position</span>
-              <select value={numPos} disabled={!numEnabled} onChange={(e) => setNumPos(e.target.value as "suffix" | "prefix")}>
-                <option value="suffix">Suffix</option>
-                <option value="prefix">Prefix</option>
-              </select>
+              <Select
+                value={numPos}
+                options={[
+                  { value: "suffix", label: "Suffix" },
+                  { value: "prefix", label: "Prefix" },
+                ]}
+                aria-label="Number position"
+                disabled={!numEnabled}
+                onChange={setNumPos}
+              />
             </label>
           </div>
           <div className="brn-hint">

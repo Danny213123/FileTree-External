@@ -11,6 +11,7 @@ import { formatBytes } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
+import { Select } from "./Select";
 
 interface CompareTabProps {
   /** The focused tab's current scan (the live "current" comparison side). */
@@ -144,18 +145,24 @@ export function CompareTab({ data, nodeById, onNavigate }: CompareTabProps) {
         <div className="compare-pick">
           <label>
             <span>Base</span>
-            <select value={aId} onChange={(e) => setAId(e.target.value)} disabled={busy}>
-              {options.length === 0 && <option value="">No snapshots yet</option>}
-              {options.map((o) => <option key={`a-${o.value}`} value={o.value}>{o.label}</option>)}
-            </select>
+            <Select
+              value={aId}
+              options={options.length ? options : [{ value: "", label: "No snapshots yet" }]}
+              aria-label="Base snapshot"
+              onChange={setAId}
+              disabled={busy}
+            />
           </label>
           <Icon name="chevron-right" size={14} className="compare-arrow" />
           <label>
             <span>Compare to</span>
-            <select value={bId} onChange={(e) => setBId(e.target.value)} disabled={busy}>
-              {options.length === 0 && <option value="">No snapshots yet</option>}
-              {options.map((o) => <option key={`b-${o.value}`} value={o.value}>{o.label}</option>)}
-            </select>
+            <Select
+              value={bId}
+              options={options.length ? options : [{ value: "", label: "No snapshots yet" }]}
+              aria-label="Comparison snapshot"
+              onChange={setBId}
+              disabled={busy}
+            />
           </label>
           <button className="compare-btn primary" onClick={() => void handleCompare()} disabled={busy || !aId || !bId}>
             {busy ? "Comparing…" : "Compare"}

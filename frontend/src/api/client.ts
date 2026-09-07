@@ -510,6 +510,28 @@ export async function fetchDrives(): Promise<DriveList> {
   return getJson<DriveList>("/api/drives");
 }
 
+/** Capacity and geometry of one volume, for a scan tab's footer. */
+export interface VolumeInfo {
+  path: string;
+  /** "NTFS", "exFAT", …; "" when the platform wouldn't say. */
+  filesystem: string;
+  /** 0 when the volume's capacity couldn't be queried. */
+  totalBytes: number;
+  freeBytes: number;
+  /** Allocation unit size; 0 when unavailable. */
+  bytesPerCluster: number;
+}
+
+/** Never throws: the footer degrades to scan-only figures when this fails. */
+export async function fetchVolumeInfo(path: string): Promise<VolumeInfo | null> {
+  if (!isTauriV2()) return null;
+  try {
+    return await invoke<VolumeInfo>("volume_info", { path });
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchSpecialFolders(): Promise<SpecialFolderList> {
   if (isTauriV2()) return invoke<SpecialFolderList>("special_folders");
   return getJson<SpecialFolderList>("/api/special-folders");
@@ -616,6 +638,10 @@ export async function openPath(path: string): Promise<void> {
 
 /** Ask the backend to terminate the app (routed through the token-authed IPC). */
 export async function exitApp(): Promise<void> {
+  if (isTauriV2()) {
+    await invoke("app_exit");
+    return;
+  }
   await postMutation("/api/exit");
 }
 

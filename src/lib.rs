@@ -15,6 +15,9 @@ mod file_ops;
 mod fileattr;
 mod io;
 mod json;
+mod mft;
+mod refresh;
+mod usn;
 mod model;
 mod owner;
 mod preflight;
@@ -82,6 +85,11 @@ pub fn drives_json() -> String {
 
 pub fn special_folders_json() -> String {
     export::special_folders_json()
+}
+
+/// Capacity, filesystem and cluster size of the volume holding `path`.
+pub fn volume_info_json(path: &str) -> String {
+    export::volume_info_json(path)
 }
 
 pub fn open_system_path(path: &str) -> Result<(), String> {

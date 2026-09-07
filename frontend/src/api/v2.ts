@@ -42,6 +42,7 @@ interface V2NodeItem {
   extension: string;
   owner: string;
   attributes: number;
+  newestCreatedMs: number;
 }
 
 export interface V2NodePage {
@@ -173,6 +174,7 @@ export function toNodeRecord(item: V2NodeItem): NodeRecord {
     owner: item.owner,
     attributes: item.attributes,
     aggregateKnown: true,
+    lastFileCreated: item.newestCreatedMs,
   };
 }
 
@@ -233,7 +235,8 @@ async function loadV2Scan(handle: V2ScanHandle, threadCount: number): Promise<Sc
     elapsedMs: handle.elapsedMs,
     threadCount,
     nodeCount: handle.nodeCount,
-    errorCount: 0,
+    // The root row carries the scan's rolled-up count of unreadable folders.
+    errorCount: root.errors,
     nodes: [toNodeRecord(root)],
     lazy: true,
     scanId: handle.scanId,

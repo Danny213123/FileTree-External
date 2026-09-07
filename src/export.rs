@@ -1213,6 +1213,110 @@ fn enumerate_drives() -> Vec<(String, String, u64, u64)> {
     result
 }
 
+/// Filesystem name and cluster size of the volume holding `path`.
+///
+/// Separate from [`enumerate_drives`] because a tab's footer describes whatever
+/// was scanned — often a folder deep inside a volume — rather than a drive the
+/// picker listed. Anything unqueryable comes back empty or zero; the footer
+/// simply omits what it doesn't know instead of guessing.
+#[cfg(windows)]
+fn volume_details(path: &std::path::Path) -> (String, u64) {
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe extern "system" {
+        fn GetVolumePathNameW(lpszFileName: *const u16, lpszVolumePathName: *mut u16, cch: u32)
+        -> i32;
+        fn GetVolumeInformationW(
+            lpRootPathName: *const u16,
+            lpVolumeNameBuffer: *mut u16,
+            nVolumeNameSize: u32,
+            lpVolumeSerialNumber: *mut u32,
+            lpMaximumComponentLength: *mut u32,
+            lpFileSystemFlags: *mut u32,
+            lpFileSystemNameBuffer: *mut u16,
+            nFileSystemNameSize: u32,
+        ) -> i32;
+        fn GetDiskFreeSpaceW(
+            lpRootPathName: *const u16,
+            lpSectorsPerCluster: *mut u32,
+            lpBytesPerSector: *mut u32,
+            lpNumberOfFreeClusters: *mut u32,
+            lpTotalNumberOfClusters: *mut u32,
+        ) -> i32;
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // Both calls below want the volume's mount point, which for a nested path
+    // is neither the path itself nor necessarily a drive letter.
+    let mut mount = vec![0u16; 260];
+    if unsafe { GetVolumePathNameW(wide.as_ptr(), mount.as_mut_ptr(), mount.len() as u32) } == 0 {
+        return (String::new(), 0);
+    }
+
+    let mut fs_name = [0u16; 32];
+    let filesystem = if unsafe {
+        GetVolumeInformationW(
+            mount.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs_name.as_mut_ptr(),
+            fs_name.len() as u32,
+        )
+    } != 0
+    {
+        let end = fs_name.iter().position(|c| *c == 0).unwrap_or(fs_name.len());
+        String::from_utf16_lossy(&fs_name[..end])
+    } else {
+        String::new()
+    };
+
+    let mut sectors_per_cluster: u32 = 0;
+    let mut bytes_per_sector: u32 = 0;
+    let cluster = if unsafe {
+        GetDiskFreeSpaceW(
+            mount.as_ptr(),
+            &mut sectors_per_cluster,
+            &mut bytes_per_sector,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } != 0
+    {
+        u64::from(sectors_per_cluster) * u64::from(bytes_per_sector)
+    } else {
+        0
+    };
+
+    (filesystem, cluster)
+}
+
+#[cfg(not(windows))]
+fn volume_details(_path: &std::path::Path) -> (String, u64) {
+    (String::new(), 0)
+}
+
+/// Capacity and geometry of the volume holding `path`, for a scan tab's footer.
+pub(crate) fn volume_info_json(path: &str) -> String {
+    let target = std::path::Path::new(path);
+    let (free, total) = crate::preflight::disk_space(target).unwrap_or((0, 0));
+    let (filesystem, bytes_per_cluster) = volume_details(target);
+    let mut output = String::from("{\"path\":");
+    push_json_string(&mut output, path);
+    output.push_str(",\"filesystem\":");
+    push_json_string(&mut output, &filesystem);
+    output.push_str(&format!(
+        ",\"totalBytes\":{total},\"freeBytes\":{free},\"bytesPerCluster\":{bytes_per_cluster}}}"
+    ));
+    output
+}
+
 pub(crate) fn push_id_array(output: &mut String, ids: &[usize]) {
     output.push('[');
     for (index, id) in ids.iter().enumerate() {

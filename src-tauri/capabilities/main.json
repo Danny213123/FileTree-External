@@ -3,5 +3,10 @@
   "identifier": "main",
   "description": "Minimum capabilities for the FileTree main window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    "core:webview:allow-set-webview-zoom"
+  ]
 }
