@@ -123,6 +123,15 @@ pub fn delete_verified_duplicate(
     )
 }
 
+/// Reversible deletion after the desktop has validated the review snapshot,
+/// keeper and scope. Metadata matches do not imply identical file contents.
+pub fn recycle_reviewed_duplicate(keeper: String, duplicate: String) -> Vec<String> {
+    dupes::action_recycle_reviewed(
+        std::path::Path::new(&keeper),
+        std::path::Path::new(&duplicate),
+    )
+}
+
 pub fn transfer_duplicate_paths(
     action: &str,
     paths: Vec<String>,

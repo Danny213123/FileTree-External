@@ -80,6 +80,7 @@ fn handle(
         if request.method == "GET" && child == Some("nodes") {
             let parent_id = query.get("parentId").and_then(|value| value.parse().ok());
             let query = ScanQuery {
+                directory_paths: Vec::new(),
                 scan_id: scan_id.to_string(),
                 parent_id,
                 offset: number(&query, "offset", 0),

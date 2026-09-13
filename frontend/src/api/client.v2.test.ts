@@ -8,6 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
+import { scanPage } from "./v2";
 import {
   claimExternalPaths,
   clipboardReadFiles,
@@ -30,6 +31,16 @@ import {
 } from "./client";
 
 describe("v2 bounded client queries", () => {
+  it("shares an in-flight search between the sidebar and main results", async () => {
+    let finish!: (value: unknown) => void;
+    vi.mocked(invoke).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const query = { scanId: "shared-search-test", search: "example", countTotal: false };
+    const first = scanPage(query);
+    const second = scanPage(query);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    finish({ items: [], total: 0, hasMore: false, offset: 0, limit: 500 });
+    expect(await first).toBe(await second);
+  });
   beforeEach(() => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,
@@ -165,6 +176,15 @@ describe("v2 bounded client queries", () => {
       mode: "symlink",
       permanent: true,
     });
+  });
+
+  it("keeps review usable when deletion is rejected before any mutation", async () => {
+    vi.mocked(invoke).mockResolvedValue({ ok: false, errors: ["File path no longer exists"], succeeded: [] });
+    const item = { path: "C:/copy.bin", keeper: "C:/keeper.bin" };
+    const result = await dupeAction("delete", [item.path], { items: [item], reviewToken: "review-1" });
+    expect(result.succeeded).toEqual([]);
+    expect(result.requiresRescan).not.toBe(true);
+    expect(result.errors).toEqual(["File path no longer exists"]);
   });
 
   it("preserves completed duplicate chunks when a later chunk is rejected", async () => {

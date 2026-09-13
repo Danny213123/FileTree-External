@@ -2,6 +2,7 @@ use std::env;
 use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -28,12 +29,54 @@ impl<T> LockRecover<T> for Mutex<T> {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn explorer_shell_path(path: &str) -> io::Result<String> {
+    if path.is_empty() || path.contains('\0') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Expected a file or folder path"));
+    }
+    let normalized = path.replace('/', "\\");
+    let shell_path = if let Some(network) = normalized.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{network}")
+    } else {
+        normalized.strip_prefix(r"\\?\").unwrap_or(&normalized).to_string()
+    };
+    if !Path::new(&shell_path).is_absolute() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Expected an absolute file or folder path"));
+    }
+    Ok(shell_path)
+}
+
 pub(crate) fn reveal_path(path: &str) -> io::Result<()> {
     #[cfg(windows)]
     {
-        Command::new("explorer.exe")
-            .arg(format!("/select,{path}"))
-            .spawn()?;
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+        use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+        use windows::Win32::UI::Shell::{SHOpenFolderAndSelectItems, SHParseDisplayName};
+        use windows::core::PCWSTR;
+
+        let target = explorer_shell_path(path)?;
+        let wide = target.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        unsafe {
+            let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            if initialized.is_err() && initialized != RPC_E_CHANGED_MODE {
+                return Err(io::Error::other(format!("Could not initialize Windows Shell: {initialized:?}")));
+            }
+            struct ComGuard(bool);
+            impl Drop for ComGuard {
+                fn drop(&mut self) { if self.0 { unsafe { CoUninitialize() }; } }
+            }
+            let _com = ComGuard(initialized.is_ok());
+            let mut pidl = std::ptr::null_mut();
+            SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None)
+                .map_err(|error| io::Error::other(format!("Could not locate {path} in Explorer: {error}")))?;
+            if pidl.is_null() {
+                return Err(io::Error::other("Windows Shell returned no item for this path"));
+            }
+            // A full item PIDL with an empty child list selects it in its parent.
+            let result = SHOpenFolderAndSelectItems(pidl, None, 0);
+            CoTaskMemFree(Some(pidl.cast()));
+            result.map_err(|error| io::Error::other(format!("Could not reveal {path}: {error}")))?;
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -594,5 +637,22 @@ mod tests {
         let without_nul: Vec<u16> = result.into_iter().take_while(|&c| c != 0).collect();
         let decoded = String::from_utf16_lossy(&without_nul);
         assert_eq!(decoded, "caf\u{00e9}");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod explorer_tests {
+    use super::explorer_shell_path;
+
+    #[test]
+    fn explorer_preserves_file_names_and_normalizes_windows_prefixes() {
+        let named = "G:\\Folder with spaces\\comma, and \u{65e5}\u{672c}.txt";
+        assert_eq!(explorer_shell_path(named).unwrap(), named);
+        assert_eq!(explorer_shell_path(r"\\?\G:\Folder with spaces\a,b.txt").unwrap(), r"G:\Folder with spaces\a,b.txt");
+        assert_eq!(explorer_shell_path(r"\\?\UNC\server\share\a,b.txt").unwrap(), r"\\server\share\a,b.txt");
+        assert_eq!(explorer_shell_path("G:/Folder/file.txt").unwrap(), r"G:\Folder\file.txt");
+        assert!(explorer_shell_path("").is_err());
+        assert!(explorer_shell_path("G:relative.txt").is_err());
+        assert!(explorer_shell_path("G:\\bad\0path").is_err());
     }
 }

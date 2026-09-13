@@ -27,7 +27,10 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::dupes::{HashCandidateProgress, HashInput, hash_candidate_groups, next_hash_cache_seq};
+use crate::dupes::{
+    FingerprintEntry, HashCandidateProgress, HashInput, hash_candidate_groups_with_fingerprints,
+    next_hash_cache_seq,
+};
 use crate::model::HashCacheEntry;
 
 pub const TREE_PAGE_DEFAULT: usize = 500;
@@ -88,6 +91,18 @@ fn load_duplicate_hash_cache(
 ) -> Result<HashMap<PathBuf, HashCacheEntry>, String> {
     const CACHE_QUERY_PATHS: usize = 400;
     let mut cached = HashMap::new();
+    // Cold scans have no reusable hashes. Avoid thousands of empty IN queries
+    // and path allocations for multi-million-file candidate sets.
+    let populated: bool = state
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM duplicate_hashes LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !populated {
+        return Ok(cached);
+    }
 
     for chunk in inputs.chunks(CACHE_QUERY_PATHS) {
         let paths = chunk
@@ -141,6 +156,75 @@ fn load_duplicate_hash_cache(
     Ok(cached)
 }
 
+// Separate, versioned table: samples must never be mistaken for full hashes.
+fn load_duplicate_fingerprints(
+    state: &Connection,
+    inputs: &[HashInput],
+) -> Result<HashMap<PathBuf, FingerprintEntry>, String> {
+    let mut cache = HashMap::new();
+    let populated: bool = state
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM duplicate_fingerprints_v1 LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !populated {
+        return Ok(cache);
+    }
+    let large_inputs = inputs
+        .iter()
+        .filter(|file| file.size > crate::dupes::FULL_SAMPLE_LIMIT)
+        .collect::<Vec<_>>();
+    for chunk in large_inputs.chunks(400) {
+        let paths = chunk
+            .iter()
+            .map(|file| file.path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let by_path = chunk
+            .iter()
+            .map(|file| (file.path.to_string_lossy().to_ascii_lowercase(), file))
+            .collect::<HashMap<_, _>>();
+        let sql = format!(
+            "SELECT path,size,modified,quick,sample FROM duplicate_fingerprints_v1 WHERE path IN ({})",
+            std::iter::repeat_n("?", paths.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut statement = state.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params_from_iter(paths.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (path, size, modified, quick, sample) = row.map_err(|e| e.to_string())?;
+            let Some(file) = by_path.get(&path.to_ascii_lowercase()) else {
+                continue;
+            };
+            if size != as_sql_i64(file.size) || modified != as_sql_i64(file.mtime) {
+                continue;
+            }
+            cache.insert(
+                file.path.clone(),
+                FingerprintEntry {
+                    size: file.size,
+                    mtime: file.mtime,
+                    quick: quick.and_then(|value| value.parse().ok()),
+                    sample: sample.and_then(|value| value.parse().ok()),
+                },
+            );
+        }
+    }
+    Ok(cache)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ScanRequest {
@@ -191,6 +275,7 @@ pub struct ScanProgress {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ScanQuery {
+    pub directory_paths: Vec<String>,
     pub scan_id: String,
     pub parent_id: Option<i64>,
     pub offset: usize,
@@ -218,6 +303,7 @@ fn default_true() -> bool {
 impl Default for ScanQuery {
     fn default() -> Self {
         Self {
+            directory_paths: Vec::new(),
             scan_id: String::new(),
             parent_id: Some(0),
             offset: 0,
@@ -453,6 +539,11 @@ pub struct DuplicatePathRule {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DuplicateScanRequest {
+    pub metadata_only: bool,
+    pub metadata_name: bool,
+    pub metadata_size: bool,
+    pub metadata_date: bool,
+    pub date_tolerance_sec: u64,
     pub sources: Vec<DuplicateSource>,
     pub min_size: u64,
     pub max_size: Option<u64>,
@@ -466,6 +557,11 @@ pub struct DuplicateScanRequest {
 impl Default for DuplicateScanRequest {
     fn default() -> Self {
         Self {
+            metadata_only: false,
+            metadata_name: true,
+            metadata_size: true,
+            metadata_date: false,
+            date_tolerance_sec: 0,
             sources: Vec::new(),
             min_size: 1,
             max_size: None,
@@ -481,6 +577,10 @@ impl Default for DuplicateScanRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DuplicateProgress {
+    #[serde(default)]
+    pub fraction: Option<f64>,
+    #[serde(default)]
+    pub bytes_read: u64,
     pub phase: String,
     pub scanned: u64,
     pub hashing: u64,
@@ -633,8 +733,14 @@ impl V2Store {
                     Ok(nodes) if cancel.load(Ordering::Relaxed) => ("cancelled", nodes, None),
                     Ok(nodes) => ("done", nodes, None),
                     Err(error) => {
-                        let _ =
-                            write_scan_metadata(&db_path, "error", 0, elapsed_ms, Some(&error), None);
+                        let _ = write_scan_metadata(
+                            &db_path,
+                            "error",
+                            0,
+                            elapsed_ms,
+                            Some(&error),
+                            None,
+                        );
                         ("error", 0, Some(error))
                     }
                 };
@@ -776,6 +882,12 @@ impl V2Store {
         }
         if query.directories_only {
             clauses.push("n.is_dir = 1".to_string());
+        }
+        if !query.directory_paths.is_empty() {
+            if query.directory_paths.len() > 500 { return Err("Too many directory paths in one page".into()); }
+            let placeholders = vec!["?"; query.directory_paths.len()].join(",");
+            clauses.push(format!("n.is_dir=1 AND RTRIM(REPLACE(n.dir_path, '\\', '/'), '/') COLLATE NOCASE IN ({placeholders})"));
+            values.extend(query.directory_paths.iter().map(|path| Value::Text(path.replace('\\', "/").trim_end_matches('/').to_string())));
         }
         if query.files_only {
             clauses.push("n.is_dir = 0".to_string());
@@ -1151,12 +1263,14 @@ impl V2Store {
             "CREATE TABLE candidates(\
                path TEXT PRIMARY KEY COLLATE NOCASE,name TEXT NOT NULL,\
                size INTEGER NOT NULL,modified_ms INTEGER NOT NULL\
-             ) WITHOUT ROWID;",
+             );",
         )
         .map_err(|error| error.to_string())?;
 
         let mut scanned = 0u64;
         progress(DuplicateProgress {
+            fraction: None,
+            bytes_read: 0,
             phase: "indexing".to_string(),
             scanned,
             hashing: 0,
@@ -1284,6 +1398,11 @@ impl V2Store {
                     .map_err(|error| error.to_string())?;
                 scanned = scanned.saturating_add(inserted as u64);
                 progress(DuplicateProgress {
+                    fraction: Some(
+                        (source_index as f64 + upper_id as f64 / max_node_id.max(1) as f64)
+                            / request.sources.len() as f64,
+                    ),
+                    bytes_read: 0,
                     phase: "indexing".to_string(),
                     scanned,
                     hashing: 0,
@@ -1295,6 +1414,8 @@ impl V2Store {
             work.execute_batch(&format!("DETACH DATABASE {schema}"))
                 .map_err(|error| error.to_string())?;
             progress(DuplicateProgress {
+                fraction: Some((source_index + 1) as f64 / request.sources.len() as f64),
+                bytes_read: 0,
                 phase: "indexing".to_string(),
                 scanned,
                 hashing: 0,
@@ -1311,18 +1432,109 @@ impl V2Store {
                 cancelled: true,
             });
         }
+        if request.metadata_only {
+            let mut keys = Vec::new();
+            if request.metadata_size {
+                keys.push("size".to_string());
+            }
+            if request.metadata_name {
+                keys.push("lower(name)".to_string());
+            }
+            if request.metadata_date {
+                keys.push(format!(
+                    "round((modified_ms / 1000) / {}.0)",
+                    request.date_tolerance_sec.max(1)
+                ));
+            }
+            if keys.is_empty() {
+                return Err("Enable Filename, Size, or Date for a metadata scan".to_string());
+            }
+            progress(DuplicateProgress {
+                fraction: Some(0.0),
+                phase: "grouping".into(),
+                scanned,
+                hashing: 0,
+                hashed: 0,
+                bytes_read: 0,
+            });
+            // Stream metadata once. Keep only keys and first row IDs for singletons,
+            // rather than sorting/materializing several SQL window-function results.
+            let key_columns = keys.iter().map(|key| format!("CAST({key} AS TEXT)"))
+                .collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT rowid,{key_columns} FROM candidates");
+            let mut statement = work.prepare(&sql).map_err(|error| error.to_string())?;
+            let mut lookup = work.prepare("SELECT path,name,size,modified_ms FROM candidates WHERE rowid=?1")
+                .map_err(|error| error.to_string())?;
+            let mut read_file = |id: i64| -> Result<DuplicateFile, String> {
+                lookup.query_row([id], |row| Ok(DuplicateFile {
+                    path: row.get(0)?,
+                    name: row.get(1)?,
+                    size: row.get::<_, i64>(2)?.max(0) as u64,
+                    modified: row.get::<_, i64>(3)?.max(0) as u64 / 1000,
+                })).map_err(|error| error.to_string())
+            };
+            let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+            let mut groups: Vec<DuplicateGroup> = Vec::new();
+            let mut buckets: HashMap<Vec<String>, (i64, Option<usize>)> = HashMap::new();
+            let mut grouped = 0u64;
+            let mut last_report = Instant::now();
+            while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(DuplicateScanResult {
+                        groups: Vec::new(), errors: Vec::new(), scanned,
+                        hashing: 0, cancelled: true,
+                    });
+                }
+                let id: i64 = row.get(0).map_err(|error| error.to_string())?;
+                let key = (1..=keys.len()).map(|column| row.get::<_, String>(column))
+                    .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+                match buckets.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(entry) => { entry.insert((id, None)); }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let (first_id, group_index) = entry.get_mut();
+                        let index = match *group_index {
+                            Some(index) => index,
+                            None => {
+                                let index = groups.len();
+                                groups.push(DuplicateGroup { files: vec![read_file(*first_id)?], waste: 0 });
+                                *group_index = Some(index);
+                                index
+                            }
+                        };
+                        let file = read_file(id)?;
+                        groups[index].waste = groups[index].waste.saturating_add(file.size);
+                        groups[index].files.push(file);
+                    }
+                }
+                grouped += 1;
+                if grouped == 1 || grouped == scanned || last_report.elapsed() >= Duration::from_millis(100) {
+                    progress(DuplicateProgress {
+                        fraction: Some(grouped as f64 / scanned.max(1) as f64),
+                        bytes_read: 0, phase: "grouping".into(), scanned,
+                        hashing: scanned, hashed: grouped,
+                    });
+                    last_report = Instant::now();
+                }
+            }
+            progress(DuplicateProgress {
+                fraction: None,
+                phase: "done".into(),
+                scanned,
+                hashing: 0,
+                hashed: 0,
+                bytes_read: 0,
+            });
+            return Ok(DuplicateScanResult {
+                groups,
+                errors: Vec::new(),
+                scanned,
+                hashing: 0,
+                cancelled: false,
+            });
+        }
+
         work.execute_batch("CREATE INDEX candidates_size ON candidates(size); PRAGMA optimize;")
             .map_err(|error| error.to_string())?;
-        let hashing = work
-            .query_row(
-                "SELECT COALESCE(SUM(member_count),0) FROM (\
-                   SELECT COUNT(*) AS member_count FROM candidates GROUP BY size HAVING COUNT(*)>1\
-                 )",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| error.to_string())?
-            .max(0) as u64;
         let size_groups = {
             let mut stmt = work
                 .prepare(
@@ -1337,18 +1549,29 @@ impl V2Store {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?
         };
+        let hashing = size_groups.iter().map(|(_, count)| count).sum::<u64>();
         let hash_batches = duplicate_hash_batches(&size_groups);
 
         progress(DuplicateProgress {
+            fraction: None,
+            bytes_read: 0,
             phase: "hashing".to_string(),
             scanned,
             hashing,
             hashed: 0,
         });
         let state = self.open_state().map_err(|error| error.to_string())?;
+        state
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS duplicate_fingerprints_v1(
+            path TEXT PRIMARY KEY COLLATE NOCASE, size INTEGER NOT NULL, modified INTEGER NOT NULL,
+            quick TEXT, sample TEXT) WITHOUT ROWID;",
+            )
+            .map_err(|e| e.to_string())?;
         let mut groups = Vec::new();
         let mut errors = Vec::new();
         let mut hashed = 0u64;
+        let mut total_bytes_read = 0u64;
         for size_batch in hash_batches {
             if cancel.load(Ordering::Relaxed) {
                 break;
@@ -1383,11 +1606,17 @@ impl V2Store {
                 })
                 .collect::<Vec<_>>();
             let cached = load_duplicate_hash_cache(&state, &inputs)?;
+            let saved_fingerprints = load_duplicate_fingerprints(&state, &inputs)?;
+            let fingerprints = Mutex::new(saved_fingerprints.clone());
             let existing_cache_paths = cached.keys().cloned().collect::<HashSet<_>>();
             let cache = Mutex::new(cached);
             let hashed_before_batch = hashed;
+            let batch_bytes_read = AtomicU64::new(0);
             let report_batch_progress = |batch_progress: HashCandidateProgress| {
+                batch_bytes_read.store(batch_progress.bytes_read, Ordering::Relaxed);
                 progress(DuplicateProgress {
+                    fraction: Some(batch_progress.fraction),
+                    bytes_read: total_bytes_read.saturating_add(batch_progress.bytes_read),
                     phase: batch_progress.stage.to_string(),
                     scanned,
                     hashing,
@@ -1396,7 +1625,7 @@ impl V2Store {
                         .min(hashing),
                 });
             };
-            let (bucket_groups, bucket_errors) = hash_candidate_groups(
+            let (bucket_groups, bucket_errors) = hash_candidate_groups_with_fingerprints(
                 &inputs,
                 // A full-file hash is sufficient for discovery. Every move,
                 // delete, copy, or link is still rechecked byte-for-byte by the
@@ -1410,7 +1639,10 @@ impl V2Store {
                 Some(&cancel),
                 request.threads,
                 Some(&report_batch_progress),
+                Some(&fingerprints),
             );
+            total_bytes_read =
+                total_bytes_read.saturating_add(batch_bytes_read.load(Ordering::Relaxed));
             errors.extend(
                 bucket_errors
                     .into_iter()
@@ -1418,6 +1650,32 @@ impl V2Store {
             );
             if cancel.load(Ordering::Relaxed) {
                 break;
+            }
+            let updated_fingerprints = fingerprints
+                .into_inner()
+                .map_err(|_| "Fingerprint cache unavailable")?;
+            let changed = updated_fingerprints
+                .iter()
+                .filter(|(path, value)| saved_fingerprints.get(*path) != Some(*value))
+                .collect::<Vec<_>>();
+            if !changed.is_empty() {
+                let tx = state.unchecked_transaction().map_err(|e| e.to_string())?;
+                {
+                    let mut insert = tx.prepare_cached("INSERT INTO duplicate_fingerprints_v1(path,size,modified,quick,sample) VALUES(?1,?2,?3,?4,?5)
+                        ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,quick=excluded.quick,sample=excluded.sample").map_err(|e| e.to_string())?;
+                    for (path, entry) in changed {
+                        insert
+                            .execute(params![
+                                path.to_string_lossy(),
+                                as_sql_i64(entry.size),
+                                as_sql_i64(entry.mtime),
+                                entry.quick.map(|value| value.to_string()),
+                                entry.sample.map(|value| value.to_string())
+                            ])
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                tx.commit().map_err(|e| e.to_string())?;
             }
             let cached = cache
                 .into_inner()
@@ -1469,6 +1727,8 @@ impl V2Store {
             }
             hashed = hashed.saturating_add(files.len() as u64);
             progress(DuplicateProgress {
+                fraction: None,
+                bytes_read: total_bytes_read,
                 phase: "hashing".to_string(),
                 scanned,
                 hashing,
@@ -1479,6 +1739,8 @@ impl V2Store {
         if !cancelled {
             groups.sort_by(|left, right| right.waste.cmp(&left.waste));
             progress(DuplicateProgress {
+                fraction: None,
+                bytes_read: total_bytes_read,
                 phase: "done".to_string(),
                 scanned,
                 hashing,
@@ -2583,10 +2845,12 @@ fn run_bounded_scan(
     // replay matches against, so only that path earns a checkpoint. Recording
     // one for a walker scan would promise an incremental refresh that could
     // never actually be applied.
-    let refresh = checkpoint.filter(|_| used_mft).map(|checkpoint| ScanRefresh {
-        checkpoint,
-        root_frn: root_frn.load(Ordering::Relaxed),
-    });
+    let refresh = checkpoint
+        .filter(|_| used_mft)
+        .map(|checkpoint| ScanRefresh {
+            checkpoint,
+            root_frn: root_frn.load(Ordering::Relaxed),
+        });
     write_scan_metadata(
         db_path,
         status,
@@ -2980,7 +3244,10 @@ fn try_mft_scan(
     let children = index.children_map();
     let components = crate::mft::components_below_root(root);
     let Some(target) = index.resolve(&children, &components) else {
-        eprintln!("[mft] {}: not found in table — falling back", root.display());
+        eprintln!(
+            "[mft] {}: not found in table — falling back",
+            root.display()
+        );
         return false;
     };
     if !index.get(target).is_some_and(|entry| entry.is_dir) {
@@ -3017,7 +3284,14 @@ fn try_mft_scan(
             }
 
             let id = next_id.fetch_add(1, Ordering::Relaxed);
-            let row = mft_row(id, dir_id, entry, &child_path, depth.saturating_add(1), record);
+            let row = mft_row(
+                id,
+                dir_id,
+                entry,
+                &child_path,
+                depth.saturating_add(1),
+                record,
+            );
             if row_tx.send(row).is_err() {
                 cancel.store(true, Ordering::Relaxed);
                 return true;
@@ -3096,7 +3370,8 @@ fn write_scan_rows(
                     .prepare_cached("UPDATE nodes SET errors=1 WHERE id=?1")
                     .map_err(|error| error.to_string())?;
                 for id in failures.iter() {
-                    stmt.execute(params![id]).map_err(|error| error.to_string())?;
+                    stmt.execute(params![id])
+                        .map_err(|error| error.to_string())?;
                 }
             }
             tx.commit().map_err(|error| error.to_string())?;
@@ -3865,6 +4140,17 @@ fn append_search_term(clauses: &mut Vec<String>, values: &mut Vec<Value>, term: 
             let pattern = search_like_pattern(&term.value);
             values.push(Value::Text(pattern.clone()));
             values.push(Value::Text(pattern));
+            // A literal without separators cannot straddle the folder/name
+            // boundary. Match folder paths once rather than reconstructing and
+            // lowercasing a full path for every file in a multi-million-row scan.
+            if !term.value.chars().any(|c| matches!(c, '/' | '\\' | '*' | '?')) {
+                return clauses.push(format!(
+                    "{}(LOWER(n.name) LIKE ? ESCAPE '\\' OR \
+                     CASE WHEN n.is_dir=1 THEN n.id ELSE n.parent_id END IN \
+                     (SELECT id FROM nodes WHERE is_dir=1 AND LOWER(dir_path) LIKE ? ESCAPE '\\'))",
+                    if term.excluded { "NOT " } else { "" }
+                ));
+            }
             format!(
                 "(LOWER(n.name) LIKE ? ESCAPE '\\' OR LOWER({}) LIKE ? ESCAPE '\\')",
                 node_path_sql()
@@ -4159,7 +4445,11 @@ mod tests {
             id,
             parent_id: parent,
             name: name.to_string(),
-            dir_path: if is_dir { name.to_string() } else { String::new() },
+            dir_path: if is_dir {
+                name.to_string()
+            } else {
+                String::new()
+            },
             is_dir,
             is_link: false,
             hidden: false,
@@ -4391,6 +4681,20 @@ mod tests {
             .unwrap();
         assert_eq!(tokenized.total, 1);
         assert_eq!(tokenized.items[0].name, "Summer Vacation 2024.mp4");
+        let bookmarked = store.query_nodes(ScanQuery {
+            scan_id: handle.scan_id.clone(), parent_id: None,
+            directory_paths: vec![source.join("Finance Archive").to_string_lossy().into_owned(), "Q:/another-scan".into()],
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(bookmarked.items.len(), 1);
+        assert!(bookmarked.items[0].is_dir);
+        assert_eq!(bookmarked.items[0].name, "Finance Archive");
+
+        let folder_matches = store.query_nodes(ScanQuery {
+            scan_id: handle.scan_id.clone(), parent_id: None,
+            search: "\"finance archive\"".into(), ..Default::default()
+        }).unwrap();
+        assert!(folder_matches.items.iter().any(|item| item.name == "Annual Report Final.pdf"));
 
         let preview = store
             .query_nodes(ScanQuery {
@@ -4847,6 +5151,135 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_scan_persists_large_file_fingerprints() {
+        let store = temp_store("persistent_fingerprints");
+        let source = store.data_root().join("fixture");
+        fs::create_dir_all(&source).unwrap();
+        for name in ["first.bin", "second.bin", "different.bin"] {
+            let mut data = vec![42u8; 256 * 1024];
+            if name == "different.bin" {
+                data[0] = 9;
+            }
+            fs::write(source.join(name), data).unwrap();
+        }
+        let handle = store
+            .start_scan(
+                ScanRequest {
+                    root: source.to_string_lossy().into_owned(),
+                    threads: 2,
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
+        for _ in 0..200 {
+            let status = store.scan_status(&handle.scan_id).unwrap();
+            if status.status != "scanning" {
+                assert_eq!(status.status, "done");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let request = DuplicateScanRequest {
+            sources: vec![DuplicateSource {
+                scan_id: handle.scan_id,
+                target_path: source.to_string_lossy().into_owned(),
+            }],
+            min_size: 1,
+            threads: 2,
+            ..Default::default()
+        };
+        let first = store
+            .find_exact_duplicates(request.clone(), Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap();
+        assert_eq!(first.groups.len(), 1);
+        assert_eq!(first.groups[0].files.len(), 2);
+        assert!(first.errors.is_empty());
+        let state = store.open_state().unwrap();
+        let count: i64 = state.query_row("SELECT COUNT(*) FROM duplicate_fingerprints_v1 WHERE quick IS NOT NULL AND sample IS NOT NULL", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 3);
+        drop(state);
+        for name in ["first.bin", "second.bin", "different.bin"] {
+            fs::remove_file(source.join(name)).unwrap();
+        }
+        // A fresh pipeline instance must load both cache types from SQLite.
+        let repeated = store
+            .find_exact_duplicates(request, Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap();
+        assert_eq!(repeated.groups.len(), 1);
+        assert!(
+            repeated.errors.is_empty(),
+            "warm discovery should perform no file reads"
+        );
+    }
+
+    #[test]
+    fn duplicate_metadata_scan_does_not_read_contents() {
+        let store = temp_store("metadata_only");
+        let source = store.data_root().join("fixture");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("same.bin"), b"aaaa").unwrap();
+        fs::write(source.join("nested/same.bin"), b"bbbb").unwrap();
+        let handle = store
+            .start_scan(
+                ScanRequest {
+                    root: source.to_string_lossy().into_owned(),
+                    threads: 2,
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
+        for _ in 0..200 {
+            let status = store.scan_status(&handle.scan_id).unwrap();
+            if status.status != "scanning" {
+                assert_eq!(status.status, "done");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Removing payloads proves grouping uses the index alone.
+        fs::remove_file(source.join("same.bin")).unwrap();
+        fs::remove_file(source.join("nested/same.bin")).unwrap();
+        let request = DuplicateScanRequest {
+            metadata_only: true,
+            sources: vec![DuplicateSource {
+                scan_id: handle.scan_id,
+                target_path: source.to_string_lossy().into_owned(),
+            }],
+            ..Default::default()
+        };
+        let fractions = Mutex::new(Vec::new());
+        let result = store
+            .find_exact_duplicates(request.clone(), Arc::new(AtomicBool::new(false)), |event| {
+                assert_eq!(event.bytes_read, 0);
+                assert_ne!(event.phase, "hashing");
+                if event.phase == "grouping" { fractions.lock().unwrap().push(event.fraction.unwrap()); }
+            })
+            .unwrap();
+        assert!(result.errors.is_empty());
+        assert_eq!(result.hashing, 0);
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].files.len(), 2);
+        let fractions = fractions.into_inner().unwrap();
+        assert_eq!(fractions.first(), Some(&0.0));
+        assert_eq!(fractions.last(), Some(&1.0));
+        assert!(fractions.iter().any(|fraction| *fraction > 0.0 && *fraction < 1.0));
+        assert!(fractions.windows(2).all(|pair| pair[0] <= pair[1]));
+        let excluded = store
+            .find_exact_duplicates(
+                DuplicateScanRequest {
+                    excluded_paths: vec![source.join("nested").to_string_lossy().into_owned()],
+                    ..request
+                },
+                Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+        assert!(excluded.groups.is_empty());
+    }
+
+    #[test]
     fn duplicate_scan_uses_persisted_index_and_full_content_hashes() {
         let store = temp_store("duplicates");
         let source = store.data_root().join("fixture");
@@ -4910,7 +5343,7 @@ mod tests {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
-            2
+            3 // Includes the fully read, rejected candidate.
         );
         state
             .execute("UPDATE duplicate_hashes SET updated_at=17", [])
@@ -4929,7 +5362,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            2
+            3 // Includes the fully read, rejected candidate.
         );
 
         let excluded = store

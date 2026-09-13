@@ -6,6 +6,11 @@
 // <Icon name="search" /> and color/size via `currentColor` / the `size` prop.
 
 const ICONS = {
+  "lock": '<path d="M4 7V5a4 4 0 0 1 8 0v2h1a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1h1zm1 0h6V5a3 3 0 0 0-6 0v2zm-2 1v6h10V8H3z"/>',
+  // Window controls use filled geometry on the same 16px grid as the icon set.
+  "window-maximize": '<path fill-rule="evenodd" d="M3 2h10a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1m0 1v10h10V3z"/>',
+  "window-restore": '<path d="M5 1h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-1v-1h1V2H5v1H4V2a1 1 0 0 1 1-1"/><path fill-rule="evenodd" d="M2 4h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1m0 1v9h9V5z"/>',
+
   // Activity bar / views
   explorer: '<path d="M13 0H6a2 2 0 0 0-2 2 2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h7a2 2 0 0 0 2-2 2 2 0 0 0 2-2V2a2 2 0 0 0-2-2m0 13V4a2 2 0 0 0-2-2H5a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1M3 4a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/>',
   search: '<path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001q.044.06.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1 1 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0"/>',

@@ -14,6 +14,8 @@ import { isTauriV2, startNativeDrag, type NativeDragResponse } from "../api/v2";
 import { loadShellThumbnail } from "../lib/shellImages";
 import { fetchFolderPreview } from "../api/client";
 import { isNodeOpen } from "../hooks/useTreeState";
+import { useCompressionExclusions } from "../hooks/useCompressionExclusions";
+import { compressionPathKey, isCompressionExcluded, saveCompressionExclusions } from "../lib/compressionExclusions";
 
 const ROW_HEIGHT = 23;
 // Smallest a column may be dragged to, so a header never collapses to nothing.
@@ -73,6 +75,7 @@ interface TreeTableProps {
    *  depth 0 with no expand twisty. All other behavior — sort, hover, context
    *  menu, selection, drag, bookmark, rename — is identical to the tree. */
   flat?: boolean;
+  expandableFlat?: boolean;
   /** LAZY mode: directories serve their children on demand, so a folder can be
    *  expandable even with zero children currently loaded. When set, the expand
    *  twisty is driven by a directory's folder/file counts rather than its loaded
@@ -246,6 +249,7 @@ function TreeTableInner({
   rows,
   scanId,
   flat,
+  expandableFlat,
   lazy,
   loadedDirs,
   nodeById,
@@ -285,6 +289,7 @@ function TreeTableInner({
   onRenameCommit,
   onRenameCancel,
 }: TreeTableProps) {
+  const [compressionExclusions] = useCompressionExclusions();
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
   // Viewport position of the floating "Move to <folder>" pill, tracked from the
   // last drag-over so the pill follows the cursor over the highlighted folder.
@@ -1007,7 +1012,7 @@ function TreeTableInner({
             // A watcher-created lazy directory has unknown counts until opened.
             // Keep its twisty visible while unloaded; once loaded, genuinely
             // empty folders lose the control. Bundles and files use children.
-            const hasKids   = !flat && (
+            const hasKids   = (!flat || expandableFlat) && (
               (lazy && node.dir && node.id >= 0)
                 ? (!loadedDirs?.has(node.id)
                   || node.children.length > 0
@@ -1188,7 +1193,7 @@ function TreeTableInner({
               >
                 <div
                   className="cell name-cell"
-                  style={{ "--depth": flat ? 0 : node.depth, "--bar-width": `${barWidth}%` } as React.CSSProperties}
+                  style={{ "--depth": flat && !expandableFlat ? 0 : node.depth, "--bar-width": `${barWidth}%` } as React.CSSProperties}
                   onMouseEnter={(e) => handleKindEnter(node, e)}
                   onMouseLeave={handleKindLeave}
                 >
@@ -1260,6 +1265,15 @@ function TreeTableInner({
                       <Icon name="file-zip" size={12} />
                     </button>
                   )}
+                  {!isBundle && node.path && (() => {
+                    const explicit = compressionExclusions.some((path) => compressionPathKey(path) === compressionPathKey(node.path));
+                    const excluded = isCompressionExcluded(node.path, compressionExclusions);
+                    const label = explicit ? "Allow compression" : excluded ? "Excluded by parent folder" : "Do not compress";
+                    return <button className={`bookmark-btn${excluded ? " bookmarked" : ""}`} title={label} aria-label={`${label}: ${node.name}`} aria-pressed={excluded} disabled={excluded && !explicit}
+                      onClick={(event) => { event.stopPropagation(); saveCompressionExclusions(explicit ? compressionExclusions.filter((path) => compressionPathKey(path) !== compressionPathKey(node.path)) : [...compressionExclusions, node.path]); }}>
+                      <Icon name="lock" size={12} />
+                    </button>;
+                  })()}
                 </div>
                 {nonNameCols.map((col) => renderCell(col, node, isBundle, parentSize))}
                 {/* Empty cell occupying the trailing filler track (keeps row

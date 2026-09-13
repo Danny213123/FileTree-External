@@ -34,6 +34,7 @@ import {
   applyProtectedLocations,
   bestSourceForTarget,
   buildContentGroups,
+  buildGroup,
   buildKeyedGroups,
   candidatesFromScan,
   dedupeCandidates,
@@ -109,6 +110,10 @@ function pickSurvivor(files: DupeGroupV2["files"], strategy: KeepStrategy, drive
 }
 
 export interface DupeProgress {
+  fraction?: number | null;
+  startedAt?: number;
+  finishedAt?: number;
+  bytesRead?: number;
   scanned: number;
   hashing: number;
   hashed: number;
@@ -139,6 +144,7 @@ const DUPLICATES_PREFS_KEY = "filetree.duplicates.preferences.v2";
 interface DuplicatePreferences {
   selectedPaths: string[];
   customPaths: string[];
+  removedPaths: string[];
   protectedPaths: string[];
   excludedPaths: string[];
   ignoredSignatures: string[];
@@ -195,6 +201,7 @@ export interface DuplicatesController {
   // Targets
   selectedPaths: string[];
   customPaths: string[];
+  removedPaths: string[];
   protectedPaths: string[];
   excludedPaths: string[];
   scopeRules: DupeScopeRule[];
@@ -289,13 +296,16 @@ export interface DuplicatesController {
 
 export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesController {
   const { getScanResults, threads, defaultIncludeHidden } = args;
-  const initialPreferences = useRef(loadDuplicatePreferences()).current;
+  const [initialPreferences] = useState(loadDuplicatePreferences);
 
   const [selectedPaths, setSelectedPaths] = useState<string[]>(() =>
     Array.isArray(initialPreferences.selectedPaths) ? initialPreferences.selectedPaths : [],
   );
   const [customPaths, setCustomPaths] = useState<string[]>(() =>
     Array.isArray(initialPreferences.customPaths) ? initialPreferences.customPaths : [],
+  );
+  const [removedPaths, setRemovedPaths] = useState<string[]>(() =>
+    Array.isArray(initialPreferences.removedPaths) ? initialPreferences.removedPaths : [],
   );
   const [protectedPaths, setProtectedPaths] = useState<string[]>(() =>
     Array.isArray(initialPreferences.protectedPaths) ? initialPreferences.protectedPaths : [],
@@ -371,6 +381,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     const preferences: DuplicatePreferences = {
       selectedPaths,
       customPaths,
+      removedPaths,
       protectedPaths,
       excludedPaths,
       ignoredSignatures,
@@ -391,6 +402,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
   }, [
     criteria,
     customPaths,
+    removedPaths,
     deleteMode,
     destPath,
     extensions,
@@ -456,24 +468,28 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     if (actionPendingRef.current) return;
     const v = p.trim();
     if (!v) return;
+    setRemovedPaths((prev) => prev.filter((item) => !isUnder(v, item)));
     setCustomPaths((prev) => addPath(prev, v));
     setSelectedPaths((prev) => addPath(prev, v));
     setProtectedPaths((prev) => dropPath(prev, v));
     setExcludedPaths((prev) => dropPath(prev, v));
   }, []);
   const removeCustomPath = useCallback((p: string) => {
-    if (actionPendingRef.current) return;
-    setCustomPaths((prev) => dropPath(prev, p));
-    setSelectedPaths((prev) => dropPath(prev, p));
-    setProtectedPaths((prev) => dropPath(prev, p));
-    setExcludedPaths((prev) => dropPath(prev, p));
-  }, []);
+    if (actionPendingRef.current || scanState === "scanning") return;
+    const outside = (item: string) => !isUnder(item, p);
+    setRemovedPaths((prev) => addPath(prev.filter(outside), p));
+    setCustomPaths((prev) => prev.filter(outside));
+    setSelectedPaths((prev) => prev.filter(outside));
+    setProtectedPaths((prev) => prev.filter(outside));
+    // An exclusion prevents a removed child from inheriting an included parent.
+    setExcludedPaths((prev) => addPath(prev.filter(outside), p));
+  }, [scanState]);
   const toggleProtectedPath = useCallback((p: string) => {
     setPathState(p, pathState(p) === "reference" ? "normal" : "reference");
   }, [pathState, setPathState]);
 
   const setCriterion = useCallback<DuplicatesController["setCriterion"]>((key, patch) => {
-    setCriteria((prev) => ({ ...prev, [key]: { ...prev[key], ...patch } }));
+    setCriteria((prev) => ({ ...prev, [key]: { ...prev[key], ...patch, ...(patch.enabled === false ? { required: false } : {}) } }));
   }, []);
   const setNameFuzzy = useCallback((v: boolean) => setCriteria((p) => ({ ...p, nameFuzzy: v })), []);
   const setNameThreshold = useCallback((v: number) => setCriteria((p) => ({ ...p, nameThreshold: v })), []);
@@ -493,7 +509,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
   }, [minSizeKb, maxSizeKb, extensions, includeHidden]);
 
   const runScan = useCallback(async () => {
-    if (actionPendingRef.current) return;
+    if (actionPendingRef.current || abortRef.current) return;
     const targets = minimalScanTargets(selectedPaths);
     if (targets.length === 0) {
       setScanState("error");
@@ -513,14 +529,13 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
       targets.some((target) => isUnder(path, target) || isUnder(target, path)),
     );
     const scanProtectionKey = scopePolicyKey(scanScopeRules);
-    abortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     const signal = ctrl.signal;
 
     setScanState("scanning");
     setPhase("aggregating");
-    setProgress({ scanned: 0, hashing: 0, hashed: 0 });
+    setProgress({ scanned: 0, hashing: 0, hashed: 0, startedAt: Date.now() });
     setGroups([]);
     setIgnoredGroups([]);
     setSelected(new Set());
@@ -542,44 +557,43 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
       }
 
       if (isTauriV2()) {
-        if (!criteria.content.enabled) {
-          throw new Error("FileTree v2 currently requires Content matching for duplicate scans.");
-        }
         const sources: { scanId: string; targetPath: string }[] = [];
         for (const target of targets) {
           let source: ScanResult | undefined;
-          let sourceLength = -1;
-          for (const candidate of pool) {
-            if (!candidate.scanId || !isUnder(target, candidate.rootPath)) continue;
-            if (candidate.rootPath.length > sourceLength) {
-              source = candidate;
-              sourceLength = candidate.rootPath.length;
-            }
-          }
+          signal.throwIfAborted();
           if (!source) {
             try {
               source = await runV2Scan(
-                { path: target, includeHidden, threads },
-                (event) => setProgress((prev) => ({ ...prev, scanned: event.nodeCount })),
+                { path: target, includeHidden, threads, nocache: true },
+                (event) => { if (!signal.aborted) setProgress((prev) => ({ ...prev, scanned: event.nodeCount })); },
                 signal,
               );
+              signal.throwIfAborted();
               pool.push(source);
             } catch (error) {
-              if (error instanceof Error && error.name === "AbortError") return;
+              if (signal.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
               aggErrors.push(`${target}: ${error instanceof Error ? error.message : String(error)}`);
               continue;
             }
           }
           if (source.scanId) sources.push({ scanId: source.scanId, targetPath: target });
         }
+        signal.throwIfAborted();
         if (sources.length === 0) {
           throw new Error(aggErrors[0] || "No duplicate scan targets could be indexed.");
         }
 
-        setPhase("hashing");
+        setPhase(criteria.content.enabled ? "hashing" : "grouping");
+        const requiredMetadata = [criteria.name, criteria.size, criteria.date].some((item) => item.enabled && item.required);
+        const metadataKey = (item: { enabled: boolean; required: boolean }) => item.enabled && (!requiredMetadata || item.required);
         const duplicateResult = await runV2DuplicateScan(
           {
             sources,
+            metadataOnly: !criteria.content.enabled,
+            metadataName: metadataKey(criteria.name),
+            metadataSize: metadataKey(criteria.size),
+            metadataDate: metadataKey(criteria.date),
+            dateToleranceSec: criteria.dateToleranceSec,
             minSize: filters.minSize,
             maxSize: filters.maxSize ?? null,
             extensions: filters.extensions,
@@ -587,57 +601,72 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
             includeHidden: filters.includeHidden,
             threads,
           },
-          scanScopeRules,
+          // Failed/offline roots are not sources. Their policy must not make
+          // native canonicalization abort scans of the remaining valid roots.
+          scanScopeRules.filter((rule) => sources.some((source) =>
+            isUnder(rule.path, source.targetPath) || isUnder(source.targetPath, rule.path))),
           (event) => {
-            setPhase(event.phase === "indexing" ? "aggregating" : "hashing");
-            setProgress({
+            if (event.phase === "done" || signal.aborted) return;
+            setPhase(event.phase === "indexing" ? "aggregating" : ["grouping", "reviewing", "finalizing"].includes(event.phase) ? "grouping" : "hashing");
+            setProgress((prev) => ({
+              ...prev,
+              fraction: event.fraction,
               scanned: event.scanned,
               hashing: event.hashing,
               hashed: event.hashed,
               stage: event.phase,
-            });
+              bytesRead: event.bytesRead,
+            }));
           },
           signal,
         );
-        if (duplicateResult.cancelled || signal.aborted) return;
+        signal.throwIfAborted();
+        if (duplicateResult.cancelled) throw new DOMException("Scan cancelled", "AbortError");
         aggErrors.push(...duplicateResult.errors.slice(0, 50));
 
-        const byPath = new Map<string, CandidateMeta>();
-        const hashGroups = duplicateResult.groups.map((group) => ({
-          paths: group.files.map((file) => {
+        setPhase("grouping");
+        const nativeGroups = duplicateResult.groups;
+        let result: DupeGroupV2[] = [];
+        const ignoredResults: DupeGroupV2[] = [];
+        setProgress((prev) => ({ ...prev, stage: "finalizing", fraction: 0, hashed: 0, hashing: nativeGroups.length }));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        let lastYield = performance.now();
+        for (let index = 0; index < nativeGroups.length; index++) {
+          if (signal.aborted) return;
+          const candidates: CandidateMeta[] = nativeGroups[index].files.map((file) => {
             const slash = Math.max(file.path.lastIndexOf("\\"), file.path.lastIndexOf("/"));
             const dot = file.name.lastIndexOf(".");
-            byPath.set(normalizeForKey(file.path), {
-              path: file.path,
-              name: file.name,
+            return {
+              path: file.path, name: file.name,
               folder: slash >= 0 ? file.path.slice(0, slash) : file.path,
-              size: file.size,
-              modifiedMs: file.modified * 1000,
-              mtimeSec: file.modified,
-              ext: dot >= 0 ? file.name.slice(dot + 1).toLowerCase() : "",
-              hidden: false,
-            });
-            return file.path;
-          }),
-        }));
-        setPhase("grouping");
-        let result = buildContentGroups(hashGroups, byPath, criteria, repriCriterion);
-        setIgnoredGroups(result.filter((group) => ignoredRef.current.has(groupSignature(group))));
-        result = result.filter((group) => !ignoredRef.current.has(groupSignature(group)));
-        result = applyProtectedLocations(
-          result,
-          scanProtectedPaths,
-          criteria,
-          repriCriterion,
-          criteria.content.enabled,
-          scanNormalPaths,
-        );
+              size: file.size, modifiedMs: file.modified * 1000, mtimeSec: file.modified,
+              ext: dot >= 0 ? file.name.slice(dot + 1).toLowerCase() : "", hidden: false,
+            };
+          });
+          // The native engine has already grouped these members.
+          const built = buildGroup(candidates, criteria, repriCriterion, criteria.content.enabled);
+          if (built) {
+            if (ignoredRef.current.size > 0 && ignoredRef.current.has(groupSignature(built))) {
+              ignoredResults.push(built);
+            } else {
+              result.push(applyProtectedLocations([built], scanProtectedPaths, criteria,
+                repriCriterion, criteria.content.enabled, scanNormalPaths)[0]);
+            }
+          }
+          if (performance.now() - lastYield >= 16 || index + 1 === nativeGroups.length) {
+            setProgress((prev) => ({ ...prev, fraction: (index + 1) / nativeGroups.length, hashed: index + 1 }));
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            lastYield = performance.now();
+          }
+        }
+        setIgnoredGroups(ignoredResults);
         result = sortGroupsByWaste(result);
         setGroups(result);
         setErrors(aggErrors);
-        contentVerifiedRef.current = true;
+        contentVerifiedRef.current = criteria.content.enabled;
         setReviewToken(duplicateResult.reviewToken || null);
         setActiveProtectionKey(scanProtectionKey);
+        setProgress((prev) => ({ ...prev, finishedAt: Date.now() }));
         setScanState("done");
         setPhase("done");
         return;
@@ -723,10 +752,18 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
       setErrors(aggErrors);
       contentVerifiedRef.current = criteria.content.enabled;
       setActiveProtectionKey(scanProtectionKey);
+      setProgress((prev) => ({ ...prev, finishedAt: Date.now() }));
       setScanState("done");
       setPhase("done");
     } catch (e) {
-      if (e instanceof Error && e.name === "AbortError") return;
+      // A stopped run may settle after a replacement run has already started.
+      if (abortRef.current !== ctrl) return;
+      if (signal.aborted || ((e instanceof Error || e instanceof DOMException) && e.name === "AbortError")) {
+        setScanState("canceled");
+        setPhase("idle");
+        setProgress((prev) => ({ ...prev, finishedAt: Date.now() }));
+        return;
+      }
       setErrors([...aggErrors, e instanceof Error ? e.message : String(e)]);
       setReviewToken(null);
       setActiveProtectionKey(null);
@@ -747,6 +784,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     setReviewToken(null);
     setActiveProtectionKey(null);
     contentVerifiedRef.current = false;
+    setProgress((prev) => ({ ...prev, finishedAt: Date.now() }));
     setScanState("canceled");
     setPhase("idle");
   }, []);
@@ -787,20 +825,24 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
       return next.size === prev.size ? prev : next;
     });
   }, [actionablePathSet]);
-  const safeSelectedPaths = useMemo(
-    () => allDupPaths.filter((path) => selected.has(path)),
-    [allDupPaths, selected],
-  );
-  const selectedActionItems = useMemo(() => {
-    const wanted = new Set(safeSelectedPaths);
-    return groups.flatMap((group) => {
+  const selectionIndex = useMemo(() => {
+    const index = new Map<string, { keeper: string; size: number; group: DupeGroupV2 }>();
+    for (const group of groups) {
       const keeper = group.files.find((file) => file.ref);
-      if (!keeper) return [];
-      return group.files
-        .filter((file) => wanted.has(file.path))
-        .map((file) => ({ path: file.path, keeper: keeper.path }));
-    });
-  }, [groups, safeSelectedPaths]);
+      if (!keeper) continue;
+      for (const file of group.files) {
+        if (!file.ref && !file.protected) index.set(file.path, { keeper: keeper.path, size: file.size, group });
+      }
+    }
+    return index;
+  }, [groups]);
+  const safeSelectedPaths = useMemo(
+    () => [...selected].filter((path) => selectionIndex.has(path)),
+    [selectionIndex, selected],
+  );
+  const selectedActionItems = useMemo(() => safeSelectedPaths.map((path) => ({
+    path, keeper: selectionIndex.get(path)!.keeper,
+  })), [selectionIndex, safeSelectedPaths]);
 
   const toggleFile = useCallback((path: string) => {
     if (actionPendingRef.current || !actionablePathSet.has(path)) return;
@@ -984,18 +1026,20 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     }
     if (dest) invalidate(dest);
   }, []);
-  const retireAmbiguousReview = useCallback((paths: string[], dest?: string) => {
+  const retireAmbiguousReview = useCallback((paths: string[], dest?: string, confirmed: string[] = []) => {
+    if (confirmed.length) {
+      const removed = new Set(confirmed.map(normalizeForKey));
+      const verified = contentVerifiedRef.current;
+      setGroups((prev) => pruneGroups(prev, removed, criteriaRef.current, repriRef.current, verified));
+      setSelected((prev) => new Set([...prev].filter((path) => !removed.has(normalizeForKey(path)))));
+    }
     invalidateAffected(paths, dest);
     if (isTauriV2()) void cancelV2DuplicateScan();
     setReviewToken(null);
     setActiveProtectionKey(null);
     contentVerifiedRef.current = false;
-    setGroups([]);
-    setIgnoredGroups([]);
-    setSelected(new Set());
-    setCollapsed(new Set());
-    setScanState("idle");
-    setPhase("idle");
+    setScanState("done");
+    setPhase("done");
     toast.warn("Some file outcomes could not be confirmed. Run a new scan before continuing.");
   }, [invalidateAffected]);
 
@@ -1019,12 +1063,14 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
       endAction();
     }
     if (res.errors.length) toast.error(`Some files could not be deleted:\n${res.errors.join("\n")}`);
+    const retired = [...res.succeeded, ...(res.missing ?? [])];
+    if (res.missing?.length) toast.info(`${res.missing.length} already-missing files removed from the report.`);
     if (res.requiresRescan) {
-      retireAmbiguousReview(paths);
+      retireAmbiguousReview(paths, undefined, retired);
       return;
     }
-    if (!res.succeeded.length) return;
-    const removed = new Set(res.succeeded.map(normalizeForKey));
+    if (!retired.length) return;
+    const removed = new Set(retired.map(normalizeForKey));
     setGroups((prev) =>
       sortGroupsByWaste(applyProtectedLocations(
         pruneGroups(prev, removed, criteriaRef.current, repriRef.current, contentVerifiedRef.current),
@@ -1035,8 +1081,8 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
         normalPaths,
       )),
     );
-    setSelected((prev) => new Set([...prev].filter((path) => !res.succeeded.includes(path))));
-    invalidateAffected(res.succeeded);
+    setSelected((prev) => new Set([...prev].filter((path) => !removed.has(normalizeForKey(path)))));
+    invalidateAffected(retired);
   }, [safeSelectedPaths, selectedActionItems, deleteMode, groups, invalidateAffected, normalPaths, protectedPaths, reviewToken, retireAmbiguousReview, beginAction, endAction]);
 
   const moveSelected = useCallback(async (destOverride?: string) => {
@@ -1063,7 +1109,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     }
     if (res.errors.length) toast.error(`Some files could not be moved:\n${res.errors.join("\n")}`);
     if (res.requiresRescan) {
-      retireAmbiguousReview(paths, dest);
+      retireAmbiguousReview(paths, dest, res.succeeded);
       return;
     }
     if (!res.succeeded.length) return;
@@ -1161,7 +1207,7 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
     }
     if (res.errors.length) toast.error(`Some links could not be created:\n${res.errors.join("\n")}`);
     if (res.requiresRescan) {
-      retireAmbiguousReview(paths);
+      retireAmbiguousReview(paths, undefined, res.succeeded);
       return;
     }
     if (res.succeeded.length > 0) {
@@ -1241,24 +1287,15 @@ export function useDuplicatesController(args: UseDuplicatesArgs): DuplicatesCont
   const totalWaste = useMemo(() => groups.reduce((s, g) => s + g.waste, 0), [groups]);
   const totalFiles = useMemo(() => groups.reduce((s, g) => s + g.files.length, 0), [groups]);
   const selectedCount = safeSelectedPaths.length;
-  const selectedBytes = useMemo(() => {
-    const wanted = new Set(safeSelectedPaths);
-    return groups.reduce(
-      (sum, group) => sum + group.files
-        .filter((file) => wanted.has(file.path))
-        .reduce((subtotal, file) => subtotal + file.size, 0),
-      0,
-    );
-  }, [groups, safeSelectedPaths]);
-  const selectedGroups = useMemo(() => {
-    const wanted = new Set(safeSelectedPaths);
-    return groups.filter((group) => group.files.some((file) => wanted.has(file.path))).length;
-  }, [groups, safeSelectedPaths]);
+  const selectedBytes = useMemo(() => safeSelectedPaths.reduce(
+    (sum, path) => sum + selectionIndex.get(path)!.size, 0), [selectionIndex, safeSelectedPaths]);
+  const selectedGroups = useMemo(() => new Set(safeSelectedPaths.map(
+    (path) => selectionIndex.get(path)!.group)).size, [selectionIndex, safeSelectedPaths]);
   const ignoredCount = ignoredSignatures.length;
   const canScan = selectedPaths.length > 0;
 
   return {
-    selectedPaths, customPaths, protectedPaths, excludedPaths, scopeRules,
+    selectedPaths, customPaths, removedPaths, protectedPaths, excludedPaths, scopeRules,
     pathState, setPathState, togglePath, addCustomPath, removeCustomPath, toggleProtectedPath,
     criteria, setCriterion, setNameFuzzy, setNameThreshold, setDateToleranceSec,
     minSizeKb, setMinSizeKb, maxSizeKb, setMaxSizeKb, extensions, setExtensions,

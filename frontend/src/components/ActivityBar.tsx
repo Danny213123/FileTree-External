@@ -1,4 +1,4 @@
-// Activity bar: a compact icon row at the top of the side bar that selects the
+// Activity bar: a persistent horizontal row above the workspace that selects the
 // active view. Icons come from the shared Bootstrap-based Icon set.
 import { Icon, type IconName } from "./Icon";
 
@@ -30,7 +30,7 @@ export function ActivityBar({
   darkMode, onToggleTheme,
 }: ActivityBarProps) {
   return (
-    <div className="activitybar">
+    <nav className="activitybar" aria-label="Workspace views">
       {ITEMS.map((item) => {
         const isActive = sidebarOpen && activeView === item.id;
         const badge = item.id === "bookmarks" ? bookmarkCount : item.id === "errors" ? errorCount : 0;
@@ -40,10 +40,12 @@ export function ActivityBar({
             key={item.id}
             className={`activity-btn${isActive ? " active" : ""}`}
             aria-label={item.label}
+            aria-current={isActive ? "page" : undefined}
             title={item.label}
             onClick={() => onSelect(item.id)}
           >
             <Icon name={item.icon} />
+            <span className="activity-label">{item.label}</span>
             {badge > 0 && <span className={`activity-badge${item.id === "errors" ? " danger" : ""}`}>{badge > 99 ? "99+" : badge}</span>}
           </button>
         );
@@ -52,6 +54,6 @@ export function ActivityBar({
       <button type="button" className="activity-btn" title={darkMode ? "Light theme" : "Dark theme"} onClick={onToggleTheme}>
         <Icon name={darkMode ? "sun" : "moon"} />
       </button>
-    </div>
+    </nav>
   );
 }

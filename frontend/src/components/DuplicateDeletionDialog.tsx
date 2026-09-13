@@ -136,6 +136,12 @@ export function DuplicateDeletionDialog({
           {permanent && (
             <p className="df-delete-warn">Permanent deletion cannot be undone.</p>
           )}
+          {!permanent && !replaceWithLink && (
+            <p className="df-delete-summary">
+              Files are sent to the Recycle Bin without re-reading their contents.
+              {unverifiedCount > 0 && " Metadata matches may have different contents; review your selection."}
+            </p>
+          )}
 
           <label className={`df-delete-option${replaceWithLink ? " on" : ""}`}>
             <input

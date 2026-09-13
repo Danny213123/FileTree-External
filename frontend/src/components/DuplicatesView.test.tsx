@@ -52,6 +52,7 @@ function controller(overrides: Partial<DuplicatesController> = {}): DuplicatesCo
   return {
     selectedPaths: ["C:\\"],
     customPaths: [],
+    removedPaths: [],
     protectedPaths: ["C:\\Library"],
     excludedPaths: [],
     scopeRules: [

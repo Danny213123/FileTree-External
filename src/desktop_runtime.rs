@@ -117,6 +117,8 @@ impl DesktopRuntime {
         let image_available = crate::compress_tools::detect_image().0.found;
         let mut skipped_unavailable = 0usize;
         let mut skipped_ineligible = 0usize;
+        let excluded = request.exclude_paths.iter().filter(|path| !path.trim().is_empty())
+            .map(|path| compression_path_key(path.trim())).collect::<HashSet<_>>();
         let needs_dedup = request.scan_directories.len() > 1
             || (!request.scan_directories.is_empty() && !request.paths.is_empty());
         let mut seen = needs_dedup.then(HashSet::<String>::new);
@@ -131,6 +133,7 @@ impl DesktopRuntime {
             indexed_files.push((path, size));
         };
         for path in std::mem::take(&mut request.paths) {
+            if compression_path_is_excluded(&path, &excluded) { continue; }
             let size = std::fs::metadata(&path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
@@ -154,14 +157,7 @@ impl DesktopRuntime {
                     .query_all_subtree_files(&directory.scan_id, directory.directory_id)?,
             );
         }
-        if !request.exclude_paths.is_empty() {
-            let excluded = request
-                .exclude_paths
-                .iter()
-                .map(|path| compression_path_key(path))
-                .collect::<HashSet<_>>();
-            scan_files.retain(|file| !excluded.contains(&compression_path_key(&file.path)));
-        }
+        scan_files.retain(|file| !compression_path_is_excluded(&file.path, &excluded));
         scan_files.retain(|file| {
             match crate::compression_eligibility(
                 &file.path,
@@ -282,10 +278,16 @@ impl DesktopRuntime {
     }
 
     pub fn cancel_compression(&self, id: &str) -> Result<(), String> {
-        let job = self
-            .live_job(id)
-            .ok_or_else(|| "Compression job was not found".to_string())?;
-        compress_job::cancel_job(&job);
+        let job = if let Some(job) = self.live_job(id) {
+            job
+        } else {
+            let job = compress_job::job_from_manifest(id)
+                .ok_or_else(|| "Compression job was not found".to_string())?;
+            self.bind_persistent_job(&job, "paused")?;
+            let mut jobs = self.state.jobs.lock_recover();
+            Arc::clone(jobs.entry(id.to_string()).or_insert(job))
+        };
+        compress_job::cancel_or_finalize_job(&job);
         if compress_job::wait_until_finished(&job, Duration::from_secs(8)) {
             Ok(())
         } else {
@@ -593,9 +595,31 @@ fn compression_path_key(path: &str) -> String {
     path.replace('\\', "/").trim_end_matches('/').to_lowercase()
 }
 
+fn compression_path_is_excluded(path: &str, excluded: &HashSet<String>) -> bool {
+    let mut key = compression_path_key(path);
+    loop {
+        if excluded.contains(&key) { return true; }
+        match key.rfind('/') {
+            Some(index) => key.truncate(index),
+            None => return false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compression_exclusions_cover_descendants_and_exact_files_only() {
+        let excluded = HashSet::from([compression_path_key("G:\\A\\"), compression_path_key("G:\\B\\keep.txt")]);
+        for path in ["g:/a/file.mp4", "G:/A/AB/deep/file.txt", "G:/A", "g:/b/KEEP.TXT"] {
+            assert!(compression_path_is_excluded(path, &excluded), "{path}");
+        }
+        for path in ["G:/AB/file.mp4", "G:/B/keep.txt.zip", "E:/A/file.mp4", "G:/B/other.txt"] {
+            assert!(!compression_path_is_excluded(path, &excluded), "{path}");
+        }
+    }
 
     #[test]
     fn compression_request_accepts_scan_directory_without_paths() {

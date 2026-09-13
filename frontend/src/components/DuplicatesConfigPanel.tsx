@@ -8,15 +8,8 @@ import type {
 } from "../api/types";
 import { browseDirectories, shellContextMenu, type BrowseDirectoryEntry } from "../api/client";
 import type { DuplicatesController } from "../hooks/useDuplicates";
-import {
-  DUPLICATE_SCAN_STEPS,
-  activeScanStep,
-  hashingDeterminate,
-  hashingPercent,
-  hashingTitle,
-  scanStepStatus,
-} from "../lib/duplicatesScanUi";
-import { normalizeForKey, scopeStateForPath } from "../lib/duplicatesEngine";
+import { DuplicateScanProgress } from "./DuplicateScanProgress";
+import { isUnder, normalizeForKey, scopeStateForPath } from "../lib/duplicatesEngine";
 import { isPathDrag, readDroppedEntries, resolveDroppedPaths } from "../lib/dropPaths";
 import { registerDropZone } from "../lib/dropZones";
 import { parentDir } from "../lib/undo";
@@ -49,13 +42,10 @@ const OPTIONAL_CRITERIA: { key: Exclude<DupeCriterionKey, "content">; label: str
   { key: "date", label: "Date" },
 ];
 
-/** Scan types map onto which criteria the grouping pass treats as mandatory. */
-type ScanType = "contents" | "contents-name" | "contents-name-date";
-
+type ScanType = "contents" | "metadata";
 const SCAN_TYPES: SelectOption<ScanType>[] = [
-  { value: "contents",           label: "Contents" },
-  { value: "contents-name",      label: "Contents + filename" },
-  { value: "contents-name-date", label: "Contents + filename + date" },
+  { value: "contents", label: "Content" },
+  { value: "metadata", label: "Metadata" },
 ];
 
 /** Subfolders rendered for one expansion before the row list is truncated. */
@@ -106,9 +96,7 @@ export function DuplicatesConfigPanel({
 
   const scanning = ctrl.scanState === "scanning";
   const locked = scanning || ctrl.actionPending;
-  const hashedPct = hashingPercent(ctrl.progress);
-  const activeStep = activeScanStep(ctrl.phase, ctrl.progress.stage);
-  const determinate = hashingDeterminate(ctrl.phase, ctrl.progress);
+
 
   const roots = useMemo<TargetRow[]>(() => {
     const drivePaths = new Set(drives.map((drive) => normalizeForKey(drive.root)));
@@ -126,8 +114,16 @@ export function DuplicatesConfigPanel({
     const folderRows: TargetRow[] = ctrl.customPaths
       .filter((path) => !drivePaths.has(normalizeForKey(path)))
       .map((path) => ({ path, kind: "folder", label: path, detail: "" }));
-    return [...driveRows, ...folderRows];
-  }, [ctrl.customPaths, drives]);
+    const listed = [...driveRows, ...folderRows];
+    // Saved drive selections survive disconnects. Keep them visible and removable
+    // even when the operating system no longer lists the drive.
+    for (const path of ctrl.selectedPaths) {
+      if (!listed.some((row) => isUnder(path, row.path))) {
+        listed.push({ path, kind: "folder", label: path, detail: "Saved scan target (not listed among connected drives)" });
+      }
+    }
+    return listed.filter((row) => !(ctrl.removedPaths ?? []).some((path) => isUnder(row.path, path)));
+  }, [ctrl.customPaths, ctrl.selectedPaths, ctrl.removedPaths, drives]);
 
   const loadChildren = useCallback(async (path: string) => {
     const key = normalizeForKey(path);
@@ -205,19 +201,13 @@ export function DuplicatesConfigPanel({
     [ctrl.scopeRules],
   );
 
-  const scanType: ScanType = ctrl.criteria.name.required
-    ? (ctrl.criteria.date.required ? "contents-name-date" : "contents-name")
-    : "contents";
-
+  const scanType: ScanType = ctrl.criteria.content.enabled ? "contents" : "metadata";
   const setScanType = (value: ScanType) => {
-    ctrl.setCriterion("name", {
-      enabled: value !== "contents" ? true : ctrl.criteria.name.enabled,
-      required: value !== "contents",
-    });
-    ctrl.setCriterion("date", {
-      enabled: value === "contents-name-date" ? true : ctrl.criteria.date.enabled,
-      required: value === "contents-name-date",
-    });
+    ctrl.setCriterion("content", { enabled: value === "contents", required: value === "contents" });
+    if (value === "metadata") {
+      ctrl.setCriterion("size", { enabled: true, required: true });
+      ctrl.setCriterion("name", { enabled: true, required: true });
+    }
   };
 
   const addFolder = (raw?: string) => {
@@ -296,9 +286,9 @@ export function DuplicatesConfigPanel({
   };
 
   const removable = activePath !== null
-    && roots.some((row) => row.kind === "folder" && row.path === activePath);
+    && dirRows.some((row) => row.type !== "note" && row.path === activePath);
   const included = ctrl.selectedPaths.length;
-  const unlistedFolders = specialFolders.filter(
+  const unlistedFolders = [...specialFolders, ...(ctrl.removedPaths ?? []).map((path) => ({ path, label: path }))].filter(
     (folder) => !roots.some((row) => normalizeForKey(row.path) === normalizeForKey(folder.path)),
   );
 
@@ -340,12 +330,12 @@ export function DuplicatesConfigPanel({
               <span className="dg-crit-head">Required</span>
               <span
                 className="dg-crit-name"
-                title="Byte-identical content is always required, and re-checked before any file action"
+                title="Read file contents to match exact duplicates"
               >
                 Contents
               </span>
-              <input type="checkbox" className="df-checkbox" checked disabled aria-label="Contents always used" />
-              <input type="checkbox" className="df-checkbox" checked disabled aria-label="Contents always required" />
+              <input type="checkbox" className="df-checkbox" checked={ctrl.criteria.content.enabled} disabled={locked} aria-label="Use Contents" onChange={(event) => setScanType(event.target.checked ? "contents" : "metadata")} />
+              <input type="checkbox" className="df-checkbox" checked={ctrl.criteria.content.required} disabled={locked || !ctrl.criteria.content.enabled} aria-label="Require Contents" onChange={(event) => ctrl.setCriterion("content", { required: event.target.checked })} />
               {OPTIONAL_CRITERIA.map((criterion) => {
                 const state = ctrl.criteria[criterion.key];
                 return [
@@ -382,7 +372,7 @@ export function DuplicatesConfigPanel({
               <span>Match similar filenames</span>
             </label>
             <label className="dg-field dg-field-inline">
-              <span>Filter hardness:</span>
+              <span>Name similarity:</span>
               <input
                 type="range"
                 min={50}
@@ -459,7 +449,7 @@ export function DuplicatesConfigPanel({
           </section>
 
           <section className="dg-optgroup">
-            <h3>Re-prioritize</h3>
+            <h3>Keep preference</h3>
             <label className="dg-field dg-field-inline">
               <span>Keep:</span>
               <Select
@@ -516,7 +506,7 @@ export function DuplicatesConfigPanel({
           <span>State</span>
         </div>
         <div className="dg-grid-body">
-          {dirRows.map((row) => {
+          {dirRows.filter((row) => row.type === "note" || !(ctrl.removedPaths ?? []).some((path) => isUnder(row.path, path))).map((row) => {
             if (row.type === "note") {
               return (
                 <div
@@ -590,6 +580,12 @@ export function DuplicatesConfigPanel({
                     stopPropagation
                     onChange={(next) => ctrl.setPathState(row.path, next)}
                   />
+                  <button type="button" className="dg-icon-btn dg-remove-target"
+                    aria-label={`Remove ${row.path} from scan`} title="Remove from scan"
+                    disabled={locked}
+                    onClick={(event) => { event.stopPropagation(); ctrl.removeCustomPath(row.path); }}>
+                    <Icon name="x" size={12} />
+                  </button>
                 </span>
               </div>
             );
@@ -612,8 +608,8 @@ export function DuplicatesConfigPanel({
         <button
           type="button"
           className="dg-icon-btn"
-          title="Remove the selected folder"
-          aria-label="Remove selected folder"
+          title="Remove selected target from scan (does not delete files)"
+          aria-label="Remove selected target"
           disabled={locked || !removable}
           onClick={() => {
             if (activePath) ctrl.removeCustomPath(activePath);
@@ -671,51 +667,12 @@ export function DuplicatesConfigPanel({
 
         <div className="dg-spacer" />
 
-        {scanning ? (
-          <div className="dg-scan" role="status" aria-live="polite">
-            <div className="dg-scan-steps">
-              {DUPLICATE_SCAN_STEPS.map((step) => (
-                <span key={step.id} className={`dg-scan-step ${scanStepStatus(step.id, activeStep)}`}>
-                  {step.label}
-                </span>
-              ))}
-            </div>
-            <div className="dg-scan-line">
-              <span className="dg-scan-text">
-                {hashingTitle(ctrl.phase, ctrl.progress)}
-                {" · "}
-                {ctrl.phase === "hashing" && ctrl.progress.hashing > 0
-                  ? `${ctrl.progress.hashing.toLocaleString()} candidates, ${hashedPct}%`
-                  : ctrl.progress.scanned > 0
-                    ? `${ctrl.progress.scanned.toLocaleString()} indexed`
-                    : "starting"}
-              </span>
-              <div
-                className="df-progress-track dg-scan-track"
-                role="progressbar"
-                aria-label="Duplicate scan progress"
-                aria-valuemin={0}
-                aria-valuemax={ctrl.phase === "hashing" ? ctrl.progress.hashing : undefined}
-                aria-valuenow={ctrl.phase === "hashing" ? ctrl.progress.hashed : undefined}
-                aria-valuetext={
-                  ctrl.phase === "hashing" && ctrl.progress.hashing > 0
-                    ? `${hashedPct}% of ${ctrl.progress.hashing} candidates processed`
-                    : ctrl.progress.scanned > 0
-                      ? `${ctrl.progress.scanned} items indexed`
-                      : "Starting scan"
-                }
-              >
-                <div
-                  className={`df-progress-bar ${determinate ? "df-progress-bar-determinate" : "df-progress-bar-sweep"}`}
-                  style={determinate
-                    ? { width: `${Math.min(100, (ctrl.progress.hashed / ctrl.progress.hashing) * 100)}%` }
-                    : undefined}
-                />
-              </div>
-            </div>
-            <button type="button" className="dg-btn dg-btn-danger" onClick={ctrl.stopScan}>Stop</button>
-          </div>
-        ) : (
+        {ctrl.scanState === "error" && ctrl.errors.length > 0 && (
+          <span role="alert" className="dg-status-errors" title={ctrl.errors.join("\n")}>
+            Scan failed: {ctrl.errors[0]}
+          </span>
+        )}
+        {scanning ? <DuplicateScanProgress ctrl={ctrl} /> : (
           <button
             type="button"
             className="dg-btn dg-btn-default"

@@ -89,6 +89,60 @@ beforeEach(() => {
 });
 
 describe("DuplicatesConfigPanel directory list", () => {
+  it("shows and allows removal of a saved disconnected drive", () => {
+    const ctrl = controller();
+    ctrl.value.selectedPaths = [...ctrl.value.selectedPaths, "F:\\"];
+    render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
+    expect(screen.getByText("Saved scan target (not listed among connected drives)")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Remove F:\\ from scan" }));
+    expect(ctrl.value.removeCustomPath).toHaveBeenCalledWith("F:\\");
+  });
+  it("shows a failed scan's reason beside an enabled retry button", () => {
+    const ctrl = controller();
+    ctrl.value.scanState = "error";
+    ctrl.value.errors = ["Scan index no longer exists: old-index"];
+    render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
+    expect(screen.getByRole("alert")).toHaveTextContent("Scan index no longer exists");
+    fireEvent.click(screen.getByRole("button", { name: "Scan" }));
+    expect(ctrl.value.startScan).toHaveBeenCalledOnce();
+  });
+  it("removes selected drives and custom folders from the scan", () => {
+    const ctrl = controller();
+    render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
+    for (const path of ctrl.value.selectedPaths) {
+      fireEvent.click(screen.getByRole("button", { name: `Remove ${path} from scan` }));
+      expect(ctrl.value.removeCustomPath).toHaveBeenCalledWith(path);
+    }
+  });
+
+  it("allows removing an excluded drive", () => {
+    const ctrl = controller();
+    render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
+    const remove = screen.getByRole("button", { name: `Remove ${drives[1].root} from scan` });
+    expect(remove).toBeEnabled();
+    fireEvent.click(remove);
+    expect(ctrl.value.removeCustomPath).toHaveBeenCalledWith(drives[1].root);
+  });
+
+  it("hides removed drives and offers them in the add menu", () => {
+    const ctrl = controller();
+    ctrl.value.removedPaths = [drives[1].root];
+    render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
+    expect(screen.queryByRole("combobox", { name: `State for ${drives[1].root}` })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Add a known folder" }));
+    fireEvent.click(screen.getByRole("button", { name: drives[1].root }));
+    expect(ctrl.value.addCustomPath).toHaveBeenCalledWith(drives[1].root);
+  });
+
+  it("locks removal while a scan is running", () => {
+    const ctrl = controller();
+    ctrl.value.scanState = "scanning";
+    render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
+    for (const path of ctrl.value.selectedPaths) {
+      expect(screen.getByRole("button", { name: `Remove ${path} from scan` })).toBeDisabled();
+    }
+  });
+
   it("lists folders with Normal, Reference, and Excluded states", () => {
     const ctrl = controller();
     render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
@@ -144,6 +198,26 @@ describe("DuplicatesConfigPanel directory list", () => {
     expect(ctrl.value.addCustomPath).toHaveBeenCalledWith("D:\\Photos");
   });
 
+  it("lets users disable Contents directly", () => {
+    const ctrl = controller();
+    render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
+    fireEvent.click(screen.getByRole("button", { name: "More Options" }));
+    const contents = screen.getByRole("checkbox", { name: "Use Contents" });
+    expect(contents).toBeEnabled();
+    fireEvent.click(contents);
+    expect(ctrl.value.setCriterion).toHaveBeenCalledWith("content", { enabled: false, required: false });
+  });
+
+  it("shows exactly Content and Metadata scan types", () => {
+    const ctrl = controller();
+    ctrl.value.criteria = { ...ctrl.value.criteria, content: { enabled: false, required: false } };
+    render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
+    fireEvent.click(screen.getByRole("combobox", { name: "Scan type" }));
+    expect(screen.getAllByRole("option")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("option", { name: /^Content$/ }));
+    expect(ctrl.value.setCriterion).toHaveBeenCalledWith("content", { enabled: true, required: true });
+  });
+
   it("maps the scan type onto the required match criteria", () => {
     const ctrl = controller();
     render(<DuplicatesConfigPanel ctrl={ctrl.value} drives={drives} specialFolders={[]} />);
@@ -151,9 +225,10 @@ describe("DuplicatesConfigPanel directory list", () => {
     const scanType = screen.getByRole("combobox", { name: "Scan type" });
     expect(scanType).toHaveAttribute("data-value", "contents");
 
-    pick(scanType, "Contents + filename");
+    pick(scanType, "Metadata");
+    expect(ctrl.value.setCriterion).toHaveBeenCalledWith("content", { enabled: false, required: false });
     expect(ctrl.value.setCriterion).toHaveBeenCalledWith("name", { enabled: true, required: true });
-    expect(ctrl.value.setCriterion).toHaveBeenCalledWith("date", { enabled: true, required: false });
+    expect(ctrl.value.setCriterion).toHaveBeenCalledWith("size", { enabled: true, required: true });
   });
 
   it("keeps match criteria and filters behind More Options", () => {

@@ -264,17 +264,17 @@ function overallScore(m: DupeMatch, criteria: DupeCriteria): number {
 
 /** A required criterion must be fully satisfied for a duplicate to stay. */
 function satisfiesRequired(m: DupeMatch, criteria: DupeCriteria): boolean {
-  if (criteria.name.required) {
+  if (criteria.name.enabled && criteria.name.required) {
     const need = criteria.nameFuzzy ? criteria.nameThreshold : 100;
     if (m.name < need) return false;
   }
-  if (criteria.size.required && m.size < 100) return false;
-  if (criteria.date.required && m.date < 100) return false;
-  if (criteria.content.required && m.content < 100) return false;
+  if (criteria.size.enabled && criteria.size.required && m.size < 100) return false;
+  if (criteria.date.enabled && criteria.date.required && m.date < 100) return false;
+  if (criteria.content.enabled && criteria.content.required && m.content < 100) return false;
   return true;
 }
 
-function buildGroup(
+export function buildGroup(
   members: CandidateMeta[],
   criteria: DupeCriteria,
   repri: ReprioritizeCriterion,
@@ -349,10 +349,10 @@ export function buildKeyedGroups(
   // Prefer the required criteria as the grouping key; if none are required,
   // fall back to all enabled (non-content) criteria.
   const useRequired =
-    criteria.name.required || criteria.size.required || criteria.date.required;
-  const keyName = useRequired ? criteria.name.required : criteria.name.enabled;
-  const keySize = useRequired ? criteria.size.required : criteria.size.enabled;
-  const keyDate = useRequired ? criteria.date.required : criteria.date.enabled;
+    [criteria.name, criteria.size, criteria.date].some((criterion) => criterion.enabled && criterion.required);
+  const keyName = criteria.name.enabled && (!useRequired || criteria.name.required);
+  const keySize = criteria.size.enabled && (!useRequired || criteria.size.required);
+  const keyDate = criteria.date.enabled && (!useRequired || criteria.date.required);
 
   if (!keyName && !keySize && !keyDate) {
     return { groups: [], error: "Enable Name, Size, or Date (or turn Content on) to match." };

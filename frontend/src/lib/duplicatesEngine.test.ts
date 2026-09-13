@@ -5,6 +5,7 @@ import {
   actionableDuplicatePaths,
   applyProtectedLocations,
   buildContentGroups,
+  buildKeyedGroups,
   minimalScanTargets,
   normalizeForKey,
   scopeStateForPath,
@@ -139,5 +140,20 @@ describe("duplicate protection policy", () => {
       "D:\\Archive",
       "D:\\Archive",
     ])).toEqual(["C:\\", "D:\\Archive"]);
+  });
+});
+
+describe("metadata matching", () => {
+  it("ignores disabled required flags and does not mark contents verified", () => {
+    const files = [candidate("C:\\one.txt", 100), candidate("D:\\two.txt", 200)];
+    const result = buildKeyedGroups(files, {
+      ...criteria,
+      content: { enabled: false, required: true },
+      name: { enabled: false, required: true },
+      date: { enabled: false, required: true },
+      size: { enabled: true, required: true },
+    }, "newest");
+    expect(result.groups).toHaveLength(1);
+    expect(result.groups[0].files.every((file) => file.match?.content === 0)).toBe(true);
   });
 });

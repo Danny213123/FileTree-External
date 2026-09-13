@@ -31,6 +31,8 @@ import type {
   CompressLogRow,
 } from "./types";
 import { isTauriV2, scanPage, toNodeRecord } from "./v2";
+import { invokeRead } from "./readRequest";
+import { loadCompressionExclusions } from "../lib/compressionExclusions";
 import { Channel, invoke } from "@tauri-apps/api/core";
 
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -1756,6 +1758,7 @@ export interface DupeActionResult {
   ok: boolean;
   errors: string[];
   succeeded: string[];
+  missing?: string[];
   requiresRescan?: boolean;
 }
 
@@ -1775,6 +1778,7 @@ export async function dupeAction(
       return { ok: false, errors: ["Duplicate action plan is incomplete; run the scan again."], succeeded: [] };
     }
     const errors: string[] = [];
+    const missing: string[] = [];
     const succeeded: string[] = [];
     let requiresRescan = false;
     for (let offset = 0; offset < opts.items.length; offset += 1_000) {
@@ -1791,6 +1795,7 @@ export async function dupeAction(
         }
         errors.push(...(result.errors ?? []));
         succeeded.push(...(result.succeeded ?? []));
+        missing.push(...(result.missing ?? []));
       } catch (error) {
         errors.push(error instanceof Error ? error.message : String(error));
         requiresRescan = true;
@@ -1801,6 +1806,7 @@ export async function dupeAction(
       ok: errors.length === 0,
       errors,
       succeeded,
+      ...(missing.length ? { missing } : {}),
       ...(requiresRescan ? { requiresRescan: true } : {}),
     };
   }
@@ -2193,7 +2199,10 @@ export interface CompressJobStartResult {
 export async function startCompressJob(body: CompressJobRequest): Promise<CompressJobStartResult> {
   // Forward the custom-preset video knobs only when defined (mirrors how the
   // other optional fields are sent), so older/non-custom requests are unchanged.
-  const payload: CompressJobRequest = { ...body };
+  const savedExclusions = loadCompressionExclusions();
+  const payload: CompressJobRequest = { ...body,
+    ...((savedExclusions.length || body.excludePaths?.length) ? { excludePaths: [...(body.excludePaths ?? []), ...savedExclusions] } : {}),
+  };
   if (body.customMaxHeight !== undefined) payload.customMaxHeight = body.customMaxHeight;
   else delete payload.customMaxHeight;
   if (body.customQuality !== undefined) payload.customQuality = body.customQuality;
@@ -2302,14 +2311,13 @@ export async function retryCompressJob(id: string): Promise<string> {
   return jobId;
 }
 
-/** List every compression job (live + persisted manifests) for the "In Progress"
- *  tab. Returns [] on any error so the tab degrades gracefully. */
+/** List every compression job. Desktop failures reach the monitor's retry UI. */
 export async function listCompressJobs(signal?: AbortSignal): Promise<CompressJobSummary[]> {
+  if (isTauriV2()) {
+    const data = await invokeRead<{ jobs?: CompressJobSummary[] }>("compression_list");
+    return Array.isArray(data?.jobs) ? data.jobs : [];
+  }
   try {
-    if (isTauriV2()) {
-      const data = await invoke<{ jobs?: CompressJobSummary[] }>("compression_list");
-      return Array.isArray(data?.jobs) ? data.jobs : [];
-    }
     const res = await fetch("/api/compress-jobs", { signal });
     if (!res.ok) return [];
     const data = (await res.json()) as { jobs?: CompressJobSummary[] } | null;

@@ -90,6 +90,10 @@ describe("TreeTable double click", () => {
       />,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: "Do not compress: clip.mp4" }));
+    expect(JSON.parse(localStorage.getItem("filetree.compression.exclusions.v1") ?? "[]")).toContain(file.path);
+    fireEvent.click(screen.getByRole("button", { name: "Allow compression: clip.mp4" }));
+    expect(JSON.parse(localStorage.getItem("filetree.compression.exclusions.v1") ?? "[]")).not.toContain(file.path);
     fireEvent.doubleClick(screen.getByText("clip.mp4"));
     expect(onDoubleClick).toHaveBeenCalledOnce();
     expect(onDoubleClick).toHaveBeenCalledWith(file);
@@ -289,4 +293,39 @@ describe("TreeTable lazy expansion", () => {
     expect(tooltip).toHaveAttribute("data-node-path", directory.path);
     expect(tooltip).toHaveAttribute("data-thumb-path", file.path);
   });
+});
+
+it("shows an expansion control for unloaded filtered folders", () => {
+  const onToggleExpand = vi.fn();
+    render(
+      <TreeTable
+        rows={[{ ...file, dir: true, name: "Media", children: [] }]}
+        flat
+        expandableFlat
+        lazy
+        nodeById={new Map()}
+        expanded={new Set()}
+        expandedAll={false}
+        collapsedOverrides={new Set()}
+        selectedId={0}
+        selectedIds={new Set()}
+        sortKey="name"
+        sortDir={1}
+        metric="size"
+        unit="auto"
+        decimals={1}
+        visibleColumns={new Set(["name"])}
+        columnWidths={{}}
+        onColumnResize={vi.fn()}
+        bookmarks={new Set()}
+        onToggleExpand={onToggleExpand}
+        onSelect={vi.fn()}
+        onDoubleClick={vi.fn()}
+        onContextMenu={vi.fn()}
+        onSortChange={vi.fn()}
+        onToggleBookmark={vi.fn()}
+      />,
+    );
+  fireEvent.click(screen.getByRole("button", { name: "Expand Media" }));
+  expect(onToggleExpand).toHaveBeenCalledWith(42);
 });

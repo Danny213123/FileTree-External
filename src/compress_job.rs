@@ -1320,6 +1320,15 @@ pub(crate) fn cancel_job(job: &CompressJob) {
     job.queue_cv.notify_all();
 }
 
+/// A restored/queued run has no worker to acknowledge cancellation. Claim the
+/// runner slot atomically so a concurrent spawn cannot race this finalization.
+pub(crate) fn cancel_or_finalize_job(job: &Arc<CompressJob>) {
+    cancel_job(job);
+    if job.runner_started.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        force_finalize_job(job);
+    }
+}
+
 /// Wait only for the bounded cancellation handshake exposed to callers. The
 /// worker owns final cleanup; this polling wait cannot itself hold a job lock or
 /// deadlock that cleanup.
@@ -1370,7 +1379,7 @@ pub(crate) fn resume_job(job: &Arc<CompressJob>) -> Result<bool, String> {
             *status = "running".to_string();
             begin_active_interval(job);
         }
-        "running" => return Ok(false),
+        "running" => return Ok(!job.runner_started.load(Ordering::SeqCst)),
         other => return Err(format!("A {other} job cannot be resumed")),
     }
     drop(status);
@@ -8514,6 +8523,30 @@ mod manifest_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn restored_compression_can_resume_or_cancel_without_stranding_paths() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let source = home.join("saved-source.txt");
+        std::fs::write(&source, b"original contents").unwrap();
+        let job = create_job(&[source.to_string_lossy().into_owned()], "balanced", &CompressOptions::default());
+        pause_job(&job).unwrap();
+        let restored = job_from_manifest(&job.id).expect("saved paused job");
+        assert!(resume_job(&restored).unwrap(), "restored job needs a runner");
+        cancel_or_finalize_job(&restored);
+        assert!(wait_until_finished(&restored, Duration::from_millis(50)));
+        assert_eq!(restored.status.lock_recover().as_str(), "cancelled");
+        let mut jobs = HashMap::new();
+        jobs.insert(restored.id.clone(), Arc::clone(&restored));
+        assert!(!restored.path_fingerprints.is_empty());
+        assert!(active_path_conflict(&jobs, &restored.path_fingerprints).is_none());
+        cancel_or_finalize_job(&restored);
+        assert!(restored.finished.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read(&source).unwrap(), b"original contents");
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

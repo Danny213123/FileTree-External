@@ -9174,3 +9174,40 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 .compression-monitor .cm-resizer:focus-visible::after {
   background: var(--df-accent);
 }
+
+.window-controls { display: flex; align-self: stretch; flex-shrink: 0; margin-right: -8px; margin-left: 8px; -webkit-app-region: no-drag; }
+.window-controls button { width: 46px; height: 100%; min-height: 0; padding: 0; flex: 0 0 46px; border: 0; border-radius: 0; background: transparent; color: inherit; display: grid; place-items: center; }
+.window-controls button:hover { background: var(--vsc-list-hover); }
+.window-controls .window-close:hover { background: #c42b1c; color: white; }
+.window-controls svg { fill: currentColor; stroke: none; opacity: 1; flex-shrink: 0; }
+.vsc-titlebar-title { position: static; transform: none; min-width: 0; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; margin-right: auto; }
+.dg-remove-target { flex-shrink: 0; margin-left: 6px; }
+
+.dg-grid-row .dg-cell-select { min-width: 0; flex: 1; }
+.window-controls button:focus-visible { outline: 1px solid var(--vsc-titlebar-fg); outline-offset: -3px; }
+
+/* One stable navigation row for every workspace, independent of side panels. */
+.vsc-middle > .activitybar { flex: 0 0 38px; padding: 0 8px; gap: 4px; }
+.vsc-middle > .activitybar .activity-btn { width: auto; flex: 0 0 auto; height: 30px; padding: 0 10px; gap: 7px; }
+.activity-label { font-size: 12px; font-weight: 500; white-space: nowrap; }
+.vsc-middle > .activitybar .activity-btn.active { box-shadow: inset 0 -2px var(--accent); }
+.vsc-middle > .activitybar .activity-badge { position: static; min-width: 16px; margin-left: 2px; }
+@media (max-width: 760px) {
+  .vsc-middle > .activitybar .activity-btn { padding: 0 7px; gap: 5px; }
+  .activity-label { font-size: 11px; }
+}
+
+/* Compact settings cards keep related labels and controls together. */
+.dg-options { grid-template-columns: repeat(auto-fit, minmax(270px, 330px)); align-items: start; justify-content: start; gap: 12px; padding: 14px; max-height: 45vh; overflow-y: auto; }
+.dg-optgroup { width: 100%; padding: 14px; gap: 12px; background: var(--df-surface); border: 1px solid var(--df-divider); border-radius: 6px; }
+.dg-optgroup h3 { font-size: 12px; text-transform: none; letter-spacing: 0; padding-bottom: 9px; width: 100%; border-bottom: 1px solid var(--df-divider); color: var(--text); }
+.dg-crit { grid-template-columns: minmax(100px, 1fr) 40px 60px; gap: 9px 6px; }
+.dg-crit input { justify-self: center; }
+.dg-optgroup .dg-field-inline { display: grid; grid-template-columns: 105px minmax(0, 1fr) auto; width: 100%; gap: 8px; }
+.dg-optgroup .dg-field-inline input, .dg-optgroup .dg-field-inline .ft-select { min-width: 0; width: 100%; }
+.dg-optgroup .dg-check { align-items: center; gap: 8px; }
+
+/* Keep explorer actions together immediately after the name. */
+.name-cell .tag-btn,
+.name-cell .bookmark-btn,
+.name-cell .row-compress-btn { margin-left: 3px; }

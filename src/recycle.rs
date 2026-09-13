@@ -27,8 +27,11 @@ pub(crate) fn recycle_path(path: &Path) -> io::Result<()> {
     use std::iter::once;
     use std::os::windows::ffi::OsStrExt;
 
+    // Legacy shell operations do not accept the verbatim prefixes returned by canonicalize.
+    let absolute = std::path::absolute(path)?;
+    let shell_path = crate::io::explorer_shell_path(&absolute.to_string_lossy())?;
     // SHFileOperation requires a double-null-terminated wide string.
-    let mut wide: Vec<u16> = OsStr::new(path)
+    let mut wide: Vec<u16> = OsStr::new(&shell_path)
         .encode_wide()
         .chain(once(0))
         .chain(once(0))
@@ -72,10 +75,17 @@ pub(crate) fn recycle_path(path: &Path) -> io::Result<()> {
     };
 
     let ret = unsafe { SHFileOperationW(&mut op) };
-    if ret == 0 {
+    recycle_operation_result(ret, op.fAnyOperationsAborted != 0)
+}
+
+#[cfg(windows)]
+fn recycle_operation_result(ret: i32, aborted: bool) -> io::Result<()> {
+    if ret == 0 && aborted {
+        Err(io::Error::new(io::ErrorKind::Interrupted, "Recycle operation was canceled; file was not deleted"))
+    } else if ret == 0 {
         Ok(())
     } else {
-        Err(io::Error::from_raw_os_error(ret))
+        Err(io::Error::other(format!("Windows Recycle Bin operation failed (Shell code 0x{ret:X})")))
     }
 }
 
@@ -106,4 +116,15 @@ pub(crate) fn delete_path_permanent(path: &Path) -> io::Result<()> {
 /// [`delete_path_permanent`].
 pub(crate) fn delete_permanent(path: &Path) -> io::Result<()> {
     delete_path_permanent(path)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::recycle_operation_result;
+    #[test]
+    fn recycle_cancellation_is_not_reported_as_deletion() {
+        assert!(recycle_operation_result(0, false).is_ok());
+        assert_eq!(recycle_operation_result(0, true).unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(recycle_operation_result(5, false).is_err());
+    }
 }

@@ -1,3 +1,6 @@
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isTauriV2 } from "../api/v2";
+import { toast } from "../lib/toast";
 import { useState, useRef, useEffect } from "react";
 import { Icon } from "./Icon";
 import type { ChatSessionMeta } from "../lib/chatSessions";
@@ -71,6 +74,22 @@ export function TitleBar({
   getSessions, onRestoreSession, optionsMenu,
   visibleColumns, onVisibleColumnsChange, decimals, onDecimalsChange, unit, onUnitChange,
 }: TitleBarProps) {
+  const nativeWindow = isTauriV2();
+  const [maximized, setMaximized] = useState(false);
+  const windowAction = async (action: "minimize" | "toggleMaximize" | "close" | "startDragging") => {
+    try { await getCurrentWindow()[action](); }
+    catch { toast.error("Unable to update the window."); }
+  };
+  useEffect(() => {
+    if (!nativeWindow) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const win = getCurrentWindow();
+    const refresh = () => { void win.isMaximized().then(value => { if (!disposed) setMaximized(value); }).catch(() => {}); };
+    refresh();
+    void win.onResized(refresh).then(off => { if (disposed) off(); else unlisten = off; }).catch(() => {});
+    return () => { disposed = true; unlisten?.(); };
+  }, [nativeWindow]);
   const [openIdx, setOpenIdx] = useState<number | null>(null);
   const [pop, setPop] = useState<Pop>(null);
   const [sessions, setSessions] = useState<ChatSessionMeta[]>([]);
@@ -106,7 +125,14 @@ export function TitleBar({
   };
 
   return (
-    <div className="vsc-titlebar" ref={barRef}>
+    <div className="vsc-titlebar" ref={barRef}
+      onMouseDown={(event) => {
+        if (nativeWindow && event.button === 0 && event.detail !== 2 && !(event.target as HTMLElement).closest("button, .vsc-menubar, .titlebar-actions, .window-controls")) void windowAction("startDragging");
+      }}
+      onDoubleClick={(event) => {
+        if (nativeWindow && !(event.target as HTMLElement).closest("button, .vsc-menubar, .titlebar-actions, .window-controls")) void windowAction("toggleMaximize");
+      }}>
+
       <Icon name="folder" size={16} className="vsc-titlebar-logo" />
       <div className="vsc-menubar">
         {menus.map((menu, idx) => {
@@ -284,6 +310,11 @@ export function TitleBar({
           <Icon name="layout-sidebar-reverse" size={15} />
         </button>
       </div>
+      {nativeWindow && <div className="window-controls">
+        <button aria-label="Minimize window" title="Minimize" onClick={() => void windowAction("minimize")}><Icon name="dash" size={16} /></button>
+        <button aria-label={maximized ? "Restore window" : "Maximize window"} title={maximized ? "Restore down" : "Maximize"} onClick={() => void windowAction("toggleMaximize")}><Icon name={maximized ? "window-restore" : "window-maximize"} size={14} /></button>
+        <button className="window-close" aria-label="Close window" title="Close" onClick={() => void windowAction("close")}><Icon name="x" size={18} /></button>
+      </div>}
     </div>
   );
 }

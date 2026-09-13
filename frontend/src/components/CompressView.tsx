@@ -46,6 +46,9 @@ import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
 import { CompressionMonitor } from "./CompressionMonitor";
 import { Select } from "./Select";
+import { CompressionExclusions } from "./CompressionExclusions";
+import { isCompressionExcluded } from "../lib/compressionExclusions";
+import { useCompressionExclusions } from "../hooks/useCompressionExclusions";
 
 // Compression page (media re-encode + zip, with live jobs).
 //
@@ -561,7 +564,7 @@ type Row =
   | { type: "file"; key: string; file: CompressFile }
   | { type: "runfile"; key: string; rf: FileProg };
 
-type CompressTab = "compress" | "progress" | "history";
+type CompressTab = "compress" | "progress" | "history" | "exclusions";
 
 interface CompressViewProps {
   /** Current scan root (for the empty state + nocache rescan). */
@@ -761,6 +764,7 @@ export function CompressView({
   const [showPerf, setShowPerf] = useState(false);
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [compressionExclusions, setCompressionExclusions] = useCompressionExclusions();
   const [scanSelectionDefault, setScanSelectionDefault] = useState(true);
   const [scanSelectionOverrides, setScanSelectionOverrides] = useState<Set<number>>(new Set());
   const [scanDirectorySources, setScanDirectorySources] = useState<CompressionScanDirectorySource[]>([]);
@@ -1118,7 +1122,7 @@ export function CompressView({
     if (inRun) return idleFilesRef.current;
     const folderScope = scanDirectorySources.length > 0;
     if (folderScope && (!scopePaths || scopePaths.size === 0)) {
-      return scanDirectoryFiles;
+      return scanDirectoryFiles.filter((file) => !isCompressionExcluded(file.path, compressionExclusions));
     }
     const out: CompressFile[] = [];
     const seen = new Set<string>();
@@ -1153,8 +1157,9 @@ export function CompressView({
       seen.add(key);
       out.push(ef);
     }
-    return out;
+    return out.filter((file) => !isCompressionExcluded(file.path, compressionExclusions));
   }, [
+    compressionExclusions,
     nodeById,
     scopePaths,
     extraFiles,
@@ -2304,9 +2309,12 @@ export function CompressView({
         >
           History
         </button>
+        <button role="tab" aria-selected={tab === "exclusions"} className={`compress-tab${tab === "exclusions" ? " active" : ""}`} onClick={() => setTab("exclusions")}>Do not compress ({compressionExclusions.length})</button>
       </div>
 
-      {tab === "progress" ? (
+      {tab === "exclusions" ? (
+        <CompressionExclusions paths={compressionExclusions} onChange={setCompressionExclusions} selectedPaths={[]} disabled={false} standalone />
+      ) : tab === "progress" ? (
         <CompressionMonitor focusJobId={jobId} />
       ) : tab === "history" ? (
         <CompressHistory onCompressAgain={compressAgain} />

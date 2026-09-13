@@ -1,4 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { invokeRead } from "./readRequest";
 import type { DupeScopeRule, NodeRecord, ScanResult } from "./types";
 import type { ScanOptions } from "./client";
 import { V2PageCache } from "../lib/v2PageCache";
@@ -68,6 +69,9 @@ export interface V2DuplicateSource {
 }
 
 export interface V2DuplicateProgress {
+  fraction?: number | null;
+  startedAt?: number;
+  bytesRead?: number;
   phase: "indexing" | "fingerprinting" | "sampling" | "hashing" | "finalizing" | "done" | string;
   scanned: number;
   hashing: number;
@@ -96,6 +100,11 @@ export interface V2DuplicateResult {
 }
 
 export interface V2DuplicateRequest {
+  metadataOnly?: boolean;
+  metadataName?: boolean;
+  metadataSize?: boolean;
+  metadataDate?: boolean;
+  dateToleranceSec?: number;
   sources: V2DuplicateSource[];
   minSize: number;
   maxSize?: number | null;
@@ -112,6 +121,7 @@ export interface NativeDragResponse {
 }
 
 const pageCache = new V2PageCache<V2NodePage>();
+const pendingPages = new Map<string, Promise<V2NodePage>>();
 let duplicateRequestSequence = 0;
 let activeDuplicateRequestId: string | null = null;
 
@@ -178,13 +188,19 @@ export function toNodeRecord(item: V2NodeItem): NodeRecord {
   };
 }
 
+export async function isV2ScanUsable(scanId: string): Promise<boolean> {
+  const handle = await invoke<V2ScanHandle | null>("scan_status", { scanId });
+  return !!handle && ["done", "stale"].includes(handle.status);
+}
+
 export async function runV2Scan(
   options: ScanOptions,
   onProgress: (value: V2ScanProgress) => void,
   signal?: AbortSignal,
 ): Promise<ScanResult> {
+  signal?.throwIfAborted();
   if (!options.nocache) {
-    const cached = await invoke<V2ScanHandle | null>("scan_find", { rootPath: options.path });
+    const cached = await invokeRead<V2ScanHandle | null>("scan_find", { rootPath: options.path });
     if (cached) return loadV2Scan(cached, options.threads ?? 0);
   }
   const channel = new Channel<V2ScanProgress>();
@@ -208,8 +224,12 @@ export async function runV2Scan(
     },
     onProgress: channel,
   });
-  const abort = () => { void invoke("scan_cancel", { scanId: handle.scanId }); };
+  const abort = () => {
+    void invoke("scan_cancel", { scanId: handle.scanId }).catch(() => {});
+    finish?.({ scanId: handle.scanId, stage: "cancelled", nodeCount: 0, elapsedMs: 0 });
+  };
   signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
   try {
     const final = terminal ?? await done;
     if (final.stage === "cancelled" || signal?.aborted) throw new DOMException("Scan cancelled", "AbortError");
@@ -250,6 +270,7 @@ async function loadV2Scan(handle: V2ScanHandle, threadCount: number): Promise<Sc
 }
 
 export async function scanPage(query: {
+  directoryPaths?: string[];
   scanId: string;
   parentId?: number | null;
   offset?: number;
@@ -269,6 +290,7 @@ export async function scanPage(query: {
   countTotal?: boolean;
 }): Promise<V2NodePage> {
   const normalized = {
+    ...(query.directoryPaths?.length ? { directoryPaths: query.directoryPaths } : {}),
     scanId: query.scanId,
     parentId: query.parentId ?? null,
     offset: query.offset ?? 0,
@@ -290,10 +312,15 @@ export async function scanPage(query: {
   const key = JSON.stringify(normalized);
   const cached = pageCache.get(key);
   if (cached) return cached;
-  const page = await invoke<V2NodePage>("scan_page", { query: normalized });
-  const estimated = page.items.reduce((total, item) => total + 192 + item.name.length * 2 + item.path.length * 2, 0);
-  pageCache.set(key, page, estimated);
-  return page;
+  const pending = pendingPages.get(key);
+  if (pending) return pending;
+  const request = invokeRead<V2NodePage>("scan_page", { query: normalized }).then((page) => {
+    const estimated = page.items.reduce((total, item) => total + 192 + item.name.length * 2 + item.path.length * 2, 0);
+    pageCache.set(key, page, estimated);
+    return page;
+  }).finally(() => { pendingPages.delete(key); });
+  pendingPages.set(key, request);
+  return request;
 }
 
 export async function v2MemoryStats(): Promise<V2MemoryStats> {
@@ -306,6 +333,7 @@ export async function runV2DuplicateScan(
   onProgress: (value: V2DuplicateProgress) => void,
   signal?: AbortSignal,
 ): Promise<V2DuplicateResult> {
+  signal?.throwIfAborted();
   const requestId = `duplicates-${Date.now().toString(36)}-${(++duplicateRequestSequence).toString(36)}`;
   activeDuplicateRequestId = requestId;
   const channel = new Channel<V2DuplicateProgress>();

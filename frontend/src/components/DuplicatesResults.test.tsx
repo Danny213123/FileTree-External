@@ -52,6 +52,7 @@ function controller(overrides: Partial<DuplicatesController> = {}): DuplicatesCo
   return {
     selectedPaths: ["C:\\"],
     customPaths: [],
+    removedPaths: [],
     protectedPaths: ["C:\\Library"],
     excludedPaths: [],
     scopeRules: [
@@ -267,4 +268,15 @@ describe("DuplicatesResults review workflow", () => {
     fireEvent.click(screen.getByRole("button", { name: "Move to Recycle Bin" }));
     expect(ctrl.executeDeletion).toHaveBeenCalledWith({ permanent: false });
   });
+});
+
+it("does not revisit every source group when a checkbox changes in All groups", () => {
+  const readFiles = vi.fn(() => group.files);
+  const source = { ...group, get files() { return readFiles(); } };
+  const groups = [source];
+  const ctrl = controller({ groups, selected: new Set() });
+  const { rerender } = render(<DuplicatesResults ctrl={ctrl} />);
+  readFiles.mockClear();
+  rerender(<DuplicatesResults ctrl={{ ...ctrl, selected: new Set([group.files[1].path]), selectedCount: 1 }} />);
+  expect(readFiles).not.toHaveBeenCalled();
 });

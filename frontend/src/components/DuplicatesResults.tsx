@@ -223,16 +223,17 @@ export function DuplicatesResults({
     return out;
   }, [ctrl.groups, search, sortKey, sortDir, fileValue]);
 
+  const markedSelection = reviewFilter === "selected" ? ctrl.selected : null;
   const displayGroups = useMemo(
     () => sortedGroups.filter((group) => {
       if (reviewFilter === "selected") {
-        return group.files.some((file) => ctrl.selected.has(file.path));
+        return group.files.some((file) => markedSelection?.has(file.path));
       }
       if (reviewFilter === "needs-review") return !isVerifiedGroup(group);
       if (reviewFilter === "protected") return group.files.some((file) => file.protected);
       return true;
     }),
-    [ctrl.selected, reviewFilter, sortedGroups],
+    [markedSelection, reviewFilter, sortedGroups],
   );
 
   const flatRows = useMemo(() => {
@@ -250,7 +251,9 @@ export function DuplicatesResults({
     }
     return rows;
   }, [displayGroups, ctrl.collapsed, dupesOnly]);
-  const activeRow = flatRows.find((row) => row.key === activeRowKey) ?? null;
+  const rowIndex = useMemo(() => new Map(flatRows.map((row, index) => [row.key, index])), [flatRows]);
+  const activeRowIndex = activeRowKey === null ? 0 : rowIndex.get(activeRowKey) ?? 0;
+  const activeRow = activeRowKey !== null && rowIndex.has(activeRowKey) ? flatRows[activeRowIndex] : null;
   const activeGroup = activeRow?.group ?? null;
   const activeFile = activeRow?.file ?? null;
 
@@ -261,10 +264,6 @@ export function DuplicatesResults({
     overscan: 24,
   });
 
-  const activeRowIndex = Math.max(
-    0,
-    flatRows.findIndex((row) => row.key === activeRowKey),
-  );
   const focusRow = useCallback((index: number) => {
     if (flatRows.length === 0) return;
     const nextIndex = Math.max(0, Math.min(index, flatRows.length - 1));
@@ -308,9 +307,11 @@ export function DuplicatesResults({
     ),
     [displayGroups],
   );
-  const allChecked = visibleDupPaths.length > 0 && visibleDupPaths.every((p) => ctrl.selected.has(p));
-  const someChecked = !allChecked && visibleDupPaths.some((p) => ctrl.selected.has(p));
-  const visibleSelectedCount = visibleDupPaths.filter((path) => ctrl.selected.has(path)).length;
+  const visibleDupSet = useMemo(() => new Set(visibleDupPaths), [visibleDupPaths]);
+  const visibleSelectedCount = useMemo(() => [...ctrl.selected].reduce(
+    (count, path) => count + Number(visibleDupSet.has(path)), 0), [ctrl.selected, visibleDupSet]);
+  const allChecked = visibleDupPaths.length > 0 && visibleSelectedCount === visibleDupPaths.length;
+  const someChecked = !allChecked && visibleSelectedCount > 0;
   const hiddenSelectedCount = Math.max(0, ctrl.selectedCount - visibleSelectedCount);
   const duplicateCount = useMemo(
     () => ctrl.groups.reduce((sum, group) => sum + Math.max(0, group.files.length - 1), 0),
@@ -323,10 +324,13 @@ export function DuplicatesResults({
     ),
     [ctrl.groups],
   );
-  const selectedFiles = useMemo(
-    () => ctrl.groups.flatMap((group) => group.files.filter((file) => ctrl.selected.has(file.path))),
-    [ctrl.groups, ctrl.selected],
-  );
+  const filesByPath = useMemo(() => {
+    const index = new Map<string, DupeFileV2>();
+    for (const group of ctrl.groups) for (const file of group.files) index.set(file.path, file);
+    return index;
+  }, [ctrl.groups]);
+  const selectedFiles = useMemo(() => [...ctrl.selected].map((path) => filesByPath.get(path))
+    .filter((file): file is DupeFileV2 => !!file), [filesByPath, ctrl.selected]);
   const unverifiedSelectedCount = selectedFiles.filter((file) => (file.match?.content ?? 0) < 100).length;
   const linkEligible = ctrl.selectedCount > 0 && unverifiedSelectedCount === 0;
 
@@ -769,6 +773,7 @@ export function DuplicatesResults({
                 ? ctrl.progress.hashing > 0
                   ? `${ctrl.progress.hashing.toLocaleString()} candidates · ${hashedPct}%`
                   : "Finding files that share the same size"
+                : ctrl.phase === "grouping" && ctrl.progress.fraction != null ? `${hashedPct}% processed`
                 : ctrl.progress.scanned > 0
                   ? `${ctrl.progress.scanned.toLocaleString()} items indexed`
                   : "Waiting for the first file-system update"}
@@ -778,20 +783,22 @@ export function DuplicatesResults({
               role="progressbar"
               aria-label="Duplicate scan progress"
               aria-valuemin={0}
-              aria-valuemax={ctrl.phase === "hashing" ? ctrl.progress.hashing : undefined}
-              aria-valuenow={ctrl.phase === "hashing" ? ctrl.progress.hashed : undefined}
+              aria-valuemax={ctrl.progress.fraction != null ? 100 : ctrl.phase === "hashing" ? ctrl.progress.hashing : undefined}
+              aria-valuenow={ctrl.progress.fraction != null ? hashedPct : ctrl.phase === "hashing" ? ctrl.progress.hashed : undefined}
               aria-valuetext={
                 ctrl.phase === "hashing" && ctrl.progress.hashing > 0
                   ? `${hashedPct}% of ${ctrl.progress.hashing} candidates processed`
+                  : ctrl.phase === "grouping" && ctrl.progress.fraction != null ? `${hashedPct}% grouped`
                   : ctrl.progress.scanned > 0
                     ? `${ctrl.progress.scanned} items indexed`
                     : "Starting scan"
               }
             >
               <div
+                key={ctrl.progress.stage ?? ctrl.phase}
                 className={`df-progress-bar ${hashingBarDeterminate ? "df-progress-bar-determinate" : "df-progress-bar-sweep"}`}
                 style={hashingBarDeterminate
-                  ? { width: `${Math.min(100, (ctrl.progress.hashed / ctrl.progress.hashing) * 100)}%` }
+                  ? { width: `${hashedPct}%` }
                   : undefined}
               />
             </div>

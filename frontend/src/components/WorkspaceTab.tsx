@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef, forwardRef, useImperativeHandle, useSyncExternalStore, memo } from "react";
+import { useResultTree } from "../hooks/useResultTree";
 import { useScan, fetchScanStream } from "../hooks/useScan";
 import { isLiveNodeId, isNodeOpen, useTreeState, type ChipKey, type LazyOptions } from "../hooks/useTreeState";
 import { invalidate as invalidateScanCache } from "../lib/scanCache";
@@ -11,7 +12,7 @@ import {
   releaseExternalPaths,
   compress, extract, checksum, copyText,
   setAttributes, setTimes,
-  fetchServerSearch, shellContextMenu,
+  fetchServerSearch, shellContextMenu, fetchChildren,
 } from "../api/client";
 import type { ScanOptions, ExportFormat, CompressionSource, AppTabSettings } from "../api/client";
 import type { NodeRecord, SortKey, TagEntry } from "../api/types";
@@ -23,6 +24,7 @@ import { beginTransfer, finishTransfer, enqueueTransfer, transferDedupeKey } fro
 import { searchNodesAdvanced, filtersActive, toServerSearchParams, type SearchFilters } from "../lib/search";
 import { exportResults } from "../lib/exportRows";
 import { loadFolderPref, saveFolderPref, normFolderKey } from "../lib/folderPrefs";
+import { compressionPathKey as bookmarkPathKey } from "../lib/compressionExclusions";
 import { compareNodes } from "../hooks/useTreeState";
 import { formatBytes } from "../utils/formatBytes";
 import { formatDate } from "../utils/formatDate";
@@ -47,6 +49,8 @@ import type { ScanStatus, ProgressStore } from "../hooks/useScan";
 import type { ScanResult, Metric, Unit } from "../api/types";
 import {
   isTauriV2,
+  scanPage,
+  toNodeRecord,
   fetchV2DirectorySnapshot,
   releaseV2ScanPages,
   startV2FilesystemWatch,
@@ -514,8 +518,48 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     return results;
   }, [taggedPaths, tree.nodeById, tree.sortKey, tree.sortDir]);
   const tagFiltering = !!activeTagFilter && !searching;
-  const showRows = searching ? searchResults : tagFiltering ? tagResults : tree.visibleRows;
-  const showFlat = searching || tagFiltering;
+  const bookmarksView = activeView === "bookmarks";
+  const bookmarkPaths = useMemo(() => {
+    const root = bookmarkPathKey(data?.rootPath ?? scanPath);
+    return bookmarkList.filter((path) => {
+      const key = bookmarkPathKey(path);
+      return root && (key === root || key.startsWith(`${root}/`));
+    });
+  }, [bookmarkList, data?.rootPath, scanPath]);
+  const bookmarkQueryKey = JSON.stringify([data?.scanId, bookmarkPaths]);
+  const [indexedBookmarks, setIndexedBookmarks] = useState<{ key: string; rows: NodeRecord[] }>({ key: "", rows: [] });
+  useEffect(() => {
+    if (!bookmarksView || !data?.scanId || !data.lazy || !bookmarkPaths.length) return;
+    let disposed = false;
+    void (async () => {
+      const rows: NodeRecord[] = [];
+      for (let offset = 0; offset < bookmarkPaths.length; offset += 500) {
+        const page = await scanPage({ scanId: data.scanId!, parentId: null, directoryPaths: bookmarkPaths.slice(offset, offset + 500), limit: 500, countTotal: false });
+        if (disposed) return;
+        rows.push(...page.items.map(toNodeRecord));
+      }
+      setIndexedBookmarks({ key: bookmarkQueryKey, rows });
+    })().catch((error) => { if (!disposed) toast.error(String(error)); });
+    return () => { disposed = true; };
+  }, [bookmarksView, data?.scanId, data?.lazy, bookmarkPaths, bookmarkQueryKey]);
+  const bookmarkRows = useMemo(() => {
+    const paths = new Set(bookmarkPaths.map(bookmarkPathKey));
+    const source = data?.lazy && indexedBookmarks.key === bookmarkQueryKey ? indexedBookmarks.rows : [...tree.nodeById.values()];
+    return source.filter((node) => node.dir && node.path && paths.has(bookmarkPathKey(node.path)))
+      .sort((a, b) => compareNodes(a, b, tree.sortKey, tree.sortDir));
+  }, [bookmarkPaths, data?.lazy, indexedBookmarks, bookmarkQueryKey, tree.nodeById, tree.sortKey, tree.sortDir]);
+  const resultRoots = bookmarksView ? bookmarkRows : searching ? searchResults : tagFiltering ? tagResults : [];
+  const resultTree = useResultTree(
+    JSON.stringify([data?.scanId, data?.scannedAt, activeView, searchQuery, bookmarkQueryKey, searchFilters]),
+    resultRoots,
+    async node => data?.lazy
+      ? fetchChildren({ rootPath: data.rootPath, scanId: data.scanId, scannedAt: data.scannedAt, dirId: node.id })
+      : node.children.map(id => tree.nodeById.get(id)).filter((child): child is NodeRecord => !!child),
+    (a, b) => compareNodes(a, b, tree.sortKey, tree.sortDir),
+    error => toast.error(String(error)),
+  );
+  const showRows = bookmarksView || searching || tagFiltering ? resultTree.rows : tree.visibleRows;
+  const showFlat = bookmarksView || searching || tagFiltering;
   const showRowsRef = useRef(showRows);
   showRowsRef.current = showRows;
   const actionNodeById = useMemo(() => {
@@ -2804,17 +2848,22 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           </div>
         )}
 
+        {bookmarksView && <div className="editor-toolbar search-results-bar">
+          <Icon name="star-fill" size={12} />
+          <span>{bookmarkRows.length} bookmarked folders in {data?.rootPath ?? scanPath}</span>
+        </div>}
         <div className="editor-stack">
           <div className="editor-main">
             <TreeTable
                   rows={showRows}
                   scanId={data?.scanId}
                   flat={showFlat}
+                  expandableFlat={showFlat}
                   lazy={!!data?.lazy}
-                  loadedDirs={tree.loadedDirs}
-                  nodeById={tree.nodeById}
-                  expanded={tree.expanded}
-                  expandedAll={tree.expandedAll}
+                  loadedDirs={showFlat ? resultTree.loadedDirs : tree.loadedDirs}
+                  nodeById={actionNodeById}
+                  expanded={showFlat ? resultTree.expanded : tree.expanded}
+                  expandedAll={showFlat ? false : tree.expandedAll}
                   collapsedOverrides={tree.collapsedOverrides}
                   selectedId={tree.selectedId}
                   selectedIds={selectedIds}
@@ -2826,7 +2875,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   visibleColumns={visibleColumns}
                   columnWidths={tree.columnWidths}
                   onColumnResize={tree.setColumnWidth}
-                  onToggleExpand={tree.toggleExpand}
+                  onToggleExpand={showFlat ? resultTree.toggle : tree.toggleExpand}
                   onSelect={handleSelectRow}
                   onSelectAll={handleSelectAllRows}
                   selectionSummary={selectionSummary}
@@ -2990,3 +3039,4 @@ function ScanOverlay({ progressStore, onCancel }: { progressStore: ProgressStore
     </div>
   );
 }
+

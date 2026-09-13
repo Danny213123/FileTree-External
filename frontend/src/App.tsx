@@ -2156,19 +2156,20 @@ export default function App() {
       />
 
       <div className="vsc-middle">
-      <div className="vsc-body">
-        {sidebarOpen && (
-          <>
-            <div className="sidebar" style={{ width: sidebarWidth, flex: `0 0 ${sidebarWidth}px` }}>
               <ActivityBar
                 activeView={activeView}
-                sidebarOpen={sidebarOpen}
+                sidebarOpen={true}
                 onSelect={handleSelectView}
                 bookmarkCount={bookmarkList.length}
                 errorCount={shellErrorCount}
                 darkMode={darkMode}
                 onToggleTheme={handleToggleDark}
               />
+
+      <div className="vsc-body">
+        {sidebarOpen && !FULL_EDITOR_VIEWS.has(activeView) && (
+          <>
+            <div className="sidebar" style={{ width: sidebarWidth, flex: `0 0 ${sidebarWidth}px` }}>
               <WorkbenchSideBar
                 store={workbenchStore}
                 view={activeView}

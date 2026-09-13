@@ -66,7 +66,7 @@ const QUICK_SAMPLE_BYTES: usize = 16 * 1024;
 const QUICK_FULL_LIMIT: u64 = QUICK_SAMPLE_OFFSET + QUICK_SAMPLE_BYTES as u64;
 const SAMPLE_BYTES: usize = 64 * 1024;
 const SAMPLE_REGIONS: u64 = 3;
-const FULL_SAMPLE_LIMIT: u64 = (SAMPLE_BYTES as u64) * SAMPLE_REGIONS;
+pub(crate) const FULL_SAMPLE_LIMIT: u64 = (SAMPLE_BYTES as u64) * SAMPLE_REGIONS;
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Multiplier from the FxHash/SeaHash family (a large odd constant with good
@@ -154,14 +154,30 @@ fn open_sequential(path: &Path) -> io::Result<File> {
 }
 
 fn content_hash_file_with_buffer(path: &Path, buffer: &mut [u8]) -> io::Result<u64> {
+    content_hash_file_reporting(path, buffer, None, |_| {})
+}
+
+fn content_hash_file_reporting(
+    path: &Path,
+    buffer: &mut [u8],
+    cancel: Option<&Arc<AtomicBool>>,
+    on_read: impl Fn(u64),
+) -> io::Result<u64> {
     let mut file = open_sequential(path)?;
     let mut hasher = FastHasher::new(0);
     loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Hashing cancelled",
+            ));
+        }
         let read = file.read(buffer)?;
         if read == 0 {
             break;
         }
         hasher.write(&buffer[..read]);
+        on_read(read as u64);
     }
     Ok(hasher.finish())
 }
@@ -411,9 +427,11 @@ fn parallel_for_with_state<S, I, F>(
     });
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct HashCandidateProgress {
+    pub(crate) fraction: f64,
     pub(crate) stage: &'static str,
+    pub(crate) bytes_read: u64,
     pub(crate) completed: usize,
     pub(crate) total: usize,
 }
@@ -433,6 +451,38 @@ pub(crate) fn hash_candidate_groups(
     cancel: Option<&Arc<AtomicBool>>,
     threads: usize,
     candidate_progress: Option<&(dyn Fn(HashCandidateProgress) + Sync)>,
+) -> (Vec<(u64, Vec<usize>)>, Vec<String>) {
+    hash_candidate_groups_with_fingerprints(
+        files,
+        confirm_bytes,
+        cache,
+        cache_path,
+        progress,
+        cancel,
+        threads,
+        candidate_progress,
+        None,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FingerprintEntry {
+    pub size: u64,
+    pub mtime: u64,
+    pub quick: Option<u64>,
+    pub sample: Option<u64>,
+}
+
+pub(crate) fn hash_candidate_groups_with_fingerprints(
+    files: &[HashInput],
+    confirm_bytes: bool,
+    cache: &Mutex<HashMap<PathBuf, HashCacheEntry>>,
+    cache_path: Option<&Path>,
+    progress: Option<&Arc<DupesProgress>>,
+    cancel: Option<&Arc<AtomicBool>>,
+    threads: usize,
+    candidate_progress: Option<&(dyn Fn(HashCandidateProgress) + Sync)>,
+    fingerprints: Option<&Mutex<HashMap<PathBuf, FingerprintEntry>>>,
 ) -> (Vec<(u64, Vec<usize>)>, Vec<String>) {
     // 1. Bucket by size — only equal-size files can be byte-identical.
     let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -456,9 +506,28 @@ pub(crate) fn hash_candidate_groups(
         }
     }
 
+    // Snapshot valid fingerprints once; worker threads never hold a cache lock
+    // while reading. Partial values are rejection filters, never full hashes.
+    let saved_fingerprints = fingerprints
+        .map(|cache| {
+            let cache = cache.lock().expect("fingerprint cache lock");
+            files
+                .iter()
+                .map(|file| {
+                    cache
+                        .get(&file.path)
+                        .copied()
+                        .filter(|entry| entry.size == file.size && entry.mtime == file.mtime)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![None; files.len()]);
+
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let reported_pipeline = Mutex::new((0usize, ""));
-    let report_pipeline = |stage: &'static str, completed: usize| {
+    let bytes_read = AtomicU64::new(0);
+    let hash_bytes_total = AtomicU64::new(0);
+    let reported_pipeline = Mutex::new((0usize, "", std::time::Instant::now()));
+    let report_pipeline = |stage: &'static str, completed: usize, stage_fraction: f64| {
         let Some(callback) = candidate_progress else {
             return;
         };
@@ -466,13 +535,21 @@ pub(crate) fn hash_candidate_groups(
         let step = (files.len() / 200).max(1);
         let mut reported = reported_pipeline.lock().expect("candidate progress lock");
         if stage != reported.1
-            || completed >= files.len()
+            || stage_fraction >= 1.0
+            || (completed >= files.len() && reported.0 < files.len())
+            || reported.2.elapsed() >= std::time::Duration::from_millis(200)
             || completed.saturating_sub(reported.0) >= step
         {
             if completed >= reported.0 {
-                *reported = (completed, stage);
+                *reported = (completed, stage, std::time::Instant::now());
+                let total_bytes = hash_bytes_total.load(Ordering::Relaxed);
+                let fraction = if stage == "hashing" && total_bytes > 0 {
+                    (bytes_read.load(Ordering::Relaxed) as f64 / total_bytes as f64).min(1.0)
+                } else { stage_fraction };
                 callback(HashCandidateProgress {
+                    fraction,
                     stage,
+                    bytes_read: bytes_read.load(Ordering::Relaxed),
                     completed,
                     total: files.len(),
                 });
@@ -524,10 +601,10 @@ pub(crate) fn hash_candidate_groups(
     let quick_progress_end = if quick_candidates.is_empty() {
         0
     } else {
-        files.len().div_ceil(3)
+        files.len() / 3
     };
     if !quick_candidates.is_empty() {
-        report_pipeline("fingerprinting", 0);
+        report_pipeline("fingerprinting", 0, 0.0);
     }
     parallel_for_with_state(
         quick_candidates.len(),
@@ -536,7 +613,11 @@ pub(crate) fn hash_candidate_groups(
         || vec![0u8; QUICK_SAMPLE_BYTES],
         |k, buffer| {
             let i = quick_candidates[k];
-            match content_hash_file_quick_with_buffer(&files[i].path, files[i].size, buffer) {
+            let result = match saved_fingerprints[i].and_then(|entry| entry.quick) {
+                Some(hash) => Ok((hash, files[i].size <= QUICK_FULL_LIMIT)),
+                None => content_hash_file_quick_with_buffer(&files[i].path, files[i].size, buffer),
+            };
+            match result {
                 Ok((fingerprint, _is_full)) => {
                     quick_fp[i].store(fingerprint, Ordering::Relaxed);
                     quick_done[i].store(true, Ordering::Relaxed);
@@ -552,11 +633,12 @@ pub(crate) fn hash_candidate_groups(
                 quick_progress_end
                     .saturating_mul(stage_done)
                     .saturating_div(quick_candidates.len()),
+                stage_done as f64 / quick_candidates.len() as f64,
             );
         },
     );
     if !quick_candidates.is_empty() {
-        report_pipeline("fingerprinting", quick_progress_end);
+        report_pipeline("fingerprinting", quick_progress_end, 1.0);
     }
     if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
         return (Vec::new(), Vec::new());
@@ -578,9 +660,8 @@ pub(crate) fn hash_candidate_groups(
             }
         }
         for (quick, members) in by_quick {
-            if members.len() < 2 || !members.iter().any(|&i| full_hash[i].is_none()) {
-                continue;
-            }
+            // A quick read covers small files completely, even when their
+            // fingerprint is unique. Retain that hash for the next scan.
             if files[members[0]].size <= QUICK_FULL_LIMIT {
                 for i in members {
                     if full_hash[i].is_none() {
@@ -588,7 +669,7 @@ pub(crate) fn hash_candidate_groups(
                         sampled_full.push((i, quick));
                     }
                 }
-            } else {
+            } else if members.len() > 1 && members.iter().any(|&i| full_hash[i].is_none()) {
                 sample_candidates.extend(members);
             }
         }
@@ -602,11 +683,10 @@ pub(crate) fn hash_candidate_groups(
     let sample_progress_end = if sample_candidates.is_empty() {
         quick_progress_end
     } else {
-        quick_progress_end
-            .saturating_add(files.len().saturating_sub(quick_progress_end).div_ceil(2))
+        quick_progress_end.saturating_add(files.len().saturating_sub(quick_progress_end) / 2)
     };
     if !sample_candidates.is_empty() {
-        report_pipeline("sampling", quick_progress_end);
+        report_pipeline("sampling", quick_progress_end, 0.0);
     }
     parallel_for_with_state(
         sample_candidates.len(),
@@ -615,7 +695,11 @@ pub(crate) fn hash_candidate_groups(
         || vec![0u8; SAMPLE_BYTES],
         |k, buffer| {
             let i = sample_candidates[k];
-            match content_hash_file_sample_with_buffer(&files[i].path, files[i].size, buffer) {
+            let result = match saved_fingerprints[i].and_then(|entry| entry.sample) {
+                Some(hash) => Ok(hash),
+                None => content_hash_file_sample_with_buffer(&files[i].path, files[i].size, buffer),
+            };
+            match result {
                 Ok(fingerprint) => {
                     sample_fp[i].store(fingerprint, Ordering::Relaxed);
                     sample_done[i].store(true, Ordering::Relaxed);
@@ -634,11 +718,12 @@ pub(crate) fn hash_candidate_groups(
                         .saturating_mul(stage_done)
                         .saturating_div(sample_candidates.len()),
                 ),
+                stage_done as f64 / sample_candidates.len() as f64,
             );
         },
     );
     if !sample_candidates.is_empty() {
-        report_pipeline("sampling", sample_progress_end);
+        report_pipeline("sampling", sample_progress_end, 1.0);
     }
     if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
         return (Vec::new(), Vec::new());
@@ -658,9 +743,7 @@ pub(crate) fn hash_candidate_groups(
             }
         }
         for (sample, members) in by_sample {
-            if members.len() < 2 || !members.iter().any(|&i| full_hash[i].is_none()) {
-                continue;
-            }
+            // Full-file samples are reusable even when they reject a candidate.
             if files[members[0]].size <= FULL_SAMPLE_LIMIT {
                 for i in members {
                     if full_hash[i].is_none() {
@@ -668,7 +751,7 @@ pub(crate) fn hash_candidate_groups(
                         sampled_full.push((i, sample));
                     }
                 }
-            } else {
+            } else if members.len() > 1 {
                 need_full.extend(members.into_iter().filter(|&i| full_hash[i].is_none()));
             }
         }
@@ -680,13 +763,18 @@ pub(crate) fn hash_candidate_groups(
         p.files_hashed.store(0, Ordering::Relaxed);
     }
 
-    // 5. Full-hash phase (parallel). Candidate progress is a monotonic weighted
-    //    pipeline position: prefilter stages occupy the first portion, while
-    //    the remaining span advances as expensive full reads complete.
+    // 5. Full-hash phase (parallel). Counts retain their pipeline position;
+    //    the displayed fraction measures this stage's bytes independently.
     let full_progress_start = sample_progress_end.max(quick_progress_end);
     let full_completed = AtomicUsize::new(0);
+    hash_bytes_total.store(
+        need_full
+            .iter()
+            .fold(0u64, |sum, &i| sum.saturating_add(files[i].size)),
+        Ordering::Relaxed,
+    );
     if !need_full.is_empty() {
-        report_pipeline("hashing", full_progress_start);
+        report_pipeline("hashing", full_progress_start, 0.0);
     }
     let computed: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
     parallel_for_with_state(
@@ -696,7 +784,20 @@ pub(crate) fn hash_candidate_groups(
         || vec![0u8; HASH_BUFFER_BYTES],
         |k, buffer| {
             let i = need_full[k];
-            match content_hash_file_with_buffer(&files[i].path, buffer) {
+            match content_hash_file_reporting(&files[i].path, buffer, cancel, |read| {
+                bytes_read.fetch_add(read, Ordering::Relaxed);
+                report_pipeline(
+                    "hashing",
+                    full_progress_start.saturating_add(
+                        files
+                            .len()
+                            .saturating_sub(full_progress_start)
+                            .saturating_mul(full_completed.load(Ordering::Relaxed))
+                            .saturating_div(need_full.len()),
+                    ),
+                    full_completed.load(Ordering::Relaxed) as f64 / need_full.len() as f64,
+                );
+            }) {
                 Ok(h) => computed.lock().expect("computed lock").push((i, h)),
                 Err(e) => errors.lock().expect("hash errors lock").push(format!(
                     "{}: {}",
@@ -717,6 +818,7 @@ pub(crate) fn hash_candidate_groups(
                         .saturating_mul(stage_done)
                         .saturating_div(need_full.len()),
                 ),
+                stage_done as f64 / need_full.len() as f64,
             );
         },
     );
@@ -730,6 +832,7 @@ pub(crate) fn hash_candidate_groups(
             "hashing"
         },
         files.len(),
+        1.0,
     );
 
     let mut computed = computed.into_inner().expect("computed lock");
@@ -780,6 +883,37 @@ pub(crate) fn hash_candidate_groups(
         // skips (that path is simply re-hashed later).
         if let Some(path) = cache_path {
             let _ = append_hash_cache(path, &new_entries);
+        }
+    }
+
+    if let Some(cache) = fingerprints {
+        let mut cache = cache.lock().expect("fingerprint cache lock");
+        for i in 0..files.len() {
+            // Small complete reads already enter the full-hash cache.
+            if files[i].size <= FULL_SAMPLE_LIMIT {
+                continue;
+            }
+            if !quick_done[i].load(Ordering::Relaxed) && !sample_done[i].load(Ordering::Relaxed) {
+                continue;
+            }
+            let saved = saved_fingerprints[i];
+            cache.insert(
+                files[i].path.clone(),
+                FingerprintEntry {
+                    size: files[i].size,
+                    mtime: files[i].mtime,
+                    quick: if quick_done[i].load(Ordering::Relaxed) {
+                        Some(quick_fp[i].load(Ordering::Relaxed))
+                    } else {
+                        saved.and_then(|entry| entry.quick)
+                    },
+                    sample: if sample_done[i].load(Ordering::Relaxed) {
+                        Some(sample_fp[i].load(Ordering::Relaxed))
+                    } else {
+                        saved.and_then(|entry| entry.sample)
+                    },
+                },
+            );
         }
     }
 
@@ -1658,6 +1792,22 @@ fn stage_verified_duplicate(
     }
 }
 
+fn recycle_reviewed_with(
+    keeper: &Path,
+    duplicate: &Path,
+    recycle: impl FnOnce(&Path) -> Vec<String>,
+) -> Vec<String> {
+    let _keeper_lock = match lock_keeper_for_action(keeper) {
+        Ok(lock) => lock,
+        Err(error) => return vec![format!("{}: could not lock keeper: {error}", keeper.display())],
+    };
+    recycle(duplicate)
+}
+
+pub(crate) fn action_recycle_reviewed(keeper: &Path, duplicate: &Path) -> Vec<String> {
+    recycle_reviewed_with(keeper, duplicate, |path| action_delete(&[path.to_path_buf()], false))
+}
+
 pub(crate) fn action_delete_verified(
     keeper: &Path,
     duplicate: &Path,
@@ -2448,12 +2598,14 @@ pub(crate) fn write_groups_to_json<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    use super::{Arc, AtomicBool, AtomicU64, Ordering, content_hash_file_reporting};
     use super::{
         HashCacheEntry, HashInput, action_delete_verified, action_link, action_transfer_verified,
         content_hash_file, copy_file_exclusive, hash_candidate_groups, verified_duplicate_pair,
     };
     use std::collections::HashMap;
     use std::fs;
+    use std::io;
     use std::sync::Mutex;
 
     fn test_root(name: &str) -> std::path::PathBuf {
@@ -2465,6 +2617,31 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn reviewed_recycling_does_not_compare_contents_and_requires_keeper() {
+        let root = test_root("reviewed_recycling");
+        fs::create_dir_all(&root).unwrap();
+        let keeper = root.join("keeper.bin");
+        let duplicate = root.join("copy.bin");
+        fs::write(&keeper, b"aaa").unwrap();
+        fs::write(&duplicate, b"bbb").unwrap();
+        let mut called = false;
+        let errors = super::recycle_reviewed_with(&keeper, &duplicate, |path| {
+            assert_eq!(path, duplicate);
+            called = true;
+            vec!["simulated shell failure".into()]
+        });
+        assert!(called);
+        assert_eq!(errors, vec!["simulated shell failure"]);
+        fs::remove_file(&keeper).unwrap();
+        let errors = super::recycle_reviewed_with(&keeper, &duplicate, |_| {
+            panic!("must not recycle without a keeper")
+        });
+        assert!(!errors.is_empty());
+        assert!(duplicate.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2589,6 +2766,167 @@ mod tests {
     }
 
     #[test]
+    fn large_rejected_files_reuse_fingerprints_and_invalidate_on_change() {
+        use super::hash_candidate_groups_with_fingerprints;
+        let root = test_root("fingerprint_reuse");
+        fs::create_dir_all(&root).unwrap();
+        let mut files = Vec::new();
+        for i in 0..32 {
+            let path = root.join(format!("{i}.bin"));
+            let mut data = vec![42u8; 256 * 1024];
+            data[0] = i; // Same quick fingerprint, different wide sample.
+            fs::write(&path, data).unwrap();
+            files.push(HashInput {
+                path,
+                size: 256 * 1024,
+                mtime: 1,
+            });
+        }
+        let full = Mutex::new(HashMap::new());
+        let partial = Mutex::new(HashMap::new());
+        let start = std::time::Instant::now();
+        let (groups, errors) = hash_candidate_groups_with_fingerprints(
+            &files,
+            false,
+            &full,
+            None,
+            None,
+            None,
+            4,
+            None,
+            Some(&partial),
+        );
+        let cold = start.elapsed();
+        assert!(groups.is_empty() && errors.is_empty());
+        assert!(
+            full.lock().unwrap().is_empty(),
+            "partial hashes are not full-content hashes"
+        );
+        assert_eq!(partial.lock().unwrap().len(), 32);
+        let start = std::time::Instant::now();
+        let (groups, errors) = hash_candidate_groups_with_fingerprints(
+            &files,
+            false,
+            &full,
+            None,
+            None,
+            None,
+            4,
+            None,
+            Some(&partial),
+        );
+        let warm = start.elapsed();
+        assert!(groups.is_empty() && errors.is_empty());
+        eprintln!("32 x 256 KiB fingerprint benchmark: cold={cold:?}, warm={warm:?}");
+        for file in &files {
+            fs::remove_file(&file.path).unwrap();
+        }
+        // Cached rejections need no file reads, even when the files are absent.
+        let (groups, errors) = hash_candidate_groups_with_fingerprints(
+            &files,
+            false,
+            &full,
+            None,
+            None,
+            None,
+            4,
+            None,
+            Some(&partial),
+        );
+        assert!(groups.is_empty() && errors.is_empty());
+        for file in &mut files {
+            file.mtime = 2;
+        }
+        let (_, errors) = hash_candidate_groups_with_fingerprints(
+            &files,
+            false,
+            &full,
+            None,
+            None,
+            None,
+            4,
+            None,
+            Some(&partial),
+        );
+        assert!(
+            !errors.is_empty(),
+            "changed metadata must force fresh reads"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_hash_reports_bytes_and_cancels_between_reads() {
+        let root = test_root("hash_live_progress");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.bin");
+        fs::write(&path, vec![42u8; 128 * 1024]).unwrap();
+        let mut buffer = vec![0u8; 4096];
+        let bytes = AtomicU64::new(0);
+        let hash = content_hash_file_reporting(&path, &mut buffer, None, |read| {
+            bytes.fetch_add(read, Ordering::Relaxed);
+        })
+        .unwrap();
+        assert_eq!(bytes.load(Ordering::Relaxed), 128 * 1024);
+        assert_eq!(hash, content_hash_file(&path).unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+        bytes.store(0, Ordering::Relaxed);
+        let error = content_hash_file_reporting(&path, &mut buffer, Some(&cancel), |read| {
+            bytes.fetch_add(read, Ordering::Relaxed);
+            cancel.store(true, Ordering::Relaxed);
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(bytes.load(Ordering::Relaxed), 4096);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejected_small_candidates_reuse_complete_hashes() {
+        for size in [8 * 1024, 96 * 1024] {
+            let root = test_root(&format!("rejected_cache_{size}"));
+            fs::create_dir_all(&root).unwrap();
+            let first = root.join("first.bin");
+            let second = root.join("second.bin");
+            let left = vec![7u8; size];
+            let mut right = left.clone();
+            // Outside the quick sample for the larger fixture, so it reaches
+            // the full-file sampling stage before being rejected.
+            right[0] = 9;
+            fs::write(&first, left).unwrap();
+            fs::write(&second, right).unwrap();
+            let files = vec![
+                HashInput {
+                    path: first.clone(),
+                    size: size as u64,
+                    mtime: 1,
+                },
+                HashInput {
+                    path: second.clone(),
+                    size: size as u64,
+                    mtime: 1,
+                },
+            ];
+            let cache = Mutex::new(HashMap::new());
+            let (groups, errors) =
+                hash_candidate_groups(&files, false, &cache, None, None, None, 2, None);
+            assert!(groups.is_empty());
+            assert!(errors.is_empty());
+            assert_eq!(cache.lock().unwrap().len(), 2);
+            fs::remove_file(first).unwrap();
+            fs::remove_file(second).unwrap();
+            let (groups, errors) =
+                hash_candidate_groups(&files, false, &cache, None, None, None, 2, None);
+            assert!(groups.is_empty());
+            assert!(
+                errors.is_empty(),
+                "warm rejected candidates must not be reopened"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn mostly_cached_bucket_hashes_misses_without_reopening_cached_files() {
         let root = test_root("mixed_warm_cache");
         fs::create_dir_all(&root).expect("create mixed cache test root");
@@ -2693,6 +3031,12 @@ mod tests {
                 .any(|progress| progress.stage == "fingerprinting")
         );
         assert!(updates.iter().any(|progress| progress.stage == "sampling"));
+        for stage in ["fingerprinting", "sampling", "hashing"] {
+            let stage_updates = updates.iter().filter(|progress| progress.stage == stage).collect::<Vec<_>>();
+            assert_eq!(stage_updates.first().unwrap().fraction, 0.0);
+            assert_eq!(stage_updates.last().unwrap().fraction, 1.0);
+        }
+
         assert!(
             updates
                 .windows(2)
