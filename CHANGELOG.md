@@ -2,7 +2,73 @@
 
 All notable changes to FileTree are documented here.
 
-This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`.
+This project follows a simple `MAJOR.MINOR.PATCH` version scheme. The application version is sourced from `Cargo.toml`. For a one-line-per-release index, see [VERSIONS.md](VERSIONS.md).
+
+Released versions get one section each. Work in progress is logged under the
+in-progress version by date, so an unreleased change is still dated; those dated
+groups are folded into release notes when the version ships.
+
+This file is rendered inside the app under **Help → What's New**.
+
+## [2.0.0-alpha.2] - Unreleased
+
+### 2026-09-13
+
+#### Added
+
+- New **Plugins** page, first in the activity bar. A plugin is a third-party tool that runs on top of FileTree rather than being wired into an existing view: it is off until you opt in, and once enabled it owns its own tab on this page and leaves the rest of the app alone. A **Catalog** tab lists every approved plugin as a card with its status and an opt-in button; each plugin also gets a tab that shows what it needs from FileTree and what it does while it is off, then hands that whole tab body to the plugin once you opt in. Opt-ins persist per plugin. No plugin has shipped yet, so the catalog ships with three labelled example listings to make the flow visible; adding a real one is a single entry in `frontend/src/lib/plugins.ts`.
+- Reworked the **Appearance** dialog (Help → View → Appearance) into a full editor: theme mode as **Light / Dark / System** (System tracks the OS live, so the palette follows a Windows theme change while the app is open), **Row density** (Compact / Normal / Relaxed), a **UI font** picker, a **Text size** slider, and a **Reduce motion** toggle. Accent presets went from 7 to 12. Every setting previews immediately and persists to `localStorage`.
+- Reduce motion layers over the OS `prefers-reduced-motion` preference rather than replacing it — it can only ever add suppression, never force motion back on. Progress indicators keep animating, because they are the only sign a long scan is alive.
+- Drop zones on the **Duplicates** and **Compress** pages now accept files and folders dragged from Explorer, with a dotted drop target and a whole-window affordance when no zone claims the drag. Tauri intercepts shell drags before the webview sees them, so drops are routed through a position-hit-tested zone registry.
+
+#### Fixed
+
+- Dialogs rendered a near-black header and footer around a white body in light mode. The shared dialog chrome had literal `#222` / `#2b2b2b` / `#444` colors baked in from when the app was dark-only; it now uses theme tokens. This affected **all 11 dialogs**, including the confirm and prompt dialogs, whose entire body was dark-on-light. Two rules also rendered invisible text (light-grey on white). Dark mode is unchanged — the replacement token resolves to the exact `#222` it replaced.
+- Row density and text size interact safely: a text size too large for the chosen row height would clip descenders, so the row height floor rises to fit.
+- Shell drag-and-drop landed short of the cursor at any UI scale other than 100%. The native drag payload reports window pixels while webview zoom rescales the CSS pixel, so coordinates are now converted before hit-testing.
+- Row action buttons (tag, bookmark, compress) sat immediately right of the file name at a ragged offset; they now align to the right edge of the Name column.
+- Bookmarks and search results drew a full-width size bar on every row. Those flat views build their node index from visible rows only, so the percentage-of-root calculation divided a value by itself and always produced 100%.
+- A hovered row was indistinguishable from a selected one — hover reused the selection color instead of the neutral hover token.
+
+### 2026-09-07
+
+- UI refinements across the workspace.
+
+### 2026-09-05
+
+- Reworked the Duplicates page and fixed duplicate detection.
+
+### 2026-09-04
+
+- Fixed the treemap, stale repository state, and clipboard copy/paste. Further UI refinements.
+
+### 2026-09-03
+
+- Fixed a batch of major bugs across the v2 workspace.
+
+### 2026-09-02
+
+- Fixed recursive compression selection so choosing a folder enqueues the files inside it.
+- Fixed folder hover thumbnails.
+
+### 2026-09-01
+
+- Fixed folder compression and compression-workspace navigation under Tauri v2.
+- Fixed v2 duplicate scans and retired the legacy duplicate pages.
+- Deduplicated live and cached tree rows by path, so a row could no longer appear twice.
+
+### 2026-08-31
+
+- Changed folders now refresh without forcing a full rescan, and lazy branch expansion survives a refresh.
+- Preserved unloaded branch aggregates and propagated live folder modified dates through a refresh, so sizes and dates no longer went stale or reset.
+- Improved search and live-refresh responsiveness.
+- Restored Windows file-type icons in tree rows and fixed them for all extensions.
+- Fixed v2 terminal and stale refresh state, removed a stale-results banner that shifted the layout, and suppressed Windows filesystem hard-error notification dialogs.
+
+### 2026-08-30
+
+- Fixed v2 file interactions and thumbnail stalls, opening paged files on double-click, duplicate drag moves, and cross-tab refresh after a move.
+- Removed inline file icons from rows while preserving hover previews.
 
 ## [2.0.0-alpha.1] - Unreleased
 
@@ -217,6 +283,8 @@ Adds two new compression presets between the existing ones: a fixed **More savin
 - **"Custom" preset (video)**: exposes a video **resolution cap** (Original / 1440p / 1080p / 720p / 480p; default 1080p) and a **quality** slider (RF base 16–40, default 26; lower = better quality, larger file). GPU encoders add the usual +2 quality offset. The chosen values — and the last-selected preset itself — are persisted across sessions in the browser, so reopening the app restores your choice. Images under Custom reuse Balanced behavior (the Custom controls are video-only). Custom settings round-trip through the job manifest so a resumed job keeps the same encoding.
 
 
+
+## [1.13.5] - 2026-06-13
 
 Restores the video compression savings that the v1.13.x audio change removed, and tells genuinely corrupt/incomplete downloads apart from real encoder failures.
 

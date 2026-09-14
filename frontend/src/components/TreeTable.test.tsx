@@ -1,16 +1,24 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+// Stub just enough of the virtualizer to render every row synchronously.
+// `estimateSize` is honored rather than assumed to be 23 so the row-height
+// pref (Appearance → Row density) is observable here.
 vi.mock("@tanstack/react-virtual", () => ({
-  useVirtualizer: ({ count }: { count: number }) => ({
-    getTotalSize: () => count * 23,
-    getVirtualItems: () => Array.from({ length: count }, (_, index) => ({
-      index,
-      key: index,
-      start: index * 23,
-      size: 23,
-    })),
-  }),
+  useVirtualizer: ({ count, estimateSize }: { count: number; estimateSize: () => number }) => {
+    const size = estimateSize();
+    return {
+      getTotalSize: () => count * size,
+      getVirtualItems: () => Array.from({ length: count }, (_, index) => ({
+        index,
+        key: index,
+        start: index * size,
+        size,
+      })),
+      measure: () => { /* no cache to drop */ },
+      scrollToIndex: () => { /* no scroll container */ },
+    };
+  },
 }));
 
 vi.mock("./FileIcon", () => ({
@@ -57,6 +65,91 @@ const file: NodeRecord = {
   extension: "mp4",
   children: [],
 };
+
+describe("TreeTable row height", () => {
+  // This suite has no global auto-cleanup, and these cases render the same row
+  // repeatedly — leaving them mounted makes later `screen` queries ambiguous.
+  afterEach(cleanup);
+
+  function renderAtRowHeight(rowHeight?: number) {
+    return render(
+      <TreeTable
+        rows={[file]}
+        flat
+        lazy
+        rowHeight={rowHeight}
+        nodeById={new Map()}
+        expanded={new Set()}
+        expandedAll={false}
+        collapsedOverrides={new Set()}
+        selectedId={0}
+        selectedIds={new Set()}
+        sortKey="name"
+        sortDir={1}
+        metric="size"
+        unit="auto"
+        decimals={1}
+        visibleColumns={new Set(["name"])}
+        columnWidths={{}}
+        onColumnResize={vi.fn()}
+        bookmarks={new Set()}
+        onToggleExpand={vi.fn()}
+        onSelect={vi.fn()}
+        onDoubleClick={vi.fn()}
+        onContextMenu={vi.fn()}
+        onSortChange={vi.fn()}
+        onToggleBookmark={vi.fn()}
+      />,
+    );
+  }
+
+  const rowOf = (view: ReturnType<typeof render>) =>
+    view.container.querySelector<HTMLElement>(".row");
+
+  it("lays rows out at the density's height", () => {
+    // Appearance → Row density: "relaxed" is 28px.
+    expect(rowOf(renderAtRowHeight(28))?.style.height).toBe("28px");
+  });
+
+  it("falls back to 23px when no density is threaded in", () => {
+    expect(rowOf(renderAtRowHeight())?.style.height).toBe("23px");
+  });
+
+  it("repositions rows when the density changes", () => {
+    const view = renderAtRowHeight(19);
+    expect(rowOf(view)?.style.height).toBe("19px");
+    view.rerender(
+      <TreeTable
+        rows={[file]}
+        flat
+        lazy
+        rowHeight={28}
+        nodeById={new Map()}
+        expanded={new Set()}
+        expandedAll={false}
+        collapsedOverrides={new Set()}
+        selectedId={0}
+        selectedIds={new Set()}
+        sortKey="name"
+        sortDir={1}
+        metric="size"
+        unit="auto"
+        decimals={1}
+        visibleColumns={new Set(["name"])}
+        columnWidths={{}}
+        onColumnResize={vi.fn()}
+        bookmarks={new Set()}
+        onToggleExpand={vi.fn()}
+        onSelect={vi.fn()}
+        onDoubleClick={vi.fn()}
+        onContextMenu={vi.fn()}
+        onSortChange={vi.fn()}
+        onToggleBookmark={vi.fn()}
+      />,
+    );
+    expect(rowOf(view)?.style.height).toBe("28px");
+  });
+});
 
 describe("TreeTable double click", () => {
   it("opens the displayed paged row even when it is absent from nodeById", () => {

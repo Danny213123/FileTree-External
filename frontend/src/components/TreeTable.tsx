@@ -17,6 +17,7 @@ import { isNodeOpen } from "../hooks/useTreeState";
 import { useCompressionExclusions } from "../hooks/useCompressionExclusions";
 import { compressionPathKey, isCompressionExcluded, saveCompressionExclusions } from "../lib/compressionExclusions";
 
+/** Default row height, used when no density pref is threaded in. */
 const ROW_HEIGHT = 23;
 // Smallest a column may be dragged to, so a header never collapses to nothing.
 const MIN_COLUMN_WIDTH = 56;
@@ -120,6 +121,9 @@ interface TreeTableProps {
   /** Tint each row's background by its size relative to the largest visible row
    *  (#9). Subtle, theme-aware accent; off renders rows normally. */
   heatTint?: boolean;
+  /** Row height in px, from the Appearance density + text-size prefs. Defaults
+   *  to the height the table was fixed at before those prefs existed. */
+  rowHeight?: number;
   /** #11: transient diff highlight applied right after a same-root refresh —
    *  node id → "added" (new entry) | "changed" (size delta). Fades upstream. */
   diffHighlight?: Map<number, "added" | "changed"> | null;
@@ -274,6 +278,7 @@ function TreeTableInner({
   onSelectAll,
   selectionSummary,
   heatTint,
+  rowHeight = ROW_HEIGHT,
   diffHighlight,
   growth,
   onDoubleClick,
@@ -612,9 +617,13 @@ function TreeTableInner({
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => ROW_HEIGHT,
+    estimateSize: () => rowHeight,
     overscan: 8,
   });
+
+  // `estimateSize` is read lazily, so a density change alone leaves every row
+  // positioned at the old height until the cache is dropped.
+  useEffect(() => { virtualizer.measure(); }, [rowHeight, virtualizer]);
 
   // ── Type-to-find (#1) ──────────────────────────────────────────────────────
   // Accumulate printable keystrokes into a buffer that resets ~800ms after the
@@ -1005,7 +1014,12 @@ function TreeTableInner({
             const node = rows[vItem.index];
             const isBundle  = node.id < 0;
             const val       = metricValue(node, metric);
-            const rootVal   = rootNode ? metricValue(rootNode, metric) : val;
+            // Flat views (search results, bookmarks, tag filters) get a
+            // nodeById built from just their visible rows, so node 0 is absent
+            // and there is no root to take a proportion of. Falling back to
+            // `val` made every row exactly val/val = 100%, painting a
+            // full-width bar with its accent cap on every single row.
+            const rootVal   = rootNode ? metricValue(rootNode, metric) : 0;
             const barWidth  = rootVal > 0 ? (val / rootVal) * 100 : 0;
             const parentNode = node.parent != null ? nodeById.get(node.parent) : null;
             const parentSize = parentNode ? parentNode.size : node.size;
@@ -1029,7 +1043,7 @@ function TreeTableInner({
             const heat = heatTint && !isBundle && visibleTotals.maxSize > 0
               ? (node.size / visibleTotals.maxSize) * 0.12
               : 0;
-            const rowStyle: React.CSSProperties = { position: "absolute", top: vItem.start, left: 0, right: 0, height: ROW_HEIGHT, gridTemplateColumns: gridTemplate };
+            const rowStyle: React.CSSProperties = { position: "absolute", top: vItem.start, left: 0, right: 0, height: rowHeight, gridTemplateColumns: gridTemplate };
             if (heat > 0) (rowStyle as Record<string, string | number>)["--heat"] = heat;
             // #11: transient added/changed tint right after a same-root refresh.
             const diffMark = !isBundle && diffHighlight ? diffHighlight.get(node.id) : undefined;

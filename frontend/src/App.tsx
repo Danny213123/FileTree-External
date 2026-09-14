@@ -42,6 +42,7 @@ import { ToastProvider, toast } from "./lib/toast";
 import { DialogProvider, promptDialog } from "./lib/dialogs";
 import { ShortcutsDialog } from "./components/ShortcutsDialog";
 import { AppearanceDialog } from "./components/AppearanceDialog";
+import { ChangelogDialog } from "./components/ChangelogDialog";
 import {
   type ShortcutBindings,
   loadBindings,
@@ -50,10 +51,30 @@ import {
   chordFromEvent,
 } from "./lib/shortcuts";
 import {
+  DEFAULT_THEME_MODE,
+  applyMetrics,
+  applyFont,
+  applyReduceMotion,
+  applyTheme,
   initAppearance,
   loadAccent,
+  loadDensity,
+  loadFont,
+  loadFontSize,
+  loadReduceMotion,
   loadScale,
+  loadThemeMode,
   nativeZoom,
+  resolveDark,
+  rowHeightFor,
+  saveDensity,
+  saveFont,
+  saveFontSize,
+  saveReduceMotion,
+  saveThemeMode,
+  watchSystemTheme,
+  type RowDensity,
+  type ThemeMode,
 } from "./lib/appearance";
 import { ActivityBar, type ViewId } from "./components/ActivityBar";
 import { SideBar } from "./components/SideBar";
@@ -63,6 +84,7 @@ import { InspectorPane } from "./components/InspectorPane";
 import { ScheduleWizard } from "./components/ScheduleWizard";
 import { LazyView } from "./components/LazyView";
 import { CompressView } from "./components/CompressView";
+import { PluginsView } from "./components/PluginsView";
 import { localDelta, localViewport } from "./lib/overlay";
 import { dropZoneAt, type DropZone } from "./lib/dropZones";
 import { recordSample as recordDriveSample } from "./lib/driveForecast";
@@ -88,7 +110,7 @@ const CLOSE_HARD_EXIT_MS = 4_000;
 // Views that take over the whole editor area (replacing the workspace tabs),
 // each rendered from its own dedicated editor block below.
 const FULL_EDITOR_VIEWS = new Set<ViewId>([
-  "duplicates", "compress",
+  "duplicates", "compress", "plugins",
 ]);
 
 let nextTabId = 1;
@@ -265,11 +287,17 @@ export default function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const chordToIdRef = useRef(buildChordToId(shortcutBindings));
   useEffect(() => { chordToIdRef.current = buildChordToId(shortcutBindings); }, [shortcutBindings]);
-  // #50 theme customization: accent color + UI scale (localStorage-persisted via
-  // the appearance lib). Held in state only to drive the dialog + menu state.
+  // #50 theme customization (localStorage-persisted via the appearance lib).
+  // Held in state only to drive the dialog + menu state.
   const [accent, setAccent] = useState<string>(() => loadAccent());
   const [uiScale, setUiScale] = useState<number>(() => loadScale());
+  const [themeMode, setThemeMode] = useState<ThemeMode>(DEFAULT_THEME_MODE);
+  const [density, setDensity] = useState<RowDensity>(() => loadDensity());
+  const [uiFontSize, setUiFontSize] = useState<number>(() => loadFontSize());
+  const [uiFont, setUiFont] = useState<string>(() => loadFont());
+  const [reduceMotion, setReduceMotion] = useState<boolean>(() => loadReduceMotion());
   const [appearanceOpen, setAppearanceOpen] = useState(false);
+  const [changelogOpen, setChangelogOpen] = useState(false);
   const [treemapDetail, setTreemapDetail] = useState(3);
   const [tmShowSingleFiles, setTmShowSingleFiles] = useState(true);
   const [tmShow3D, setTmShow3D] = useState(false);
@@ -706,12 +734,46 @@ export default function App() {
     input.click();
   }, []);
 
+  // Pick a theme mode explicitly. "system" resolves against the OS here and
+  // then keeps tracking it through the listener effect below.
+  const handleThemeMode = useCallback((mode: ThemeMode) => {
+    setThemeMode(mode);
+    saveThemeMode(mode);
+    const dark = resolveDark(mode);
+    setDarkModeState(dark);
+    applyTheme(dark);
+  }, []);
+
+  // The View menu / title-bar "Dark Theme" control stays a plain flip. It pins
+  // the result, so flipping it while following the OS drops out of "system".
+  // The rendered attribute, not React state, is what's being inverted.
   const handleToggleDark = useCallback(() => {
-    setDarkModeState((v) => {
-      const next = !v;
-      document.documentElement.dataset.theme = next ? "dark" : "light";
-      return next;
-    });
+    const dark = document.documentElement.dataset.theme !== "dark";
+    handleThemeMode(dark ? "dark" : "light");
+  }, [handleThemeMode]);
+
+  const handleDensityChange = useCallback((next: RowDensity) => {
+    setDensity(next);
+    saveDensity(next);
+    applyMetrics(next, loadFontSize());
+  }, []);
+
+  const handleFontSizeChange = useCallback((px: number) => {
+    setUiFontSize(px);
+    saveFontSize(px);
+    applyMetrics(loadDensity(), px);
+  }, []);
+
+  const handleFontChange = useCallback((stack: string) => {
+    setUiFont(stack);
+    saveFont(stack);
+    applyFont(stack);
+  }, []);
+
+  const handleReduceMotionChange = useCallback((on: boolean) => {
+    setReduceMotion(on);
+    saveReduceMotion(on);
+    applyReduceMotion(on);
   }, []);
 
   // Stable menu/title-bar toggle handlers — extracted so the memoized `menus`/
@@ -744,15 +806,29 @@ export default function App() {
     () => window.alert("FileTree — a fast disk-usage analyzer with a built-in local-AI assistant."),
     [],
   );
+  const handleOpenChangelog = useCallback(() => setChangelogOpen(true), []);
 
-  useEffect(() => {
-    document.documentElement.dataset.theme = darkMode ? "dark" : "light";
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // #50: apply every persisted appearance pref once on mount, before paint (the
+  // helpers write CSS variables on :root / a zoom on <body>). This also applies
+  // the theme, so there is no flash of the wrong palette; mirror the resolved
+  // mode into state for the dialog and the menu checkmarks.
+  useLayoutEffect(() => {
+    const stored = initAppearance();
+    if (stored) {
+      setThemeMode(stored);
+      setDarkModeState(resolveDark(stored));
+    }
   }, []);
 
-  // #50: apply the persisted accent color + UI scale once on mount (the helpers
-  // write CSS variables on :root / a zoom on <body>).
-  useLayoutEffect(() => { initAppearance(); }, []);
+  // Track the OS palette while the mode is "system". Re-resolving on entry
+  // matters as well as on change: the OS may have flipped while the app was
+  // closed, or since the pref was last saved.
+  useEffect(() => {
+    if (themeMode !== "system") return;
+    const adopt = (dark: boolean) => { setDarkModeState(dark); applyTheme(dark); };
+    adopt(resolveDark("system"));
+    return watchSystemTheme(adopt);
+  }, [themeMode]);
 
   // #47: persist + apply a new shortcut binding map from the editor dialog.
   const handleApplyShortcuts = useCallback((next: ShortcutBindings) => {
@@ -812,9 +888,21 @@ export default function App() {
       fetchSettings(),
     ]).then(([config, driveList, folderList, savedBookmarks, persistedSettings]) => {
       const settings = newestSessionSettings(persistedSettings);
-      if (settings.darkMode !== undefined) {
+      // The theme-mode pref supersedes the older session `darkMode` boolean,
+      // which cannot express "follow the OS". Fall back to it only on installs
+      // that predate the pref, so upgrading preserves the chosen theme instead
+      // of resetting it, and adopt it as the explicit mode.
+      //
+      // Saving here is what makes this a one-time migration. This runs off an
+      // async fetch, well after the pre-paint theme has been applied from the
+      // default, so leaving it unsaved would flash dark before correcting to
+      // light on every single launch.
+      if (settings.darkMode !== undefined && !loadThemeMode()) {
+        const mode: ThemeMode = settings.darkMode ? "dark" : "light";
         setDarkModeState(settings.darkMode);
-        document.documentElement.dataset.theme = settings.darkMode ? "dark" : "light";
+        setThemeMode(mode);
+        saveThemeMode(mode);
+        applyTheme(settings.darkMode);
       }
       if (settings.threads !== undefined) setThreads(settings.threads);
       if (settings.includeHidden !== undefined) setIncludeHidden(settings.includeHidden);
@@ -829,7 +917,7 @@ export default function App() {
       if (settings.decimals !== undefined) setDecimals(settings.decimals);
       // Layout
       const legacyTreemapView = settings.activeView === "treemap";
-      if (settings.activeView && ["explorer", "search", "duplicates", "compress", "bookmarks", "errors"].includes(settings.activeView)) {
+      if (settings.activeView && ["plugins", "explorer", "search", "duplicates", "compress", "bookmarks", "errors"].includes(settings.activeView)) {
         setActiveView(settings.activeView as ViewId);
       } else if (legacyTreemapView) {
         setActiveView("explorer");
@@ -1980,6 +2068,8 @@ export default function App() {
     {
       label: "Help",
       items: [
+        { label: "What's New…", onClick: handleOpenChangelog },
+        { separator: true },
         { label: "About FileTree", onClick: handleAbout },
       ],
     },
@@ -1995,7 +2085,8 @@ export default function App() {
     handleOpenInNewTab, handleCloseTab, handleSaveSession, handleLoadSession,
     handleToggleTerminal, handleToggleChat, handleToggleDark, handleToggleSidebar,
     handleToggleTreemap, handleTogglePreview, handleToggleDetails, handleToggleTmLabels,
-    handleToggleTmHierarchy, handleToggleTmLegend, handleOpen3D, handleOpenSchedule, handleAbout, getActiveRef,
+    handleToggleTmHierarchy, handleToggleTmLegend, handleOpen3D, handleOpenSchedule, handleAbout,
+    handleOpenChangelog, getActiveRef,
   ]);
 
   // Overflow menu for the right-hand "⋯" control in the title bar.
@@ -2013,12 +2104,14 @@ export default function App() {
     { label: "Export ▸ XML", onClick: () => getActiveRef()?.doExport("xml"), disabled: !statusData },
     { label: "Export ▸ CSV", onClick: () => getActiveRef()?.doExport("csv"), disabled: !statusData },
     { label: "Export ▸ JSON", onClick: () => getActiveRef()?.doExport("json"), disabled: !statusData },
+    { separator: true },
+    { label: "What's New…", onClick: handleOpenChangelog },
     { label: "About FileTree", onClick: handleAbout },
   ],
   [
     chatOpen, sidebarOpen, darkMode, statusData,
     handleNewAgentSession, handleToggleChat, handleToggleSidebar,
-    handleToggleDark, handleAbout, getActiveRef,
+    handleToggleDark, handleAbout, handleOpenChangelog, getActiveRef,
   ]);
 
   // ── Exclude from scans (#12) ───────────────────────────────────────────────
@@ -2066,6 +2159,7 @@ export default function App() {
   // when the command fires (the palette defers run() until after it closes).
   const paletteCommands: PaletteCommand[] = useMemo(() => {
     const views: { id: ViewId; label: string }[] = [
+      { id: "plugins", label: "Plugins" },
       { id: "explorer", label: "Explorer" },
       { id: "search", label: "Search" },
       { id: "duplicates", label: "Duplicates" },
@@ -2274,6 +2368,7 @@ export default function App() {
                         onDecimalsChange={setDecimals}
                         folderDblClickExplorer={folderDblClickExplorer}
                         heatTint={heatTint}
+                        rowHeight={rowHeightFor(density, uiFontSize)}
                         onToggleBookmark={handleToggleBookmark}
                         onCompress={handleCompressPaths}
                         onScanPath={handleScanPath}
@@ -2293,6 +2388,12 @@ export default function App() {
             );
           })}
         </div>
+
+        {activeView === "plugins" && (
+          <div className="plugins-editor">
+            <PluginsView />
+          </div>
+        )}
 
         {activeView === "duplicates" && (
           <div className="dupes-editor">
@@ -2432,12 +2533,23 @@ export default function App() {
         <AppearanceDialog
           accent={accent}
           scale={uiScale}
-          darkMode={darkMode}
+          themeMode={themeMode}
+          density={density}
+          fontSize={uiFontSize}
+          font={uiFont}
+          reduceMotion={reduceMotion}
           onAccentChange={setAccent}
           onScaleChange={setUiScale}
-          onToggleDark={handleToggleDark}
+          onThemeModeChange={handleThemeMode}
+          onDensityChange={handleDensityChange}
+          onFontSizeChange={handleFontSizeChange}
+          onFontChange={handleFontChange}
+          onReduceMotionChange={handleReduceMotionChange}
           onClose={() => setAppearanceOpen(false)}
         />
+      )}
+      {changelogOpen && (
+        <ChangelogDialog version={appVersion} onClose={() => setChangelogOpen(false)} />
       )}
 
       {/* Shell-drag affordance. Only shown when no view claimed the drag — a

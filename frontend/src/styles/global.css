@@ -130,7 +130,7 @@ html, body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font);
-  font-size: 12px;
+  font-size: var(--ui-font-size, 12px);
   letter-spacing: 0;
 }
 
@@ -1103,9 +1103,13 @@ input:focus, select:focus {
 
 .rows { flex: 1; overflow: auto; min-height: 0; position: relative; }
 
+/* --row-h is published by lib/appearance from the density + text-size prefs.
+   The fallback is the 23px this was fixed at, so an unconfigured install and
+   the "normal" density lay out identically. TreeTable's virtualizer is given
+   the same number through a prop; both come from `rowHeightFor`. */
 .row {
   position: relative;
-  min-height: 23px;
+  min-height: var(--row-h, 23px);
   border-bottom: 1px solid rgba(0, 0, 0, 0.04);
   color: var(--text);
   cursor: pointer;
@@ -1113,7 +1117,9 @@ input:focus, select:focus {
   overflow: hidden;
 }
 
-.row:hover:not(.selected) { background: var(--vsc-list-selected); }
+/* Neutral hover, NOT --vsc-list-selected: reusing the selection color made a
+   merely hovered row indistinguishable from a selected one. */
+.row:hover:not(.selected) { background: var(--vsc-list-hover); }
 html.native-context-menu-open .row:hover {
   background: transparent !important;
   box-shadow: none;
@@ -1159,8 +1165,8 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  line-height: 23px;
-  font-size: 12px;
+  line-height: var(--row-h, 23px);
+  font-size: var(--ui-font-size, 12px);
 }
 
 .num { text-align: right; font-variant-numeric: tabular-nums; font-weight: 400; font-family: var(--vsc-mono); }
@@ -2021,16 +2027,21 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   justify-content: center;
 }
 
+/* Dialog chrome is theme-aware, not hardcoded dark. These `.fd-*` classes are
+   shared by 11 dialogs, so the old literal #222 / #2b2b2b / #444 painted a
+   near-black header and footer around a white body on every one of them in
+   light mode. --bg-3 is #222222 in dark, the exact value it replaces, so the
+   dark appearance is unchanged. */
 .filter-dialog {
-  background: #2b2b2b;
-  border: 1px solid #555;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  background: var(--surface);
+  border: 1px solid var(--border-2);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
   min-width: 560px;
   max-width: 760px;
   width: 90vw;
   display: flex;
   flex-direction: column;
-  color: #e8e8e8;
+  color: var(--text);
   font-size: 12px;
 }
 
@@ -2039,14 +2050,14 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   align-items: center;
   justify-content: space-between;
   padding: 10px 14px 8px;
-  border-bottom: 1px solid #444;
-  background: #222;
+  border-bottom: 1px solid var(--border-2);
+  background: var(--bg-3);
 }
 
 .fd-title {
   font-size: 14px;
   font-weight: 600;
-  color: #f0f0f0;
+  color: var(--text);
 }
 
 .fd-header-actions {
@@ -2059,9 +2070,9 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   height: 22px;
   padding: 0;
   background: transparent;
-  border: 1px solid #555;
+  border: 1px solid var(--border-2);
   border-radius: 0;
-  color: #ccc;
+  color: var(--text-4);
   font-size: 11px;
   cursor: pointer;
   display: flex;
@@ -2071,9 +2082,9 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
 }
 
 .fd-icon-btn:hover:not(:disabled) {
-  background: rgba(255,255,255,0.10);
-  border-color: #888;
-  color: #fff;
+  background: var(--hover);
+  border-color: var(--border-5);
+  color: var(--text);
   transform: none;
   box-shadow: none;
 }
@@ -2139,9 +2150,9 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   top: 100%;
   left: 0;
   z-index: 100;
-  background: #1e1e1e;
-  border: 1px solid #555;
-  box-shadow: 2px 3px 8px rgba(0,0,0,0.5);
+  background: var(--bg-2);
+  border: 1px solid var(--border-2);
+  box-shadow: 2px 3px 8px rgba(0,0,0,0.35);
   min-width: 56px;
   display: flex;
   flex-direction: column;
@@ -2153,7 +2164,7 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   padding: 0 10px;
   background: transparent;
   border: 0;
-  color: #e0e0e0;
+  color: var(--text);
   font-size: 12px;
   font-weight: 600;
   text-align: left;
@@ -2162,7 +2173,7 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   border-radius: 0;
 }
 
-.fd-join-menu button:hover { background: rgba(255,255,255,0.10); transform: none; box-shadow: none; }
+.fd-join-menu button:hover { background: var(--hover); transform: none; box-shadow: none; }
 .fd-join-active { color: color-mix(in srgb, var(--accent) 80%, #fff) !important; }
 
 /* Field / operator selects */
@@ -2229,16 +2240,16 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   height: 26px;
   padding: 0 10px;
   background: transparent;
-  border: 1px dashed #555;
+  border: 1px dashed var(--border-2);
   border-radius: 0;
-  color: #aaa;
+  color: var(--text-5);
   font-size: 11.5px;
   cursor: pointer;
   margin-top: 2px;
   min-height: 0;
 }
 
-.fd-add-btn:hover { background: rgba(255,255,255,0.06); border-color: #888; color: #e0e0e0; transform: none; box-shadow: none; }
+.fd-add-btn:hover { background: var(--hover); border-color: var(--border-5); color: var(--text); transform: none; box-shadow: none; }
 
 /* Footer */
 .fd-footer {
@@ -2247,8 +2258,8 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   justify-content: flex-end;
   gap: 8px;
   padding: 10px 14px;
-  border-top: 1px solid #444;
-  background: #222;
+  border-top: 1px solid var(--border-2);
+  background: var(--bg-3);
 }
 
 /* Dialog primary button — same accent identity as button.primary /
@@ -2273,23 +2284,23 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
 .fd-cancel {
   height: 28px;
   padding: 0 18px;
-  background: #3a3a3a;
-  border: 1px solid #666;
-  color: #ccc;
+  background: var(--bg-4);
+  border: 1px solid var(--border-2);
+  color: var(--text-2);
   font-size: 12px;
   border-radius: var(--radius);
   cursor: pointer;
   min-height: 0;
 }
 
-.fd-cancel:hover { background: #4a4a4a; color: #fff; transform: none; box-shadow: none; }
+.fd-cancel:hover { background: var(--bg-5); color: var(--text); transform: none; box-shadow: none; }
 
 .fd-clear {
   height: 28px;
   padding: 0 14px;
   background: transparent;
-  border: 1px solid #844;
-  color: #e08080;
+  border: 1px solid color-mix(in srgb, var(--danger) 55%, transparent);
+  color: var(--danger);
   font-size: 11.5px;
   border-radius: var(--radius);
   cursor: pointer;
@@ -2297,7 +2308,7 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   min-height: 0;
 }
 
-.fd-clear:hover { background: rgba(196,43,28,0.15); color: #ff9090; transform: none; box-shadow: none; }
+.fd-clear:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); transform: none; box-shadow: none; }
 
 /* ── Scheduled-scan wizard (#10) ───────────────────────────── */
 
@@ -2398,15 +2409,15 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
 /* ── Move conflict dialog ──────────────────────────────────── */
 
 .conflict-dialog {
-  background: #2b2b2b;
-  border: 1px solid #555;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  background: var(--surface);
+  border: 1px solid var(--border-2);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
   min-width: 420px;
   max-width: 560px;
   width: 90vw;
   display: flex;
   flex-direction: column;
-  color: #e8e8e8;
+  color: var(--text);
   font-size: 12px;
 }
 
@@ -2419,7 +2430,7 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
 
 .cd-msg {
   margin: 0;
-  color: #cfcfcf;
+  color: var(--text-2);
 }
 
 .cd-list {
@@ -2428,8 +2439,8 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   list-style: none;
   max-height: 200px;
   overflow-y: auto;
-  background: #222;
-  border: 1px solid #3c3c3c;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -2439,27 +2450,27 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  color: #e8e8e8;
+  color: var(--text);
 }
 
 .cd-list .cd-more {
-  color: #9a9a9a;
+  color: var(--text-6);
   font-style: italic;
 }
 
 .cd-keep {
   height: 28px;
   padding: 0 16px;
-  background: #3a3a3a;
-  border: 1px solid #666;
-  color: #e8e8e8;
+  background: var(--bg-4);
+  border: 1px solid var(--border-2);
+  color: var(--text-2);
   font-size: 12px;
   border-radius: var(--radius);
   cursor: pointer;
   min-height: 0;
 }
 
-.cd-keep:hover { background: #4a4a4a; color: #fff; transform: none; box-shadow: none; }
+.cd-keep:hover { background: var(--bg-5); color: var(--text); transform: none; box-shadow: none; }
 
 .cd-apply-all {
   display: flex;
@@ -2467,7 +2478,7 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
   gap: 8px;
   margin-top: 12px;
   font-size: 12px;
-  color: #cfcfcf;
+  color: var(--text-2);
   cursor: pointer;
   user-select: none;
 }
@@ -2603,22 +2614,22 @@ html.native-context-menu-open .row.selected:hover::after { display: none; }
 /* ── Confirm & prompt modals (themed; match the filter/conflict dialogs) ── */
 
 .confirm-dialog, .prompt-dialog {
-  background: #2b2b2b;
-  border: 1px solid #555;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  background: var(--surface);
+  border: 1px solid var(--border-2);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
   min-width: 380px;
   max-width: 520px;
   width: 90vw;
   display: flex;
   flex-direction: column;
-  color: #e8e8e8;
+  color: var(--text);
   font-size: 12px;
 }
 /* Risk prompts carry multi-line copy ("…This CANNOT be undone."). */
 .confirm-dialog .cd-msg, .prompt-dialog .cd-msg { white-space: pre-wrap; line-height: 1.5; }
 
 .prompt-field { display: flex; flex-direction: column; gap: 5px; }
-.prompt-label { font-size: 11.5px; color: #c4c4c4; }
+.prompt-label { font-size: 11.5px; color: var(--text-2); }
 .prompt-input {
   height: 28px;
   padding: 0 9px;
@@ -5305,7 +5316,8 @@ html.native-context-menu-open .compress-log-vrow:hover { background: transparent
 .dg-page,
 .df-results-root,
 .compress-view,
-.compression-monitor {
+.compression-monitor,
+.plg-view {
   /* Neutrals come from the app's own gray scale rather than being restated
      here. The originals were blue-tinted (hue ~215: #171c24, #202733, #303a48),
      which read as a cool cast against the neutral gray every other view uses.
@@ -5341,7 +5353,8 @@ html.native-context-menu-open .compress-log-vrow:hover { background: transparent
 [data-theme="dark"] .dg-page,
 [data-theme="dark"] .df-results-root,
 [data-theme="dark"] .compress-view,
-[data-theme="dark"] .compression-monitor {
+[data-theme="dark"] .compression-monitor,
+[data-theme="dark"] .plg-view {
   /* Light runs lightest→darkest and dark runs darkest→lightest, so the recessed
      canvas and the raised surface swap places; the rest resolve per theme.
      --bg-2 IS the surface here, so subtle has to step up to --bg-4 or secondary
@@ -5375,7 +5388,8 @@ html.native-context-menu-open .compress-log-vrow:hover { background: transparent
   .dg-page,
   .df-results-root,
   .compress-view,
-  .compression-monitor {
+  .compression-monitor,
+  .plg-view {
     --df-accent: oklch(from var(--accent) 0.48 c h);
     --df-accent-soft: oklch(from var(--accent) 0.95 0.03 h);
     --df-focus: oklch(from var(--accent) 0.45 c h);
@@ -5384,7 +5398,8 @@ html.native-context-menu-open .compress-log-vrow:hover { background: transparent
   [data-theme="dark"] .dg-page,
   [data-theme="dark"] .df-results-root,
   [data-theme="dark"] .compress-view,
-  [data-theme="dark"] .compression-monitor {
+  [data-theme="dark"] .compression-monitor,
+  [data-theme="dark"] .plg-view {
     --df-accent: oklch(from var(--accent) 0.78 c h);
     --df-accent-soft: oklch(from var(--accent) 0.3 0.06 h);
     --df-accent-fill: oklch(from var(--accent) 0.5 c h);
@@ -7166,7 +7181,7 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 .row.heat:not(.selected):not(.drop-target) {
   background: color-mix(in srgb, var(--accent) calc(var(--heat, 0) * 100%), transparent);
 }
-.row.heat:not(.selected):not(.drop-target):hover { background: var(--vsc-list-selected); }
+.row.heat:not(.selected):not(.drop-target):hover { background: var(--vsc-list-hover); }
 
 /* #11 diff-on-rescan transient row highlights (fade out after the tint clears
    upstream). Added rows get a positive (accent/green) tint; size-changed rows a
@@ -7365,6 +7380,7 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 .cleanup-editor,
 .snapshots-editor,
 .gallery-editor,
+.plugins-editor,
 .compress-editor { animation: ft-view-fade 150ms ease; }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -7568,6 +7584,57 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
   }
 }
 
+/* The in-app Reduce motion toggle (Appearance) suppresses the same animations
+   as the OS preference above. It layers over that query rather than replacing
+   it — there is no way to switch motion back on when the OS asks for less. The
+   selector lists are duplicated because CSS cannot combine a media query and a
+   selector condition with OR. */
+html[data-motion="reduce"] :is(
+  .filter-dialog-overlay,
+  .filter-dialog,
+  .conflict-dialog,
+  .confirm-dialog,
+  .prompt-dialog,
+  .rb-dropdown-menu,
+  .toast,
+  .vsc-body > .sidebar,
+  .chatpanel,
+  .inspector-pane,
+  .bottom-panel,
+  .terminal-panel,
+  .editor-main,
+  .reports-editor,
+  .dupes-editor,
+  .cleanup-editor,
+  .snapshots-editor,
+  .gallery-editor,
+  .compress-editor,
+  .compress-bar-fill,
+  .scan-overlay,
+  .skeleton-bar,
+  .cmdk-overlay,
+  .cmdk,
+  .xfer-panel,
+  .tag-popover
+) {
+  animation: none !important;
+}
+
+html[data-motion="reduce"] :is(.tool-card-caret, .ctx-meter-fill, .compress-bar-fill) {
+  transition: none !important;
+}
+
+/* Progress indicators keep moving — they are the only sign a scan is alive —
+   but slow to a calmer linear sweep. */
+html[data-motion="reduce"] .scan-overlay .df-scanning-spinner { animation-duration: 1.4s; }
+html[data-motion="reduce"] .scan-overlay .df-progress-bar-sweep {
+  animation-duration: 2.4s;
+  animation-timing-function: linear;
+}
+html[data-motion="reduce"] :is(.cm-run-progress i, .cm-file-progress-fill, .cm-overall-track span) {
+  transition: none !important;
+}
+
 /* ── #25 Duplicate group preview (overlay) ─────────────────────────────────── */
 .dgp-overlay {
   position: fixed; inset: 0; z-index: 9700;
@@ -7686,6 +7753,33 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
   display: flex; flex-direction: column;
   width: min(92vw, 520px); max-height: 82vh;
 }
+/* ── What's New (#changelog) ────────────────────────────────────────────── */
+.changelog-dialog {
+  background: var(--surface);
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  color: var(--text);
+  display: flex; flex-direction: column;
+  width: min(94vw, 760px); height: min(84vh, 760px);
+}
+/* Sits between the title and the close button, which takes `margin-left: auto`. */
+.changelog-version {
+  margin-left: 8px; padding: 1px 7px; border-radius: 9px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent); font-size: 10.5px; font-weight: 600;
+}
+.changelog-body { padding: 4px 16px 14px; overflow: auto; min-height: 0; }
+/* The changelog leads with a level-2 release heading, so drop the browser's
+   large top margin that would otherwise open the panel with a gap. */
+.changelog-body .md > :first-child { margin-top: 6px; }
+.changelog-more {
+  display: block; width: 100%; margin: 18px 0 4px;
+  background: var(--bg-3); border: 1px solid var(--border-2);
+  color: var(--text-3); font-size: 12px;
+}
+.changelog-more:hover { border-color: var(--accent); color: var(--text); }
+
 .fd-close {
   margin-left: auto; background: transparent; border: none; cursor: pointer;
   color: var(--text-5); display: inline-flex; padding: 2px; border-radius: var(--radius);
@@ -7790,12 +7884,46 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 .appearance-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 16px; overflow: auto; }
 .appearance-section { display: flex; flex-direction: column; gap: 8px; }
 .appearance-label { font-size: 12px; font-weight: 600; color: var(--text-2); }
-.appearance-theme-btn {
-  display: inline-flex; align-items: center; gap: 8px; align-self: flex-start;
-  padding: 5px 12px; background: var(--bg-3); border: 1px solid var(--border-2);
-  border-radius: var(--radius); color: var(--text); cursor: pointer; font-size: 12px;
+/* Segmented radio groups (theme mode, row density). The global `button` rule
+   is a 28px filled box, so each segment restates its own metrics; the :hover
+   and .active rules have to out-specify `button:hover`, which is why they are
+   written as compound selectors rather than plain `.appearance-seg:hover`. */
+.appearance-segmented {
+  display: inline-flex; align-self: flex-start;
+  border: 1px solid var(--border-2); border-radius: var(--radius); overflow: hidden;
 }
-.appearance-theme-btn:hover { border-color: var(--accent); }
+.appearance-seg {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 26px; min-height: 0; padding: 0 12px;
+  background: var(--bg-3); border: 0; border-radius: 0;
+  color: var(--text-3); cursor: pointer; font-size: 12px;
+}
+.appearance-seg + .appearance-seg { border-left: 1px solid var(--border-2); }
+.appearance-seg:hover:not(.active) {
+  background: var(--bg-5); border-color: transparent; color: var(--text);
+}
+.appearance-seg.active,
+.appearance-seg.active:hover { background: var(--accent); border-color: transparent; color: #fff; }
+
+.appearance-hint { font-size: 11px; color: var(--text-5); line-height: 1.45; }
+
+.appearance-select {
+  align-self: flex-start; min-width: 190px; height: 26px; padding: 0 6px;
+  background: var(--surface); border: 1px solid var(--border-3);
+  border-radius: var(--radius); color: var(--text); font-size: 12px;
+}
+.appearance-select:focus { border-color: var(--accent); outline: none; }
+
+/* Keeps a slider's Reset beside its track rather than stacked under it. */
+.appearance-slider-row { display: flex; align-items: center; gap: 10px; }
+.appearance-slider-row .appearance-slider { flex: 1 1 auto; min-width: 0; }
+.appearance-slider-row .appearance-reset { align-self: auto; flex: 0 0 auto; }
+
+.appearance-check {
+  display: inline-flex; align-items: center; gap: 8px; align-self: flex-start;
+  font-size: 12px; color: var(--text-2); cursor: pointer; user-select: none;
+}
+.appearance-check input { cursor: pointer; accent-color: var(--accent); }
 .accent-swatches { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .accent-swatch {
   width: 24px; height: 24px; border-radius: 50%; border: 2px solid transparent;
@@ -9207,7 +9335,200 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
 .dg-optgroup .dg-field-inline input, .dg-optgroup .dg-field-inline .ft-select { min-width: 0; width: 100%; }
 .dg-optgroup .dg-check { align-items: center; gap: 8px; }
 
-/* Keep explorer actions together immediately after the name. */
+/* Park the explorer row actions at the right edge of the Name column, still
+   tightly grouped. Only the FIRST button may take the free space: flexbox
+   splits the slack evenly between every `auto` margin, so leaving it on all of
+   them scatters the icons across the cell. Which button comes first varies (the
+   tag and compress actions are both conditional), so rather than naming one,
+   the adjacency rules below demote any button that follows another. These have
+   to be restated here even though earlier rules already set the 4px gaps —
+   equal specificity means this block's `auto` would otherwise win. */
 .name-cell .tag-btn,
 .name-cell .bookmark-btn,
-.name-cell .row-compress-btn { margin-left: 3px; }
+.name-cell .row-compress-btn { margin-left: auto; }
+.name-cell .tag-btn + .bookmark-btn,
+.name-cell .tag-btn + .row-compress-btn,
+.name-cell .bookmark-btn + .bookmark-btn,
+.name-cell .bookmark-btn + .row-compress-btn,
+.name-cell .row-compress-btn + .bookmark-btn,
+.name-cell .row-compress-btn + .tag-btn { margin-left: 3px; }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Plugins page. The catalog of approved plugins and the opt-in switch for each
+   one, plus the host chrome an enabled plugin's tab is framed in. The tab strip
+   copies the Duplicates/Compress rhythm; everything else is built from the
+   shared tokens so light and dark both work.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+.plugins-editor { flex: 1 1 0; min-width: 0; display: flex; overflow: hidden; }
+.plg-view {
+  flex: 1; min-width: 0; display: flex; flex-direction: column;
+  height: 100%; background: var(--bg); color: var(--text); overflow: hidden;
+}
+
+/* ── Tab strip: Catalog, then one tab per plugin ──────────────────────────── */
+.plg-tabstrip {
+  display: flex; align-items: stretch; gap: 2px; flex: 0 0 auto;
+  min-height: 29px; padding: 0 8px; overflow-x: auto;
+  background: var(--df-surface-subtle); border-bottom: 1px solid var(--df-divider);
+}
+.plg-tab {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  height: 28px; padding: 0 14px; cursor: pointer;
+  background: transparent; border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+  color: var(--df-muted); font-size: 12px;
+}
+.plg-tab:hover { background: var(--vsc-list-hover); color: var(--text); }
+.plg-tab.active {
+  color: var(--text); border-bottom-color: var(--df-accent);
+  font-weight: var(--vsc-fw-semibold);
+}
+.plg-tab-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 16px; height: 15px; padding: 0 4px;
+  background: var(--df-accent-soft); color: var(--df-accent);
+  font-size: 10.5px; font-weight: var(--vsc-fw-semibold);
+}
+/* Opt-in state at a glance, without widening the tab. */
+.plg-dot { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; background: var(--muted-2); }
+.plg-dot.on { background: var(--accent-2); }
+
+.plg-body { flex: 1; min-width: 0; min-height: 0; overflow: auto; padding: 20px 24px 28px; }
+.plg-catalog, .plg-detail { max-width: 940px; }
+
+/* ── Catalog ──────────────────────────────────────────────────────────────── */
+.plg-intro h1 { margin: 0 0 6px; font-size: 19px; font-weight: var(--vsc-fw-semibold); }
+.plg-intro p { margin: 0; max-width: 660px; font-size: 12.5px; line-height: 1.6; color: var(--muted); }
+
+.plg-note {
+  display: flex; align-items: flex-start; gap: 7px; margin: 14px 0 0; padding: 8px 10px;
+  background: var(--df-accent-soft); color: var(--text);
+  border-left: 2px solid var(--df-accent); font-size: 12px; line-height: 1.55;
+}
+.plg-note .bi { flex: 0 0 auto; margin-top: 2px; color: var(--df-accent); }
+
+.plg-grid {
+  display: grid; gap: 12px; margin-top: 18px;
+  grid-template-columns: repeat(auto-fill, minmax(274px, 1fr));
+}
+.plg-card {
+  display: flex; flex-direction: column; gap: 10px; padding: 13px 14px 12px;
+  background: var(--surface); border: 1px solid var(--border);
+}
+.plg-card.on { border-color: color-mix(in srgb, var(--accent-2) 45%, var(--border)); }
+.plg-card-head { display: flex; align-items: flex-start; gap: 9px; }
+.plg-glyph {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; flex: 0 0 30px;
+  background: var(--bg-4); color: var(--text-4);
+}
+.plg-glyph.lg { width: 42px; height: 42px; flex-basis: 42px; }
+.plg-card.on .plg-glyph, .plg-hero.compact .plg-glyph { background: var(--df-accent-soft); color: var(--df-accent); }
+.plg-ident { flex: 1; min-width: 0; }
+.plg-ident h1, .plg-ident h3 { margin: 0; font-weight: var(--vsc-fw-semibold); }
+.plg-ident h3 { font-size: 13px; }
+.plg-ident h1 { font-size: 18px; }
+.plg-vendor { display: block; margin-top: 2px; font-size: 11.5px; color: var(--muted-2); }
+.plg-tag { margin-left: 8px; padding: 1px 5px; background: var(--bg-5); color: var(--text-6); font-size: 10.5px; }
+
+.plg-pill {
+  flex: 0 0 auto; padding: 2px 7px; font-size: 10.5px; letter-spacing: .02em;
+  font-weight: var(--vsc-fw-semibold);
+  border: 1px solid var(--border); color: var(--muted);
+}
+.plg-pill.on {
+  color: var(--accent-2);
+  border-color: color-mix(in srgb, var(--accent-2) 45%, transparent);
+  background: color-mix(in srgb, var(--accent-2) 12%, transparent);
+}
+.plg-pill.preview {
+  color: var(--df-accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.plg-summary { flex: 1; margin: 0; font-size: 12.5px; line-height: 1.55; color: var(--text-4); }
+.plg-card-foot { display: flex; gap: 8px; }
+
+/* ── Buttons ──────────────────────────────────────────────────────────────── */
+.plg-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  height: 26px; padding: 0 12px; cursor: pointer;
+  background: var(--bg-4); border: 1px solid var(--border); color: var(--text);
+  font-size: 12px; font-weight: var(--vsc-fw-semibold);
+}
+.plg-btn .bi { flex: 0 0 auto; }
+.plg-btn:hover:not(:disabled) { background: var(--bg-5); }
+.plg-btn.primary { background: var(--df-accent-fill); border-color: var(--df-accent-fill); color: #fff; }
+.plg-btn.primary:hover:not(:disabled) { filter: brightness(1.1); }
+.plg-btn.ghost { background: transparent; border-color: transparent; color: var(--muted); font-weight: 400; }
+.plg-btn.ghost:hover { background: var(--vsc-list-hover); color: var(--text); }
+.plg-btn.wide { min-width: 98px; }
+.plg-btn:disabled { opacity: .5; cursor: default; }
+
+/* ── A plugin's tab while it is still off ─────────────────────────────────── */
+.plg-hero {
+  display: flex; align-items: center; gap: 12px;
+  padding-bottom: 16px; border-bottom: 1px solid var(--border);
+}
+.plg-about { margin: 16px 0 0; max-width: 680px; font-size: 13px; line-height: 1.65; color: var(--text-3); }
+.plg-section { margin-top: 22px; }
+.plg-section h2 {
+  margin: 0 0 9px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--muted-2); font-weight: var(--vsc-fw-semibold);
+}
+.plg-list { display: flex; flex-direction: column; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.plg-list li { display: flex; align-items: flex-start; gap: 7px; font-size: 12.5px; line-height: 1.5; color: var(--text-4); }
+.plg-list .bi { flex: 0 0 auto; margin-top: 3px; color: var(--accent-2); }
+
+.plg-foot { margin: 20px 0 0; font-size: 11.5px; color: var(--muted-2); }
+
+/* ── An enabled plugin's tab ──────────────────────────────────────────────────
+   The plugin owns the tab body, so the host keeps only a compact header strip
+   above it — enough to identify the plugin and opt back out. The surface below
+   does not scroll: a plugin lays out against a fixed box and scrolls its own
+   content, the same contract the built-in views work to. */
+.plg-hosted { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.plg-hero.compact {
+  flex: 0 0 auto; gap: 10px; padding: 8px 16px;
+  background: var(--df-surface-subtle); border-bottom: 1px solid var(--df-divider);
+}
+.plg-hero.compact .plg-glyph { width: 26px; height: 26px; flex-basis: 26px; }
+.plg-hero.compact .plg-ident h2 { margin: 0; font-size: 13px; font-weight: var(--vsc-fw-semibold); }
+.plg-hero.compact .plg-vendor { margin-top: 0; }
+.plg-surface { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+.plg-surface > * { flex: 1; min-height: 0; }
+
+/* Shown in place of a plugin that has no panel yet. */
+.plg-placeholder {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 9px; padding: 40px 24px; overflow: auto; text-align: center;
+  background: repeating-linear-gradient(
+    -45deg, transparent, transparent 9px,
+    color-mix(in srgb, var(--border) 34%, transparent) 9px,
+    color-mix(in srgb, var(--border) 34%, transparent) 10px);
+}
+.plg-placeholder .bi { color: var(--muted-2); }
+.plg-placeholder h3 { margin: 0; font-size: 14px; color: var(--text); font-weight: var(--vsc-fw-semibold); }
+.plg-placeholder p { margin: 0; max-width: 430px; font-size: 12.5px; line-height: 1.55; color: var(--muted); }
+.plg-placeholder-list {
+  margin: 6px 0 0; padding: 10px 16px; list-style: none; text-align: left;
+  display: flex; flex-direction: column; gap: 5px;
+  background: var(--surface); border: 1px solid var(--border);
+  font-size: 12px; color: var(--text-4);
+}
+.plg-placeholder-list li::before { content: "— "; color: var(--muted-2); }
+
+/* ── Empty registry (every example entry removed, none shipped yet) ───────── */
+.plg-empty {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 64px 16px; text-align: center; color: var(--muted);
+}
+.plg-empty .bi { color: var(--muted-2); }
+.plg-empty h2 { margin: 0; font-size: 15px; color: var(--text); font-weight: var(--vsc-fw-semibold); }
+.plg-empty p { margin: 0; max-width: 390px; font-size: 12.5px; }
+
+@media (max-width: 720px) {
+  .plg-body { padding: 16px 14px 24px; }
+  .plg-hero { flex-wrap: wrap; }
+  .plg-surface { flex-direction: column; gap: 3px; }
+  .plg-where { flex-basis: auto; }
+}

@@ -19,6 +19,11 @@ export default defineConfig({
     assetsInlineLimit: 1024 * 1024,
   },
   server: {
+    fs: {
+      // The What's New dialog imports CHANGELOG.md from the repository root,
+      // which is outside this project root and so is blocked by default.
+      allow: [".."],
+    },
     // Dev mode: proxy API calls to the Rust backend
     proxy: {
       "/api": "http://127.0.0.1:7878",

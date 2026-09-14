@@ -1,6 +1,7 @@
-// Theme customization: accent color + UI font-size scaling (#50).
+// Theme customization (#50): theme mode, accent color, UI scale, row density,
+// base text size, reduced motion and UI font family.
 //
-// Both prefs are persisted in localStorage (like the other lightweight UI
+// Every pref is persisted in localStorage (like the other lightweight UI
 // toggles) and applied at runtime by overriding CSS variables on :root / zooming
 // the webview. Applying on load (before paint) avoids a flash.
 
@@ -8,18 +9,28 @@ import { isTauriV2 } from "../api/v2";
 
 const ACCENT_KEY = "filetree_accent";
 const SCALE_KEY = "filetree_ui_scale";
+const THEME_KEY = "filetree_theme_mode";
+const DENSITY_KEY = "filetree_row_density";
+const MOTION_KEY = "filetree_reduce_motion";
+const FONT_KEY = "filetree_ui_font";
+const FONT_SIZE_KEY = "filetree_ui_font_size";
 
 export const DEFAULT_ACCENT = ""; // empty ⇒ fall back to the theme's --accent
 export const DEFAULT_SCALE = 100; // percent
 
 export const ACCENT_PRESETS: { name: string; value: string }[] = [
   { name: "Blue", value: "#0078d4" },
+  { name: "Indigo", value: "#4f46e5" },
+  { name: "Cyan", value: "#0891b2" },
   { name: "Teal", value: "#0d9488" },
   { name: "Green", value: "#16a34a" },
   { name: "Purple", value: "#7c3aed" },
+  { name: "Magenta", value: "#a21caf" },
   { name: "Pink", value: "#db2777" },
+  { name: "Amber", value: "#d97706" },
   { name: "Orange", value: "#ea580c" },
   { name: "Red", value: "#dc2626" },
+  { name: "Slate", value: "#475569" },
 ];
 
 export const MIN_SCALE = 90;
@@ -28,6 +39,67 @@ export const MAX_SCALE = 130;
 function clampScale(n: number): number {
   if (!Number.isFinite(n)) return DEFAULT_SCALE;
   return Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(n)));
+}
+
+/**
+ * How the light/dark choice is made. "system" tracks the OS preference live;
+ * the other two pin it regardless of what the OS reports.
+ */
+export type ThemeMode = "light" | "dark" | "system";
+
+/** The app shipped dark-only, so an unconfigured install stays dark. */
+export const DEFAULT_THEME_MODE: ThemeMode = "dark";
+
+export type RowDensity = "compact" | "normal" | "relaxed";
+
+export const DEFAULT_DENSITY: RowDensity = "normal";
+
+/**
+ * Row heights per density. "normal" is the 23px the table was hardcoded to, so
+ * the default density reproduces the previous layout exactly.
+ */
+export const ROW_HEIGHTS: Record<RowDensity, number> = {
+  compact: 19,
+  normal: 23,
+  relaxed: 28,
+};
+
+/**
+ * Base text size. Only text that inherits it responds — that covers the file
+ * table and most body copy, while chrome that pins its own px size does not.
+ * `uiScale` remains the control that resizes everything uniformly.
+ */
+export const DEFAULT_FONT_SIZE = 12;
+export const MIN_FONT_SIZE = 11;
+export const MAX_FONT_SIZE = 16;
+
+/** Empty value ⇒ keep the stylesheet's own stack. */
+export const FONT_PRESETS: { name: string; value: string }[] = [
+  { name: "System", value: "" },
+  { name: "Segoe UI", value: '"Segoe UI", system-ui, sans-serif' },
+  { name: "Inter", value: 'Inter, "Segoe UI", system-ui, sans-serif' },
+  { name: "Roboto", value: 'Roboto, "Segoe UI", system-ui, sans-serif' },
+  { name: "Arial", value: "Arial, Helvetica, sans-serif" },
+  { name: "Verdana", value: "Verdana, Geneva, sans-serif" },
+  { name: "Tahoma", value: "Tahoma, Geneva, sans-serif" },
+  { name: "Georgia", value: 'Georgia, "Times New Roman", serif' },
+  { name: "Consolas", value: 'Consolas, "Cascadia Mono", monospace' },
+];
+
+function clampFontSize(n: number): number {
+  if (!Number.isFinite(n)) return DEFAULT_FONT_SIZE;
+  return Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, Math.round(n)));
+}
+
+/**
+ * The row height to lay rows out at.
+ *
+ * Density picks the base, but a row shorter than its own text clips the
+ * descenders, so the larger text sizes raise the floor — otherwise "compact"
+ * plus 16px text would cut the names off.
+ */
+export function rowHeightFor(density: RowDensity, fontSize: number): number {
+  return Math.max(ROW_HEIGHTS[density] ?? ROW_HEIGHTS.normal, clampFontSize(fontSize) + 7);
 }
 
 /** Parse "#rrggbb" → [r,g,b], or null when not a 6-digit hex color. */
@@ -185,8 +257,157 @@ export function saveScale(percent: number): void {
   try { localStorage.setItem(SCALE_KEY, String(clampScale(percent))); } catch { /* ignore */ }
 }
 
-/** Apply both persisted prefs on startup. */
-export function initAppearance(): void {
+// ── Theme mode (light / dark / system) ──────────────────────────────────────
+
+function darkQuery(): MediaQueryList | null {
+  try { return window.matchMedia?.("(prefers-color-scheme: dark)") ?? null; } catch { return null; }
+}
+
+/**
+ * The stored mode, or null when this install has never chosen one.
+ *
+ * Null is distinct from the default: it tells the caller to fall back to the
+ * `darkMode` boolean in the saved session, so upgrading doesn't flip the theme
+ * out from under someone who had set it before this pref existed.
+ */
+export function loadThemeMode(): ThemeMode | null {
+  try {
+    const raw = localStorage.getItem(THEME_KEY);
+    return raw === "light" || raw === "dark" || raw === "system" ? raw : null;
+  } catch { return null; }
+}
+
+export function saveThemeMode(mode: ThemeMode): void {
+  try { localStorage.setItem(THEME_KEY, mode); } catch { /* ignore */ }
+}
+
+/** Whether `mode` means "dark" right now — reads the OS only for "system". */
+export function resolveDark(mode: ThemeMode): boolean {
+  if (mode === "system") return darkQuery()?.matches ?? false;
+  return mode === "dark";
+}
+
+export function applyTheme(dark: boolean): void {
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+}
+
+/**
+ * Subscribe to OS light/dark changes. Fires regardless of the current mode, so
+ * the caller must ignore it unless the mode is "system".
+ */
+export function watchSystemTheme(onChange: (dark: boolean) => void): () => void {
+  const query = darkQuery();
+  if (!query) return () => { /* no matchMedia */ };
+  const handler = (e: MediaQueryListEvent) => onChange(e.matches);
+  query.addEventListener("change", handler);
+  return () => query.removeEventListener("change", handler);
+}
+
+// ── Row density + base text size ────────────────────────────────────────────
+
+export function loadDensity(): RowDensity {
+  try {
+    const raw = localStorage.getItem(DENSITY_KEY);
+    return raw === "compact" || raw === "normal" || raw === "relaxed" ? raw : DEFAULT_DENSITY;
+  } catch { return DEFAULT_DENSITY; }
+}
+
+export function saveDensity(density: RowDensity): void {
+  try { localStorage.setItem(DENSITY_KEY, density); } catch { /* ignore */ }
+}
+
+export function loadFontSize(): number {
+  try {
+    const raw = localStorage.getItem(FONT_SIZE_KEY);
+    return raw ? clampFontSize(parseInt(raw, 10)) : DEFAULT_FONT_SIZE;
+  } catch { return DEFAULT_FONT_SIZE; }
+}
+
+export function saveFontSize(px: number): void {
+  try { localStorage.setItem(FONT_SIZE_KEY, String(clampFontSize(px))); } catch { /* ignore */ }
+}
+
+/**
+ * Publish the row metrics the stylesheet needs. The table virtualizer takes the
+ * same number through a prop rather than reading it back out of CSS, so both
+ * must be driven from `rowHeightFor` to stay in step.
+ */
+export function applyMetrics(density: RowDensity, fontSize: number): void {
+  const root = document.documentElement;
+  root.style.setProperty("--row-h", `${rowHeightFor(density, fontSize)}px`);
+  root.style.setProperty("--ui-font-size", `${clampFontSize(fontSize)}px`);
+}
+
+// ── Reduce motion ───────────────────────────────────────────────────────────
+
+export function loadReduceMotion(): boolean {
+  try { return localStorage.getItem(MOTION_KEY) === "1"; } catch { return false; }
+}
+
+export function saveReduceMotion(on: boolean): void {
+  try {
+    if (on) localStorage.setItem(MOTION_KEY, "1");
+    else localStorage.removeItem(MOTION_KEY);
+  } catch { /* ignore */ }
+}
+
+/**
+ * Opt into the reduced-motion rules from inside the app.
+ *
+ * The stylesheet already suppresses decorative animation under
+ * `prefers-reduced-motion`; this sets an attribute those same rules also match,
+ * so the toggle layers over the OS preference instead of replacing it. There is
+ * deliberately no "force motion on" — the OS preference always wins.
+ */
+export function applyReduceMotion(on: boolean): void {
+  const root = document.documentElement;
+  if (on) root.dataset.motion = "reduce";
+  else delete root.dataset.motion;
+}
+
+// ── UI font family ──────────────────────────────────────────────────────────
+
+export function loadFont(): string {
+  try { return localStorage.getItem(FONT_KEY) ?? ""; } catch { return ""; }
+}
+
+export function saveFont(stack: string): void {
+  try {
+    if (stack) localStorage.setItem(FONT_KEY, stack);
+    else localStorage.removeItem(FONT_KEY);
+  } catch { /* ignore */ }
+}
+
+/** Drives both family tokens: --font for the shell, --vsc-font for the workbench. */
+export function applyFont(stack: string): void {
+  const root = document.documentElement;
+  if (!stack) {
+    root.style.removeProperty("--font");
+    root.style.removeProperty("--vsc-font");
+    return;
+  }
+  root.style.setProperty("--font", stack);
+  root.style.setProperty("--vsc-font", stack);
+}
+
+/**
+ * Apply every persisted appearance pref on startup, before first paint.
+ *
+ * The theme is applied here too so there is no flash of the wrong palette; the
+ * return value hands the resolved mode back to the caller, which owns the
+ * `darkMode` React state the rest of the app renders from.
+ */
+export function initAppearance(): ThemeMode | null {
   applyAccent(loadAccent());
   applyScale(loadScale());
+  applyMetrics(loadDensity(), loadFontSize());
+  applyReduceMotion(loadReduceMotion());
+  applyFont(loadFont());
+  // Apply the default too, not just a stored mode: the stylesheet's base
+  // palette is the *light* one and dark is opt-in via [data-theme], so leaving
+  // the attribute unset would render light while the state said dark. A session
+  // `darkMode` from an install predating this pref overrides it just after.
+  const mode = loadThemeMode();
+  applyTheme(resolveDark(mode ?? DEFAULT_THEME_MODE));
+  return mode;
 }

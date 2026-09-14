@@ -342,6 +342,8 @@ interface WorkspaceTabProps {
   folderDblClickExplorer: boolean;
   /** #9: tint table rows by size relative to the largest visible row. */
   heatTint: boolean;
+  /** Row height in px, from the Appearance density + text-size prefs. */
+  rowHeight: number;
   onToggleBookmark: (path: string) => void;
   // Quick-load files or persisted scan folders into the Compress page.
   onCompress: (sources: CompressionSource[]) => void;
@@ -367,7 +369,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     bookmarkList, tagsByPath, activeTagFilter, onSetTags, onClearTagFilter,
     threads, includeHidden, followLinks, collectOwners, onCollectOwnersChange, exclude,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
-    folderDblClickExplorer, heatTint,
+    folderDblClickExplorer, heatTint, rowHeight,
     onToggleBookmark, onCompress, onScanPath, onStateChange, onWorkbenchChange, onOpenTerminal,
     onOpenFolderInTab, onUndo,
   }: WorkspaceTabProps,
@@ -2880,6 +2882,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
                   onSelectAll={handleSelectAllRows}
                   selectionSummary={selectionSummary}
                   heatTint={heatTint}
+                  rowHeight={rowHeight}
                   diffHighlight={diffHighlight}
                   onDoubleClick={handleDblClick}
                   onContextMenu={handleContextMenu}

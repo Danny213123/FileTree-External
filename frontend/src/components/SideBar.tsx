@@ -32,6 +32,7 @@ import { promptDialog } from "../lib/dialogs";
 import { toast } from "../lib/toast";
 
 const VIEW_TITLES: Record<ViewId, string> = {
+  plugins: "Plugins",
   explorer: "Explorer",
   search: "Search",
   duplicates: "Duplicates",

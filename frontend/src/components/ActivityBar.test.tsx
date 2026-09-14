@@ -1,6 +1,8 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActivityBar } from "./ActivityBar";
+
+afterEach(cleanup);
 
 describe("ActivityBar", () => {
   it("opens the compression workspace from the primary navigation", () => {
@@ -38,5 +40,28 @@ describe("ActivityBar", () => {
     );
 
     expect(screen.queryByRole("button", { name: "Treemap" })).not.toBeInTheDocument();
+  });
+
+  it("puts Plugins ahead of Explorer", () => {
+    const onSelect = vi.fn();
+
+    render(
+      <ActivityBar
+        activeView="explorer"
+        sidebarOpen
+        onSelect={onSelect}
+        bookmarkCount={0}
+        errorCount={0}
+        darkMode
+        onToggleTheme={() => {}}
+      />,
+    );
+
+    const labels = screen.getAllByRole("button").map((b) => b.getAttribute("aria-label"));
+    expect(labels.indexOf("Plugins")).toBe(0);
+    expect(labels.indexOf("Plugins")).toBeLessThan(labels.indexOf("Explorer"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Plugins" }));
+    expect(onSelect).toHaveBeenCalledWith("plugins");
   });
 });
