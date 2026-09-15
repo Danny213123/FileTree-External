@@ -3376,6 +3376,17 @@ fn process_file(
         .updated_at
         .store(crate::io::now_ms(), Ordering::Relaxed);
     job.emit(ev_stage(index, "finalizing"));
+    // Re-encoding changes contents, not when the file was created or last edited.
+    #[cfg(windows)]
+    if let Err(error) = preserve_compression_dates(&input, &out) {
+        let _ = std::fs::remove_file(&out);
+        return FileOutcome::Error {
+            reason: Reason::ErrorInternal,
+            message: format!("Could not preserve original file dates: {error}"),
+            diag,
+            meta,
+        };
+    }
     let out_str = out.to_string_lossy().into_owned();
 
     // [COMPRESSED] sidecar metadata tag keyed to the new path (the filename
@@ -4086,6 +4097,19 @@ fn encoder_error_message(diag: &EncodeDiag) -> String {
         msg.push_str(&format!(" [command: {}]", diag.command));
     }
     msg
+}
+
+/// Carry the original's creation and modified dates onto the compressed file,
+/// which replaces it; re-encoding shouldn't make the file look new.
+#[cfg(windows)]
+fn preserve_compression_dates(input: &Path, output: &Path) -> io::Result<()> {
+    let meta = std::fs::metadata(input)?;
+    let millis = |time: std::time::SystemTime| -> io::Result<i64> {
+        let ms = time.duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?.as_millis();
+        Ok(ms.min(i64::MAX as u128) as i64)
+    };
+    crate::fileattr::set_times(output, Some(millis(meta.created()?)?), Some(millis(meta.modified()?)?), None)
 }
 
 /// Output path beside the original: `name [COMPRESSED].ext` (zip → `.zip`).
@@ -8821,4 +8845,21 @@ mod manifest_tests {
             started.elapsed()
         );
     }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn compression_dates_are_preserved() {
+    let root = std::env::temp_dir().join(format!("filetree-creation-{}-{}", std::process::id(), crate::io::now_ms()));
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("source"); let output = root.join("output");
+    std::fs::write(&source, b"original").unwrap();
+    std::fs::write(&output, b"compressed").unwrap();
+    crate::fileattr::set_times(&source, Some(1_600_000_000_000), Some(1_650_000_000_000), None).unwrap();
+    preserve_compression_dates(&source, &output).unwrap();
+    let meta = std::fs::metadata(&output).unwrap();
+    let ms = |time: std::time::SystemTime| time.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    assert_eq!(ms(meta.created().unwrap()), 1_600_000_000_000);
+    assert_eq!(ms(meta.modified().unwrap()), 1_650_000_000_000);
+    std::fs::remove_file(source).unwrap(); std::fs::remove_file(output).unwrap(); std::fs::remove_dir(root).unwrap();
 }

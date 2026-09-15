@@ -278,6 +278,17 @@ fn roll_up(
     Ok(())
 }
 
+/// Rebuild ancestor maxima from immediate children after a corrected birth date.
+/// Uses the parent index and cached child aggregates, not filesystem traversal.
+fn recompute_newest_created(conn: &Connection, mut parent: Option<i64>) -> rusqlite::Result<()> {
+    for _ in 0..4096 {
+        let Some(id) = parent else { break };
+        conn.execute("UPDATE nodes SET newest_created_ms=COALESCE((SELECT MAX(newest_created_ms) FROM nodes WHERE parent_id=?1),0) WHERE id=?1", params![id])?;
+        parent = conn.query_row("SELECT parent_id FROM nodes WHERE id=?1", params![id], |row| row.get::<_, Option<i64>>(0)).optional()?.flatten();
+    }
+    Ok(())
+}
+
 /// Carry a newly created file's date up to every folder that now contains it.
 ///
 /// This is a maximum rather than a sum, so it only ever moves forwards. Deleting
@@ -436,9 +447,12 @@ fn apply_one(conn: &Connection, pending: &Pending, root_frn: u64) -> rusqlite::R
                         ],
                     )?;
                     roll_up(conn, Some(parent.id), delta, 0, 0)?;
-                    // Deliberately not touching created_ms or newest_created_ms:
-                    // rewriting a file's contents is exactly the case this
-                    // column has to stay still for.
+                    // Compression can restore the source birth date after its output
+                    // was first observed. Correct both the leaf and ancestor maxima.
+                    if !pending.is_dir && created_ms > 0 {
+                        let changed = conn.execute("UPDATE nodes SET created_ms=?2,newest_created_ms=?2 WHERE id=?1 AND created_ms<>?2", params![node.id, created_ms])?;
+                        if changed > 0 { recompute_newest_created(conn, Some(parent.id))?; }
+                    }
                     Ok(true)
                 }
                 None => {
@@ -756,6 +770,16 @@ mod tests {
             row.get(0)
         })
         .unwrap()
+    }
+
+    #[test]
+    fn compression_creation_date_rollup_can_move_backwards() {
+        let conn = seeded_db();
+        conn.execute("UPDATE nodes SET newest_created_ms=9000", []).unwrap();
+        conn.execute("UPDATE nodes SET newest_created_ms=1000 WHERE id=2", []).unwrap();
+        recompute_newest_created(&conn, Some(1)).unwrap();
+        assert_eq!(newest_created_of(&conn, 1), 1000);
+        assert_eq!(newest_created_of(&conn, 0), 1000);
     }
 
     fn newest_created_of(conn: &Connection, id: i64) -> i64 {
