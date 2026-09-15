@@ -9532,3 +9532,54 @@ html[data-motion="reduce"] :is(.cm-run-progress i, .cm-file-progress-fill, .cm-o
   .plg-surface { flex-direction: column; gap: 3px; }
   .plg-where { flex-basis: auto; }
 }
+
+.cdl-view { display: flex; flex-direction: column; height: 100%; min-height: 0; color: var(--fg); }
+.cdl-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.cdl-toolbar label { display: inline-flex; align-items: center; gap: 6px; }
+.cdl-toolbar input:not([type=checkbox]) { min-width: 180px; }
+.cdl-status { margin-left: auto; padding: 8px 14px; color: var(--muted); }
+.cdl-message { padding: 8px 14px; color: var(--accent); overflow-wrap: anywhere; }
+.cdl-message.error { color: #ff8989; }
+.cdl-setup { overflow: auto; padding: 12px 20px; }
+.cdl-setup h2 { font-size: 13px; margin: 12px 0; }
+.cdl-setup p { color: var(--muted); font-size: 12px; }
+.cdl-setup > .cdl-toolbar { padding-left: 0; }
+.cdl-setup > .cdl-toolbar input { flex: 1; max-width: 700px; }
+.cdl-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 340px)); gap: 14px 24px; margin: 20px 0; }
+.cdl-fields label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.cdl-fields .cdl-check { flex-direction: row; align-items: center; }
+.cdl-location { overflow-wrap: anywhere; }
+.cdl-editor, .cdl-monitor { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.cdl-editor textarea { flex: 1; min-height: 160px; resize: none; border: none; border-radius: 0; background: var(--bg); color: var(--fg); font: 13px/1.65 Consolas, monospace; padding: 12px 16px; tab-size: 2; }
+.cdl-monitor pre { flex: 1; overflow: auto; margin: 0; padding: 14px; font: 12px/1.6 Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cdl-monitor small { padding: 8px 14px; color: var(--muted); }
+
+.cdl-file-tabs { display:flex; flex-shrink:0; overflow-x:auto; border-bottom:1px solid var(--border); min-height:30px; }
+.cdl-file-tab { display:flex; flex:0 0 auto; align-items:center; border-right:1px solid var(--border); border-top:2px solid transparent; }
+.cdl-file-tab.active { border-top-color:var(--accent); background:var(--bg); }
+.cdl-file-tab button { background:transparent; border:0; border-radius:0; box-shadow:none; white-space:nowrap; padding:5px 9px; }
+.cdl-file-tab button[role=tab] { max-width:220px; overflow:hidden; text-overflow:ellipsis; }
+.cdl-file-tab button:last-child { padding:5px 7px; color:var(--muted); }
+.cdl-transfers { overflow:auto; flex:1; min-height:0; }
+.cdl-transfers table { width:100%; border-collapse:collapse; table-layout:fixed; }
+.cdl-transfers th, .cdl-transfers td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--border); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.cdl-transfers th:first-child { width:30%; }
+.cdl-transfers th:nth-child(3) { width:20%; }
+.cdl-transfers progress { display:block; width:100%; height:5px; accent-color:var(--accent); margin-bottom:4px; }
+.cdl-empty { padding:24px; color:var(--muted); }
+
+.cdl-summary-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:10px; }
+.cdl-card { border:1px solid var(--border); margin:10px 0; min-width:0; }
+.cdl-card header { display:flex; justify-content:space-between; gap:12px; padding:8px 10px; border-bottom:1px solid var(--border); }
+.cdl-card-body { padding:10px; max-height:260px; overflow:auto; }
+.cdl-count-row { display:grid; grid-template-columns:minmax(100px,1fr) minmax(50px,1fr) 60px 60px; gap:8px; align-items:center; margin:5px 0; }
+.cdl-count-row > span:first-child { overflow-wrap:anywhere; }
+.cdl-count-row > span:nth-child(3), .cdl-count-row strong { text-align:right; font-variant-numeric:tabular-nums; }
+.cdl-transfers .cdl-count-row progress { margin:0; }
+.cdl-scrape-list { padding:10px; max-height:180px; overflow:auto; }
+.cdl-scrape-list > div { display:flex; justify-content:space-between; gap:15px; padding:3px 0; }
+.cdl-scrape-list > div > span:first-child { overflow-wrap:anywhere; }
+.cdl-muted { color:var(--muted); }
+.cdl-compression-file { display:grid; grid-template-columns:minmax(140px,2fr) minmax(80px,1fr) repeat(4,auto); align-items:center; gap:12px; padding:8px 0; }
+.cdl-compression-file strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+@media(max-width:800px) { .cdl-compression-file { display:flex; flex-wrap:wrap; } }

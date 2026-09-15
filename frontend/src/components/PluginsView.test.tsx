@@ -1,9 +1,11 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PluginsView } from "./PluginsView";
 import { PLUGINS, canOptIn, loadPluginPrefs, type PluginPanelProps } from "../lib/plugins";
 
-const shippable = PLUGINS.find((d) => canOptIn(d))!;
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({})) }));
+import { invoke } from "@tauri-apps/api/core";
+const shippable = PLUGINS.find((d) => canOptIn(d) && !d.panel)!;
 const planned = PLUGINS.find((d) => !canOptIn(d));
 
 /** The catalog card for a plugin, found by its heading. */
@@ -148,4 +150,11 @@ describe("PluginsView", () => {
     expect(screen.getByRole("tab", { name: shippable.name })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByText(shippable.about)).toBeInTheDocument();
   });
+});
+
+it("initializes the Cyberdrop workspace when opting in from the catalog", async () => {
+  render(<PluginsView />);
+  fireEvent.click(within(cardFor("Cyberdrop DL")).getByRole("button", { name: "Opt in" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("cyberdrop_workspace", expect.objectContaining({ request: { action: "init" } })));
+  await waitFor(() => expect(loadPluginPrefs().cyberdrop?.enabled).toBe(true));
 });

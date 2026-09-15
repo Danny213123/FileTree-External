@@ -9,6 +9,8 @@
 // shipping a new plugin needs no change here.
 
 import { useCallback, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { toast } from "../lib/toast";
 import { Icon } from "./Icon";
 import {
   PLUGINS,
@@ -32,11 +34,15 @@ export function PluginsView() {
   const [tab, setTab] = useState<string>(CATALOG_TAB);
 
   const toggle = useCallback<ToggleFn>((id, enabled) => {
-    setPrefs((prev) => {
+    const apply = () => setPrefs((prev) => {
       const next = setOptIn(prev, id, enabled);
       savePluginPrefs(next);
       return next;
     });
+    if (id === "cyberdrop" && enabled) {
+      void invoke("cyberdrop_workspace", { repo: localStorage.getItem("filetree.cyberdrop.repo") || "C:\\Tools\\CyberDropDownloader", request: { action: "init" } })
+        .then(apply).catch(error => { apply(); toast.error(String(error)); });
+    } else apply();
   }, []);
 
   const active = PLUGINS.find((d) => d.id === tab) ?? null;

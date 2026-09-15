@@ -22,6 +22,7 @@ use tauri::window::{ProgressBarState, ProgressBarStatus};
 use tauri::{AppHandle, Manager, State};
 
 mod terminal;
+mod cyberdrop;
 
 struct FsWatchRegistry {
     next_id: AtomicU64,
@@ -2940,7 +2941,13 @@ pub fn run() {
         .manage(DuplicateScanRegistry::default())
         .manage(ExternalCopyGrants::default())
         .manage(Arc::new(terminal::TerminalRegistry::default()))
+        .manage(Arc::new(cyberdrop::CyberdropState::default()))
         .invoke_handler(tauri::generate_handler![
+            cyberdrop::cyberdrop_workspace,
+            cyberdrop::cyberdrop_document,
+            cyberdrop::cyberdrop_start,
+            cyberdrop::cyberdrop_stop,
+            cyberdrop::cyberdrop_status,
             app_version,
             app_exit,
             app_config,
@@ -3021,6 +3028,7 @@ pub fn run() {
             _ => {}
         }
         if matches!(event, tauri::RunEvent::Exit) {
+            app_handle.state::<Arc<cyberdrop::CyberdropState>>().shutdown();
             filetree_core::set_keep_awake(false);
             app_handle.state::<Arc<DesktopRuntime>>().shutdown();
             app_handle

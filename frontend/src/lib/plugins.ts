@@ -12,6 +12,7 @@
 // Adding one is a data change: append a PluginDef below and the Plugins page
 // picks up the catalog card and the tab automatically.
 
+import { CyberdropView } from "../components/CyberdropView";
 import type { ComponentType } from "react";
 import type { IconName } from "../components/Icon";
 
@@ -70,11 +71,18 @@ export interface PluginDef {
 /**
  * The approved catalog.
  *
- * No plugin has shipped yet, so every entry is flagged as an example and none
- * carries a `panel` — they show what a real listing looks like and keep the
- * opt-in flow exercisable. Real plugins replace them one at a time.
+ * Cyberdrop ships a native-backed panel. The remaining example entries
+ * demonstrate integrations that have not been implemented yet.
  */
 export const PLUGINS: PluginDef[] = [
+  {
+    id: "cyberdrop", name: "Cyberdrop DL", vendor: "Cyberdrop-DL", icon: "arrow-repeat", status: "available",
+    summary: "Download URL lists with Cyberdrop, with setup, live monitoring and an integrated editor.",
+    about: "Use your local Cyberdrop installation from FileTree. Setup and Edit share one config.yml; keep separate named URL lists and monitor downloads without a separate terminal.",
+    needs: ["Your local Cyberdrop installation and Python environment", "Read/write access to its FileTree configuration and URL list library", "Network and destination folder access when you start a download"],
+    provides: ["Setup, Monitor and Edit tabs", "Shared config.yml and saved URL lists", "Start/Stop controls and live CLI output"],
+    panel: CyberdropView,
+  },
   {
     id: "everything",
     name: "Everything",
