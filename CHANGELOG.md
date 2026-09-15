@@ -22,6 +22,7 @@ This file is rendered inside the app under **Help → What's New**.
 - **Pause all** and **Stop all** buttons in the Compress → Monitor run list. Queued runs are handled before active ones, so the scheduler can't start the next queued run part-way through; Stop all asks for confirmation.
 - Middle-click a folder in the tree to open it in a background tab.
 - An **Options** button in each pane's address bar shows or hides that pane's view options toolbar (size, units, filters, columns). It replaces the unlabelled icon in the tab strip. The toolbar also has its own hide button at the end, and **View → Pane Toolbar** toggles the focused pane.
+- **Undo** (Ctrl+Z) now covers moves, copies (the copies go to the Recycle Bin), recycles (restored from the Recycle Bin), renames and new folders in the desktop app. A move or copy is undoable only for items FileTree can confirm landed at their expected path.
 
 
 #### Changed
@@ -34,6 +35,11 @@ This file is rendered inside the app under **Help → What's New**.
 - Paused runs, and restored runs with no live worker, no longer block the compression queue.
 - The per-pane toolbar wraps onto another row in narrow panes instead of splitting button labels, collapsing the filter box and cutting off its last controls.
 - The address bar's **Recent locations** menu opened invisibly; it now appears under its button.
+- **Rename**, **Delete**, **Recycle** and **New folder** failed in the desktop app because they still called the removed HTTP server; they now run natively.
+- Dragging a folder onto another folder sometimes did nothing: at a UI scale other than 100% the drop point missed its row. It is now corrected for zoom.
+- Dropping files from File Explorer onto a folder on the **same drive** now moves them, as Explorer does, instead of copying. Other drives and network shares still copy.
+- Dragging items within FileTree no longer shows the "Drop to open in FileTree" overlay.
+- The AI assistant could not find **Ollama** in the desktop app. It now talks to Ollama directly (honouring `OLLAMA_HOST`).
 
 ### 2026-09-13
 
