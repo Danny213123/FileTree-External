@@ -152,7 +152,17 @@ describe("PluginsView", () => {
   });
 });
 
+it("opts in to Cyberdrop without a backend call until an installation folder is chosen", async () => {
+  localStorage.clear();
+  render(<PluginsView />);
+  fireEvent.click(within(cardFor("Cyberdrop DL")).getByRole("button", { name: "Opt in" }));
+  await waitFor(() => expect(loadPluginPrefs().cyberdrop?.enabled).toBe(true));
+  expect(invoke).not.toHaveBeenCalledWith("cyberdrop_workspace", expect.anything());
+});
+
 it("initializes the Cyberdrop workspace when opting in from the catalog", async () => {
+  localStorage.clear();
+  localStorage.setItem("filetree.cyberdrop.repo", "C:\\Tools\\CyberDropDownloader");
   render(<PluginsView />);
   fireEvent.click(within(cardFor("Cyberdrop DL")).getByRole("button", { name: "Opt in" }));
   await waitFor(() => expect(invoke).toHaveBeenCalledWith("cyberdrop_workspace", expect.objectContaining({ request: { action: "init" } })));

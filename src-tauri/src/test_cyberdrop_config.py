@@ -17,7 +17,7 @@ class ConfigBridgeTests(unittest.TestCase):
         return result.returncode, json.loads(result.stdout)
 
     def test_loading_with_null_patch_preserves_config(self):
-        text = "download_folder: 'G:\\My Media\\Downloads'\n"
+        text = "download_folder: 'E:\\My Media\\Downloads'\n"
         code, data = self.run_bridge(text)
         self.assertEqual(code, 0)
         self.assertEqual(data["text"], text)

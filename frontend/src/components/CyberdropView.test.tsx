@@ -10,6 +10,7 @@ const api = vi.mocked(invoke);
 afterEach(cleanup);
 beforeEach(() => {
   localStorage.clear(); api.mockReset();
+  localStorage.setItem("filetree.cyberdrop.repo", "C:\\Tools\\CyberDropDownloader");
   const workspace = { folder: "C:/central", name: "URLs-A2B64", text: "https://example.com/one\n", stations: [{ id: "URLs-A2B64", label: "URLs.txt", opened: 1, edited: 1 }], revisions: ["1"], loaded: null as { id: string } | null, activeText: "", compressionMode: "off", sideload: { preset: "balanced", originalAction: "keep" } };
   let count = 0;
   api.mockImplementation(async (command, args) => {
@@ -89,6 +90,13 @@ describe("Cyberdrop workstations", () => {
     fireEvent.change(screen.getByLabelText("Side-load originals"), { target: { value: "recycle" } });
     await waitFor(() => expect(api).toHaveBeenCalledWith("cyberdrop_workspace", expect.objectContaining({ request: { action: "sideload", settings: { originalAction: "recycle" } } })));
     expect(screen.getByLabelText("Side-load preset")).toHaveValue("high");
+  });
+  it("waits for an installation folder before connecting", () => {
+    localStorage.removeItem("filetree.cyberdrop.repo");
+    render(<CyberdropView plugin={{} as PluginDef} />);
+    expect(screen.getByLabelText("Cyberdrop installation folder")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Connect" })).toBeDisabled();
+    expect(api).not.toHaveBeenCalledWith("cyberdrop_workspace", expect.anything());
   });
 });
 

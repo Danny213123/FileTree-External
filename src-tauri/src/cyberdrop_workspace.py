@@ -161,7 +161,8 @@ def preferences(root):
 
 def operate(request):
     root = Path(request["root"])
-    initialize(root, Path(request.get("base", r"G:\My Media")))
+    # "base" is an optional older cyberdrop-dl folder to import config and cache from.
+    initialize(root, Path(request["base"]) if request.get("base") else root)
     action = request.get("action", "init")
     name = request.get("name", "")
     if action == "create":

@@ -11,7 +11,6 @@ type Transfer = { description: string; domain: string; size: number | null; comp
 type Monitor = { status: string; logs: string[]; started: number; progress?: DashboardData & { files: Transfer[]; active: number; bytes: number; speed: number } | null };
 function bytes(value: number) { const unit = Math.min(4, Math.floor(Math.log2(Math.max(1, value)) / 10)); return `${(value / 1024 ** unit).toFixed(unit ? 1 : 0)} ${["B", "KiB", "MiB", "GiB", "TiB"][unit]}`; }
 function eta(value: number | null) { return value == null ? "Estimating" : value < 60 ? `${Math.ceil(value)}s` : `${Math.floor(value / 60)}m ${Math.ceil(value % 60)}s`; }
-const initialRepo = "C:\\Tools\\CyberDropDownloader";
 type FieldDef = readonly [path: string, label: string, type: "text" | "number" | "checkbox" | "select", fallback: string | number | boolean, extra?: { min?: number; max?: number; options?: readonly (readonly [string, string])[] }];
 const fields: FieldDef[] = [
   ["download_folder", "Download folder", "text", "downloads/cyberdrop-dl"],
@@ -50,7 +49,7 @@ function get(settings: Record<string, unknown>, path: string, fallback: unknown)
 }
 const drafts = new Map<string, string>();
 export function CyberdropView(_props: PluginPanelProps) {
-  const [repo, setRepo] = useState(() => localStorage.getItem("filetree.cyberdrop.repo") || initialRepo);
+  const [repo, setRepo] = useState(() => localStorage.getItem("filetree.cyberdrop.repo") || "");
   const [tab, setTab] = useState<"setup" | "monitor" | "edit">("setup");
   const [config, setConfig] = useState<Document | null>(null);
   const [ws, setWs] = useState<Workspace | null>(null);
@@ -91,7 +90,8 @@ export function CyberdropView(_props: PluginPanelProps) {
     const value = await doc("load"); setConfig(value);
     if (value.validationError) setError(value.validationError);
   };
-  useEffect(() => { void perform(initialize); }, []);
+  // Nothing to connect to until the user has chosen an installation folder.
+  useEffect(() => { if (repo) void perform(initialize); }, []);
   useEffect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -191,7 +191,7 @@ export function CyberdropView(_props: PluginPanelProps) {
     </div>
     {tab === "setup" && <div className="cdl-setup">
       <h2>Cyberdrop installation</h2>
-      <div className="cdl-toolbar"><input aria-label="Cyberdrop installation folder" value={repo} onChange={event => setRepo(event.target.value)} /><button disabled={busy} onClick={() => void perform(initialize)}>Connect</button></div>
+      <div className="cdl-toolbar"><input aria-label="Cyberdrop installation folder" placeholder="Folder that contains cyberdrop_dl and .venv" value={repo} onChange={event => setRepo(event.target.value)} /><button disabled={busy || !repo.trim()} onClick={() => void perform(initialize)}>Connect</button></div>
       <h2>Download settings</h2>
       <p>Configuration, cache, download history, logs and URL workstations live together in {ws?.folder ?? "the central workspace"}.</p>
       <div className="cdl-fields">{fields.map(renderField)}

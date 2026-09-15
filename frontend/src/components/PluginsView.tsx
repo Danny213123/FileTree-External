@@ -39,8 +39,11 @@ export function PluginsView() {
       savePluginPrefs(next);
       return next;
     });
-    if (id === "cyberdrop" && enabled) {
-      void invoke("cyberdrop_workspace", { repo: localStorage.getItem("filetree.cyberdrop.repo") || "C:\\Tools\\CyberDropDownloader", request: { action: "init" } })
+    // Prepare Cyberdrop's workspace once an installation folder is known;
+    // otherwise its Setup tab asks for one.
+    const repo = localStorage.getItem("filetree.cyberdrop.repo");
+    if (id === "cyberdrop" && enabled && repo) {
+      void invoke("cyberdrop_workspace", { repo, request: { action: "init" } })
         .then(apply).catch(error => { apply(); toast.error(String(error)); });
     } else apply();
   }, []);
