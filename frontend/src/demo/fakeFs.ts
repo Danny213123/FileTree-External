@@ -244,9 +244,18 @@ export interface PageQuery {
   modifiedBefore: number | null; ext: string; category: string;
 }
 
-export function toItem(node: DemoNode, rootDepth: number) {
+/** A scan's rows are relative to its root, as in FileTree's scan index: the
+ *  root is id 0 with no parent and depth 0; every other id is offset by one. */
+export type ScanRoot = { id: number; depth: number };
+export const encodeId = (id: number, root: ScanRoot) => id === root.id ? 0 : id + 1;
+export const decodeId = (id: number, root: ScanRoot) => id === 0 ? root.id : id - 1;
+
+export function toItem(node: DemoNode, root: ScanRoot) {
+  const rootDepth = root.depth;
   return {
-    id: node.id, parentId: node.parentId, name: node.name, path: node.path, isDir: node.isDir,
+    id: encodeId(node.id, root),
+    parentId: node.id === root.id || node.parentId == null ? null : encodeId(node.parentId, root),
+    name: node.name, path: node.path, isDir: node.isDir,
     isLink: false, hidden: false, readonly: false, size: node.size, allocated: node.isDir ? node.size : Math.ceil(node.size / 4096) * 4096,
     files: node.files, folders: node.folders, modifiedMs: node.modifiedMs, createdMs: node.createdMs,
     accessedMs: node.modifiedMs, depth: node.depth - rootDepth, errors: 0, extension: node.extension,
@@ -254,8 +263,8 @@ export function toItem(node: DemoNode, rootDepth: number) {
   };
 }
 
-export function toRecord(node: DemoNode, rootDepth = 0): NodeRecord {
-  const item = toItem(node, rootDepth);
+export function toRecord(node: DemoNode, root: ScanRoot = { id: -1, depth: 0 }): NodeRecord {
+  const item = toItem(node, root);
   return {
     id: item.id, parent: item.parentId, name: item.name, path: item.path, dir: item.isDir, link: false,
     hidden: false, readonly: false, size: item.size, allocated: item.allocated, files: item.files,
@@ -277,7 +286,7 @@ export function page(root: DemoNode, query: PageQuery) {
   let rows: DemoNode[];
   if (query.directoryPaths?.length) rows = query.directoryPaths.map(lookup).filter((node): node is DemoNode => !!node);
   else if (query.parentId == null) rows = filtered ? descendants(root) : [root];
-  else rows = (nodes[query.parentId]?.children ?? []).map((id) => nodes[id]);
+  else rows = (nodes[decodeId(query.parentId, root)]?.children ?? []).map((id) => nodes[id]);
   let matcher: (name: string) => boolean = () => true;
   if (query.search) {
     const needle = query.search.toLowerCase();
@@ -294,6 +303,6 @@ export function page(root: DemoNode, query: PageQuery) {
   const field = SORT_FIELD[query.sort] ?? ((node: DemoNode) => node.size);
   const sign = query.direction === "asc" ? 1 : -1;
   rows.sort((a, b) => { const x = field(a), y = field(b); return (x < y ? -1 : x > y ? 1 : a.name.localeCompare(b.name)) * sign; });
-  const items = rows.slice(query.offset, query.offset + query.limit).map((node) => toItem(node, root.depth));
+  const items = rows.slice(query.offset, query.offset + query.limit).map((node) => toItem(node, root));
   return { items, total: rows.length, offset: query.offset, limit: query.limit, hasMore: query.offset + items.length < rows.length };
 }

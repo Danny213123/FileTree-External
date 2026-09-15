@@ -24,6 +24,15 @@ describe("demo build IPC", () => {
     expect(sizes).toEqual([...sizes].sort((a, b) => b - a));
   });
 
+  it("returns a subfolder scan's root without a parent so the tree can render it", async () => {
+    const handle = await invoke<{ scanId: string }>("scan_find", { rootPath: "C:\\Program Files" });
+    const root = await invoke<{ items: { id: number; name: string; parentId: number | null; depth: number }[] }>("scan_page", query(handle.scanId, null, 1));
+    expect(root.items[0]).toMatchObject({ id: 0, name: "Program Files", parentId: null, depth: 0 });
+    const children = await invoke<{ items: { parentId: number | null; depth: number }[] }>("scan_page", query(handle.scanId, 0));
+    expect(children.items.length).toBeGreaterThan(0);
+    expect(children.items.every((item) => item.parentId === 0 && item.depth === 1)).toBe(true);
+  });
+
   it("scans a drive or folder however its path is spelled", async () => {
     for (const rootPath of ["D:", "D:\\", "d:/Media/", "E:"]) {
       const handle = await invoke<{ nodeCount: number } | null>("scan_find", { rootPath });

@@ -24,7 +24,9 @@ const handleOf = (node: fs.DemoNode) => ({
 });
 const send = (channel: unknown, message: unknown) => (channel as { onmessage?: (value: unknown) => void } | undefined)?.onmessage?.(message);
 const later = <T,>(ms: number, value: () => T) => new Promise<T>((resolve) => setTimeout(() => resolve(value()), ms));
-const filesUnder = (id: number) => fs.descendants(fs.nodes[id] ?? fs.nodes[0]).filter((node) => !node.isDir);
+/** A folder named by a scan-relative directory id (0 is the scan's root). */
+const dirOf = (scanId: string, directoryId: number) => { const root = rootOf(scanId); return fs.nodes[fs.decodeId(directoryId, root)] ?? root; };
+const filesUnder = (dir: fs.DemoNode) => fs.descendants(dir).filter((node) => !node.isDir);
 
 function thumbnail(path: string): string | null {
   const node = fs.lookup(path);
@@ -65,22 +67,22 @@ const handlers: Record<string, Handler> = {
   scan_page: ({ query }) => fs.page(rootOf(query.scanId), query),
   directory_snapshot: ({ path, scanId }) => {
     const node = fs.lookup(String(path));
-    const depth = scanId ? rootOf(scanId).depth : 0;
-    return node ? node.children.map((id) => fs.toRecord(fs.nodes[id], depth)) : [];
+    const root = scanId ? rootOf(scanId) : undefined;
+    return node ? node.children.map((id) => fs.toRecord(fs.nodes[id], root)) : [];
   },
   fs_watch_start: () => 1,
   memory_stats: () => ({ workingSetBytes: 212e6, privateBytes: 184e6, managedBudgetBytes: 512e6, scanIndexBytes: 38e6, activeScans: 0, retainedScanHandles: 3 }),
   scan_subtree_files: ({ query }) => {
-    const files = filesUnder(query.directoryId).map((node) => ({ path: node.path, size: node.size }));
+    const files = filesUnder(dirOf(query.scanId, query.directoryId)).map((node) => ({ path: node.path, size: node.size }));
     const items = files.slice(query.offset ?? 0, (query.offset ?? 0) + (query.limit ?? 5_000));
     return { items, offset: query.offset ?? 0, limit: query.limit ?? 5_000, hasMore: (query.offset ?? 0) + items.length < files.length };
   },
-  scan_folder_preview: ({ directoryId }) => {
-    const best = filesUnder(directoryId).filter((node) => fs.kindOf(node) !== "other").sort((a, b) => b.size - a.size)[0];
+  scan_folder_preview: ({ scanId, directoryId }) => {
+    const best = filesUnder(dirOf(scanId, directoryId)).filter((node) => fs.kindOf(node) !== "other").sort((a, b) => b.size - a.size)[0];
     return best ? { path: best.path, size: best.size } : null;
   },
-  scan_compression_candidates_stream: ({ directoryId, allowVideo, allowImage, minSizeBytes, onBatch }) => {
-    const all = filesUnder(directoryId);
+  scan_compression_candidates_stream: ({ scanId, directoryId, allowVideo, allowImage, minSizeBytes, onBatch }) => {
+    const all = filesUnder(dirOf(scanId, directoryId));
     const typed = all.filter((node) => (allowVideo && fs.kindOf(node) === "video") || (allowImage && fs.kindOf(node) === "image"));
     const eligible = typed.filter((node) => node.size >= (minSizeBytes ?? 0));
     const progress = { scanned: all.length, eligible: eligible.length, skippedUnavailable: all.length - typed.length, skippedNoGain: 0, skippedTooSmall: typed.length - eligible.length };
@@ -109,7 +111,10 @@ const handlers: Record<string, Handler> = {
   compression_telemetry: () => compression.telemetry(),
   compression_subscribe: () => new Promise(() => {}),
   compression_control: ({ action, request }) => compression.control(action, request ?? {}),
-  compression_start: ({ request }) => compression.startJob(request ?? {}),
+  compression_start: ({ request }) => compression.startJob({
+    ...request,
+    scanDirectories: (request?.scanDirectories ?? []).map((dir: { scanId: string; directoryId: number }) => ({ directoryId: dirOf(dir.scanId, dir.directoryId).id })),
+  }),
   compression_log: ({ limit }) => compression.historyLog(limit ?? 500),
   compression_log_path: ({ kind }) => ({ path: `${USER}\\AppData\\Roaming\\FileTree\\${kind === "debug" ? "compress-debug.log" : "compress-log.csv"}` }),
 
