@@ -76,8 +76,13 @@ export function Breadcrumb({ path, scanning, canBack, canForward, canUp, onNavig
   // store each time it opens so it always reflects the latest navigation.
   const [recentOpen, setRecentOpen] = useState(false);
   const [recents, setRecents] = useState<string[]>([]);
+  // The breadcrumb bar clips overflow, so the menu is placed in viewport
+  // coordinates under its button instead of inside the bar.
+  const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
 
-  const openRecents = () => {
+  const openRecents = (anchor: HTMLElement) => {
+    const rect = anchor.getBoundingClientRect();
+    setMenuPos({ top: rect.bottom + 2, left: rect.left });
     setRecents(loadRecentPaths().slice(0, 10));
     setRecentOpen(true);
   };
@@ -116,7 +121,7 @@ export function Breadcrumb({ path, scanning, canBack, canForward, canUp, onNavig
             aria-label="Recent locations"
             aria-haspopup="menu"
             aria-expanded={recentOpen}
-            onClick={() => (recentOpen ? setRecentOpen(false) : openRecents())}
+            onClick={(e) => (recentOpen ? setRecentOpen(false) : openRecents(e.currentTarget))}
           >
             <Icon name={recentOpen ? "caret-up" : "caret-down"} size={12} />
           </button>
@@ -124,7 +129,7 @@ export function Breadcrumb({ path, scanning, canBack, canForward, canUp, onNavig
             <>
               {/* Transparent backdrop closes the menu on an outside click. */}
               <div className="bc-recent-backdrop" onClick={() => setRecentOpen(false)} />
-              <div className="bc-recent-menu" role="menu">
+              <div className="bc-recent-menu" role="menu" style={menuPos ? { position: "fixed", top: menuPos.top, left: menuPos.left } : undefined}>
                 {recents.length === 0 ? (
                   <div className="bc-recent-empty">No recent locations</div>
                 ) : (
