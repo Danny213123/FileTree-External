@@ -1,6 +1,6 @@
 # FileTree v2 Performance Gates
 
-Production `2.0.0` is blocked until every gate below is recorded against a release build from `D:\FileTree`.
+Production `2.0.0` is blocked until every gate below is recorded against a release build of this repository.
 
 | Workload | Aggregate FileTree + descendant WebView2 private bytes |
 | --- | ---: |

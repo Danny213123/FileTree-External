@@ -646,7 +646,7 @@ pub(crate) fn is_volume_root(path: &Path) -> bool {
     trimmed.len() == 2 && volume_letter(path).is_some()
 }
 
-/// Path components below the volume root, e.g. `C:\Users\alex` → `["Users","dan"]`.
+/// Path components below the volume root, e.g. `C:\Windows\System32` → `["Windows","System32"]`.
 pub(crate) fn components_below_root(path: &Path) -> Vec<&str> {
     let Some(text) = path.to_str() else {
         return Vec::new();
