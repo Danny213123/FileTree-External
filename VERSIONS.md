@@ -8,7 +8,7 @@ Current version: **2.0.0** (`VERSION`, `Cargo.toml`, `src-tauri/tauri.conf.json`
 
 | Version | Date | Summary |
 | --- | --- | --- |
-| 2.0.0-alpha.2 | Unreleased | Appearance editor, app-wide light-mode dialog fix, shell drag-and-drop zones, v2 refresh/search/icon fixes |
+
 | 2.0.0-alpha.1 | Unreleased | Electron → Tauri 2 rewrite, per-scan SQLite, paged rendering, memory budgets |
 | 1.14.7 | 2026-08-24 | Persist no-gain compression skips across presets and encoders |
 | 1.14.6 | 2026-08-24 | Skip partial downloads; ZIP64 for files over 4 GiB |

@@ -12,6 +12,26 @@ This file is rendered inside the app under **Help → What's New**.
 
 ## [2.0.0-alpha.2] - Unreleased
 
+### 2026-09-15
+
+#### Added
+
+
+
+
+- **Pause all** and **Stop all** buttons in the Compress → Monitor run list. Queued runs are handled before active ones, so the scheduler can't start the next queued run part-way through; Stop all asks for confirmation.
+- Middle-click a folder in the tree to open it in a background tab.
+
+
+#### Changed
+
+- Compressed files keep the original's **modified** date as well as its creation date, so a compressed replacement no longer looks like a new file. The live tree also corrects a folder's newest-created date when compression restores an older one.
+
+#### Fixed
+
+- A queued compression run can be paused, and the scheduler no longer starts a run that was paused just after it was picked.
+- Paused runs, and restored runs with no live worker, no longer block the compression queue.
+
 ### 2026-09-13
 
 #### Added
