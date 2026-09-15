@@ -7,15 +7,16 @@ param(
 # profile, and FileTree's data folders redirected to %TEMP%\FileTree-Demo.
 # It never reads or changes your real scans, settings or compression queue.
 #
-# The demo shares target\release with the normal build, so run
-# build-portable.bat afterwards before shipping a regular release.
+# The demo compiles into its own target\demo folder so it never replaces (or
+# is blocked by) the regular target\release\FileTree.exe.
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $outDir = Join-Path $repoRoot "dist-demo\FileTree Demo"
-$exe = Join-Path $repoRoot "target\release\FileTree.exe"
+$env:CARGO_TARGET_DIR = Join-Path $repoRoot "target\demo"
+$exe = Join-Path $env:CARGO_TARGET_DIR "release\FileTree.exe"
 
 Push-Location $repoRoot
 try {
