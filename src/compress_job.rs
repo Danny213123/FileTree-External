@@ -1360,6 +1360,9 @@ pub(crate) fn pause_job(job: &Arc<CompressJob>) -> Result<String, String> {
                 *status = "pausing".to_string();
             }
         }
+        // Hold a queued run: the scheduler only starts `queued` jobs, and a run
+        // that never started has no active interval to close.
+        "queued" => *status = "paused".to_string(),
         "pausing" | "paused" => {}
         other => return Err(format!("A {other} job cannot be paused")),
     }
@@ -1373,15 +1376,23 @@ pub(crate) fn pause_job(job: &Arc<CompressJob>) -> Result<String, String> {
 }
 
 pub(crate) fn resume_job(job: &Arc<CompressJob>) -> Result<bool, String> {
+    resume_job_from(job, false)
+}
+
+/// `queued_only` is the scheduler's start: it checks the status under the same
+/// lock as the transition, so a run paused after the scheduler picked it stays
+/// paused instead of starting.
+fn resume_job_from(job: &Arc<CompressJob>, queued_only: bool) -> Result<bool, String> {
     let mut status = job.status.lock_recover();
     match status.as_str() {
-        "paused" | "pausing" | "queued" => {
-            *status = "running".to_string();
-            begin_active_interval(job);
-        }
+        "queued" => {}
+        _ if queued_only => return Ok(false),
+        "paused" | "pausing" => {}
         "running" => return Ok(!job.runner_started.load(Ordering::SeqCst)),
         other => return Err(format!("A {other} job cannot be resumed")),
     }
+    *status = "running".to_string();
+    begin_active_interval(job);
     drop(status);
     write_manifest(job);
     job.emit(ev_job_state(&job.id, "running"));
@@ -1658,7 +1669,7 @@ pub(crate) fn start_queue_scheduler(state: Arc<CompressionRuntimeState>) {
                 }
             };
             if let Some(job) = next {
-                if matches!(resume_job(&job), Ok(true)) {
+                if matches!(resume_job_from(&job, true), Ok(true)) {
                     spawn_job(Arc::clone(&state), job);
                 }
             }
@@ -8539,6 +8550,36 @@ mod manifest_tests {
         assert_eq!(job.files[0].status.lock_recover().as_str(), "skipped");
         assert_eq!(job.files[0].reason.lock_recover().as_str(), "skipped_user");
         assert_eq!(std::fs::read(&small).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn pausing_a_queued_job_holds_it_from_the_scheduler() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, _restore) = redirect_home();
+        let dir = std::env::temp_dir().join(format!("ft-queued-pause-{}", new_job_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("queued.bin");
+        std::fs::write(&source, b"source-bytes").unwrap();
+        let job = prepare_queued_job(create_job(
+            &[source.to_string_lossy().into_owned()],
+            "balanced",
+            &CompressOptions::default(),
+        ));
+
+        assert_eq!(pause_job(&job).unwrap(), "paused");
+        assert!(
+            !resume_job_from(&job, true).unwrap(),
+            "the scheduler must not start a paused run"
+        );
+        assert_eq!(job.status.lock_recover().as_str(), "paused");
+        assert!(
+            resume_job(&job).unwrap(),
+            "a manual resume still starts the held run"
+        );
+        assert_eq!(job.status.lock_recover().as_str(), "running");
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);

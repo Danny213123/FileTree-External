@@ -504,6 +504,27 @@ export function CompressionMonitor({ focusJobId }: Props) {
     void mutate("reorder", () => reorderQueuedCompressJobs(next));
   };
 
+  // Bulk run controls act on queued runs first: paused runs don't block the
+  // queue, so handling the active run first would let the scheduler start the
+  // next queued run before it is reached.
+  const pauseAllIds = [...queuedIds, ...jobs.filter((job) => job.status === "running").map((job) => job.id)];
+  const stopAllIds = [...queuedIds, ...jobs.filter((job) => ["running", "pausing", "paused"].includes(job.status)).map((job) => job.id)];
+  const runForAll = (label: string, ids: string[], action: (id: string) => Promise<unknown>) => void mutate(label, async () => {
+    const failures: string[] = [];
+    for (const id of ids) {
+      try {
+        const result = await action(id);
+        if (result && typeof result === "object" && (result as { ok?: boolean }).ok === false) {
+          failures.push((result as { error?: string }).error ?? id);
+        }
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (failures.length) return { ok: false, error: `${label}: ${failures.length} of ${ids.length} runs failed (${failures[0]})` };
+    return undefined;
+  });
+
   const selectedRows = useMemo(() => {
     const rows: CompressJobFile[] = [];
     pageCache.current.forEach((page) => page.forEach((file) => {
@@ -707,7 +728,15 @@ export function CompressionMonitor({ focusJobId }: Props) {
       <aside id="compression-runs" className="cm-runs" aria-label="Compression runs">
         <div className="cm-runs-head">
           <strong>Runs</strong>
-          <button type="button" className="icon-button" aria-label="Refresh runs" title="Refresh runs" onClick={() => void refreshJobs()}><Icon name="refresh" size={14} /></button>
+          <span className="cm-runs-head-actions">
+            <button type="button" className="icon-button" aria-label="Pause all runs" title="Pause every running and queued run (active files finish safely)" disabled={!!busy || !pauseAllIds.length} onClick={() => runForAll("Pause all", pauseAllIds, pauseCompressJob)}><Icon name="pause-fill" size={14} /></button>
+            <button type="button" className="icon-button" aria-label="Stop all runs" title="Stop every running, paused, and queued run now" disabled={!!busy || !stopAllIds.length} onClick={() => {
+              if (window.confirm(`Stop ${stopAllIds.length} run${stopAllIds.length === 1 ? "" : "s"} now? Active encoders will be terminated and partial outputs removed. Runs remain resumable.`)) {
+                runForAll("Stop all", stopAllIds, cancelCompressJob);
+              }
+            }}><Icon name="stop-fill" size={14} /></button>
+            <button type="button" className="icon-button" aria-label="Refresh runs" title="Refresh runs" onClick={() => void refreshJobs()}><Icon name="refresh" size={14} /></button>
+          </span>
         </div>
         <div className="cm-run-list">
           {jobs.map((job) => {

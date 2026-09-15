@@ -129,6 +129,25 @@ describe("CompressionMonitor controls", () => {
     expect(screen.getByText("nvenc")).toBeInTheDocument();
   });
 
+  it("pauses and stops every run, handling queued runs before active ones", async () => {
+    const queued: CompressJobSummary = { ...job, id: "job-2", status: "queued", active: false };
+    const done: CompressJobSummary = { ...job, id: "job-3", status: "done", active: false };
+    api.listCompressJobs.mockResolvedValue([job, queued, done]);
+    api.pauseCompressJob.mockResolvedValue(undefined);
+    api.cancelCompressJob.mockResolvedValue({ ok: true });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<CompressionMonitor focusJobId={job.id} />);
+    await screen.findByText("Metrics");
+
+    fireEvent.click(screen.getByRole("button", { name: "Pause all runs" }));
+    await waitFor(() => expect(api.pauseCompressJob.mock.calls).toEqual([["job-2"], ["job-1"]]));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Stop all runs" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Stop all runs" }));
+    await waitFor(() => expect(api.cancelCompressJob.mock.calls).toEqual([["job-2"], ["job-1"]]));
+    expect(window.confirm).toHaveBeenCalledOnce();
+  });
+
   it("hides live-only controls but preserves the completed run telemetry structure", async () => {
     api.listCompressJobs.mockResolvedValue([{
       ...job,
