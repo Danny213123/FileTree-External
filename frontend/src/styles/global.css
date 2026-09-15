@@ -6234,15 +6234,19 @@ html.native-context-menu-open .compress-log-vrow:hover { background: transparent
 .editor-group .wtab-toolbar-toggle.active:hover { background: var(--vsc-list-selected); color: var(--text); }
 .editor-stack { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .editor-main { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; position: relative; }
+/* Narrow panes wrap whole controls onto another row instead of squeezing
+   them: a fixed height with shrinking children split button labels in two,
+   collapsed the filter box and clipped the last controls. */
 .editor-toolbar {
-  display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px;
-  border-bottom: 1px solid var(--vsc-border); background: var(--vsc-editor-bg); flex: 0 0 auto;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-height: 30px; padding: 3px 10px;
+  box-sizing: border-box; border-bottom: 1px solid var(--vsc-border); background: var(--vsc-editor-bg); flex: 0 0 auto;
 }
+.editor-toolbar > * { flex-shrink: 0; }
 .editor-toolbar .sep { width: 1px; height: 18px; background: var(--vsc-border); }
-.editor-toolbar label { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
+.editor-toolbar label { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); white-space: nowrap; }
 .editor-toolbar select { height: 24px; background: var(--vsc-input-bg); border: 1px solid var(--vsc-border); color: var(--text); font-size: 12px; padding: 0 6px; }
 .editor-toolbar .spacer { flex: 1; }
-.editor-toolbar button { height: 24px; padding: 0 8px; background: transparent; border: 1px solid transparent; color: var(--text-3); font-size: 12px; }
+.editor-toolbar button { height: 24px; padding: 0 8px; background: transparent; border: 1px solid transparent; color: var(--text-3); font-size: 12px; white-space: nowrap; }
 .editor-toolbar button:hover { background: var(--vsc-list-hover); border-color: transparent; color: var(--text); }
 .editor-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--muted-2); }
 .editor-empty .big { font-size: 40px; opacity: 0.4; }
