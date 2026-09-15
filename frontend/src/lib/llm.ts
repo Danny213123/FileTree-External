@@ -2,14 +2,17 @@
 //
 // One `llmStream()` abstraction normalizes three transports into a single event
 // stream so the agent runtime never has to care which provider it talks to:
-//   • ollama    → POST /api/ai-chat on the Rust server (NDJSON). Works in both
-//                 Electron and the dev-web build.
+//   • ollama    → the desktop's `ollama_chat` command (Rust streams Ollama's
+//                 NDJSON over a channel), or POST /api/ai-chat in the legacy
+//                 server/dev-web build.
 //   • openai    → Electron main IPC (Node `fetch` handles TLS + SSE).
 //   • anthropic → Electron main IPC.
 // The cloud providers are routed through Electron main because the Rust server
 // is a no-TLS custom HTTP server and can't call HTTPS APIs cleanly.
 
+import { Channel, invoke } from "@tauri-apps/api/core";
 import type { ToolDef } from "./agent";
+import { isTauriV2 } from "../api/v2";
 
 export type LlmProvider = "ollama" | "openai" | "anthropic";
 
@@ -144,6 +147,7 @@ let ollamaModelsInFlight: Promise<string[]> | null = null;
 
 async function fetchOllamaModels(): Promise<string[]> {
   try {
+    if (isTauriV2()) return await invoke<string[]>("ollama_models");
     const res = await fetch("/api/ai-models");
     if (!res.ok) return [];
     const data = (await res.json()) as { models?: { name: string }[] };
@@ -243,42 +247,46 @@ function toOllamaMessages(messages: LlmMessage[]): unknown[] {
 }
 
 async function* streamOllama(req: LlmRequest): AsyncGenerator<LlmEvent> {
-  let res: Response;
-  // Anti-repetition + context-budget controls. The Rust /api/ai-chat proxy
-  // forwards this body verbatim to Ollama's /api/chat, so `options` needs no
-  // server-side change.
+  // Anti-repetition + context-budget controls, forwarded verbatim to Ollama's
+  // /api/chat (by the desktop's Rust command, or the legacy server's proxy).
   const o = resolveLlmOptions(req.options);
-  try {
-    res = await fetch("/api/ai-chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: req.model,
-        messages: toOllamaMessages(req.messages),
-        tools: req.tools && req.tools.length ? req.tools : undefined,
-        stream: true,
-        options: {
-          temperature: o.temperature,
-          top_p: o.topP,
-          repeat_penalty: o.repeatPenalty,
-          repeat_last_n: o.repeatLastN,
-          num_ctx: o.numCtx,
-          num_predict: o.numPredict,
-        },
-      }),
-      signal: req.signal,
-    });
-  } catch (e) {
-    if ((e as Error).name === "AbortError") return;
-    yield { type: "error", value: `Could not reach Ollama: ${(e as Error).message}` };
-    return;
+  const body = {
+    model: req.model,
+    messages: toOllamaMessages(req.messages),
+    tools: req.tools && req.tools.length ? req.tools : undefined,
+    stream: true,
+    options: {
+      temperature: o.temperature,
+      top_p: o.topP,
+      repeat_penalty: o.repeatPenalty,
+      repeat_last_n: o.repeatLastN,
+      num_ctx: o.numCtx,
+      num_predict: o.numPredict,
+    },
+  };
+  let reader: ByteReader;
+  if (isTauriV2()) {
+    reader = tauriOllamaReader(body, req.signal);
+  } else {
+    let res: Response;
+    try {
+      res = await fetch("/api/ai-chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: req.signal,
+      });
+    } catch (e) {
+      if ((e as Error).name === "AbortError") return;
+      yield { type: "error", value: `Could not reach Ollama: ${(e as Error).message}` };
+      return;
+    }
+    if (!res.ok || !res.body) {
+      yield { type: "error", value: `Ollama HTTP ${res.status}` };
+      return;
+    }
+    reader = res.body.getReader();
   }
-  if (!res.ok || !res.body) {
-    yield { type: "error", value: `Ollama HTTP ${res.status}` };
-    return;
-  }
-
-  const reader = res.body.getReader();
   const decoder = new TextDecoder();
   const think = createThinkSplitter();
   // Accumulate tool calls so each logical call has ONE stable id for the whole
@@ -343,6 +351,50 @@ async function* streamOllama(req: LlmRequest): AsyncGenerator<LlmEvent> {
   const toolCalls = toolAcc.filter(Boolean);
   if (toolCalls.length) yield { type: "tool_calls", value: toolCalls };
   yield { type: "done" };
+}
+
+/** The slice of a stream reader the NDJSON loop needs. */
+type ByteReader = { read(): Promise<{ done: boolean; value?: Uint8Array }> };
+
+/**
+ * Desktop transport: the `ollama_chat` command streams Ollama's NDJSON lines
+ * over a channel and sends an empty line when the reply is complete (Ollama
+ * never emits blank lines). Presented as a byte reader so the parsing loop is
+ * shared with the HTTP transport.
+ */
+function tauriOllamaReader(body: unknown, signal?: AbortSignal): ByteReader {
+  const encoder = new TextEncoder();
+  const queue: Uint8Array[] = [];
+  let finished = false;
+  let failure: Error | null = null;
+  let wake: (() => void) | null = null;
+  const finish = (error?: unknown) => {
+    if (finished) return;
+    if (error != null) failure = error instanceof Error ? error : new Error(String(error));
+    finished = true;
+    wake?.();
+  };
+  const requestId = uid("ollama_");
+  const channel = new Channel<string>();
+  channel.onmessage = (line) => {
+    if (line === "") { finish(); return; }
+    queue.push(encoder.encode(`${line}\n`));
+    wake?.();
+  };
+  // Success is signalled by the end-of-stream line; a rejection is an error.
+  invoke("ollama_chat", { requestId, body, onLine: channel }).catch(finish);
+  signal?.addEventListener("abort", () => {
+    void invoke("ollama_cancel", { requestId }).catch(() => {});
+    finish(new DOMException("Aborted", "AbortError"));
+  }, { once: true });
+  return {
+    async read() {
+      while (!queue.length && !finished) await new Promise<void>((resolve) => { wake = resolve; });
+      if (queue.length) return { done: false, value: queue.shift() };
+      if (failure) throw failure;
+      return { done: true };
+    },
+  };
 }
 
 // Parse tool-call arguments robustly. Objects pass through; strings are JSON.parsed

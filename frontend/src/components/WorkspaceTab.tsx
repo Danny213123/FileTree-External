@@ -18,8 +18,10 @@ import type { ScanOptions, ExportFormat, CompressionSource, AppTabSettings } fro
 import type { NodeRecord, SortKey, TagEntry } from "../api/types";
 import type { FilterRule } from "../hooks/useFilterRules";
 import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow, type AgentApi } from "../lib/agent";
-import { confirmRisky, isCrossDrive } from "../lib/confirmRisky";
+import { confirmRisky, isCrossDrive, isSameDrive } from "../lib/confirmRisky";
 import { clearUndo, pushUndo, parentDir } from "../lib/undo";
+import { resolveDroppedPaths } from "../lib/dropPaths";
+import { claimExternalPaths } from "../api/client";
 import { beginTransfer, finishTransfer, enqueueTransfer, transferDedupeKey } from "../lib/transfers";
 import { searchNodesAdvanced, filtersActive, toServerSearchParams, type SearchFilters } from "../lib/search";
 import { exportResults } from "../lib/exportRows";
@@ -112,7 +114,9 @@ export interface WorkspaceTabHandle {
   /** Paste CF_HDROP clipboard files into the focused folder (move or copy). #9 */
   doPaste: () => void;
   /** Drop Explorer files into a specific folder (drag-in): move same-drive, copy cross-drive. #9 */
-  dropExternalInto: (paths: string[], destination: string, provenance?: string) => Promise<void>;
+  /** Move (same drive) or copy Explorer-dropped paths into `destination`.
+   *  `claimNativeDrop` claims the one-shot capability a native drop created. */
+  dropExternalInto: (paths: string[], destination: string, claimNativeDrop?: boolean) => Promise<void>;
   doRename: () => void;
   doRenamePath: (path: string) => void;
   /** Open the bulk-rename dialog for the current selection (F3). */
@@ -363,6 +367,18 @@ interface WorkspaceTabProps {
   // Reverse the most recent reversible op (the same handler Ctrl+Z runs). Wired
   // to the "Undo (Ctrl+Z)" action link on move/rename/recycle success toasts.
   onUndo?: () => void;
+}
+
+/** `parent\name` — where a move or copy is expected to put an item. */
+function childPath(parent: string, name: string): string {
+  return `${parent.replace(/[\\/]+$/, "")}\\${name}`;
+}
+
+/** Which of `paths` exist right now. The shell's transfer engine may rename
+ *  or merge on a collision without reporting output paths, so undo is only
+ *  recorded for items confirmed at their expected destination. */
+async function existingPaths(paths: string[]): Promise<Set<string>> {
+  return new Set((await resolveDroppedPaths(paths)).map((entry) => entry.path));
 }
 
 const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(function WorkspaceTab(
@@ -1931,7 +1947,16 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       async () => {
         try {
           suppressWatchRef.current = true;
+          // Note which destination names were free so the copies this operation
+          // created can be confirmed — and undone — afterwards.
+          const targets = sources.map((s) => childPath(destination, basenameFromPath(s)));
+          const takenBefore = await existingPaths(targets);
           const res = await copyItemsNative(sources, destination, provenance);
+          if (res.moved > 0) {
+            const arrived = await existingPaths(targets);
+            const created = targets.filter((t) => !takenBefore.has(t) && arrived.has(t));
+            if (created.length > 0) pushUndo({ kind: "copy", paths: created });
+          }
           const unaccounted = Math.max(0, sources.length - res.moved - res.skipped - res.failed);
           const incomplete = res.skipped + res.failed + unaccounted;
           if (res.aborted || incomplete > 0) {
@@ -2028,20 +2053,27 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           let outcome: { ok: boolean; error?: string };
           let didMove = false;
           let movedCount = 0;
-          let canUndoCompleteBatch = false;
+          let undoItems: { name: string; originalParent: string }[] = [];
           if (hasNativeMove()) {
+            // Note which destination names were free beforehand, then confirm
+            // each item afterwards: only items found at their expected path
+            // (and gone from the source) get an undo entry.
+            const targets = realSources.map((s) => childPath(destination, basenameFromPath(s)));
+            const takenBefore = await existingPaths(targets);
             const res = await moveItemsNative(realSources, destination, provenance);
             movedCount = res.moved;
             didMove = movedCount > 0;
+            if (didMove) {
+              const [arrived, remaining] = await Promise.all([existingPaths(targets), existingPaths(realSources)]);
+              undoItems = realSources
+                .filter((s, i) => !takenBefore.has(targets[i]) && arrived.has(targets[i]) && !remaining.has(s))
+                .map((s) => ({ name: basenameFromPath(s), originalParent: parentDir(s) }));
+            }
             const unaccounted = Math.max(0, realSources.length - res.moved - res.skipped - res.failed);
             const incomplete = res.skipped + res.failed + unaccounted;
             const complete = !res.aborted
               && incomplete === 0
               && res.moved === realSources.length;
-            // IFileOperation may keep both under a generated name or merge a
-            // folder. Its aggregate response does not expose exact output
-            // paths, so FileTree must not construct a basename-based undo.
-            canUndoCompleteBatch = false;
             outcome = complete
               ? { ok: true }
               : {
@@ -2058,27 +2090,18 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
             outcome = fallback;
             didMove = fallback.movedPaths.length > 0;
             movedCount = fallback.movedPaths.length;
-            canUndoCompleteBatch = fallback.undoSafe;
+            if (fallback.undoSafe) {
+              undoItems = realSources.map((s) => ({ name: basenameFromPath(s), originalParent: parentDir(s) }));
+            }
           }
-          // Record a custom reverse move only when the fallback confirmed every
-          // original basename and no collision could rename or merge output.
-          // Native IFileOperation already records its own shell undo metadata,
-          // but does not expose enough output identity for FileTree's undo stack.
-          // If files moved without a safe custom inverse, discard older entries
-          // so Ctrl+Z cannot target an unrelated operation across this boundary.
-          if (canUndoCompleteBatch) {
-            pushUndo({
-              kind: "move",
-              destination,
-              items: realSources.map((s) => ({ name: basenameFromPath(s), originalParent: parentDir(s) })),
-            });
-          } else if (didMove) {
-            clearUndo();
-          }
+          // Items that moved without a confirmed destination can't be reversed
+          // safely; drop older entries so Ctrl+Z cannot skip past this move.
+          if (didMove && undoItems.length < movedCount) clearUndo();
+          if (undoItems.length > 0) pushUndo({ kind: "move", destination, items: undoItems });
           if (outcome.ok) {
             toast.success(
               `Moved ${itemsLabel(movedCount)} to \u201C${basenameFromPath(destination)}\u201D.`,
-              canUndoCompleteBatch ? { action: undoAction } : undefined,
+              undoItems.length > 0 ? { action: undoAction } : undefined,
             );
           }
           if (didMove || !outcome.ok) refreshAfterMutation([...realSources, destination]);
@@ -2161,18 +2184,26 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       });
   }, [handleSelectRow, runPaste]);
 
-  // Explorer drag-in is copy-only. Tauri's native drop event does not expose
-  // Ctrl/Shift drop intent, so treating a same-drive drop as a destructive move
-  // could delete the source against the user's intent. Explicit Cut/Paste still
-  // carries a MOVE capability from the OS clipboard.
+  // Explorer drag-in follows Explorer's own default: a drop on the same drive
+  // moves, anything else (another drive, a network share) copies. Tauri's drop
+  // event carries no Ctrl/Shift intent. The one-shot capability for the
+  // dropped paths is claimed with the matching kind, so Rust refuses a move
+  // that wasn't a same-drive drop.
   const dropExternalInto = useCallback(async (
     sources: string[],
     destination: string,
-    provenance?: string,
+    claimNativeDrop = false,
   ): Promise<void> => {
     if (sources.length === 0 || !destination) return;
-    await runPasteCopy(sources, destination, provenance);
-  }, [runPasteCopy]);
+    const move = isSameDrive(sources, destination);
+    const provenance = claimNativeDrop ? await claimExternalPaths(sources, move ? "move" : "copy") : undefined;
+    if (!move) {
+      await runPasteCopy(sources, destination, provenance);
+      return;
+    }
+    const outcome = await handleInternalMove(sources, destination, provenance);
+    if (!outcome.ok && outcome.error) setMoveNotice(`Move failed: ${outcome.error}`);
+  }, [runPasteCopy, handleInternalMove]);
 
   // "Move to…" / "Copy to…" (ribbon / context / palette). #42: a richer dialog
   // with recent destinations + an inline "New folder…" affordance replaces the
@@ -2594,7 +2625,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     doChecksum: () => { void runChecksum(); },
     doCutFiles: runCutFiles,
     doPaste: () => { void runPaste(); },
-    dropExternalInto: (paths, destination, provenance) => dropExternalInto(paths, destination, provenance),
+    dropExternalInto: (paths, destination, claimNativeDrop) => dropExternalInto(paths, destination, claimNativeDrop),
     doExport: (format) => {
       if (!data) return;
       // "pdf" isn't a server format: per roadmap #8, PDF = print the HTML

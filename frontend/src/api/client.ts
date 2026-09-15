@@ -651,6 +651,14 @@ export async function deletePath(
   path: string,
   permanent = false,
 ): Promise<{ ok: boolean; error?: string }> {
+  if (isTauriV2()) {
+    try {
+      const res = await invoke<{ deleted: string[]; failed: { path: string; error: string }[] }>("delete_paths", { paths: [path], permanent });
+      return res.failed.length ? { ok: false, error: res.failed[0].error } : { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   const r = await postMutation("/api/delete", { path, permanent });
   if (r.ok) return { ok: true };
   return { ok: false, error: mutateErrorText(r) };
@@ -698,6 +706,10 @@ export async function openProperties(path: string): Promise<void> {
 }
 
 export async function createFolder(path: string): Promise<void> {
+  if (isTauriV2()) {
+    await invoke("create_folder", { path });
+    return;
+  }
   const r = await postMutation("/api/mkdir", { path });
   if (!r.ok) throw new Error(mutateErrorText(r));
 }
@@ -1258,10 +1270,11 @@ export async function clipboardReadFiles(): Promise<ClipboardFiles> {
   }
 }
 
-/** Claim the one-shot capability created by a native Tauri file-drop event. */
-export async function claimExternalPaths(paths: string[]): Promise<string | undefined> {
+/** Claim the one-shot capability created by a native Tauri file-drop event.
+ *  `mode` is what the drop will do: "move" (same drive) or "copy". */
+export async function claimExternalPaths(paths: string[], mode: "copy" | "move" = "copy"): Promise<string | undefined> {
   if (!isTauriV2()) return undefined;
-  return invoke<string>("claim_external_paths", { paths });
+  return invoke<string>("claim_external_paths", { paths, mode });
 }
 
 /** Revoke an unused outside-root capability after a canceled paste/drop. */
@@ -1272,7 +1285,7 @@ export async function releaseExternalPaths(provenance?: string): Promise<void> {
 
 /** True when the native Recycle Bin restore (Phase 6 undo) is available. */
 export function hasRecycleRestore(): boolean {
-  return typeof eAPI().restoreFromRecycleBin === "function";
+  return isTauriV2() || typeof eAPI().restoreFromRecycleBin === "function";
 }
 
 /**
@@ -1282,6 +1295,13 @@ export function hasRecycleRestore(): boolean {
  * user to restore manually) or when running outside Electron. Never throws.
  */
 export async function restoreFromRecycleBin(originalPath: string): Promise<boolean> {
+  if (isTauriV2()) {
+    try {
+      return (await invoke<string[]>("restore_recycled", { paths: [originalPath] })).length > 0;
+    } catch {
+      return false;
+    }
+  }
   const api = eAPI();
   if (!api.restoreFromRecycleBin) return false;
   try {
@@ -1304,6 +1324,14 @@ export async function copyPath(path: string): Promise<void> {
 }
 
 export async function renameItem(path: string, newName: string): Promise<{ ok: boolean; error?: string }> {
+  if (isTauriV2()) {
+    try {
+      await invoke<string>("rename_path", { path, newName });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   const r = await postMutation("/api/rename", { path, newName });
   if (r.ok) return { ok: true };
   return { ok: false, error: mutateErrorText(r) };

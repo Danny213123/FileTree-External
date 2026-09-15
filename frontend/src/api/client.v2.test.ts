@@ -305,6 +305,7 @@ describe("v2 bounded client queries", () => {
     });
     expect(invoke).toHaveBeenNthCalledWith(4, "claim_external_paths", {
       paths: ["D:\\Downloads\\one.bin"],
+      mode: "copy",
     });
     expect(invoke).toHaveBeenNthCalledWith(5, "release_external_paths", {
       provenance: "drop-1",

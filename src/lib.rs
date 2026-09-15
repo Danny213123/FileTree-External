@@ -100,6 +100,18 @@ pub fn reveal_system_path(path: &str) -> Result<(), String> {
     io::reveal_path(path).map_err(|error| error.to_string())
 }
 
+/// Recycle (default) or permanently delete one file or folder. Authorization
+/// and scanned-root policy are enforced by the Tauri command boundary.
+pub fn delete_path(path: &str, permanent: bool) -> Result<(), String> {
+    let path = std::path::Path::new(path);
+    let result = if permanent {
+        recycle::delete_path_permanent(path)
+    } else {
+        recycle::recycle_path(path)
+    };
+    result.map_err(|error| error.to_string())
+}
+
 /// File actions used by the desktop duplicate-review workflow. Authorization
 /// and protected-location policy are enforced by the Tauri command boundary;
 /// these helpers keep the proven action implementations shared with legacy.

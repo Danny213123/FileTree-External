@@ -23,6 +23,8 @@ use tauri::{AppHandle, Manager, State};
 
 mod terminal;
 mod cyberdrop;
+mod fileops;
+mod ollama;
 
 struct FsWatchRegistry {
     next_id: AtomicU64,
@@ -218,7 +220,7 @@ impl ExternalCopyGrants {
         }
     }
 
-    fn claim_native_drop(&self, paths: &[String]) -> Option<String> {
+    fn claim_native_drop(&self, paths: &[String], kind: ExternalTransferKind) -> Option<String> {
         let keys = Self::keys_from_strings(paths)?;
         if keys.is_empty() {
             return None;
@@ -237,7 +239,7 @@ impl ExternalCopyGrants {
         for key in &keys {
             state.pending_drop_paths.remove(key);
         }
-        self.insert_capability(&mut state, keys, ExternalTransferKind::Copy)
+        self.insert_capability(&mut state, keys, kind)
     }
 
     fn consume_capability(
@@ -819,7 +821,7 @@ mod desktop_tests {
         let native_path = std::path::PathBuf::from(&granted);
         grants.grant_native_drop(std::slice::from_ref(&native_path));
         let drop_token = grants
-            .claim_native_drop(std::slice::from_ref(&granted))
+            .claim_native_drop(std::slice::from_ref(&granted), ExternalTransferKind::Copy)
             .expect("drop capability");
 
         // A later OS event must not revoke an operation already waiting in the
@@ -2510,13 +2512,17 @@ async fn clipboard_read_files(
 fn claim_external_paths(
     grants: State<'_, ExternalCopyGrants>,
     paths: Vec<String>,
+    mode: Option<String>,
 ) -> Result<String, String> {
     if paths.is_empty() || paths.len() > 1_000 {
         return Err("Select between 1 and 1,000 dropped items".to_string());
     }
     require_existing_copy_sources(&paths)?;
+    // Explorer semantics: a drop on the same drive moves, otherwise it copies.
+    // The client picks the mode; the grant only covers the paths actually dropped.
+    let kind = if mode.as_deref() == Some("move") { ExternalTransferKind::Move } else { ExternalTransferKind::Copy };
     grants
-        .claim_native_drop(&paths)
+        .claim_native_drop(&paths, kind)
         .ok_or_else(|| "The dropped-file authorization expired; drop the items again".to_string())
 }
 
@@ -2955,12 +2961,20 @@ pub fn run() {
         .manage(ExternalCopyGrants::default())
         .manage(Arc::new(terminal::TerminalRegistry::default()))
         .manage(Arc::new(cyberdrop::CyberdropState::default()))
+        .manage(Arc::new(ollama::OllamaRequests::default()))
         .invoke_handler(tauri::generate_handler![
             cyberdrop::cyberdrop_workspace,
             cyberdrop::cyberdrop_document,
             cyberdrop::cyberdrop_start,
             cyberdrop::cyberdrop_stop,
             cyberdrop::cyberdrop_status,
+            fileops::rename_path,
+            fileops::delete_paths,
+            fileops::create_folder,
+            fileops::restore_recycled,
+            ollama::ollama_models,
+            ollama::ollama_chat,
+            ollama::ollama_cancel,
             app_version,
             app_exit,
             app_config,

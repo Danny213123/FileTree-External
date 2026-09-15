@@ -10,6 +10,7 @@ import { eqPath, isNoOpMove } from "../lib/agent";
 import { attributeLetters, attributeList } from "../lib/attributes";
 import { isImage, isVideo, pickLargestFolderFile } from "../lib/thumbs";
 import { localPoint } from "../lib/overlay";
+import { nativeZoom } from "../lib/appearance";
 import { isTauriV2, startNativeDrag, type NativeDragResponse } from "../api/v2";
 import { loadShellThumbnail } from "../lib/shellImages";
 import { fetchFolderPreview } from "../api/client";
@@ -778,7 +779,12 @@ function TreeTableInner({
       return;
     }
 
-    const element = document.elementFromPoint(info.clientX, info.clientY) as HTMLElement | null;
+    // The drop point is in logical window pixels, but UI zoom rescales the CSS
+    // pixel. Divide (as App does for shell drops) so the hit-test lands where
+    // the cursor was; otherwise drops at a non-100% UI scale missed their row
+    // and the move silently did nothing.
+    const zoom = nativeZoom() || 1;
+    const element = document.elementFromPoint(info.clientX / zoom, info.clientY / zoom) as HTMLElement | null;
     const tabStrip = element?.closest<HTMLElement>("[data-tabstrip]");
     if (tabStrip && folderTabPath) {
       const groupId = tabStrip.dataset.groupId || undefined;

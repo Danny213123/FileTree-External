@@ -14,7 +14,6 @@ import {
   fetchDriveSpace,
   fetchAppVersion,
   fetchCompressTools,
-  claimExternalPaths,
   notify,
   exitApp,
 } from "./api/client";
@@ -1303,10 +1302,9 @@ export default function App() {
       const destFolder = folderRow?.dataset.nodePath;
       if (destFolder) {
         void (async () => {
-          const provenance = claimNativeDrop
-            ? await claimExternalPaths(paths)
-            : undefined;
-          await getActiveRefRef.current()?.dropExternalInto(paths, destFolder, provenance);
+          // The tab decides move (same drive) vs copy and claims the drop's
+          // one-shot capability for that kind.
+          await getActiveRefRef.current()?.dropExternalInto(paths, destFolder, claimNativeDrop);
         })().catch((error: unknown) => {
           toast.error(`Drop failed: ${error instanceof Error ? error.message : String(error)}`);
         });
@@ -1324,7 +1322,9 @@ export default function App() {
     };
     const onDragOver = (e: DragEvent) => {
       if (!e.dataTransfer) return;
-      if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+      const types = Array.from(e.dataTransfer.types);
+      // Only shell (Explorer) drags get the app-wide box, never FileTree's own rows.
+      if (!types.includes("Files") || types.includes("application/x-filetree-path")) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "copy";
       setShellDragHint(!dropZoneAt(e.clientX, e.clientY));
@@ -1403,8 +1403,10 @@ export default function App() {
               markNativeDropTarget(logical.x, logical.y);
             }
             // A folder row is its own drop target (it highlights), so the
-            // app-wide box would only add noise on top of it.
-            setShellDragHint(!zone && !nativeDropTarget);
+            // app-wide box would only add noise on top of it. FileTree's own
+            // row drags never "open in FileTree", so they get no box either.
+            const internalDrag = !!(window as unknown as { __FILETREE_NATIVE_DRAG_ACTIVE__?: boolean }).__FILETREE_NATIVE_DRAG_ACTIVE__;
+            setShellDragHint(!zone && !nativeDropTarget && !internalDrag);
             return;
           }
           clearNativeDropTarget();

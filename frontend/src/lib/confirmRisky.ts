@@ -106,6 +106,16 @@ export function isCrossDrive(sources: string[], destination: string): boolean {
   });
 }
 
+/**
+ * True only when every source is on the destination's drive and every drive is
+ * known. Unlike {@link isCrossDrive}, an unknown drive (e.g. a network share)
+ * never counts as "the same", so a drop from it is never treated as a move.
+ */
+export function isSameDrive(sources: string[], destination: string): boolean {
+  const dest = driveOf(destination);
+  return dest !== "" && sources.length > 0 && sources.every((source) => driveOf(source) === dest);
+}
+
 function buildMessage(input: RiskInput): string {
   const subject = describeSubject(input);
   if (input.kind === "delete") {

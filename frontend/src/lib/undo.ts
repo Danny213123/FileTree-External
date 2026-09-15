@@ -31,6 +31,7 @@ import {
   hasRecycleRestore,
   fetchScan,
 } from "../api/client";
+import { fetchV2DirectorySnapshot, isTauriV2 } from "../api/v2";
 
 export type UndoEntry =
   | { kind: "move"; items: { name: string; originalParent: string }[]; destination: string }
@@ -39,6 +40,8 @@ export type UndoEntry =
   // Reversed as a batch (newest-first) by renaming each `to` back to `from`.
   | { kind: "bulkRename"; items: { parent: string; from: string; to: string }[] }
   | { kind: "recycle"; paths: string[] }
+  // A copy: the exact new paths FileTree confirmed it created. Undo recycles them.
+  | { kind: "copy"; paths: string[] }
   | { kind: "mkdir"; path: string }
   | { kind: "permanentDelete"; count: number };
 
@@ -95,6 +98,7 @@ export function peekUndoLabel(): string | null {
     case "rename": return `rename to "${e.to}"`;
     case "bulkRename": return `bulk rename of ${plural(e.items.length, "item")}`;
     case "recycle": return `recycle of ${plural(e.paths.length, "item")}`;
+    case "copy": return `copy of ${plural(e.paths.length, "item")}`;
     case "mkdir": return `new folder "${baseName(e.path)}"`;
     case "permanentDelete": return `delete of ${plural(e.count, "item")}`;
     default: return "last action";
@@ -224,6 +228,23 @@ export async function undoLast(): Promise<UndoResult | null> {
         return { ok: false, message: `Couldn't restore from the Recycle Bin — restore manually (${tail}).` };
       }
 
+      case "copy": {
+        // Remove only the copies this operation created — to the Recycle Bin,
+        // so even the undo stays recoverable.
+        let removed = 0;
+        const errors: string[] = [];
+        for (const p of entry.paths) {
+          const r = await deletePath(p, false);
+          if (r.ok) removed++;
+          else errors.push(`${baseName(p)}: ${r.error ?? "couldn't remove"}`);
+        }
+        const total = entry.paths.length;
+        if (removed === total) return { ok: true, message: `Undone — removed ${plural(removed, "copy")} (sent to the Recycle Bin).` };
+        const tail = errors.slice(0, 3).join("; ") + (errors.length > 3 ? "…" : "");
+        if (removed > 0) return { ok: true, partial: true, message: `Removed ${removed} of ${total} copies; ${tail}` };
+        return { ok: false, message: `Couldn't undo copy: ${tail || "copies not found"}` };
+      }
+
       case "mkdir": {
         // Only remove the folder if it's still empty: undoing "create folder"
         // must never sweep files the user has since added into the bin.
@@ -249,6 +270,7 @@ export async function undoLast(): Promise<UndoResult | null> {
  */
 async function isEmptyDir(path: string): Promise<boolean | null> {
   try {
+    if (isTauriV2()) return (await fetchV2DirectorySnapshot(path)).length === 0;
     const res = await fetchScan({ path, maxDepth: 1, nocache: true });
     // nodeCount includes the root folder itself; >1 means it has children.
     return res.nodeCount <= 1;

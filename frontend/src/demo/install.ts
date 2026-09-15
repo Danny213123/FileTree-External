@@ -102,6 +102,26 @@ const handlers: Record<string, Handler> = {
       return { groups, errors: [], scanned, hashing: groups.length * 2, cancelled: false, reviewToken: "demo-review" };
     });
   },
+  rename_path: ({ path, newName }) => `${String(path).replace(/[\\/][^\\/]*$/, "")}\\${newName}`,
+  delete_paths: ({ paths }) => ({ deleted: paths ?? [], failed: [] }),
+  create_folder: () => null,
+  restore_recycled: ({ paths }) => paths ?? [],
+  ollama_models: () => ["llama3.1:8b", "qwen2.5:14b", "llava:13b"],
+  ollama_chat: ({ onLine }) => {
+    const reply = "Your largest folder is D:\\Media\\Videos at 263.7 GB — mostly the Movies and TV Shows folders. Compressing them with the Balanced preset would likely save 90–130 GB.";
+    const words = reply.split(" ");
+    return new Promise<null>((resolve) => {
+      let index = 0;
+      const timer = setInterval(() => {
+        if (index < words.length) { send(onLine, JSON.stringify({ message: { content: (index ? " " : "") + words[index++] } })); return; }
+        clearInterval(timer);
+        send(onLine, JSON.stringify({ done: true }));
+        send(onLine, "");
+        resolve(null);
+      }, 40);
+    });
+  },
+  ollama_cancel: () => null,
   duplicates_action: (args) => ({ ok: true, errors: [], succeeded: args.paths ?? args.request?.paths ?? [] }),
   duplicates_link: (args) => ({ ok: true, errors: [], succeeded: args.paths ?? args.request?.paths ?? [] }),
 
