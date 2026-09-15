@@ -316,6 +316,8 @@ interface WorkspaceTabProps {
   // Whether the per-pane controls toolbar row (under the tabs) is shown. Toggled
   // from the tab bar's toolbar button; per-editor-group, defaults to visible.
   toolbarVisible: boolean;
+  /** Toggle the view options toolbar of the pane holding this tab. */
+  onToggleToolbar?: (tabId: string) => void;
   // data + options
   bookmarkList: string[];
   // Tags & color labels (F4): path → entry map for the row badges + popover, the
@@ -365,7 +367,7 @@ interface WorkspaceTabProps {
 
 const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(function WorkspaceTab(
   {
-    tabId, initialPath, initialViewState, active, activeView, searchQuery, searchFilters, toolbarVisible,
+    tabId, initialPath, initialViewState, active, activeView, searchQuery, searchFilters, toolbarVisible, onToggleToolbar,
     bookmarkList, tagsByPath, activeTagFilter, onSetTags, onClearTagFilter,
     threads, includeHidden, followLinks, collectOwners, onCollectOwnersChange, exclude,
     decimals, visibleColumns, onVisibleColumnsChange, onDecimalsChange,
@@ -376,6 +378,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   ref,
 ) {
   const [scanPath, setScanPathState] = useState(initialPath);
+  const toggleToolbar = useCallback(() => onToggleToolbar?.(tabId), [onToggleToolbar, tabId]);
   // Stable "Undo (Ctrl+Z)" action for success toasts — reads the latest onUndo
   // via a ref so the action keeps a stable identity (no re-render churn) while
   // always invoking the current undo handler.
@@ -2702,6 +2705,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
           onBack={goBack}
           onForward={goForward}
           onUp={handleNavigateParent}
+          toolbarVisible={toolbarVisible}
+          onToggleToolbar={onToggleToolbar ? toggleToolbar : undefined}
         />
         {data && data.nodeCount > VERY_LARGE_SCAN_NODES && !largeScanDismissed && status !== "scanning" && (
           <div className="stale-bar" role="status">
@@ -2806,6 +2811,11 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
               />
               <span className="spacer" />
               <button onClick={handleOpenTerminal} title="Open terminal here (Ctrl+`)">Terminal</button>
+              {onToggleToolbar && (
+                <button className="toolbar-hide" onClick={toggleToolbar} title="Hide view options (Options in the address bar shows them again)" aria-label="Hide view options">
+                  <Icon name="caret-up" size={12} />
+                </button>
+              )}
             </div>
         )}
 

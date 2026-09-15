@@ -63,12 +63,17 @@ interface BreadcrumbProps {
   onBack: () => void;
   onForward: () => void;
   onUp: () => void;
+  /** Whether this pane's view options toolbar is showing. */
+  toolbarVisible?: boolean;
+  /** Show/hide the view options toolbar. The address bar never hides, so this
+   *  is always reachable. */
+  onToggleToolbar?: () => void;
 }
 
 // Explorer-style address bar: Back / Forward / Up controls plus the current
 // path as clickable segments. Clicking the empty track (or the "no folder"
 // hint) switches to an editable input so a path can be typed directly.
-export function Breadcrumb({ path, scanning, canBack, canForward, canUp, onNavigate, onBack, onForward, onUp }: BreadcrumbProps) {
+export function Breadcrumb({ path, scanning, canBack, canForward, canUp, onNavigate, onBack, onForward, onUp, toolbarVisible = true, onToggleToolbar }: BreadcrumbProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(path);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -204,6 +209,19 @@ export function Breadcrumb({ path, scanning, canBack, canForward, canUp, onNavig
             <Icon name="pencil-square" size={13} />
           </button>
         </>
+      )}
+      {onToggleToolbar && (
+        <button
+          className={`bc-btn bc-options${toolbarVisible ? " active" : ""}`}
+          title={toolbarVisible ? "Hide view options (size, units, filters, columns)" : "Show view options (size, units, filters, columns)"}
+          aria-label={toolbarVisible ? "Hide view options" : "Show view options"}
+          aria-expanded={toolbarVisible}
+          onClick={onToggleToolbar}
+        >
+          <Icon name="tools" size={13} />
+          <span>Options</span>
+          <Icon name={toolbarVisible ? "caret-up" : "caret-down"} size={10} />
+        </button>
       )}
     </div>
   );

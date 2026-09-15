@@ -1744,6 +1744,11 @@ export default function App() {
   // Toggle the controls toolbar (Size/Unit/Files… row) for one pane. Scoped
   // per-editor-group to match the toolbar and the split button, which are both
   // per-pane; persisted alongside the pane layout in paneGroups.
+  // Stable for WorkspaceTab's memoization: resolves the pane from the tab id.
+  const handleToggleToolbarForTab = useCallback((tabId: string) => {
+    setGroups((prev) => prev.map((g) => (g.tabIds.includes(tabId) ? { ...g, toolbarHidden: !g.toolbarHidden } : g)));
+  }, []);
+
   const handleToggleToolbar = useCallback((groupId: string) => {
     setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, toolbarHidden: !g.toolbarHidden } : g)));
   }, []);
@@ -1972,6 +1977,7 @@ export default function App() {
     document.title = `${activeLabel} — FileTree${appVersion ? ` v${appVersion}` : ""}`;
   }, [activeLabel, appVersion]);
 
+  const focusedToolbarHidden = !!groups.find((g) => g.id === focusedGroupId)?.toolbarHidden;
   const menus: Menu[] = useMemo(() => [
     {
       label: "File",
@@ -2034,6 +2040,7 @@ export default function App() {
         { label: "Details Pane", kbd: "Alt+Shift+P", checked: inspectorEligible && detailsOpen, disabled: !inspectorEligible, onClick: handleToggleDetails },
         { separator: true },
         { label: "Configure Columns…", opensColumns: true },
+        { label: "Pane Toolbar (view options)", checked: !focusedToolbarHidden, onClick: () => handleToggleToolbar(focusedGroupId) },
         { separator: true },
         { label: "Double-click opens folder in Explorer", checked: folderDblClickExplorer, onClick: handleToggleFolderDblClick },
         { label: "Size heat-tint rows", checked: heatTint, onClick: handleToggleHeatTint },
@@ -2087,7 +2094,7 @@ export default function App() {
     handleToggleTerminal, handleToggleChat, handleToggleDark, handleToggleSidebar,
     handleToggleTreemap, handleTogglePreview, handleToggleDetails, handleToggleTmLabels,
     handleToggleTmHierarchy, handleToggleTmLegend, handleOpen3D, handleOpenSchedule, handleAbout,
-    handleOpenChangelog, getActiveRef,
+    handleOpenChangelog, getActiveRef, focusedToolbarHidden, handleToggleToolbar,
   ]);
 
   // Overflow menu for the right-hand "⋯" control in the title bar.
@@ -2330,8 +2337,6 @@ export default function App() {
                     onMoveTab={handleMoveTab}
                     onFolderDrop={(path, beforeId) => openTabInGroup(group.id, path, beforeId)}
                     onSplit={canSplit ? () => handleSplitFromGroup(group.id) : undefined}
-                    toolbarVisible={!group.toolbarHidden}
-                    onToggleToolbar={() => handleToggleToolbar(group.id)}
                     canCloseLast={groups.length > 1}
                     onRenameTab={handleRenameTab}
                     onResetTabName={handleResetTabName}
@@ -2356,6 +2361,7 @@ export default function App() {
                         searchQuery={debouncedSearchQuery}
                         searchFilters={searchFilters}
                         toolbarVisible={!group.toolbarHidden}
+                        onToggleToolbar={handleToggleToolbarForTab}
                         bookmarkList={bookmarkList}
                         threads={threads}
                         includeHidden={includeHidden}

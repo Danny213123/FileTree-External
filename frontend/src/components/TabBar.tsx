@@ -29,10 +29,6 @@ interface TabBarProps {
   onFolderDrop: (path: string, beforeId?: string) => void;
   /** Split this group's active tab into a new pane (omit to hide the button). */
   onSplit?: () => void;
-  /** Whether this group's controls toolbar (under the tabs) is currently shown. */
-  toolbarVisible?: boolean;
-  /** Toggle this group's controls toolbar visibility (omit to hide the button). */
-  onToggleToolbar?: () => void;
   /** Allow closing the very last tab in this group (closes the pane). */
   canCloseLast?: boolean;
   // #49 Tab QoL actions (context menu + double-click rename).
@@ -46,7 +42,7 @@ interface TabBarProps {
 
 interface TabMenuState { id: string; x: number; y: number; }
 
-export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, onMoveTab, onFolderDrop, onSplit, toolbarVisible = true, onToggleToolbar, canCloseLast, onRenameTab, onResetTabName, onSetTabColor, onTogglePinTab, tabColors = [] }: TabBarProps) {
+export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, onMoveTab, onFolderDrop, onSplit, canCloseLast, onRenameTab, onResetTabName, onSetTabColor, onTogglePinTab, tabColors = [] }: TabBarProps) {
   const draggingTabIdRef = useRef<string | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
   const nativeDragPathRef = useRef<string | null>(null);
@@ -323,18 +319,8 @@ export function TabBar({ groupId, tabs, activeId, onActivate, onClose, onNew, on
       ><Icon name="plus" size={14} /></button>
 
       <span className="wtab-spacer" />
-      {(onToggleToolbar || onSplit) && (
+      {onSplit && (
         <div className="wtab-actions">
-          {onToggleToolbar && (
-            <button
-              className={`wtab-new wtab-toolbar-toggle${toolbarVisible ? "" : " active"}`}
-              onClick={onToggleToolbar}
-              title={toolbarVisible ? "Hide toolbar" : "Show toolbar"}
-              aria-pressed={!toolbarVisible}
-            >
-              <Icon name="window" size={14} />
-            </button>
-          )}
           {onSplit && (
             <button className="wtab-new wtab-split" onClick={onSplit} title="Split editor right">
               <Icon name="layout-split" size={14} />
