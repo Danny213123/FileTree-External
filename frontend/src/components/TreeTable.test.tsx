@@ -230,6 +230,50 @@ describe("TreeTable double click", () => {
     expect(onContextMenu).toHaveBeenCalledWith(file, 123, 234);
   });
 
+  it("opens a middle-clicked folder in a background tab and ignores files", () => {
+    const onOpenFolderInTab = vi.fn();
+    const folder: NodeRecord = { ...file, id: 7, name: "Albums", path: "E:\\Media\\Albums", dir: true, extension: "" };
+    const view = render(
+      <TreeTable
+        rows={[folder, file]}
+        flat
+        lazy
+        nodeById={new Map()}
+        expanded={new Set()}
+        expandedAll={false}
+        collapsedOverrides={new Set()}
+        selectedId={0}
+        selectedIds={new Set()}
+        sortKey="name"
+        sortDir={1}
+        metric="size"
+        unit="auto"
+        decimals={1}
+        visibleColumns={new Set(["name"])}
+        columnWidths={{}}
+        onColumnResize={vi.fn()}
+        bookmarks={new Set()}
+        onToggleExpand={vi.fn()}
+        onSelect={vi.fn()}
+        onDoubleClick={vi.fn()}
+        onContextMenu={vi.fn()}
+        onSortChange={vi.fn()}
+        onToggleBookmark={vi.fn()}
+        onOpenFolderInTab={onOpenFolderInTab}
+      />,
+    );
+    const rowFor = (name: string) => within(view.container).getByText(name).closest<HTMLElement>(".row")!;
+    const middleClick = (el: HTMLElement) => fireEvent(el, new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }));
+
+    // A prevented mousedown suppresses the Windows autoscroll cursor.
+    expect(fireEvent.mouseDown(rowFor("Albums"), { button: 1 })).toBe(false);
+    middleClick(rowFor("Albums"));
+    expect(onOpenFolderInTab).toHaveBeenCalledWith(folder.path, undefined, true);
+
+    middleClick(rowFor("clip.mp4"));
+    expect(onOpenFolderInTab).toHaveBeenCalledOnce();
+  });
+
   it("excludes hidden cached selections from a flat-row drag", () => {
     const stale = {
       ...file,

@@ -1208,9 +1208,9 @@ export default function App() {
     setLowSpaceThreshold((cur) => presets[(presets.indexOf(cur) + 1) % presets.length] ?? 10);
   }, []);
 
-  // Open a new tab inside a specific group (before `beforeId`, else appended),
-  // make it that group's active tab, and focus the group.
-  const openTabInGroup = useCallback((groupId: string, path: string, beforeId?: string) => {
+  // Open a new tab inside a specific group (before `beforeId`, else appended).
+  // Unless `background`, make it that group's active tab and focus the group.
+  const openTabInGroup = useCallback((groupId: string, path: string, beforeId?: string, background = false) => {
     const id = newTabId();
     const ref = createRef<WorkspaceTabHandle>();
     setTabs((prev) => [...prev, { id, initialPath: path, ref }]);
@@ -1222,10 +1222,10 @@ export default function App() {
         const tabIds = [...g.tabIds];
         const at = beforeId ? tabIds.indexOf(beforeId) : -1;
         if (at >= 0) tabIds.splice(at, 0, id); else tabIds.push(id);
-        return { ...g, tabIds, activeTabId: id };
+        return background ? { ...g, tabIds } : { ...g, tabIds, activeTabId: id };
       });
     });
-    setFocusedGroupId((cur) => (groupsRef.current.some((g) => g.id === groupId) ? groupId : cur));
+    if (!background) setFocusedGroupId((cur) => (groupsRef.current.some((g) => g.id === groupId) ? groupId : cur));
   }, []);
 
   // New tabs from global actions (Ctrl+T, external file drop, File ▸ New Tab)
@@ -1262,12 +1262,13 @@ export default function App() {
   // Open a folder in a new tab of a SPECIFIC group (used when a native folder
   // drag is dropped on that group's tab strip — see TreeTable). Falls back to
   // the focused group when no/unknown group id is supplied. Stable identity so
-  // it doesn't defeat WorkspaceTab's memoization.
-  const handleOpenFolderInTab = useCallback((path: string, groupId?: string) => {
+  // it doesn't defeat WorkspaceTab's memoization. `background` (middle-click on
+  // a folder row) adds the tab without switching to it.
+  const handleOpenFolderInTab = useCallback((path: string, groupId?: string, background?: boolean) => {
     const target = groupId && groupsRef.current.some((g) => g.id === groupId)
       ? groupId
       : focusedGroupIdRef.current;
-    openTabInGroup(target, path);
+    openTabInGroup(target, path, undefined, background);
   }, [openTabInGroup]);
 
   const handleActivateTab = useCallback((groupId: string, tabId: string) => {

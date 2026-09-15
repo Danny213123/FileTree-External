@@ -357,7 +357,7 @@ interface WorkspaceTabProps {
   onOpenTerminal?: (cwd: string) => void;
   // Open `path` in a new workspace tab of editor group `groupId` (falls back to
   // the focused group). Used when a native folder drag is dropped on a tab strip.
-  onOpenFolderInTab?: (path: string, groupId?: string) => void;
+  onOpenFolderInTab?: (path: string, groupId?: string, background?: boolean) => void;
   // Reverse the most recent reversible op (the same handler Ctrl+Z runs). Wired
   // to the "Undo (Ctrl+Z)" action link on move/rename/recycle success toasts.
   onUndo?: () => void;

@@ -148,7 +148,7 @@ interface TreeTableProps {
   onMoveItems?: (sourcePaths: string[], destinationFolder: string) => Promise<MoveItemsResult | void> | MoveItemsResult | void;
   /** Open a folder in a new workspace tab. Used when a native folder drag is
    *  dropped on a tab strip; `groupId` selects which editor group's bar. */
-  onOpenFolderInTab?: (path: string, groupId?: string) => void;
+  onOpenFolderInTab?: (path: string, groupId?: string, background?: boolean) => void;
   /** Called after a native drag moved item(s) OUT (to Explorer / another app)
    *  and removed a directory from the source, so the owner can invalidate the
    *  scan cache and rescan (the moved-out folder would otherwise linger). */
@@ -1066,6 +1066,15 @@ function TreeTableInner({
                 onContextMenu={(e) => {
                   e.preventDefault();
                   if (!isBundle) onContextMenu(node, e.clientX, e.clientY);
+                }}
+                // Middle-click a folder: open it in a background tab (browser
+                // convention). Suppress the mousedown so Windows' autoscroll
+                // cursor doesn't appear.
+                onMouseDown={(e) => { if (e.button === 1 && node.dir && !isBundle) e.preventDefault(); }}
+                onAuxClick={(e) => {
+                  if (e.button !== 1 || !node.dir || isBundle || !node.path) return;
+                  e.preventDefault();
+                  onOpenFolderInTabRef.current?.(node.path, undefined, true);
                 }}
                 onDragStart={(e) => {
                   if (!isDraggable) return;
