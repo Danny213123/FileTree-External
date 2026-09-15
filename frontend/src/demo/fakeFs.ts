@@ -211,7 +211,12 @@ export const DRIVES = [
 });
 
 // ── Queries ─────────────────────────────────────────────────────────────────
-export const lookup = (path: string) => byPath.get(path.replace(/[\\/]+$/, "").toLowerCase()) ?? byPath.get(path.toLowerCase());
+/** Find a node by path, accepting "D:", "D:\", "d:/Media/" and other spellings. */
+export function lookup(path: string): DemoNode | undefined {
+  let key = path.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+  if (/^[a-z]:$/.test(key)) key += "\\";
+  return byPath.get(key);
+}
 export const driveOf = (path: string) => DRIVES.find((drive) => path.toUpperCase().startsWith(drive.root[0]));
 
 export function descendants(root: DemoNode): DemoNode[] {

@@ -24,6 +24,13 @@ describe("demo build IPC", () => {
     expect(sizes).toEqual([...sizes].sort((a, b) => b - a));
   });
 
+  it("scans a drive or folder however its path is spelled", async () => {
+    for (const rootPath of ["D:", "D:\\", "d:/Media/", "E:"]) {
+      const handle = await invoke<{ nodeCount: number } | null>("scan_find", { rootPath });
+      expect(handle?.nodeCount, rootPath).toBeGreaterThan(10);
+    }
+  });
+
   it("answers compression, Cyberdrop and unknown commands from demo data", async () => {
     const { jobs } = await invoke<{ jobs: { status: string }[] }>("compression_list");
     expect(new Set(jobs.map((job) => job.status))).toEqual(new Set(["running", "queued", "paused", "done", "cancelled"]));
