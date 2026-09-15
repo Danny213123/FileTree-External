@@ -4880,8 +4880,8 @@ mod tests {
     #[test]
     fn join_child_path_inserts_exactly_one_separator() {
         assert_eq!(join_child_path("C:\\", "Users"), "C:\\Users");
-        assert_eq!(join_child_path("C:\\Users", "dan"), "C:\\Users\\alex");
-        assert_eq!(join_child_path("C:/Users", "dan"), "C:/Users\\alex");
+        assert_eq!(join_child_path("C:\\Users", "alex"), "C:\\Users\\alex");
+        assert_eq!(join_child_path("C:/Users", "alex"), "C:/Users\\alex");
     }
 
     /// End-to-end equivalence: the fast path must be invisible in the results.

@@ -61,7 +61,7 @@ describe("splitPath", () => {
 
 describe("shortenParent", () => {
   it("elides all but the trailing segments", () => {
-    expect(shortenParent("C:\\Users\\alex\\Documents")).toBe("…\\dan\\Documents");
+    expect(shortenParent("C:\\Users\\alex\\Documents")).toBe("…\\alex\\Documents");
   });
 
   it("leaves short parents alone", () => {
@@ -73,7 +73,7 @@ describe("PathPicker", () => {
   it("shows the target leaf with its elided parent", () => {
     setup("C:\\Users\\alex\\Documents\\Reports");
     expect(screen.getByText("Reports")).toBeInTheDocument();
-    expect(screen.getByText("…\\dan\\Documents")).toBeInTheDocument();
+    expect(screen.getByText("…\\alex\\Documents")).toBeInTheDocument();
   });
 
   it("prefers the volume label over the parent for a drive root", () => {
