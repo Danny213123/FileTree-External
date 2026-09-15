@@ -1586,6 +1586,23 @@ pub(crate) fn selective_retry_from_manifest(
     ))
 }
 
+fn blocks_queued_jobs(status: &str, runner_started: bool, finished: bool) -> bool {
+    // Pausing drains active work; paused jobs hold no encoder permits and
+    // must not globally pause unrelated queued runs. Restored records without
+    // a live runner also cannot make progress and must not block the queue.
+    runner_started && !finished && matches!(status, "running" | "pausing")
+}
+
+#[test]
+fn paused_and_stale_runs_do_not_block_compression_queue() {
+    assert!(!blocks_queued_jobs("paused", true, false));
+    assert!(!blocks_queued_jobs("running", false, false));
+    assert!(!blocks_queued_jobs("queued", false, false));
+    assert!(!blocks_queued_jobs("running", true, true));
+    assert!(blocks_queued_jobs("running", true, false));
+    assert!(blocks_queued_jobs("pausing", true, false));
+}
+
 /// Restore persisted queued jobs and run one queued batch at a time. Encoder
 /// lane gates still coordinate this scheduler with any manually resumed job.
 pub(crate) fn start_queue_scheduler(state: Arc<CompressionRuntimeState>) {
@@ -1625,10 +1642,11 @@ pub(crate) fn start_queue_scheduler(state: Arc<CompressionRuntimeState>) {
             let next = {
                 let jobs = state.jobs.lock_recover();
                 let blocked = jobs.values().any(|job| {
-                    matches!(
+                    blocks_queued_jobs(
                         job.status.lock_recover().as_str(),
-                        "running" | "pausing" | "paused"
-                    ) && !job.finished.load(Ordering::SeqCst)
+                        job.runner_started.load(Ordering::SeqCst),
+                        job.finished.load(Ordering::SeqCst),
+                    )
                 });
                 if blocked {
                     None
@@ -1640,8 +1658,9 @@ pub(crate) fn start_queue_scheduler(state: Arc<CompressionRuntimeState>) {
                 }
             };
             if let Some(job) = next {
-                let _ = resume_job(&job);
-                spawn_job(Arc::clone(&state), job);
+                if matches!(resume_job(&job), Ok(true)) {
+                    spawn_job(Arc::clone(&state), job);
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
