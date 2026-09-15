@@ -146,6 +146,8 @@ function pluginFallback(cmd: string): unknown {
 export function installDemo(): void {
   try {
     if (!localStorage.getItem("filetree_plugins")) localStorage.setItem("filetree_plugins", JSON.stringify({ cyberdrop: { enabled: true, since: fs.DEMO_NOW } }));
+    // Cyberdrop only connects once an installation folder is known.
+    if (!localStorage.getItem("filetree.cyberdrop.repo")) localStorage.setItem("filetree.cyberdrop.repo", "C:\\Tools\\CyberDropDownloader");
   } catch { /* storage blocked: the Cyberdrop tab just starts opted out */ }
   const w = window as unknown as Record<string, any>;
   // Inside the desktop shell Tauri's IPC is present and read-only; leave it be.
