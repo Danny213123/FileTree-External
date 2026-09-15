@@ -1,8 +1,13 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   plugins: [react()],
+  resolve: {
+    // The demo build (`--mode demo`) answers every backend command from
+    // invented data; see src/demo/tauriCore.ts.
+    alias: mode === "demo" ? [{ find: /^@tauri-apps\/api\/core$/, replacement: "/src/demo/tauriCore.ts" }] : [],
+  },
   build: {
     outDir: "dist",
     // Content hashes prevent WebView2 from serving an older embedded renderer
@@ -29,4 +34,4 @@ export default defineConfig({
       "/api": "http://127.0.0.1:7878",
     },
   },
-});
+}));

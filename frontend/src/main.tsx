@@ -17,4 +17,7 @@ async function boot() {
   );
 }
 
-void boot();
+void boot().catch((error: unknown) => {
+  // Startup failed before React could mount; show why instead of a blank window.
+  document.body.textContent = `FileTree failed to start: ${error instanceof Error ? error.message : String(error)}`;
+});

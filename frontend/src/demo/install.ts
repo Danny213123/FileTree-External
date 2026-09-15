@@ -1,7 +1,7 @@
-// Demo build only (VITE_FILETREE_DEMO=1). Replaces Tauri's IPC `invoke` so
-// every FileTree command is answered from invented data and nothing on this
-// machine is read or changed. Window controls (`plugin:*`) still reach Tauri
-// when running inside the desktop shell; in a plain browser they are stubbed.
+// Demo build only (VITE_FILETREE_DEMO=1). Every FileTree command is answered
+// from invented data, so nothing on this machine is read or changed. In the
+// desktop shell, tauriCore.ts routes app commands here; in a plain browser,
+// installDemo() provides a stand-in for Tauri's IPC and stubs window controls.
 import * as fs from "./fakeFs";
 import * as compression from "./fakeCompression";
 import * as cyberdrop from "./fakeCyberdrop";
@@ -125,6 +125,12 @@ const handlers: Record<string, Handler> = {
   file_thumbnail: ({ path }) => thumbnail(String(path)),
 };
 
+/** Answers one app command from demo data; unknown commands resolve to null. */
+export function handleDemoCommand(cmd: string, args: Args = {}): unknown {
+  const handler = handlers[cmd];
+  return handler ? handler(args) : null;
+}
+
 /** Browser-only answers for Tauri's window/event plugins. */
 function pluginFallback(cmd: string): unknown {
   if (cmd === "plugin:event|listen") return Math.floor(Math.random() * 1e9);
@@ -137,27 +143,24 @@ export function installDemo(): void {
     if (!localStorage.getItem("filetree_plugins")) localStorage.setItem("filetree_plugins", JSON.stringify({ cyberdrop: { enabled: true, since: fs.DEMO_NOW } }));
   } catch { /* storage blocked: the Cyberdrop tab just starts opted out */ }
   const w = window as unknown as Record<string, any>;
-  const internals = (w.__TAURI_INTERNALS__ ??= {});
-  w.__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
-  const native = typeof internals.invoke === "function" ? internals.invoke.bind(internals) : null;
-  if (typeof internals.transformCallback !== "function") {
+  // Inside the desktop shell Tauri's IPC is present and read-only; leave it be.
+  if (!w.__TAURI_INTERNALS__) {
     const callbacks = new Map<number, (data: unknown) => void>();
     let nextId = 1;
-    internals.transformCallback = (callback: (data: unknown) => void, once = false) => {
-      const id = nextId++;
-      callbacks.set(id, (data) => { if (once) callbacks.delete(id); callback?.(data); });
-      return id;
+    w.__TAURI_INTERNALS__ = {
+      transformCallback: (callback: (data: unknown) => void, once = false) => {
+        const id = nextId++;
+        callbacks.set(id, (data) => { if (once) callbacks.delete(id); callback?.(data); });
+        return id;
+      },
+      unregisterCallback: (id: number) => callbacks.delete(id),
+      runCallback: (id: number, data: unknown) => callbacks.get(id)?.(data),
+      callbacks,
+      metadata: { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } },
+      convertFileSrc: (path: string) => path,
+      invoke: async (cmd: string, args: Args = {}) => cmd.startsWith("plugin:") ? pluginFallback(cmd) : handleDemoCommand(cmd, args),
     };
-    internals.unregisterCallback = (id: number) => callbacks.delete(id);
-    internals.runCallback = (id: number, data: unknown) => callbacks.get(id)?.(data);
-    internals.callbacks = callbacks;
   }
-  internals.metadata ??= { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } };
-  internals.convertFileSrc ??= (path: string) => path;
-  internals.invoke = async (cmd: string, args: Args = {}, options?: unknown) => {
-    if (cmd.startsWith("plugin:")) return native ? native(cmd, args, options) : pluginFallback(cmd);
-    const handler = handlers[cmd];
-    return handler ? handler(args) : null;
-  };
+  w.__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
   document.title = "FileTree Demo";
 }
