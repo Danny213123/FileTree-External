@@ -1,0 +1,28 @@
+{
+  "productName": "FileTree Demo",
+  "identifier": "com.danny213123.filetree.demo",
+  "build": {
+    "beforeBuildCommand": "npm --prefix frontend run build:demo",
+    "frontendDist": "../frontend/dist-demo"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "FileTree Demo",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 640,
+        "minHeight": 400,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": false,
+        "dataDirectory": "renderer-demo",
+        "backgroundColor": "#1e1e1e"
+      }
+    ]
+  },
+  "bundle": {
+    "active": false
+  }
+}

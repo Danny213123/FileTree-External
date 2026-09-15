@@ -2922,6 +2922,19 @@ fn compression_subscribe(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The demo build must never touch the user's FileTree data. Every store,
+    // including the compression queue restored at startup, resolves under
+    // these variables, so point them at an empty demo folder first.
+    #[cfg(feature = "demo")]
+    {
+        let home = std::env::temp_dir().join("FileTree-Demo");
+        let _ = std::fs::create_dir_all(home.join("Roaming"));
+        let _ = std::fs::create_dir_all(home.join("Local"));
+        unsafe {
+            std::env::set_var("APPDATA", home.join("Roaming"));
+            std::env::set_var("LOCALAPPDATA", home.join("Local"));
+        }
+    }
     #[cfg(windows)]
     unsafe {
         // FileTree deliberately keeps the WebView compositor in software. Video
