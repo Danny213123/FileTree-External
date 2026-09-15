@@ -21,6 +21,7 @@ This file is rendered inside the app under **Help → What's New**.
 
 - **Pause all** and **Stop all** buttons in the Compress → Monitor run list. Queued runs are handled before active ones, so the scheduler can't start the next queued run part-way through; Stop all asks for confirmation.
 - Middle-click a folder in the tree to open it in a background tab.
+- An **Options** button in each pane's address bar shows or hides that pane's view options toolbar (size, units, filters, columns). It replaces the unlabelled icon in the tab strip. The toolbar also has its own hide button at the end, and **View → Pane Toolbar** toggles the focused pane.
 
 
 #### Changed
@@ -31,6 +32,8 @@ This file is rendered inside the app under **Help → What's New**.
 
 - A queued compression run can be paused, and the scheduler no longer starts a run that was paused just after it was picked.
 - Paused runs, and restored runs with no live worker, no longer block the compression queue.
+- The per-pane toolbar wraps onto another row in narrow panes instead of splitting button labels, collapsing the filter box and cutting off its last controls.
+- The address bar's **Recent locations** menu opened invisibly; it now appears under its button.
 
 ### 2026-09-13
 
