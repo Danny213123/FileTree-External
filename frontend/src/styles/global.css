@@ -9590,3 +9590,30 @@ html[data-motion="reduce"] :is(.cm-run-progress i, .cm-file-progress-fill, .cm-o
 .cdl-compression-file { display:grid; grid-template-columns:minmax(140px,2fr) minmax(80px,1fr) repeat(4,auto); align-items:center; gap:12px; padding:8px 0; }
 .cdl-compression-file strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 @media(max-width:800px) { .cdl-compression-file { display:flex; flex-wrap:wrap; } }
+
+/* Monitor palette, after cyberdrop-dl's terminal UI: green frames, pink bars,
+   purple percentages and one color per figure. Light values keep contrast. */
+.cdl-view { --cdl-green:#1a7f37; --cdl-yellow:#9a6700; --cdl-cyan:#0e7c86; --cdl-red:#cf222e; --cdl-pink:#d6246e; --cdl-purple:#8250df; --cdl-magenta:#a626a4; --cdl-track:rgba(0,0,0,.1); }
+[data-theme="dark"] .cdl-view { --cdl-green:#6fd66f; --cdl-yellow:#e8c46a; --cdl-cyan:#4fd6c4; --cdl-red:#ff6b6b; --cdl-pink:#ff2e7e; --cdl-purple:#c58af9; --cdl-magenta:#e38ee3; --cdl-track:rgba(255,255,255,.14); }
+.cdl-view .cdl-card { border-color:color-mix(in srgb, var(--cdl-green) 55%, transparent); border-radius:6px; }
+.cdl-view .cdl-card header { border-bottom-color:color-mix(in srgb, var(--cdl-green) 25%, transparent); }
+.cdl-view .cdl-card header strong { color:var(--cdl-green); }
+.cdl-view progress { -webkit-appearance:none; appearance:none; height:5px; border:0; border-radius:3px; background:var(--cdl-track); overflow:hidden; }
+.cdl-view progress::-webkit-progress-bar { background:var(--cdl-track); border-radius:3px; }
+.cdl-view progress::-webkit-progress-value { background:var(--cdl-pink); border-radius:3px; }
+.cdl-view progress::-moz-progress-bar { background:var(--cdl-pink); }
+.cdl-view .cdl-count-row progress { width:100%; }
+.cdl-view .cdl-pct { color:var(--cdl-purple); font-variant-numeric:tabular-nums; }
+.cdl-view .cdl-tone-green > span:first-child { color:var(--cdl-green); }
+.cdl-view .cdl-tone-yellow > span:first-child { color:var(--cdl-yellow); }
+.cdl-view .cdl-tone-cyan > span:first-child { color:var(--cdl-cyan); }
+.cdl-view .cdl-tone-red > span:first-child { color:var(--cdl-red); }
+.cdl-view .cdl-host { color:var(--cdl-magenta); }
+.cdl-view .cdl-bytes { color:var(--cdl-green); font-variant-numeric:tabular-nums; }
+.cdl-view .cdl-speed { color:var(--cdl-red); font-variant-numeric:tabular-nums; }
+.cdl-view .cdl-eta { color:var(--cdl-cyan); font-variant-numeric:tabular-nums; }
+.cdl-view .cdl-transfers th { color:var(--muted); font-weight:600; }
+.cdl-view .cdl-downloads-bar strong { color:var(--cdl-green); }
+.cdl-view .cdl-run-status.running { color:var(--cdl-green); }
+.cdl-view .cdl-run-status.running::before { content:"●"; margin-right:6px; animation:cdl-pulse 1.6s ease-in-out infinite; }
+@keyframes cdl-pulse { 50% { opacity:.35; } }
