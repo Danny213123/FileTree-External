@@ -542,9 +542,9 @@ fn native_transfer_files(
         // overwrite target.
         if result.aborted {
             result.skipped += 1;
-        } else if move_items && std::fs::symlink_metadata(&source).is_err() {
-            result.moved += 1;
-        } else if perform_error.is_none() && !target_existed && target.exists() {
+        } else if (move_items && std::fs::symlink_metadata(&source).is_err())
+            || (perform_error.is_none() && !target_existed && target.exists())
+        {
             result.moved += 1;
         } else {
             result.failed += 1;
@@ -853,10 +853,10 @@ unsafe extern "system" fn shell_menu_subclass_proc(
             if unsafe { menu.HandleMenuMsg2(message, wparam, lparam, Some(&mut result)) }.is_ok() {
                 return result;
             }
-        } else if let Some(menu) = &bridge.menu2 {
-            if unsafe { menu.HandleMenuMsg(message, wparam, lparam) }.is_ok() {
-                return LRESULT(0);
-            }
+        } else if let Some(menu) = &bridge.menu2
+            && unsafe { menu.HandleMenuMsg(message, wparam, lparam) }.is_ok()
+        {
+            return LRESULT(0);
         }
     }
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
@@ -1061,15 +1061,14 @@ pub(crate) fn shell_context_menu(
     // Always append one FileTree-owned action: files are selected in their
     // containing folder, while directories are opened directly.
     unsafe {
-        AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null())
-            .and_then(|_| {
-                AppendMenuW(
-                    menu.0,
-                    MF_STRING,
-                    MENU_ID_OPEN_IN_EXPLORER as usize,
-                    w!("Open in File Explorer"),
-                )
-            })
+        AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null()).and_then(|_| {
+            AppendMenuW(
+                menu.0,
+                MF_STRING,
+                MENU_ID_OPEN_IN_EXPLORER as usize,
+                w!("Open in File Explorer"),
+            )
+        })
     }
     .map_err(|error| format!("Windows could not add the Explorer menu item: {error}"))?;
 
@@ -1126,8 +1125,7 @@ pub(crate) fn shell_context_menu(
         };
         drop(proxy);
         drop(bridge);
-        open_result
-            .map_err(|error| format!("Windows could not open File Explorer: {error}"))?;
+        open_result.map_err(|error| format!("Windows could not open File Explorer: {error}"))?;
         return Ok(Some("filetree_open_in_explorer".to_string()));
     }
     let command_offset = command - MENU_ID_FIRST;

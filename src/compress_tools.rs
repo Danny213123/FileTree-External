@@ -385,10 +385,10 @@ pub(crate) fn detect_handbrake_caps_and_raw(path: &Path) -> (HandbrakeCaps, bool
 fn run_handbrake_help(path: &Path) -> Option<String> {
     let mut cmd = Command::new(path);
     cmd.arg("-h");
-    if let Some(dir) = path.parent() {
-        if dir.is_dir() {
-            cmd.current_dir(dir);
-        }
+    if let Some(dir) = path.parent()
+        && dir.is_dir()
+    {
+        cmd.current_dir(dir);
     }
     no_window(&mut cmd);
     let out = cmd.output().ok()?;
@@ -637,12 +637,11 @@ pub(crate) fn invalidate_tools_cache() {
 /// Build the `GET /api/compress-tools` JSON body, served from a short-lived
 /// cache (see [`TOOLS_TTL`]). Use [`invalidate_tools_cache`] to force a refresh.
 pub(crate) fn tools_json() -> String {
-    if let Ok(guard) = tools_cache().lock() {
-        if let Some(c) = guard.as_ref() {
-            if c.at.elapsed() < TOOLS_TTL {
-                return c.json.clone();
-            }
-        }
+    if let Ok(guard) = tools_cache().lock()
+        && let Some(c) = guard.as_ref()
+        && c.at.elapsed() < TOOLS_TTL
+    {
+        return c.json.clone();
     }
     let json = tools_json_uncached();
     if let Ok(mut guard) = tools_cache().lock() {
@@ -849,7 +848,7 @@ fn write_test_clip() -> Option<PathBuf> {
             }
         }
         // Neutral chroma planes.
-        data.extend(std::iter::repeat(128u8).take(2 * c_size));
+        data.extend(std::iter::repeat_n(128u8, 2 * c_size));
     }
     let path = std::env::temp_dir().join("filetree_gpuprobe.y4m");
     std::fs::write(&path, &data).ok()?;
@@ -883,10 +882,10 @@ fn run_encode_probe(hb: &Path, src: &Path, encoder_token: &str, is_gpu: bool) ->
         "--encoder-preset",
         enc_preset,
     ]);
-    if let Some(dir) = hb.parent() {
-        if dir.is_dir() {
-            cmd.current_dir(dir);
-        }
+    if let Some(dir) = hb.parent()
+        && dir.is_dir()
+    {
+        cmd.current_dir(dir);
     }
     no_window(&mut cmd);
     let start = Instant::now();

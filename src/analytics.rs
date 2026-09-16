@@ -98,10 +98,10 @@ pub(crate) fn write_duplicates_full_json<W: Write>(
         if node.size == 0 || node.size < filter.min_size {
             continue;
         }
-        if let Some(max) = filter.max_size {
-            if node.size > max {
-                continue;
-            }
+        if let Some(max) = filter.max_size
+            && node.size > max
+        {
+            continue;
         }
         if !filter.extensions.is_empty()
             && !filter.extensions.contains(&node.extension.to_lowercase())
@@ -453,7 +453,7 @@ pub(crate) fn age_stats(nodes: &[NodeRecord], scanned_at_ms: u64) -> Vec<AgeBuck
         let bucket = if node.modified_ms == 0 || node.modified_ms > scanned_at_ms {
             5
         } else {
-            let days = ((scanned_at_ms - node.modified_ms) / 86_400_000) as u64;
+            let days = (scanned_at_ms - node.modified_ms) / 86_400_000;
             match days {
                 0..=7 => 0,
                 8..=30 => 1,

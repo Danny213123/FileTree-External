@@ -117,8 +117,12 @@ impl DesktopRuntime {
         let image_available = crate::compress_tools::detect_image().0.found;
         let mut skipped_unavailable = 0usize;
         let mut skipped_ineligible = 0usize;
-        let excluded = request.exclude_paths.iter().filter(|path| !path.trim().is_empty())
-            .map(|path| compression_path_key(path.trim())).collect::<HashSet<_>>();
+        let excluded = request
+            .exclude_paths
+            .iter()
+            .filter(|path| !path.trim().is_empty())
+            .map(|path| compression_path_key(path.trim()))
+            .collect::<HashSet<_>>();
         let needs_dedup = request.scan_directories.len() > 1
             || (!request.scan_directories.is_empty() && !request.paths.is_empty());
         let mut seen = needs_dedup.then(HashSet::<String>::new);
@@ -133,7 +137,9 @@ impl DesktopRuntime {
             indexed_files.push((path, size));
         };
         for path in std::mem::take(&mut request.paths) {
-            if compression_path_is_excluded(&path, &excluded) { continue; }
+            if compression_path_is_excluded(&path, &excluded) {
+                continue;
+            }
             let size = std::fs::metadata(&path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
@@ -184,7 +190,6 @@ impl DesktopRuntime {
         for file in scan_files {
             push_file(file.path, file.size);
         }
-        drop(push_file);
         if indexed_files.is_empty() {
             return Err(
                 if skipped_missing > 0 && skipped_unavailable == 0 && skipped_ineligible == 0 {
@@ -598,7 +603,9 @@ fn compression_path_key(path: &str) -> String {
 fn compression_path_is_excluded(path: &str, excluded: &HashSet<String>) -> bool {
     let mut key = compression_path_key(path);
     loop {
-        if excluded.contains(&key) { return true; }
+        if excluded.contains(&key) {
+            return true;
+        }
         match key.rfind('/') {
             Some(index) => key.truncate(index),
             None => return false,
@@ -612,11 +619,24 @@ mod tests {
 
     #[test]
     fn compression_exclusions_cover_descendants_and_exact_files_only() {
-        let excluded = HashSet::from([compression_path_key("G:\\A\\"), compression_path_key("G:\\B\\keep.txt")]);
-        for path in ["g:/a/file.mp4", "G:/A/AB/deep/file.txt", "G:/A", "g:/b/KEEP.TXT"] {
+        let excluded = HashSet::from([
+            compression_path_key("G:\\A\\"),
+            compression_path_key("G:\\B\\keep.txt"),
+        ]);
+        for path in [
+            "g:/a/file.mp4",
+            "G:/A/AB/deep/file.txt",
+            "G:/A",
+            "g:/b/KEEP.TXT",
+        ] {
             assert!(compression_path_is_excluded(path, &excluded), "{path}");
         }
-        for path in ["G:/AB/file.mp4", "G:/B/keep.txt.zip", "E:/A/file.mp4", "G:/B/other.txt"] {
+        for path in [
+            "G:/AB/file.mp4",
+            "G:/B/keep.txt.zip",
+            "E:/A/file.mp4",
+            "G:/B/other.txt",
+        ] {
             assert!(!compression_path_is_excluded(path, &excluded), "{path}");
         }
     }

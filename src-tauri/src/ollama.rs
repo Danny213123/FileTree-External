@@ -8,8 +8,8 @@ use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::ipc::Channel;
 use tauri::State;
+use tauri::ipc::Channel;
 
 /// Cancellation flags for in-flight chat streams, keyed by client request id.
 #[derive(Default)]
@@ -22,7 +22,10 @@ fn base_url() -> String {
         .ok()
         .filter(|host| !host.trim().is_empty())
         .unwrap_or_else(|| "127.0.0.1:11434".to_string());
-    let host = host.trim().trim_end_matches('/').replace("0.0.0.0", "127.0.0.1");
+    let host = host
+        .trim()
+        .trim_end_matches('/')
+        .replace("0.0.0.0", "127.0.0.1");
     if host.starts_with("http://") || host.starts_with("https://") {
         host
     } else {
@@ -34,9 +37,19 @@ fn describe(error: ureq::Error) -> String {
     match error {
         ureq::Error::Status(code, response) => {
             let detail = response.into_string().unwrap_or_default();
-            format!("Ollama HTTP {code}{}", if detail.is_empty() { String::new() } else { format!(": {detail}") })
+            format!(
+                "Ollama HTTP {code}{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            )
         }
-        other => format!("Could not reach Ollama at {} ({other}). Is Ollama running?", base_url()),
+        other => format!(
+            "Could not reach Ollama at {} ({other}). Is Ollama running?",
+            base_url()
+        ),
     }
 }
 
@@ -56,7 +69,12 @@ pub(crate) async fn ollama_models() -> Result<Vec<String>, String> {
             .map_err(|error| error.to_string())?;
         Ok(body["models"]
             .as_array()
-            .map(|models| models.iter().filter_map(|model| model["name"].as_str().map(str::to_string)).collect())
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(|model| model["name"].as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default())
     })
     .await
@@ -73,14 +91,21 @@ pub(crate) async fn ollama_chat(
 ) -> Result<(), String> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let registry = Arc::clone(requests.inner());
-    registry.0.lock().map_err(|error| error.to_string())?.insert(request_id.clone(), Arc::clone(&cancelled));
+    registry
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(request_id.clone(), Arc::clone(&cancelled));
     let result = tauri::async_runtime::spawn_blocking(move || {
         // No overall deadline: large models can take minutes to load and answer.
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(3))
             .timeout_read(Duration::from_secs(600))
             .build();
-        let response = agent.post(&format!("{}/api/chat", base_url())).send_json(body).map_err(describe)?;
+        let response = agent
+            .post(&format!("{}/api/chat", base_url()))
+            .send_json(body)
+            .map_err(describe)?;
         for line in BufReader::new(response.into_reader()).lines() {
             if cancelled.load(Ordering::Relaxed) {
                 break;
@@ -109,9 +134,9 @@ pub(crate) async fn ollama_chat(
 /// Stop a chat stream started with the same request id.
 #[tauri::command]
 pub(crate) fn ollama_cancel(requests: State<'_, Arc<OllamaRequests>>, request_id: String) {
-    if let Ok(map) = requests.0.lock() {
-        if let Some(flag) = map.get(&request_id) {
-            flag.store(true, Ordering::Relaxed);
-        }
+    if let Ok(map) = requests.0.lock()
+        && let Some(flag) = map.get(&request_id)
+    {
+        flag.store(true, Ordering::Relaxed);
     }
 }

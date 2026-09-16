@@ -39,6 +39,8 @@ pub(crate) fn recycle_path(path: &Path) -> io::Result<()> {
 
     #[repr(C)]
     #[allow(non_snake_case)]
+    // Named after the Win32 struct it mirrors.
+    #[allow(clippy::upper_case_acronyms)]
     struct SHFILEOPSTRUCTW {
         hwnd: *mut std::ffi::c_void,
         wFunc: u32,
@@ -81,11 +83,16 @@ pub(crate) fn recycle_path(path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn recycle_operation_result(ret: i32, aborted: bool) -> io::Result<()> {
     if ret == 0 && aborted {
-        Err(io::Error::new(io::ErrorKind::Interrupted, "Recycle operation was canceled; file was not deleted"))
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Recycle operation was canceled; file was not deleted",
+        ))
     } else if ret == 0 {
         Ok(())
     } else {
-        Err(io::Error::other(format!("Windows Recycle Bin operation failed (Shell code 0x{ret:X})")))
+        Err(io::Error::other(format!(
+            "Windows Recycle Bin operation failed (Shell code 0x{ret:X})"
+        )))
     }
 }
 
@@ -124,7 +131,10 @@ mod tests {
     #[test]
     fn recycle_cancellation_is_not_reported_as_deletion() {
         assert!(recycle_operation_result(0, false).is_ok());
-        assert_eq!(recycle_operation_result(0, true).unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(
+            recycle_operation_result(0, true).unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
         assert!(recycle_operation_result(5, false).is_err());
     }
 }

@@ -774,7 +774,7 @@ fn atomic_write_settings(final_path: &Path, body: &[u8]) -> io::Result<()> {
         file.sync_all()?;
     } // handle dropped (closed) before MoveFileExW rename
 
-    if let Err(error) = fs::rename(&tmp_path, &final_path) {
+    if let Err(error) = fs::rename(&tmp_path, final_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(error);
     }

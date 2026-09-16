@@ -442,6 +442,7 @@ pub(crate) struct HashCandidateProgress {
 /// cache. Returns one `(full_hash, indices_into_files)` entry per duplicate
 /// group plus any per-file errors. When `cache_path` is set, newly-computed
 /// hashes are appended to the on-disk cache incrementally (survives restarts).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn hash_candidate_groups(
     files: &[HashInput],
     confirm_bytes: bool,
@@ -473,6 +474,7 @@ pub(crate) struct FingerprintEntry {
     pub sample: Option<u64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn hash_candidate_groups_with_fingerprints(
     files: &[HashInput],
     confirm_bytes: bool,
@@ -497,10 +499,11 @@ pub(crate) fn hash_candidate_groups_with_fingerprints(
         let guard = cache.lock().expect("hash_cache lock");
         for bucket in &buckets {
             for &i in bucket {
-                if let Some(entry) = guard.get(&files[i].path) {
-                    if entry.size == files[i].size && entry.mtime == files[i].mtime {
-                        full_hash[i] = Some(entry.hash);
-                    }
+                if let Some(entry) = guard.get(&files[i].path)
+                    && entry.size == files[i].size
+                    && entry.mtime == files[i].mtime
+                {
+                    full_hash[i] = Some(entry.hash);
                 }
             }
         }
@@ -534,26 +537,27 @@ pub(crate) fn hash_candidate_groups_with_fingerprints(
         let completed = completed.min(files.len());
         let step = (files.len() / 200).max(1);
         let mut reported = reported_pipeline.lock().expect("candidate progress lock");
-        if stage != reported.1
+        if (stage != reported.1
             || stage_fraction >= 1.0
             || (completed >= files.len() && reported.0 < files.len())
             || reported.2.elapsed() >= std::time::Duration::from_millis(200)
-            || completed.saturating_sub(reported.0) >= step
+            || completed.saturating_sub(reported.0) >= step)
+            && completed >= reported.0
         {
-            if completed >= reported.0 {
-                *reported = (completed, stage, std::time::Instant::now());
-                let total_bytes = hash_bytes_total.load(Ordering::Relaxed);
-                let fraction = if stage == "hashing" && total_bytes > 0 {
-                    (bytes_read.load(Ordering::Relaxed) as f64 / total_bytes as f64).min(1.0)
-                } else { stage_fraction };
-                callback(HashCandidateProgress {
-                    fraction,
-                    stage,
-                    bytes_read: bytes_read.load(Ordering::Relaxed),
-                    completed,
-                    total: files.len(),
-                });
-            }
+            *reported = (completed, stage, std::time::Instant::now());
+            let total_bytes = hash_bytes_total.load(Ordering::Relaxed);
+            let fraction = if stage == "hashing" && total_bytes > 0 {
+                (bytes_read.load(Ordering::Relaxed) as f64 / total_bytes as f64).min(1.0)
+            } else {
+                stage_fraction
+            };
+            callback(HashCandidateProgress {
+                fraction,
+                stage,
+                bytes_read: bytes_read.load(Ordering::Relaxed),
+                completed,
+                total: files.len(),
+            });
         }
     };
 
@@ -1116,7 +1120,7 @@ pub(crate) fn build_candidates_from_nodes(
     nodes
         .iter()
         .filter(|n| !n.is_dir && n.size >= filter.min_size.max(1))
-        .filter(|n| filter.max_size.map_or(true, |max| n.size <= max))
+        .filter(|n| filter.max_size.is_none_or(|max| n.size <= max))
         .filter(|n| {
             filter.extensions.is_empty() || filter.extensions.contains(&n.extension.to_lowercase())
         })
@@ -1126,7 +1130,7 @@ pub(crate) fn build_candidates_from_nodes(
             path: PathBuf::from(node_abs_path(nodes, n.id)),
             name: n.name.clone(),
             size: n.size,
-            modified: (n.modified_ms / 1000) as u64,
+            modified: (n.modified_ms / 1000),
             is_ref: false,
         })
         .collect()
@@ -1799,13 +1803,20 @@ fn recycle_reviewed_with(
 ) -> Vec<String> {
     let _keeper_lock = match lock_keeper_for_action(keeper) {
         Ok(lock) => lock,
-        Err(error) => return vec![format!("{}: could not lock keeper: {error}", keeper.display())],
+        Err(error) => {
+            return vec![format!(
+                "{}: could not lock keeper: {error}",
+                keeper.display()
+            )];
+        }
     };
     recycle(duplicate)
 }
 
 pub(crate) fn action_recycle_reviewed(keeper: &Path, duplicate: &Path) -> Vec<String> {
-    recycle_reviewed_with(keeper, duplicate, |path| action_delete(&[path.to_path_buf()], false))
+    recycle_reviewed_with(keeper, duplicate, |path| {
+        action_delete(&[path.to_path_buf()], false)
+    })
 }
 
 pub(crate) fn action_delete_verified(
@@ -1926,10 +1937,10 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// directory into its own subtree). `dst` usually doesn't exist yet, so its
 /// PARENT is canonicalized and compared against the source.
 fn dest_inside_dir(src_dir: &Path, dst: &Path) -> bool {
-    if let (Ok(s), Some(parent)) = (fs::canonicalize(src_dir), dst.parent()) {
-        if let Ok(p) = fs::canonicalize(parent) {
-            return p == s || p.starts_with(&s);
-        }
+    if let (Ok(s), Some(parent)) = (fs::canonicalize(src_dir), dst.parent())
+        && let Ok(p) = fs::canonicalize(parent)
+    {
+        return p == s || p.starts_with(&s);
     }
     false
 }
@@ -2033,11 +2044,11 @@ pub(crate) fn action_move(src_dst: &[(PathBuf, PathBuf)]) -> Vec<String> {
             ));
             continue;
         }
-        if let Some(parent) = dst.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                errors.push(format!("{}: {}", dst.display(), e));
-                continue;
-            }
+        if let Some(parent) = dst.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            errors.push(format!("{}: {}", dst.display(), e));
+            continue;
         }
         // Keep-both on collision: route to a unique name rather than overwrite.
         let target = if dst.exists() {
@@ -2051,9 +2062,9 @@ pub(crate) fn action_move(src_dst: &[(PathBuf, PathBuf)]) -> Vec<String> {
         let result: io::Result<()> = match fs::rename(src, &target) {
             Ok(_) => Ok(()),
             Err(error) if matches!(error.raw_os_error(), Some(17 | 18)) => {
-                let dest_dir = target.parent().unwrap_or_else(|| target.as_path());
+                let dest_dir = target.parent().unwrap_or(target.as_path());
                 if let Err(message) = crate::preflight::ensure_space_for_copy(src, dest_dir) {
-                    Err(io::Error::new(io::ErrorKind::Other, message))
+                    Err(io::Error::other(message))
                 } else {
                     copy_file_exclusive(src, &target).and_then(|_| {
                         if let Err(remove_error) = fs::remove_file(src) {
@@ -2122,11 +2133,11 @@ pub(crate) fn action_copy(src_dst: &[(PathBuf, PathBuf)]) -> Vec<String> {
             ));
             continue;
         }
-        if let Some(parent) = dst.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                errors.push(format!("{}: {}", dst.display(), e));
-                continue;
-            }
+        if let Some(parent) = dst.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            errors.push(format!("{}: {}", dst.display(), e));
+            continue;
         }
         let target = if dst.exists() {
             unique_dst(dst)
@@ -2135,9 +2146,9 @@ pub(crate) fn action_copy(src_dst: &[(PathBuf, PathBuf)]) -> Vec<String> {
         };
         // Pre-flight the destination's free space before starting the copy
         // (Phase 3) — don't begin a copy we can't finish.
-        let dest_dir = target.parent().unwrap_or_else(|| target.as_path());
+        let dest_dir = target.parent().unwrap_or(target.as_path());
         let result: io::Result<()> = match crate::preflight::ensure_space_for_copy(src, dest_dir) {
-            Err(message) => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Err(message) => Err(io::Error::other(message)),
             Ok(()) => copy_file_exclusive(src, &target).map(|_| ()),
         };
         // Audit the copy (Phase 5).
@@ -2380,7 +2391,7 @@ impl IgnoreList {
     }
 
     pub(crate) fn are_ignored(&self, a: &Path, b: &Path) -> bool {
-        self.pairs.get(a).map_or(false, |s| s.contains(b))
+        self.pairs.get(a).is_some_and(|s| s.contains(b))
     }
 
     pub(crate) fn clear(&mut self) {
@@ -2545,9 +2556,7 @@ pub(crate) fn write_groups_to_json<W: Write>(
                 ),
                 _ => (100, 100, 100),
             };
-            let content_m: u8 = if is_ref {
-                100
-            } else if mode == ScanMode::Exact {
+            let content_m: u8 = if is_ref || mode == ScanMode::Exact {
                 100
             } else {
                 group.score
@@ -3032,7 +3041,10 @@ mod tests {
         );
         assert!(updates.iter().any(|progress| progress.stage == "sampling"));
         for stage in ["fingerprinting", "sampling", "hashing"] {
-            let stage_updates = updates.iter().filter(|progress| progress.stage == stage).collect::<Vec<_>>();
+            let stage_updates = updates
+                .iter()
+                .filter(|progress| progress.stage == stage)
+                .collect::<Vec<_>>();
             assert_eq!(stage_updates.first().unwrap().fraction, 0.0);
             assert_eq!(stage_updates.last().unwrap().fraction, 1.0);
         }

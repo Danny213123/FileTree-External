@@ -21,10 +21,10 @@ use tauri::ipc::Channel;
 use tauri::window::{ProgressBarState, ProgressBarStatus};
 use tauri::{AppHandle, Manager, State};
 
-mod terminal;
 mod cyberdrop;
 mod fileops;
 mod ollama;
+mod terminal;
 
 struct FsWatchRegistry {
     next_id: AtomicU64,
@@ -95,12 +95,18 @@ struct DuplicateFileIdentity {
 
 impl DuplicateMemberSnapshot {
     fn matches_current(&self, current: &Self) -> bool {
-        if self.size != current.size { return false; }
+        if self.size != current.size {
+            return false;
+        }
         match (&self.identity, &current.identity) {
-            (Some(expected), Some(actual)) => self.modified_ns == current.modified_ns
-                && expected.identity_key == actual.identity_key
-                && expected.file_identity == actual.file_identity,
-            (None, Some(_)) => self.modified_ns / 1_000_000_000 == current.modified_ns / 1_000_000_000,
+            (Some(expected), Some(actual)) => {
+                self.modified_ns == current.modified_ns
+                    && expected.identity_key == actual.identity_key
+                    && expected.file_identity == actual.file_identity
+            }
+            (None, Some(_)) => {
+                self.modified_ns / 1_000_000_000 == current.modified_ns / 1_000_000_000
+            }
             _ => false,
         }
     }
@@ -714,7 +720,9 @@ fn browse_directory_entries(path: &Path) -> Result<Vec<BrowseDirectoryEntry>, St
             continue;
         };
         let is_dir = if file_type.is_symlink() {
-            fs::metadata(&entry_path).map(|meta| meta.is_dir()).unwrap_or(false)
+            fs::metadata(&entry_path)
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false)
         } else {
             file_type.is_dir()
         };
@@ -998,34 +1006,66 @@ mod desktop_tests {
 
     #[test]
     fn duplicate_review_reports_attempted_files_and_honors_cancellation() {
-        use super::{prepare_duplicate_review, DuplicateScanResult};
+        use super::{DuplicateScanResult, prepare_duplicate_review};
         use std::sync::{Mutex, atomic::AtomicBool};
         use std::time::{SystemTime, UNIX_EPOCH};
-        let root = std::env::temp_dir().join(format!("filetree_review_progress_{}_{}",
-            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "filetree_review_progress_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir(&root).unwrap();
         let file = root.join("present.bin");
         fs::write(&file, b"test").unwrap();
         let result = DuplicateScanResult {
             groups: vec![filetree_core::v2::DuplicateGroup {
-                files: [file.clone(), root.join("missing.bin")].into_iter().map(|path| filetree_core::v2::DuplicateFile {
-                    name: path.file_name().unwrap().to_string_lossy().into_owned(),
-                    path: path.to_string_lossy().into_owned(), size: 4, modified: 0,
-                }).collect(), waste: 4,
-            }], errors: Vec::new(), scanned: 2, hashing: 0, cancelled: false,
+                files: [file.clone(), root.join("missing.bin")]
+                    .into_iter()
+                    .map(|path| filetree_core::v2::DuplicateFile {
+                        name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                        path: path.to_string_lossy().into_owned(),
+                        size: 4,
+                        modified: 0,
+                    })
+                    .collect(),
+                waste: 4,
+            }],
+            errors: Vec::new(),
+            scanned: 2,
+            hashing: 0,
+            cancelled: false,
         };
-        let mut review = DuplicateReviewState { authorized_roots: vec![fs::canonicalize(&root).unwrap()], ..Default::default() };
+        let mut review = DuplicateReviewState {
+            authorized_roots: vec![fs::canonicalize(&root).unwrap()],
+            ..Default::default()
+        };
         let updates = Mutex::new(Vec::new());
-        prepare_duplicate_review(&result, &mut review, &AtomicBool::new(false), |event| updates.lock().unwrap().push(event));
+        prepare_duplicate_review(&result, &mut review, &AtomicBool::new(false), |event| {
+            updates.lock().unwrap().push(event)
+        });
         let updates = updates.into_inner().unwrap();
         assert_eq!(updates.first().unwrap().fraction, Some(0.0));
         assert_eq!(updates.last().unwrap().fraction, Some(1.0));
         assert_eq!(updates.last().unwrap().hashed, 2);
-        assert!(updates.iter().all(|event| event.phase == "reviewing" && event.bytes_read == 0));
+        assert!(
+            updates
+                .iter()
+                .all(|event| event.phase == "reviewing" && event.bytes_read == 0)
+        );
         assert_eq!(review.members.len(), 2);
-        assert!(review.members.values().all(|member| member.identity.is_none()));
+        assert!(
+            review
+                .members
+                .values()
+                .all(|member| member.identity.is_none())
+        );
         let mut canceled = DuplicateReviewState::default();
-        prepare_duplicate_review(&result, &mut canceled, &AtomicBool::new(true), |event| assert_eq!(event.hashed, 0));
+        prepare_duplicate_review(&result, &mut canceled, &AtomicBool::new(true), |event| {
+            assert_eq!(event.hashed, 0)
+        });
         assert!(canceled.members.is_empty());
         fs::remove_file(file).unwrap();
         fs::remove_dir(root).unwrap();
@@ -1033,30 +1073,55 @@ mod desktop_tests {
 
     #[test]
     fn duplicate_review_registers_large_index_without_disk_access() {
-        use super::{prepare_duplicate_review, DuplicateScanResult};
+        use super::{DuplicateScanResult, prepare_duplicate_review};
         use std::sync::atomic::AtomicBool;
         let root = std::env::temp_dir().join("filetree_nonexistent_index_fixture");
         let result = DuplicateScanResult {
             groups: vec![filetree_core::v2::DuplicateGroup {
-                files: (0..100_000).map(|index| filetree_core::v2::DuplicateFile {
-                    name: format!("{index}.bin"),
-                    path: root.join(format!("{index}.bin")).to_string_lossy().into_owned(),
-                    size: 4096, modified: 0,
-                }).collect(), waste: 0,
-            }], errors: Vec::new(), scanned: 100_000, hashing: 0, cancelled: false,
+                files: (0..100_000)
+                    .map(|index| filetree_core::v2::DuplicateFile {
+                        name: format!("{index}.bin"),
+                        path: root
+                            .join(format!("{index}.bin"))
+                            .to_string_lossy()
+                            .into_owned(),
+                        size: 4096,
+                        modified: 0,
+                    })
+                    .collect(),
+                waste: 0,
+            }],
+            errors: Vec::new(),
+            scanned: 100_000,
+            hashing: 0,
+            cancelled: false,
         };
         let mut review = DuplicateReviewState::default();
         let started = std::time::Instant::now();
         prepare_duplicate_review(&result, &mut review, &AtomicBool::new(false), |_| {});
-        eprintln!("Registered 100,000 indexed matches in {:?}", started.elapsed());
+        eprintln!(
+            "Registered 100,000 indexed matches in {:?}",
+            started.elapsed()
+        );
         assert_eq!(review.members.len(), 100_000);
-        assert!(review.members.values().all(|member| member.identity.is_none()));
+        assert!(
+            review
+                .members
+                .values()
+                .all(|member| member.identity.is_none())
+        );
     }
 
     #[test]
     fn duplicate_review_deferred_identity_rejects_changed_files() {
-        let root = std::env::temp_dir().join(format!("filetree_deferred_review_{}_{}",
-            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "filetree_deferred_review_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir(&root).unwrap();
         let first = root.join("first.bin");
         let keeper = root.join("keeper.bin");
@@ -1067,36 +1132,62 @@ mod desktop_tests {
             let mut indexed = duplicate_member_snapshot(path, 0).unwrap();
             indexed.identity = None;
             indexed.modified_ns = indexed.modified_ns / 1_000_000_000 * 1_000_000_000;
-            members.insert(normalized_review_path(&path.to_string_lossy()).unwrap(), indexed);
+            members.insert(
+                normalized_review_path(&path.to_string_lossy()).unwrap(),
+                indexed,
+            );
         }
         let active = members.keys().cloned().collect();
         let review = DuplicateReviewState {
-            token: Some("indexed".into()), members,
+            token: Some("indexed".into()),
+            members,
             active_by_group: HashMap::from([(0, active)]),
             authorized_roots: vec![fs::canonicalize(&root).unwrap()],
             ..Default::default()
         };
         let items = vec![DuplicateActionItem {
-            path: first.to_string_lossy().into_owned(), keeper: keeper.to_string_lossy().into_owned(),
+            path: first.to_string_lossy().into_owned(),
+            keeper: keeper.to_string_lossy().into_owned(),
         }];
         let plan = validate_duplicate_plan_and_reserve(&review, "indexed", &items).unwrap();
-        assert_eq!(plan[0].canonical_path, fs::canonicalize(&first).unwrap().to_string_lossy());
+        assert_eq!(
+            plan[0].canonical_path,
+            fs::canonicalize(&first).unwrap().to_string_lossy()
+        );
         let missing = root.join("missing.bin").to_string_lossy().into_owned();
         let mixed = vec![
-            DuplicateActionItem { path: missing, keeper: keeper.to_string_lossy().into_owned() },
-            DuplicateActionItem { path: first.to_string_lossy().into_owned(), keeper: keeper.to_string_lossy().into_owned() },
+            DuplicateActionItem {
+                path: missing,
+                keeper: keeper.to_string_lossy().into_owned(),
+            },
+            DuplicateActionItem {
+                path: first.to_string_lossy().into_owned(),
+                keeper: keeper.to_string_lossy().into_owned(),
+            },
         ];
-        let (accepted, errors) = super::prepare_duplicate_action_batch(&review, "indexed", &mixed).unwrap();
+        let (accepted, errors) =
+            super::prepare_duplicate_action_batch(&review, "indexed", &mixed).unwrap();
         assert_eq!(accepted.len(), 1);
         assert_eq!(errors.len(), 1);
         assert!(first.exists());
         let both_selected = vec![
-            DuplicateActionItem { path: first.to_string_lossy().into_owned(), keeper: keeper.to_string_lossy().into_owned() },
-            DuplicateActionItem { path: keeper.to_string_lossy().into_owned(), keeper: first.to_string_lossy().into_owned() },
+            DuplicateActionItem {
+                path: first.to_string_lossy().into_owned(),
+                keeper: keeper.to_string_lossy().into_owned(),
+            },
+            DuplicateActionItem {
+                path: keeper.to_string_lossy().into_owned(),
+                keeper: first.to_string_lossy().into_owned(),
+            },
         ];
         assert!(super::prepare_duplicate_action_batch(&review, "indexed", &both_selected).is_err());
         fs::write(&first, b"changed size").unwrap();
-        assert!(validate_duplicate_plan_and_reserve(&review, "indexed", &items).err().unwrap().contains("identity changed"));
+        assert!(
+            validate_duplicate_plan_and_reserve(&review, "indexed", &items)
+                .err()
+                .unwrap()
+                .contains("identity changed")
+        );
         fs::remove_file(&first).unwrap();
         fs::remove_file(&keeper).unwrap();
         fs::remove_dir(&root).unwrap();
@@ -1212,9 +1303,13 @@ async fn scan_start(
     on_progress: Channel<ScanProgress>,
 ) -> Result<ScanHandle, String> {
     let store = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || store.start_scan(request, move |event| {
-        let _ = on_progress.send(event);
-    })).await.map_err(|error| format!("Scan startup worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        store.start_scan(request, move |event| {
+            let _ = on_progress.send(event);
+        })
+    })
+    .await
+    .map_err(|error| format!("Scan startup worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1225,7 +1320,9 @@ fn scan_cancel(state: State<'_, Arc<V2Store>>, scan_id: String) -> bool {
 #[tauri::command]
 async fn scan_status(app: AppHandle, scan_id: String) -> Option<ScanHandle> {
     let store = Arc::clone(&*app.state::<Arc<V2Store>>());
-    tauri::async_runtime::spawn_blocking(move || store.scan_status(&scan_id)).await.unwrap_or(None)
+    tauri::async_runtime::spawn_blocking(move || store.scan_status(&scan_id))
+        .await
+        .unwrap_or(None)
 }
 
 #[tauri::command]
@@ -1485,12 +1582,23 @@ fn prepare_duplicate_review(
     cancel: &AtomicBool,
     on_progress: impl Fn(DuplicateProgress),
 ) {
-    let total = result.groups.iter().map(|group| group.files.len() as u64).sum::<u64>();
+    let total = result
+        .groups
+        .iter()
+        .map(|group| group.files.len() as u64)
+        .sum::<u64>();
     let report = |completed: u64| {
         on_progress(DuplicateProgress {
-            phase: "reviewing".into(), scanned: result.scanned,
-            hashing: total, hashed: completed, bytes_read: 0,
-            fraction: Some(if total == 0 { 1.0 } else { completed as f64 / total as f64 }),
+            phase: "reviewing".into(),
+            scanned: result.scanned,
+            hashing: total,
+            hashed: completed,
+            bytes_read: 0,
+            fraction: Some(if total == 0 {
+                1.0
+            } else {
+                completed as f64 / total as f64
+            }),
         });
     };
     report(0);
@@ -1499,16 +1607,23 @@ fn prepare_duplicate_review(
     'groups: for (group_index, group) in result.groups.iter().enumerate() {
         let group_id = group_index as u64;
         for file in &group.files {
-            if cancel.load(Ordering::Relaxed) { break 'groups; }
+            if cancel.load(Ordering::Relaxed) {
+                break 'groups;
+            }
             // Register the index result without opening or stat-ing any file.
             // Selected files and keepers are resolved and checked at action time.
             if let Ok(path_key) = normalized_review_path(&file.path) {
                 let snapshot = DuplicateMemberSnapshot {
-                    group_id, size: file.size,
+                    group_id,
+                    size: file.size,
                     modified_ns: file.modified as u128 * 1_000_000_000,
                     identity: None,
                 };
-                review.active_by_group.entry(group_id).or_default().insert(path_key.clone());
+                review
+                    .active_by_group
+                    .entry(group_id)
+                    .or_default()
+                    .insert(path_key.clone());
                 review.members.insert(path_key, snapshot);
             }
             completed += 1;
@@ -1620,7 +1735,9 @@ async fn duplicates_scan(
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         store.find_exact_duplicates(request, worker_cancel, move |event| {
             // Discovery completion is followed by desktop review preparation.
-            if event.phase != "done" { let _ = scan_progress.send(event); }
+            if event.phase != "done" {
+                let _ = scan_progress.send(event);
+            }
         })
     })
     .await
@@ -1658,7 +1775,9 @@ async fn duplicates_scan(
             let _ = on_progress.send(event);
         });
         (result, review)
-    }).await.map_err(|error| format!("Duplicate review worker failed: {error}"))?;
+    })
+    .await
+    .map_err(|error| format!("Duplicate review worker failed: {error}"))?;
     result = result_after_review;
     let review = prepared_review;
     let mut active = registry
@@ -1842,18 +1961,21 @@ fn validate_duplicate_plan_and_reserve(
             ));
         }
         let current_path = duplicate_member_snapshot(Path::new(&item.path), path_member.group_id)?;
-        if !path_member.matches_current(&current_path)
-        {
+        if !path_member.matches_current(&current_path) {
             return Err(format!(
                 "{}: file identity changed since the duplicate scan",
                 item.path
             ));
         }
-        let canonical = &current_path.identity.as_ref().expect("resolved action identity").canonical_path;
+        let canonical = &current_path
+            .identity
+            .as_ref()
+            .expect("resolved action identity")
+            .canonical_path;
         if !review
             .authorized_roots
             .iter()
-            .any(|root| review_path_is_within(&canonical, root))
+            .any(|root| review_path_is_within(canonical, root))
         {
             return Err(format!(
                 "{}: file resolves outside the authorized scan locations",
@@ -1862,18 +1984,21 @@ fn validate_duplicate_plan_and_reserve(
         }
         let current_keeper =
             duplicate_member_snapshot(Path::new(&item.keeper), keeper_member.group_id)?;
-        if !keeper_member.matches_current(&current_keeper)
-        {
+        if !keeper_member.matches_current(&current_keeper) {
             return Err(format!(
                 "{}: keeper identity changed since the duplicate scan",
                 item.keeper
             ));
         }
-        let canonical_keeper = &current_keeper.identity.as_ref().expect("resolved keeper identity").canonical_path;
+        let canonical_keeper = &current_keeper
+            .identity
+            .as_ref()
+            .expect("resolved keeper identity")
+            .canonical_path;
         if !review
             .authorized_roots
             .iter()
-            .any(|root| review_path_is_within(&canonical_keeper, root))
+            .any(|root| review_path_is_within(canonical_keeper, root))
         {
             return Err(format!(
                 "{}: keeper resolves outside the authorized scan locations",
@@ -1918,7 +2043,9 @@ fn prepare_duplicate_action_batch(
     token: &str,
     items: &[DuplicateActionItem],
 ) -> Result<(Vec<DuplicatePlanReservation>, Vec<String>), String> {
-    let selected = items.iter().map(|item| normalized_review_path(&item.path))
+    let selected = items
+        .iter()
+        .map(|item| normalized_review_path(&item.path))
         .collect::<Result<HashSet<_>, _>>()?;
     if selected.len() != items.len() {
         return Err("Duplicate action plan contains the same file more than once".into());
@@ -1992,12 +2119,25 @@ async fn duplicates_action(
         }
         // Validation runs before any file changes. Report a normal failed action,
         // rather than an IPC rejection that makes the client retire the review.
-        let (reservations, preflight_errors) = match prepare_duplicate_action_batch(&review, &review_token, &items) {
-            Ok(prepared) => prepared,
-            Err(error) => return Ok(DuplicateActionResponse { ok: false, errors: vec![error], succeeded: Vec::new(), missing }),
-        };
+        let (reservations, preflight_errors) =
+            match prepare_duplicate_action_batch(&review, &review_token, &items) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return Ok(DuplicateActionResponse {
+                        ok: false,
+                        errors: vec![error],
+                        succeeded: Vec::new(),
+                        missing,
+                    });
+                }
+            };
         if reservations.is_empty() {
-            return Ok(DuplicateActionResponse { ok: preflight_errors.is_empty(), errors: preflight_errors, succeeded: Vec::new(), missing });
+            return Ok(DuplicateActionResponse {
+                ok: preflight_errors.is_empty(),
+                errors: preflight_errors,
+                succeeded: Vec::new(),
+                missing,
+            });
         }
         let mut destination_for_worker = destination.clone();
         if matches!(action.as_str(), "move" | "copy") {
@@ -2030,7 +2170,12 @@ async fn duplicates_action(
             .map(|path| normalized_review_path(path))
             .collect::<Result<HashSet<_>, _>>()?;
         review.in_flight.extend(locked_paths.iter().cloned());
-        (reservations, locked_paths, destination_for_worker, preflight_errors)
+        (
+            reservations,
+            locked_paths,
+            destination_for_worker,
+            preflight_errors,
+        )
     };
     let action_for_worker = action.clone();
     let worker_items = reservations
@@ -2048,8 +2193,9 @@ async fn duplicates_action(
         let mut succeeded = Vec::new();
         for (keeper, path, requested_path) in worker_items {
             let item_errors = match action_for_worker.as_str() {
-                "delete" if !permanent.unwrap_or(false) =>
-                    filetree_core::recycle_reviewed_duplicate(keeper, path),
+                "delete" if !permanent.unwrap_or(false) => {
+                    filetree_core::recycle_reviewed_duplicate(keeper, path)
+                }
                 "delete" => filetree_core::delete_verified_duplicate(
                     keeper,
                     path,
@@ -2211,7 +2357,9 @@ fn scan_pin(state: State<'_, Arc<V2Store>>, scan_id: String, pinned: bool) -> Re
 #[tauri::command]
 async fn memory_stats(state: State<'_, Arc<V2Store>>) -> Result<MemoryStats, String> {
     let store = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || store.memory_stats()).await.map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || store.memory_stats())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn json_value(text: String) -> Result<Value, String> {
@@ -2238,12 +2386,16 @@ fn app_config() -> Result<Value, String> {
 
 #[tauri::command]
 async fn drives() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(|| json_value(filetree_core::drives_json())).await.map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(|| json_value(filetree_core::drives_json()))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
 async fn special_folders() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(|| json_value(filetree_core::special_folders_json())).await.map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(|| json_value(filetree_core::special_folders_json()))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2251,24 +2403,30 @@ async fn volume_info(path: String) -> Result<Value, String> {
     // Querying a volume can stall for seconds on a disconnected network share,
     // and a tab footer polls this on a timer. Keep it off the command thread so
     // an unreachable drive can never freeze the window.
-    tauri::async_runtime::spawn_blocking(move || {
-        json_value(filetree_core::volume_info_json(&path))
-    })
-    .await
-    .map_err(|error| format!("Volume query worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || json_value(filetree_core::volume_info_json(&path)))
+        .await
+        .map_err(|error| format!("Volume query worker failed: {error}"))?
 }
 
 #[tauri::command]
 async fn app_settings_get(state: State<'_, Arc<V2Store>>) -> Result<Value, String> {
     let store = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || json_value(store.load_json_setting("app.settings", "{}")?)).await.map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        json_value(store.load_json_setting("app.settings", "{}")?)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
 async fn app_settings_set(state: State<'_, Arc<V2Store>>, settings: Value) -> Result<(), String> {
     let text = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
     let store = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || store.save_json_setting("app.settings", &text, SETTINGS_JSON_MAX_BYTES)).await.map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        store.save_json_setting("app.settings", &text, SETTINGS_JSON_MAX_BYTES)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2409,7 +2567,9 @@ async fn native_move_items(
     let owner_handle = owner.0 as isize;
     let result = tauri::async_runtime::spawn_blocking(move || {
         filetree_core::move_items_with_windows(paths, destination, owner_handle)
-    }).await.map_err(|error| format!("Windows move worker failed: {error}"))??;
+    })
+    .await
+    .map_err(|error| format!("Windows move worker failed: {error}"))??;
     Ok(NativeMoveResponse {
         aborted: result.aborted,
         moved: result.moved,
@@ -2520,7 +2680,11 @@ fn claim_external_paths(
     require_existing_copy_sources(&paths)?;
     // Explorer semantics: a drop on the same drive moves, otherwise it copies.
     // The client picks the mode; the grant only covers the paths actually dropped.
-    let kind = if mode.as_deref() == Some("move") { ExternalTransferKind::Move } else { ExternalTransferKind::Copy };
+    let kind = if mode.as_deref() == Some("move") {
+        ExternalTransferKind::Move
+    } else {
+        ExternalTransferKind::Copy
+    };
     grants
         .claim_native_drop(&paths, kind)
         .ok_or_else(|| "The dropped-file authorization expired; drop the items again".to_string())
@@ -3055,7 +3219,9 @@ pub fn run() {
             _ => {}
         }
         if matches!(event, tauri::RunEvent::Exit) {
-            app_handle.state::<Arc<cyberdrop::CyberdropState>>().shutdown();
+            app_handle
+                .state::<Arc<cyberdrop::CyberdropState>>()
+                .shutdown();
             filetree_core::set_keep_awake(false);
             app_handle.state::<Arc<DesktopRuntime>>().shutdown();
             app_handle

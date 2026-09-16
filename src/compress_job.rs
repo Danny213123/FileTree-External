@@ -315,10 +315,13 @@ pub(crate) struct CompressJob {
     pub(crate) manifest_path: PathBuf,
 }
 
+/// Callback the desktop runtime installs so live views refresh a touched path.
+pub(crate) type PathChangedHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
 #[derive(Default)]
 pub(crate) struct CompressionRuntimeState {
     pub(crate) jobs: Mutex<HashMap<String, Arc<CompressJob>>>,
-    pub(crate) path_changed: Mutex<Option<Arc<dyn Fn(&Path) + Send + Sync>>>,
+    pub(crate) path_changed: Mutex<Option<PathChangedHook>>,
 }
 
 impl std::fmt::Debug for CompressionRuntimeState {
@@ -1324,7 +1327,11 @@ pub(crate) fn cancel_job(job: &CompressJob) {
 /// runner slot atomically so a concurrent spawn cannot race this finalization.
 pub(crate) fn cancel_or_finalize_job(job: &Arc<CompressJob>) {
     cancel_job(job);
-    if job.runner_started.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+    if job
+        .runner_started
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
         force_finalize_job(job);
     }
 }
@@ -1668,10 +1675,10 @@ pub(crate) fn start_queue_scheduler(state: Arc<CompressionRuntimeState>) {
                         .map(Arc::clone)
                 }
             };
-            if let Some(job) = next {
-                if matches!(resume_job_from(&job, true), Ok(true)) {
-                    spawn_job(Arc::clone(&state), job);
-                }
+            if let Some(job) = next
+                && matches!(resume_job_from(&job, true), Ok(true))
+            {
+                spawn_job(Arc::clone(&state), job);
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
@@ -2217,6 +2224,7 @@ fn record_internal_error_guarded(job: &Arc<CompressJob>, i: usize, counts: &Coun
 /// Process one file and record its outcome (FileState, CSV row, debug log, live
 /// event, manifest checkpoint). Runs on a pool worker thread. Returns `true` when
 /// the worker should stop (the job was cancelled mid-file).
+#[allow(clippy::too_many_arguments)]
 fn process_and_record(
     state: &Arc<CompressionRuntimeState>,
     job: &Arc<CompressJob>,
@@ -3002,6 +3010,7 @@ fn source_modified_ms(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_file(
     state: &Arc<CompressionRuntimeState>,
     job: &Arc<CompressJob>,
@@ -3041,10 +3050,12 @@ fn process_file(
             .map(|metadata| metadata.len())
             .unwrap_or_else(|_| job.files[index].orig_bytes.load(Ordering::Relaxed));
         job.files[index].orig_bytes.store(orig, Ordering::Relaxed);
-        let mut meta = EncodeMeta::default();
-        meta.tool = "filename preflight".to_string();
-        meta.tool_version = "v1".to_string();
-        meta.codec_params = "pre-skip: filename contains [COMPRESSED]".to_string();
+        let meta = EncodeMeta {
+            tool: "filename preflight".to_string(),
+            tool_version: "v1".to_string(),
+            codec_params: "pre-skip: filename contains [COMPRESSED]".to_string(),
+            ..Default::default()
+        };
         return FileOutcome::Skipped {
             reason: Reason::SkippedAlreadyCompressed,
             new_bytes: orig,
@@ -3090,10 +3101,12 @@ fn process_file(
     // encoder/archive work so a multi-gigabyte `.mp4.part` cannot waste minutes
     // and then fail at an archive boundary.
     if is_incomplete_download(&input) {
-        let mut meta = EncodeMeta::default();
-        meta.tool = "filename preflight".to_string();
-        meta.tool_version = "v1".to_string();
-        meta.codec_params = "pre-skip: incomplete download suffix".to_string();
+        let meta = EncodeMeta {
+            tool: "filename preflight".to_string(),
+            tool_version: "v1".to_string(),
+            codec_params: "pre-skip: incomplete download suffix".to_string(),
+            ..Default::default()
+        };
         return FileOutcome::Skipped {
             reason: Reason::SkippedIncomplete,
             new_bytes: orig,
@@ -3112,15 +3125,17 @@ fn process_file(
     // as a terminal `skipped` (SkippedTooSmall) so it flows into the same skipped
     // bucket the post==pre count reconciliation relies on.
     if job.min_size_bytes > 0 && orig < job.min_size_bytes {
-        let mut meta = EncodeMeta::default();
-        meta.tool = match kind {
-            FileKind::Video => "handbrake",
-            FileKind::Image => "ffmpeg",
-            FileKind::Other => "zip",
-        }
-        .to_string();
-        meta.tool_version = "pre-skip".to_string();
-        meta.codec_params = format!("pre-skip: below min size ({orig} < {})", job.min_size_bytes);
+        let meta = EncodeMeta {
+            tool: match kind {
+                FileKind::Video => "handbrake",
+                FileKind::Image => "ffmpeg",
+                FileKind::Other => "zip",
+            }
+            .to_string(),
+            tool_version: "pre-skip".to_string(),
+            codec_params: format!("pre-skip: below min size ({orig} < {})", job.min_size_bytes),
+            ..Default::default()
+        };
         return FileOutcome::Skipped {
             reason: Reason::SkippedTooSmall,
             new_bytes: orig,
@@ -3134,10 +3149,12 @@ fn process_file(
     }
 
     if crate::compress_log::was_unchanged_no_gain(&input_str, orig, source_modified) {
-        let mut meta = EncodeMeta::default();
-        meta.tool = "no-gain cache".to_string();
-        meta.tool_version = "v1".to_string();
-        meta.codec_params = "pre-skip: unchanged source previously produced no savings".to_string();
+        let meta = EncodeMeta {
+            tool: "no-gain cache".to_string(),
+            tool_version: "v1".to_string(),
+            codec_params: "pre-skip: unchanged source previously produced no savings".to_string(),
+            ..Default::default()
+        };
         return FileOutcome::Skipped {
             reason: Reason::SkippedPriorNoGain,
             new_bytes: orig,
@@ -3154,10 +3171,12 @@ fn process_file(
     // entropy-coded (zip/7z/jpg/mp4/office…) won't shrink under Deflate, so skip
     // spawning the zip work entirely and record it as a no-gain skip.
     if kind == FileKind::Other && is_already_compressed_ext(&input) {
-        let mut meta = EncodeMeta::default();
-        meta.tool = "zip".to_string();
-        meta.codec_params = "store (pre-skip: already compressed)".to_string();
-        meta.tool_version = "built-in".to_string();
+        let meta = EncodeMeta {
+            tool: "zip".to_string(),
+            codec_params: "store (pre-skip: already compressed)".to_string(),
+            tool_version: "built-in".to_string(),
+            ..Default::default()
+        };
         return FileOutcome::Skipped {
             reason: Reason::SkippedNoGain,
             new_bytes: orig,
@@ -3176,15 +3195,17 @@ fn process_file(
     // isn't worth it. Recorded as a no-gain skip (same outcome the post-encode
     // size check would produce) but without the wasted encode.
     if let Some(reason) = media_pre_skip(kind, &input, orig) {
-        let mut meta = EncodeMeta::default();
-        meta.tool = if kind == FileKind::Video {
-            "handbrake"
-        } else {
-            "ffmpeg"
-        }
-        .to_string();
-        meta.tool_version = "pre-skip".to_string();
-        meta.codec_params = format!("pre-skip: {reason}");
+        let meta = EncodeMeta {
+            tool: if kind == FileKind::Video {
+                "handbrake"
+            } else {
+                "ffmpeg"
+            }
+            .to_string(),
+            tool_version: "pre-skip".to_string(),
+            codec_params: format!("pre-skip: {reason}"),
+            ..Default::default()
+        };
         return FileOutcome::Skipped {
             reason: Reason::SkippedNoGain,
             new_bytes: orig,
@@ -3812,15 +3833,14 @@ fn verify_media(
             if let (Some(od), Some(nd)) = (
                 probe_duration_secs(job, index, ffmpeg, orig),
                 probe_duration_secs(job, index, ffmpeg, out),
-            ) {
-                if od > 0.5 {
-                    let diff = (od - nd).abs();
-                    let tol = (od * 0.05).max(2.0);
-                    if diff > tol {
-                        return Verify::Failed(format!(
-                            "output duration {nd:.1}s differs from original {od:.1}s beyond tolerance ({tol:.1}s)"
-                        ));
-                    }
+            ) && od > 0.5
+            {
+                let diff = (od - nd).abs();
+                let tol = (od * 0.05).max(2.0);
+                if diff > tol {
+                    return Verify::Failed(format!(
+                        "output duration {nd:.1}s differs from original {od:.1}s beyond tolerance ({tol:.1}s)"
+                    ));
                 }
             }
             return Verify::Ok;
@@ -3899,13 +3919,12 @@ fn verify_image(
             if let (Some(o), Some(n)) = (
                 ffmpeg_image_dims(job, index, ffmpeg, orig),
                 ffmpeg_image_dims(job, index, ffmpeg, out),
-            ) {
-                if o != n {
-                    return Verify::Failed(format!(
-                        "output dimensions {}x{} != original {}x{}",
-                        n.0, n.1, o.0, o.1
-                    ));
-                }
+            ) && o != n
+            {
+                return Verify::Failed(format!(
+                    "output dimensions {}x{} != original {}x{}",
+                    n.0, n.1, o.0, o.1
+                ));
             }
             return Verify::Ok;
         }
@@ -4009,13 +4028,14 @@ fn parse_stream_dims(s: &str) -> Option<(u64, u64)> {
         if !line.contains("Video:") {
             continue;
         }
-        for tok in line.split(|c: char| c == ' ' || c == ',' || c == '[' || c == '(') {
+        for tok in line.split([' ', ',', '[', '(']) {
             if let Some((w, h)) = tok.split_once('x') {
                 let h_digits: String = h.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let (Ok(w), Ok(h)) = (w.parse::<u64>(), h_digits.parse::<u64>()) {
-                    if w > 0 && h > 0 {
-                        return Some((w, h));
-                    }
+                if let (Ok(w), Ok(h)) = (w.parse::<u64>(), h_digits.parse::<u64>())
+                    && w > 0
+                    && h > 0
+                {
+                    return Some((w, h));
                 }
             }
         }
@@ -4105,11 +4125,18 @@ fn encoder_error_message(diag: &EncodeDiag) -> String {
 fn preserve_compression_dates(input: &Path, output: &Path) -> io::Result<()> {
     let meta = std::fs::metadata(input)?;
     let millis = |time: std::time::SystemTime| -> io::Result<i64> {
-        let ms = time.duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?.as_millis();
+        let ms = time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .as_millis();
         Ok(ms.min(i64::MAX as u128) as i64)
     };
-    crate::fileattr::set_times(output, Some(millis(meta.created()?)?), Some(millis(meta.modified()?)?), None)
+    crate::fileattr::set_times(
+        output,
+        Some(millis(meta.created()?)?),
+        Some(millis(meta.modified()?)?),
+        None,
+    )
 }
 
 /// Output path beside the original: `name [COMPRESSED].ext` (zip → `.zip`).
@@ -4209,6 +4236,7 @@ enum EncodeResult {
 /// lane, and run HandBrake. A hardware failure is terminal for this file; the
 /// partial output is removed and the original remains untouched. Software video
 /// encoding is never attempted.
+#[allow(clippy::too_many_arguments)]
 fn run_video(
     job: &Arc<CompressJob>,
     index: usize,
@@ -4316,6 +4344,7 @@ fn build_handbrake_args(
 /// (RF/CQ/ICQ) + optional downscale + `--encoder-preset`; progress + fps are
 /// parsed from the encoder output. Acquires the encoder's global-budget lane for
 /// the duration of the encode (released on return). There is no software retry.
+#[allow(clippy::too_many_arguments)]
 fn run_handbrake(
     job: &Arc<CompressJob>,
     index: usize,
@@ -6131,14 +6160,17 @@ fn summary_from_live(job: &CompressJob) -> JobSummary {
     }
 }
 
+/// Manifest path → (modified, length, summary), so an unchanged manifest is parsed once.
+type SummaryCache = Mutex<HashMap<PathBuf, (u64, u64, JobSummary)>>;
+
 fn summary_from_manifest(id: &str, path: &Path) -> Option<JobSummary> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (u64, u64, JobSummary)>>> = OnceLock::new();
+    static CACHE: OnceLock<SummaryCache> = OnceLock::new();
     let signature = manifest_signature(path);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some((modified, length, summary)) = cache.lock_recover().get(path) {
-        if (*modified, *length) == signature {
-            return Some(summary.clone());
-        }
+    if let Some((modified, length, summary)) = cache.lock_recover().get(path)
+        && (*modified, *length) == signature
+    {
+        return Some(summary.clone());
     }
     if let Some(summary) = load_summary_sidecar(id, path, signature) {
         cache.lock_recover().insert(
@@ -6399,10 +6431,11 @@ pub(crate) fn compress_telemetry_json(
 ) -> String {
     static CACHE: Mutex<Option<(u64, String, String)>> = Mutex::new(None);
     let now = crate::io::now_ms();
-    if let Some((sampled, id, json)) = CACHE.lock_recover().as_ref() {
-        if *id == selected_id && now.saturating_sub(*sampled) < 1_000 {
-            return json.clone();
-        }
+    if let Some((sampled, id, json)) = CACHE.lock_recover().as_ref()
+        && *id == selected_id
+        && now.saturating_sub(*sampled) < 1_000
+    {
+        return json.clone();
     }
 
     let selected = state.jobs.lock_recover().get(selected_id).map(Arc::clone);
@@ -6454,28 +6487,28 @@ pub(crate) fn compress_telemetry_json(
         "--format=csv,noheader,nounits",
     ]);
     compress_tools::no_window(&mut smi);
-    if let Ok(output) = smi.output() {
-        if output.status.success() {
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                let values = line.split(',').map(str::trim).collect::<Vec<_>>();
-                let parse = |index: usize| values.get(index).and_then(|v| v.parse::<f64>().ok());
-                if let Some(value) = parse(0) {
-                    gpu_encode = Some(gpu_encode.unwrap_or(0.0_f64).max(value));
-                }
-                if let Some(value) = parse(1) {
-                    nvidia_sessions = Some(nvidia_sessions.unwrap_or(0.0_f64).max(value));
-                }
-                if let Some(value) = parse(2) {
-                    nvidia_fps = Some(nvidia_fps.unwrap_or(0.0_f64) + value);
-                }
-                if let Some(value) = parse(3) {
-                    gpu_memory_used =
-                        Some(gpu_memory_used.unwrap_or(0.0_f64) + value * 1024.0 * 1024.0);
-                }
-                if let Some(value) = parse(4) {
-                    gpu_memory_total =
-                        Some(gpu_memory_total.unwrap_or(0.0_f64) + value * 1024.0 * 1024.0);
-                }
+    if let Ok(output) = smi.output()
+        && output.status.success()
+    {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let values = line.split(',').map(str::trim).collect::<Vec<_>>();
+            let parse = |index: usize| values.get(index).and_then(|v| v.parse::<f64>().ok());
+            if let Some(value) = parse(0) {
+                gpu_encode = Some(gpu_encode.unwrap_or(0.0_f64).max(value));
+            }
+            if let Some(value) = parse(1) {
+                nvidia_sessions = Some(nvidia_sessions.unwrap_or(0.0_f64).max(value));
+            }
+            if let Some(value) = parse(2) {
+                nvidia_fps = Some(nvidia_fps.unwrap_or(0.0_f64) + value);
+            }
+            if let Some(value) = parse(3) {
+                gpu_memory_used =
+                    Some(gpu_memory_used.unwrap_or(0.0_f64) + value * 1024.0 * 1024.0);
+            }
+            if let Some(value) = parse(4) {
+                gpu_memory_total =
+                    Some(gpu_memory_total.unwrap_or(0.0_f64) + value * 1024.0 * 1024.0);
             }
         }
     }
@@ -6632,6 +6665,7 @@ fn ev_job_state(id: &str, status: &str) -> String {
     s
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ev_file_done(
     index: usize,
     out_path: &str,
@@ -8616,10 +8650,17 @@ mod manifest_tests {
         std::fs::create_dir_all(&home).unwrap();
         let source = home.join("saved-source.txt");
         std::fs::write(&source, b"original contents").unwrap();
-        let job = create_job(&[source.to_string_lossy().into_owned()], "balanced", &CompressOptions::default());
+        let job = create_job(
+            &[source.to_string_lossy().into_owned()],
+            "balanced",
+            &CompressOptions::default(),
+        );
         pause_job(&job).unwrap();
         let restored = job_from_manifest(&job.id).expect("saved paused job");
-        assert!(resume_job(&restored).unwrap(), "restored job needs a runner");
+        assert!(
+            resume_job(&restored).unwrap(),
+            "restored job needs a runner"
+        );
         cancel_or_finalize_job(&restored);
         assert!(wait_until_finished(&restored, Duration::from_millis(50)));
         assert_eq!(restored.status.lock_recover().as_str(), "cancelled");
@@ -8850,16 +8891,33 @@ mod manifest_tests {
 #[cfg(all(test, windows))]
 #[test]
 fn compression_dates_are_preserved() {
-    let root = std::env::temp_dir().join(format!("filetree-creation-{}-{}", std::process::id(), crate::io::now_ms()));
+    let root = std::env::temp_dir().join(format!(
+        "filetree-creation-{}-{}",
+        std::process::id(),
+        crate::io::now_ms()
+    ));
     std::fs::create_dir_all(&root).unwrap();
-    let source = root.join("source"); let output = root.join("output");
+    let source = root.join("source");
+    let output = root.join("output");
     std::fs::write(&source, b"original").unwrap();
     std::fs::write(&output, b"compressed").unwrap();
-    crate::fileattr::set_times(&source, Some(1_600_000_000_000), Some(1_650_000_000_000), None).unwrap();
+    crate::fileattr::set_times(
+        &source,
+        Some(1_600_000_000_000),
+        Some(1_650_000_000_000),
+        None,
+    )
+    .unwrap();
     preserve_compression_dates(&source, &output).unwrap();
     let meta = std::fs::metadata(&output).unwrap();
-    let ms = |time: std::time::SystemTime| time.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let ms = |time: std::time::SystemTime| {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    };
     assert_eq!(ms(meta.created().unwrap()), 1_600_000_000_000);
     assert_eq!(ms(meta.modified().unwrap()), 1_650_000_000_000);
-    std::fs::remove_file(source).unwrap(); std::fs::remove_file(output).unwrap(); std::fs::remove_dir(root).unwrap();
+    std::fs::remove_file(source).unwrap();
+    std::fs::remove_file(output).unwrap();
+    std::fs::remove_dir(root).unwrap();
 }

@@ -1224,8 +1224,11 @@ fn volume_details(path: &std::path::Path) -> (String, u64) {
     use std::os::windows::ffi::OsStrExt;
 
     unsafe extern "system" {
-        fn GetVolumePathNameW(lpszFileName: *const u16, lpszVolumePathName: *mut u16, cch: u32)
-        -> i32;
+        fn GetVolumePathNameW(
+            lpszFileName: *const u16,
+            lpszVolumePathName: *mut u16,
+            cch: u32,
+        ) -> i32;
         fn GetVolumeInformationW(
             lpRootPathName: *const u16,
             lpVolumeNameBuffer: *mut u16,
@@ -1271,7 +1274,10 @@ fn volume_details(path: &std::path::Path) -> (String, u64) {
         )
     } != 0
     {
-        let end = fs_name.iter().position(|c| *c == 0).unwrap_or(fs_name.len());
+        let end = fs_name
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(fs_name.len());
         String::from_utf16_lossy(&fs_name[..end])
     } else {
         String::new()

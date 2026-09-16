@@ -1,3 +1,9 @@
+// The crate still carries v1 code paths (snapshots, schedules, smart folders,
+// archive and analytics helpers) that the v2 desktop and CLI have not re-wired
+// yet. They compile and are tested, so dead-code warnings are allowed rather
+// than deleting work the v2 UI is expected to call again.
+#![allow(dead_code)]
+
 mod analytics;
 mod archive;
 mod audit;
@@ -16,12 +22,11 @@ mod fileattr;
 mod io;
 mod json;
 mod mft;
-mod refresh;
-mod usn;
 mod model;
 mod owner;
 mod preflight;
 mod recycle;
+mod refresh;
 mod scan;
 mod schedule;
 #[cfg(windows)]
@@ -29,6 +34,7 @@ mod settings;
 mod smartfolders;
 mod snapshots;
 mod tags;
+mod usn;
 mod v2_headless;
 mod windows_native;
 mod xlsx;

@@ -482,7 +482,11 @@ pub(crate) fn parse_record(record: &[u8]) -> ParsedRecord {
 
     // `$STANDARD_INFORMATION` is authoritative for attributes; the copy in
     // `$FILE_NAME` is the fallback for records missing it.
-    let attributes = if attributes != 0 { attributes } else { name_flags };
+    let attributes = if attributes != 0 {
+        attributes
+    } else {
+        name_flags
+    };
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
     let (size, allocated) = match sizes {
@@ -533,12 +537,7 @@ fn parse_file_name(value: &[u8]) -> Option<(String, u8, u32, u32)> {
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     // Lossy: NTFS permits unpaired surrogates that Rust strings cannot hold.
-    Some((
-        String::from_utf16_lossy(&units),
-        namespace,
-        parent,
-        flags,
-    ))
+    Some((String::from_utf16_lossy(&units), namespace, parent, flags))
 }
 
 /// Sizes from a `$DATA` header, or `None` for extents that don't carry them.
@@ -608,9 +607,7 @@ impl MftIndex {
             if index == ROOT_RECORD || entry.parent == index {
                 continue;
             }
-            let parent_is_dir = self
-                .get(entry.parent)
-                .is_some_and(|parent| parent.is_dir);
+            let parent_is_dir = self.get(entry.parent).is_some_and(|parent| parent.is_dir);
             if !parent_is_dir {
                 continue;
             }
@@ -885,7 +882,9 @@ where
     let mut stream_position: u64 = 0;
 
     'runs: for run in runs {
-        let run_bytes = run.clusters.saturating_mul(geometry.bytes_per_cluster as u64);
+        let run_bytes = run
+            .clusters
+            .saturating_mul(geometry.bytes_per_cluster as u64);
         let Some(run_lcn) = run.lcn else {
             stream_position = stream_position.saturating_add(run_bytes);
             continue;

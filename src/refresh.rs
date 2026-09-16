@@ -284,7 +284,14 @@ fn recompute_newest_created(conn: &Connection, mut parent: Option<i64>) -> rusql
     for _ in 0..4096 {
         let Some(id) = parent else { break };
         conn.execute("UPDATE nodes SET newest_created_ms=COALESCE((SELECT MAX(newest_created_ms) FROM nodes WHERE parent_id=?1),0) WHERE id=?1", params![id])?;
-        parent = conn.query_row("SELECT parent_id FROM nodes WHERE id=?1", params![id], |row| row.get::<_, Option<i64>>(0)).optional()?.flatten();
+        parent = conn
+            .query_row(
+                "SELECT parent_id FROM nodes WHERE id=?1",
+                params![id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
     }
     Ok(())
 }
@@ -451,15 +458,17 @@ fn apply_one(conn: &Connection, pending: &Pending, root_frn: u64) -> rusqlite::R
                     // was first observed. Correct both the leaf and ancestor maxima.
                     if !pending.is_dir && created_ms > 0 {
                         let changed = conn.execute("UPDATE nodes SET created_ms=?2,newest_created_ms=?2 WHERE id=?1 AND created_ms<>?2", params![node.id, created_ms])?;
-                        if changed > 0 { recompute_newest_created(conn, Some(parent.id))?; }
+                        if changed > 0 {
+                            recompute_newest_created(conn, Some(parent.id))?;
+                        }
                     }
                     Ok(true)
                 }
                 None => {
                     // A file the scan never saw. Give it the next free id rather
                     // than reusing one; ids are dense but not meaningful.
-                    let next_id: i64 = conn
-                        .query_row("SELECT COALESCE(MAX(id),0)+1 FROM nodes", [], |row| {
+                    let next_id: i64 =
+                        conn.query_row("SELECT COALESCE(MAX(id),0)+1 FROM nodes", [], |row| {
                             row.get(0)
                         })?;
                     let extension = if pending.is_dir {
@@ -589,11 +598,9 @@ pub(crate) fn refresh_scan(db_path: &Path, root: &Path) -> Refresh {
 /// Live node count after a refresh, for keeping the catalog honest.
 pub(crate) fn node_count(db_path: &Path) -> Option<u64> {
     let conn = Connection::open(db_path).ok()?;
-    conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| {
-        row.get::<_, i64>(0)
-    })
-    .ok()
-    .map(|count| count.max(0) as u64)
+    conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get::<_, i64>(0))
+        .ok()
+        .map(|count| count.max(0) as u64)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -601,9 +608,7 @@ pub(crate) fn node_count(db_path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usn::{
-        USN_REASON_DATA_EXTEND, USN_REASON_DATA_TRUNCATION,
-    };
+    use crate::usn::{USN_REASON_DATA_EXTEND, USN_REASON_DATA_TRUNCATION};
 
     const DIR: u32 = 0x10;
 
@@ -742,17 +747,50 @@ mod tests {
         // root: 100 bytes, 1 file, 1 folder beneath it
         conn.execute(
             insert,
-            params![0i64, None::<i64>, "C:\\", "C:\\", 1i64, 100i64, 1i64, 1i64, 0i64, 5i64],
+            params![
+                0i64,
+                None::<i64>,
+                "C:\\",
+                "C:\\",
+                1i64,
+                100i64,
+                1i64,
+                1i64,
+                0i64,
+                5i64
+            ],
         )
         .unwrap();
         conn.execute(
             insert,
-            params![1i64, Some(0i64), "docs", "C:\\docs", 1i64, 100i64, 1i64, 0i64, 1i64, 20i64],
+            params![
+                1i64,
+                Some(0i64),
+                "docs",
+                "C:\\docs",
+                1i64,
+                100i64,
+                1i64,
+                0i64,
+                1i64,
+                20i64
+            ],
         )
         .unwrap();
         conn.execute(
             insert,
-            params![2i64, Some(1i64), "report.txt", "", 0i64, 100i64, 1i64, 0i64, 2i64, 21i64],
+            params![
+                2i64,
+                Some(1i64),
+                "report.txt",
+                "",
+                0i64,
+                100i64,
+                1i64,
+                0i64,
+                2i64,
+                21i64
+            ],
         )
         .unwrap();
         conn
@@ -775,8 +813,10 @@ mod tests {
     #[test]
     fn compression_creation_date_rollup_can_move_backwards() {
         let conn = seeded_db();
-        conn.execute("UPDATE nodes SET newest_created_ms=9000", []).unwrap();
-        conn.execute("UPDATE nodes SET newest_created_ms=1000 WHERE id=2", []).unwrap();
+        conn.execute("UPDATE nodes SET newest_created_ms=9000", [])
+            .unwrap();
+        conn.execute("UPDATE nodes SET newest_created_ms=1000 WHERE id=2", [])
+            .unwrap();
         recompute_newest_created(&conn, Some(1)).unwrap();
         assert_eq!(newest_created_of(&conn, 1), 1000);
         assert_eq!(newest_created_of(&conn, 0), 1000);
@@ -811,7 +851,11 @@ mod tests {
     fn an_unknown_creation_date_is_not_rolled_up() {
         let conn = seeded_db();
         bump_newest_created(&conn, Some(1), 0).expect("bumped");
-        assert_eq!(newest_created_of(&conn, 1), 0, "zero means unknown, not 1970");
+        assert_eq!(
+            newest_created_of(&conn, 1),
+            0,
+            "zero means unknown, not 1970"
+        );
     }
 
     #[test]

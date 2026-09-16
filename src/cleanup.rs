@@ -98,10 +98,10 @@ fn walk_into(dir: &Path, bucket: &mut Bucket) {
         let path = entry.path();
         if ft.is_dir() {
             walk_into(&path, bucket);
-        } else if ft.is_file() {
-            if let Some((size, modified)) = file_meta(&path) {
-                bucket.add(path.to_string_lossy().into_owned(), size, modified);
-            }
+        } else if ft.is_file()
+            && let Some((size, modified)) = file_meta(&path)
+        {
+            bucket.add(path.to_string_lossy().into_owned(), size, modified);
         }
     }
 }
@@ -120,11 +120,11 @@ fn dir_size(dir: &Path) -> (u64, u64) {
             let (t, c) = dir_size(&entry.path());
             total = total.saturating_add(t);
             count = count.saturating_add(c);
-        } else if ft.is_file() {
-            if let Ok(md) = entry.metadata() {
-                total = total.saturating_add(md.len());
-                count = count.saturating_add(1);
-            }
+        } else if ft.is_file()
+            && let Ok(md) = entry.metadata()
+        {
+            total = total.saturating_add(md.len());
+            count = count.saturating_add(1);
         }
     }
     (total, count)
@@ -334,13 +334,13 @@ fn downloads_old(dir: &Path, now_secs: u64, bucket: &mut Bucket) {
         let path = e.path();
         if ft.is_dir() {
             downloads_old(&path, now_secs, bucket);
-        } else if ft.is_file() {
-            if let Some((size, modified)) = file_meta(&path) {
-                let big = size > DOWNLOADS_BIG_BYTES;
-                let old = modified != 0 && now_secs.saturating_sub(modified) > DOWNLOADS_OLD_SECS;
-                if big || old {
-                    bucket.add(path.to_string_lossy().into_owned(), size, modified);
-                }
+        } else if ft.is_file()
+            && let Some((size, modified)) = file_meta(&path)
+        {
+            let big = size > DOWNLOADS_BIG_BYTES;
+            let old = modified != 0 && now_secs.saturating_sub(modified) > DOWNLOADS_OLD_SECS;
+            if big || old {
+                bucket.add(path.to_string_lossy().into_owned(), size, modified);
             }
         }
     }

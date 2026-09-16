@@ -2,7 +2,7 @@
 //! new folder, and Recycle Bin restore (used by undo). The React client used to
 //! reach these through the removed HTTP server. Every path is checked against
 //! the scanned roots before anything touches the disk.
-use super::{require_authorized_path, require_authorized_paths, V2Store};
+use super::{V2Store, require_authorized_path, require_authorized_paths};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,9 +56,13 @@ pub(crate) async fn rename_path(
             .ok_or_else(|| "A drive root cannot be renamed".to_string())?
             .join(&name);
         // A case-only rename targets the same item, so it is not a collision.
-        let same_item = target.to_string_lossy().eq_ignore_ascii_case(&source.to_string_lossy());
+        let same_item = target
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&source.to_string_lossy());
         if !same_item && std::fs::symlink_metadata(&target).is_ok() {
-            return Err(format!("\u{201C}{name}\u{201D} already exists in this folder"));
+            return Err(format!(
+                "\u{201C}{name}\u{201D} already exists in this folder"
+            ));
         }
         std::fs::rename(&source, &target).map_err(|error| error.to_string())?;
         Ok(target.to_string_lossy().into_owned())
@@ -91,7 +95,10 @@ pub(crate) async fn delete_paths(
     }
     require_authorized_paths(&state, &paths)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let mut outcome = DeleteOutcome { deleted: Vec::new(), failed: Vec::new() };
+        let mut outcome = DeleteOutcome {
+            deleted: Vec::new(),
+            failed: Vec::new(),
+        };
         for path in paths {
             match filetree_core::delete_path(&path, permanent) {
                 Ok(()) => outcome.deleted.push(path),
@@ -106,11 +113,17 @@ pub(crate) async fn delete_paths(
 
 /// Create one new folder inside a scanned folder.
 #[tauri::command]
-pub(crate) async fn create_folder(state: State<'_, Arc<V2Store>>, path: String) -> Result<(), String> {
+pub(crate) async fn create_folder(
+    state: State<'_, Arc<V2Store>>,
+    path: String,
+) -> Result<(), String> {
     let parent = parent_of(&path)?;
     require_authorized_path(&state, &parent)?;
     let name = valid_name(
-        &Path::new(&path).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+        &Path::new(&path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     )?;
     tauri::async_runtime::spawn_blocking(move || {
         std::fs::create_dir(Path::new(&parent).join(name)).map_err(|error| error.to_string())
@@ -150,8 +163,16 @@ fn restore_one(original: &Path) -> Result<(), String> {
     if std::fs::symlink_metadata(original).is_ok() {
         return Err("Something already exists at the original location".to_string());
     }
-    let parent = original.parent().ok_or("No parent folder")?.to_string_lossy().into_owned();
-    let name = original.file_name().ok_or("No file name")?.to_string_lossy().into_owned();
+    let parent = original
+        .parent()
+        .ok_or("No parent folder")?
+        .to_string_lossy()
+        .into_owned();
+    let name = original
+        .file_name()
+        .ok_or("No file name")?
+        .to_string_lossy()
+        .into_owned();
     // Shell display names may hide extensions, so an exact name wins and a
     // stem-only match is used only when it is unambiguous.
     const SCRIPT: &str = r#"
@@ -167,7 +188,14 @@ $hit = $hits | Sort-Object { $_.ExtendedProperty('System.Recycle.DateDeleted') }
 $hit.InvokeVerb('undelete')
 "#;
     let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", SCRIPT])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            SCRIPT,
+        ])
         .env("FT_PARENT", &parent)
         .env("FT_NAME", &name)
         .creation_flags(0x0800_0000)
@@ -199,7 +227,18 @@ mod tests {
     fn rejects_unsafe_names_and_keeps_ordinary_ones() {
         assert_eq!(valid_name("  Holiday photos ").unwrap(), "Holiday photos");
         assert_eq!(valid_name("report.v2.pdf").unwrap(), "report.v2.pdf");
-        for bad in ["", ".", "..", "a/b", "a\\b", "what?", "CON", "com1.txt", "trailing.", "x\u{1}y"] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "what?",
+            "CON",
+            "com1.txt",
+            "trailing.",
+            "x\u{1}y",
+        ] {
             assert!(valid_name(bad).is_err(), "{bad:?} should be rejected");
         }
         assert!(valid_name("COM0").is_ok());

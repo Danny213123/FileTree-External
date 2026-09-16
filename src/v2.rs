@@ -622,7 +622,9 @@ struct ScanJob {
 
 #[derive(Debug)]
 enum CompressionWrite {
-    File(CompressionFileRecord),
+    // Boxed: a file record dwarfs the job-state variant, and every queued
+    // message would otherwise be sized for the larger one.
+    File(Box<CompressionFileRecord>),
     JobState {
         id: String,
         status: String,
@@ -884,10 +886,14 @@ impl V2Store {
             clauses.push("n.is_dir = 1".to_string());
         }
         if !query.directory_paths.is_empty() {
-            if query.directory_paths.len() > 500 { return Err("Too many directory paths in one page".into()); }
+            if query.directory_paths.len() > 500 {
+                return Err("Too many directory paths in one page".into());
+            }
             let placeholders = vec!["?"; query.directory_paths.len()].join(",");
             clauses.push(format!("n.is_dir=1 AND RTRIM(REPLACE(n.dir_path, '\\', '/'), '/') COLLATE NOCASE IN ({placeholders})"));
-            values.extend(query.directory_paths.iter().map(|path| Value::Text(path.replace('\\', "/").trim_end_matches('/').to_string())));
+            values.extend(query.directory_paths.iter().map(|path| {
+                Value::Text(path.replace('\\', "/").trim_end_matches('/').to_string())
+            }));
         }
         if query.files_only {
             clauses.push("n.is_dir = 0".to_string());
@@ -1459,19 +1465,27 @@ impl V2Store {
             });
             // Stream metadata once. Keep only keys and first row IDs for singletons,
             // rather than sorting/materializing several SQL window-function results.
-            let key_columns = keys.iter().map(|key| format!("CAST({key} AS TEXT)"))
-                .collect::<Vec<_>>().join(",");
+            let key_columns = keys
+                .iter()
+                .map(|key| format!("CAST({key} AS TEXT)"))
+                .collect::<Vec<_>>()
+                .join(",");
             let sql = format!("SELECT rowid,{key_columns} FROM candidates");
             let mut statement = work.prepare(&sql).map_err(|error| error.to_string())?;
-            let mut lookup = work.prepare("SELECT path,name,size,modified_ms FROM candidates WHERE rowid=?1")
+            let mut lookup = work
+                .prepare("SELECT path,name,size,modified_ms FROM candidates WHERE rowid=?1")
                 .map_err(|error| error.to_string())?;
             let mut read_file = |id: i64| -> Result<DuplicateFile, String> {
-                lookup.query_row([id], |row| Ok(DuplicateFile {
-                    path: row.get(0)?,
-                    name: row.get(1)?,
-                    size: row.get::<_, i64>(2)?.max(0) as u64,
-                    modified: row.get::<_, i64>(3)?.max(0) as u64 / 1000,
-                })).map_err(|error| error.to_string())
+                lookup
+                    .query_row([id], |row| {
+                        Ok(DuplicateFile {
+                            path: row.get(0)?,
+                            name: row.get(1)?,
+                            size: row.get::<_, i64>(2)?.max(0) as u64,
+                            modified: row.get::<_, i64>(3)?.max(0) as u64 / 1000,
+                        })
+                    })
+                    .map_err(|error| error.to_string())
             };
             let mut rows = statement.query([]).map_err(|error| error.to_string())?;
             let mut groups: Vec<DuplicateGroup> = Vec::new();
@@ -1481,22 +1495,32 @@ impl V2Store {
             while let Some(row) = rows.next().map_err(|error| error.to_string())? {
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(DuplicateScanResult {
-                        groups: Vec::new(), errors: Vec::new(), scanned,
-                        hashing: 0, cancelled: true,
+                        groups: Vec::new(),
+                        errors: Vec::new(),
+                        scanned,
+                        hashing: 0,
+                        cancelled: true,
                     });
                 }
                 let id: i64 = row.get(0).map_err(|error| error.to_string())?;
-                let key = (1..=keys.len()).map(|column| row.get::<_, String>(column))
-                    .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+                let key = (1..=keys.len())
+                    .map(|column| row.get::<_, String>(column))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
                 match buckets.entry(key) {
-                    std::collections::hash_map::Entry::Vacant(entry) => { entry.insert((id, None)); }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert((id, None));
+                    }
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
                         let (first_id, group_index) = entry.get_mut();
                         let index = match *group_index {
                             Some(index) => index,
                             None => {
                                 let index = groups.len();
-                                groups.push(DuplicateGroup { files: vec![read_file(*first_id)?], waste: 0 });
+                                groups.push(DuplicateGroup {
+                                    files: vec![read_file(*first_id)?],
+                                    waste: 0,
+                                });
                                 *group_index = Some(index);
                                 index
                             }
@@ -1507,11 +1531,17 @@ impl V2Store {
                     }
                 }
                 grouped += 1;
-                if grouped == 1 || grouped == scanned || last_report.elapsed() >= Duration::from_millis(100) {
+                if grouped == 1
+                    || grouped == scanned
+                    || last_report.elapsed() >= Duration::from_millis(100)
+                {
                     progress(DuplicateProgress {
                         fraction: Some(grouped as f64 / scanned.max(1) as f64),
-                        bytes_read: 0, phase: "grouping".into(), scanned,
-                        hashing: scanned, hashed: grouped,
+                        bytes_read: 0,
+                        phase: "grouping".into(),
+                        scanned,
+                        hashing: scanned,
+                        hashed: grouped,
                     });
                     last_report = Instant::now();
                 }
@@ -2050,7 +2080,10 @@ impl V2Store {
     }
 
     pub fn queue_compression_file(&self, file: CompressionFileRecord, terminal: bool) {
-        match self.compression_tx.try_send(CompressionWrite::File(file)) {
+        match self
+            .compression_tx
+            .try_send(CompressionWrite::File(Box::new(file)))
+        {
             Ok(()) => {}
             Err(TrySendError::Full(CompressionWrite::File(file))) if terminal => {
                 let _ = self.compression_tx.send(CompressionWrite::File(file));
@@ -2589,40 +2622,38 @@ impl V2Store {
                 )?;
             }
         }
-        if let Ok(text) = fs::read_to_string(legacy_root.join("secrets.json")) {
-            if let Ok(entries) = serde_json::from_str::<HashMap<String, String>>(&text) {
-                for (key, encoded) in entries {
-                    if validate_secret_key(&key).is_err() {
-                        continue;
-                    }
-                    let exists = conn
-                        .query_row("SELECT 1 FROM secrets WHERE key=?1", params![key], |_| {
-                            Ok(())
-                        })
-                        .optional()?
-                        .is_some();
-                    if exists {
-                        continue;
-                    }
-                    let decoded = if let Some(plain) = encoded.strip_prefix("plain:") {
-                        base64::engine::general_purpose::STANDARD.decode(plain).ok()
-                    } else {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(encoded)
-                            .ok()
-                            .and_then(|cipher| {
-                                crate::windows_native::unprotect_secret(&cipher).ok()
-                            })
-                    };
-                    let Some(decoded) = decoded else { continue };
-                    let Ok(cipher) = crate::windows_native::protect_secret(&decoded) else {
-                        continue;
-                    };
-                    conn.execute(
-                        "INSERT INTO secrets(key,value,updated_at) VALUES(?1,?2,?3)",
-                        params![key, cipher, now_ms() as i64],
-                    )?;
+        if let Ok(text) = fs::read_to_string(legacy_root.join("secrets.json"))
+            && let Ok(entries) = serde_json::from_str::<HashMap<String, String>>(&text)
+        {
+            for (key, encoded) in entries {
+                if validate_secret_key(&key).is_err() {
+                    continue;
                 }
+                let exists = conn
+                    .query_row("SELECT 1 FROM secrets WHERE key=?1", params![key], |_| {
+                        Ok(())
+                    })
+                    .optional()?
+                    .is_some();
+                if exists {
+                    continue;
+                }
+                let decoded = if let Some(plain) = encoded.strip_prefix("plain:") {
+                    base64::engine::general_purpose::STANDARD.decode(plain).ok()
+                } else {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .ok()
+                        .and_then(|cipher| crate::windows_native::unprotect_secret(&cipher).ok())
+                };
+                let Some(decoded) = decoded else { continue };
+                let Ok(cipher) = crate::windows_native::protect_secret(&decoded) else {
+                    continue;
+                };
+                conn.execute(
+                    "INSERT INTO secrets(key,value,updated_at) VALUES(?1,?2,?3)",
+                    params![key, cipher, now_ms() as i64],
+                )?;
             }
         }
         Ok(())
@@ -2665,10 +2696,10 @@ fn run_bounded_scan(
         depth: 0,
     }));
     let visited = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
-    if request.follow_links {
-        if let Ok(canonical) = fs::canonicalize(root) {
-            visited.lock_unpoisoned().insert(canonical);
-        }
+    if request.follow_links
+        && let Ok(canonical) = fs::canonicalize(root)
+    {
+        visited.lock_unpoisoned().insert(canonical);
     }
 
     row_tx
@@ -2719,7 +2750,6 @@ fn run_bounded_scan(
         let request = request.clone();
         let progress = Arc::clone(&progress);
         let scan_id = scan_id.to_string();
-        let started = started;
         let visited = Arc::clone(&visited);
         let last_progress_ms = Arc::clone(&last_progress_ms);
         let unreadable = Arc::clone(&unreadable);
@@ -2797,7 +2827,7 @@ fn run_bounded_scan(
                                 let elapsed_ms = started.elapsed().as_millis() as u64;
                                 let previous_ms = last_progress_ms.load(Ordering::Relaxed);
                                 let periodic_update = elapsed_ms.saturating_sub(previous_ms) >= 250;
-                                if (count % 2_048 == 0 || periodic_update)
+                                if (count.is_multiple_of(2_048) || periodic_update)
                                     && last_progress_ms
                                         .compare_exchange(
                                             previous_ms,
@@ -3297,7 +3327,7 @@ fn try_mft_scan(
                 return true;
             }
             let count = node_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if count % 4_096 == 0 {
+            if count.is_multiple_of(4_096) {
                 report(count);
             }
 
@@ -3486,7 +3516,7 @@ fn collect_compression_write(
 ) {
     match write {
         CompressionWrite::File(file) => {
-            files.insert((file.job_id.clone(), file.index), file);
+            files.insert((file.job_id.clone(), file.index), *file);
         }
         CompressionWrite::JobState {
             id,
@@ -4143,7 +4173,11 @@ fn append_search_term(clauses: &mut Vec<String>, values: &mut Vec<Value>, term: 
             // A literal without separators cannot straddle the folder/name
             // boundary. Match folder paths once rather than reconstructing and
             // lowercasing a full path for every file in a multi-million-row scan.
-            if !term.value.chars().any(|c| matches!(c, '/' | '\\' | '*' | '?')) {
+            if !term
+                .value
+                .chars()
+                .any(|c| matches!(c, '/' | '\\' | '*' | '?'))
+            {
                 return clauses.push(format!(
                     "{}(LOWER(n.name) LIKE ? ESCAPE '\\' OR \
                      CASE WHEN n.is_dir=1 THEN n.id ELSE n.parent_id END IN \
@@ -4189,7 +4223,7 @@ fn append_extension_filter(clauses: &mut Vec<String>, values: &mut Vec<Value>, r
         .map(|extension| {
             extension
                 .trim()
-                .trim_start_matches(|character| character == '.' || character == '*')
+                .trim_start_matches(['.', '*'])
                 .to_ascii_lowercase()
         })
         .filter(|extension| !extension.is_empty())
@@ -4681,20 +4715,38 @@ mod tests {
             .unwrap();
         assert_eq!(tokenized.total, 1);
         assert_eq!(tokenized.items[0].name, "Summer Vacation 2024.mp4");
-        let bookmarked = store.query_nodes(ScanQuery {
-            scan_id: handle.scan_id.clone(), parent_id: None,
-            directory_paths: vec![source.join("Finance Archive").to_string_lossy().into_owned(), "Q:/another-scan".into()],
-            ..Default::default()
-        }).unwrap();
+        let bookmarked = store
+            .query_nodes(ScanQuery {
+                scan_id: handle.scan_id.clone(),
+                parent_id: None,
+                directory_paths: vec![
+                    source
+                        .join("Finance Archive")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "Q:/another-scan".into(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(bookmarked.items.len(), 1);
         assert!(bookmarked.items[0].is_dir);
         assert_eq!(bookmarked.items[0].name, "Finance Archive");
 
-        let folder_matches = store.query_nodes(ScanQuery {
-            scan_id: handle.scan_id.clone(), parent_id: None,
-            search: "\"finance archive\"".into(), ..Default::default()
-        }).unwrap();
-        assert!(folder_matches.items.iter().any(|item| item.name == "Annual Report Final.pdf"));
+        let folder_matches = store
+            .query_nodes(ScanQuery {
+                scan_id: handle.scan_id.clone(),
+                parent_id: None,
+                search: "\"finance archive\"".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            folder_matches
+                .items
+                .iter()
+                .any(|item| item.name == "Annual Report Final.pdf")
+        );
 
         let preview = store
             .query_nodes(ScanQuery {
@@ -5254,7 +5306,9 @@ mod tests {
             .find_exact_duplicates(request.clone(), Arc::new(AtomicBool::new(false)), |event| {
                 assert_eq!(event.bytes_read, 0);
                 assert_ne!(event.phase, "hashing");
-                if event.phase == "grouping" { fractions.lock().unwrap().push(event.fraction.unwrap()); }
+                if event.phase == "grouping" {
+                    fractions.lock().unwrap().push(event.fraction.unwrap());
+                }
             })
             .unwrap();
         assert!(result.errors.is_empty());
@@ -5264,7 +5318,11 @@ mod tests {
         let fractions = fractions.into_inner().unwrap();
         assert_eq!(fractions.first(), Some(&0.0));
         assert_eq!(fractions.last(), Some(&1.0));
-        assert!(fractions.iter().any(|fraction| *fraction > 0.0 && *fraction < 1.0));
+        assert!(
+            fractions
+                .iter()
+                .any(|fraction| *fraction > 0.0 && *fraction < 1.0)
+        );
         assert!(fractions.windows(2).all(|pair| pair[0] <= pair[1]));
         let excluded = store
             .find_exact_duplicates(

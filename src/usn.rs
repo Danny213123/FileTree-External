@@ -788,7 +788,14 @@ mod tests {
 
     #[test]
     fn parses_a_v2_record() {
-        let raw = record_v2(0x0002_0000_0000_0100, 5, 8192, USN_REASON_FILE_CREATE, 0, "notes.txt");
+        let raw = record_v2(
+            0x0002_0000_0000_0100,
+            5,
+            8192,
+            USN_REASON_FILE_CREATE,
+            0,
+            "notes.txt",
+        );
         let change = parse_change_record(&raw).expect("parsed");
         assert_eq!(change.name, "notes.txt");
         assert_eq!(change.usn, 8192);
@@ -802,7 +809,14 @@ mod tests {
 
     #[test]
     fn parses_a_v3_record() {
-        let raw = record_v3(0x2A, 5, 4096, USN_REASON_FILE_DELETE, FILE_ATTRIBUTE_DIRECTORY, "bin");
+        let raw = record_v3(
+            0x2A,
+            5,
+            4096,
+            USN_REASON_FILE_DELETE,
+            FILE_ATTRIBUTE_DIRECTORY,
+            "bin",
+        );
         let change = parse_change_record(&raw).expect("parsed");
         assert_eq!(change.name, "bin");
         assert_eq!(change.usn, 4096);
@@ -846,7 +860,10 @@ mod tests {
 
     #[test]
     fn stops_at_a_truncated_trailing_record() {
-        let mut buf = change_buffer(9000, &[record_v2(10, 5, 8192, USN_REASON_FILE_CREATE, 0, "a.txt")]);
+        let mut buf = change_buffer(
+            9000,
+            &[record_v2(10, 5, 8192, USN_REASON_FILE_CREATE, 0, "a.txt")],
+        );
         // A header claiming more bytes than the buffer holds.
         buf.extend_from_slice(&4096u32.to_le_bytes());
         buf.extend_from_slice(&[0u8; 16]);
@@ -856,7 +873,10 @@ mod tests {
 
     #[test]
     fn a_zero_length_record_cannot_spin_the_walker() {
-        let mut buf = change_buffer(9000, &[record_v2(10, 5, 8192, USN_REASON_FILE_CREATE, 0, "a.txt")]);
+        let mut buf = change_buffer(
+            9000,
+            &[record_v2(10, 5, 8192, USN_REASON_FILE_CREATE, 0, "a.txt")],
+        );
         buf.extend_from_slice(&[0u8; 16]);
         let (_, changes) = parse_change_buffer(&buf).expect("parsed");
         assert_eq!(changes.len(), 1);
@@ -871,42 +891,92 @@ mod tests {
 
     #[test]
     fn checkpoint_survives_a_journal_that_has_only_grown() {
-        let checkpoint = Checkpoint { volume_serial: 1, journal_id: 7, next_usn: 5000 };
-        let info = JournalInfo { journal_id: 7, first_usn: 4096, next_usn: 9000, ..Default::default() };
+        let checkpoint = Checkpoint {
+            volume_serial: 1,
+            journal_id: 7,
+            next_usn: 5000,
+        };
+        let info = JournalInfo {
+            journal_id: 7,
+            first_usn: 4096,
+            next_usn: 9000,
+            ..Default::default()
+        };
         assert!(checkpoint_is_live(&checkpoint, &info));
     }
 
     #[test]
     fn checkpoint_dies_when_the_journal_is_recreated() {
-        let checkpoint = Checkpoint { volume_serial: 1, journal_id: 7, next_usn: 5000 };
-        let info = JournalInfo { journal_id: 8, first_usn: 0, next_usn: 9000, ..Default::default() };
+        let checkpoint = Checkpoint {
+            volume_serial: 1,
+            journal_id: 7,
+            next_usn: 5000,
+        };
+        let info = JournalInfo {
+            journal_id: 8,
+            first_usn: 0,
+            next_usn: 9000,
+            ..Default::default()
+        };
         assert!(!checkpoint_is_live(&checkpoint, &info));
     }
 
     #[test]
     fn checkpoint_dies_when_the_ring_has_wrapped_past_it() {
-        let checkpoint = Checkpoint { volume_serial: 1, journal_id: 7, next_usn: 1000 };
-        let info = JournalInfo { journal_id: 7, first_usn: 4096, next_usn: 9000, ..Default::default() };
+        let checkpoint = Checkpoint {
+            volume_serial: 1,
+            journal_id: 7,
+            next_usn: 1000,
+        };
+        let info = JournalInfo {
+            journal_id: 7,
+            first_usn: 4096,
+            next_usn: 9000,
+            ..Default::default()
+        };
         assert!(!checkpoint_is_live(&checkpoint, &info));
     }
 
     #[test]
     fn checkpoint_dies_when_it_sits_past_the_journal_head() {
-        let checkpoint = Checkpoint { volume_serial: 1, journal_id: 7, next_usn: 99_000 };
-        let info = JournalInfo { journal_id: 7, first_usn: 4096, next_usn: 9000, ..Default::default() };
+        let checkpoint = Checkpoint {
+            volume_serial: 1,
+            journal_id: 7,
+            next_usn: 99_000,
+        };
+        let info = JournalInfo {
+            journal_id: 7,
+            first_usn: 4096,
+            next_usn: 9000,
+            ..Default::default()
+        };
         assert!(!checkpoint_is_live(&checkpoint, &info));
     }
 
     #[test]
     fn an_unset_checkpoint_is_never_live() {
-        let info = JournalInfo { journal_id: 7, first_usn: 0, next_usn: 9000, ..Default::default() };
+        let info = JournalInfo {
+            journal_id: 7,
+            first_usn: 0,
+            next_usn: 9000,
+            ..Default::default()
+        };
         assert!(!checkpoint_is_live(&Checkpoint::default(), &info));
     }
 
     #[test]
     fn a_mark_exactly_at_the_ring_tail_still_replays() {
-        let checkpoint = Checkpoint { volume_serial: 1, journal_id: 7, next_usn: 4096 };
-        let info = JournalInfo { journal_id: 7, first_usn: 4096, next_usn: 9000, ..Default::default() };
+        let checkpoint = Checkpoint {
+            volume_serial: 1,
+            journal_id: 7,
+            next_usn: 4096,
+        };
+        let info = JournalInfo {
+            journal_id: 7,
+            first_usn: 4096,
+            next_usn: 9000,
+            ..Default::default()
+        };
         assert!(checkpoint_is_live(&checkpoint, &info));
     }
 
@@ -930,7 +1000,10 @@ mod tests {
             info.journal_id, info.first_usn, info.next_usn, info.maximum_size
         );
         assert!(info.journal_id != 0, "a live journal always has an id");
-        assert!(info.next_usn >= info.first_usn, "head must not precede tail");
+        assert!(
+            info.next_usn >= info.first_usn,
+            "head must not precede tail"
+        );
 
         // Replay the tail of the journal rather than the whole ring: start a
         // little behind the head so the read returns something without walking
@@ -958,7 +1031,10 @@ mod tests {
                         change.name
                     );
                 }
-                assert!(replay.next_usn >= checkpoint.next_usn, "replay must advance");
+                assert!(
+                    replay.next_usn >= checkpoint.next_usn,
+                    "replay must advance"
+                );
             }
             Err(error) => println!("changes_since unavailable: {error}"),
         }
@@ -966,11 +1042,20 @@ mod tests {
 
     #[test]
     fn tree_relevance_filters_noise_reasons() {
-        let touched = UsnChange { reason: 0x0000_0020, ..UsnChange::default() };
+        let touched = UsnChange {
+            reason: 0x0000_0020,
+            ..UsnChange::default()
+        };
         assert!(!touched.affects_tree());
-        let written = UsnChange { reason: USN_REASON_DATA_EXTEND, ..UsnChange::default() };
+        let written = UsnChange {
+            reason: USN_REASON_DATA_EXTEND,
+            ..UsnChange::default()
+        };
         assert!(written.affects_tree());
-        let renamed = UsnChange { reason: USN_REASON_RENAME_NEW_NAME, ..UsnChange::default() };
+        let renamed = UsnChange {
+            reason: USN_REASON_RENAME_NEW_NAME,
+            ..UsnChange::default()
+        };
         assert!(renamed.affects_tree());
     }
 }

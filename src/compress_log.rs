@@ -454,7 +454,7 @@ pub(crate) fn read_rows_json(limit: usize) -> String {
 }
 
 fn rows_json_from_text(text: &str, limit: usize) -> String {
-    let mut records = parse_csv(&text);
+    let mut records = parse_csv(text);
     if records.is_empty() {
         return "[]".to_string();
     }
@@ -476,7 +476,7 @@ fn rows_json_from_text(text: &str, limit: usize) -> String {
 }
 
 /// Field accessor that tolerates short/long records.
-fn col<'a>(rec: &'a [String], i: usize) -> &'a str {
+fn col(rec: &[String], i: usize) -> &str {
     rec.get(i).map(|s| s.as_str()).unwrap_or("")
 }
 
