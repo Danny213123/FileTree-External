@@ -1,12 +1,27 @@
 import { cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PluginsView } from "./PluginsView";
-import { PLUGINS, canOptIn, loadPluginPrefs, type PluginPanelProps } from "../lib/plugins";
+import { PLUGINS, canOptIn, loadPluginPrefs, type PluginDef, type PluginPanelProps } from "../lib/plugins";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({})) }));
 import { invoke } from "@tauri-apps/api/core";
-const shippable = PLUGINS.find((d) => canOptIn(d) && !d.panel)!;
-const planned = PLUGINS.find((d) => !canOptIn(d));
+
+// Two entries the shipped catalog no longer has: every plugin in it now brings
+// its own panel and none is still "coming soon". The opt-in flow, the
+// stand-in surface and the planned state are all still worth covering, so the
+// tests supply their own catalog entries rather than depending on which
+// plugins happen to have shipped.
+const shippable: PluginDef = {
+  id: "fixture-open", name: "Fixture Tool", vendor: "test", icon: "tools", status: "available",
+  summary: "one line", about: "the longer pitch", needs: ["needs one thing"], provides: ["provides one thing"],
+};
+const planned: PluginDef = {
+  id: "fixture-planned", name: "Fixture Planned", vendor: "test", icon: "tools", status: "planned",
+  summary: "one line", about: "not yet", needs: ["n"], provides: ["p"],
+};
+
+beforeEach(() => { PLUGINS.push(shippable, planned); });
+afterEach(() => { PLUGINS.splice(PLUGINS.indexOf(shippable), 2); });
 
 /** The catalog card for a plugin, found by its heading. */
 function cardFor(name: string): HTMLElement {
@@ -132,7 +147,6 @@ describe("PluginsView", () => {
   });
 
   it("lists planned plugins but refuses to turn them on", () => {
-    if (!planned) return;
     render(<PluginsView />);
 
     const card = cardFor(planned.name);

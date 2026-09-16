@@ -23,9 +23,14 @@ use tauri::{AppHandle, Manager, State};
 
 mod bunkr;
 mod cyberdrop;
+mod everything;
 mod fileops;
+mod mediainfo;
 mod ollama;
+mod rclone;
+mod restic;
 mod terminal;
+mod tools;
 
 struct FsWatchRegistry {
     next_id: AtomicU64,
@@ -3134,6 +3139,16 @@ pub fn run() {
             cyberdrop::cyberdrop_stop,
             cyberdrop::cyberdrop_status,
             bunkr::bunkr_search,
+            everything::everything_status,
+            everything::everything_search,
+            rclone::rclone_remotes,
+            rclone::rclone_about,
+            rclone::rclone_list,
+            rclone::rclone_coverage,
+            restic::restic_snapshots,
+            restic::restic_stats,
+            restic::restic_coverage,
+            mediainfo::media_probe,
             fileops::rename_path,
             fileops::delete_paths,
             fileops::create_folder,

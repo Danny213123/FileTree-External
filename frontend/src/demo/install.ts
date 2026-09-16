@@ -144,6 +144,80 @@ const handlers: Record<string, Handler> = {
   cyberdrop_start: () => { cyberdrop.setRunning(true); return null; },
   cyberdrop_stop: () => { cyberdrop.setRunning(false); return null; },
 
+  // No Everything install in the demo: answer from the invented file tree.
+  everything_status: () => ({ es: "C:\\Program Files\\Everything\\es.exe", http: false, ready: true }),
+  everything_search: ({ query, limit }) => {
+    const needle = String(query ?? "").trim().toLowerCase();
+    const matches = fs.nodes.filter((node) => node.name.toLowerCase().includes(needle));
+    const results = matches.slice(0, Math.min(Number(limit) || 200, 500)).map((node) => ({
+      name: node.name,
+      path: node.path,
+      size: node.isDir ? null : node.size,
+      modified: Math.floor(node.modifiedMs / 1000),
+      isDir: node.isDir,
+    }));
+    return { results, total: matches.length, source: "es" };
+  },
+
+  // Invented ffprobe output, ranked the way the real panel ranks it.
+  media_probe: ({ limit }) => {
+    const sources = fs.nodes.filter((node) => !node.isDir && node.extension === "mp4").slice(0, Math.min(Number(limit) || 100, 40));
+    const files = sources.map((node, index) => {
+      const duration = 600 + index * 37;
+      const bitrate = Math.round((node.size * 8) / duration);
+      const height = [2160, 1080, 720][index % 3];
+      const target = { 2160: 18_000_000, 1080: 6_000_000, 720: 3_000_000 }[height]!;
+      const savings = bitrate > target ? Math.round(node.size * (1 - target / bitrate)) : 0;
+      return {
+        path: node.path, name: node.name, size: node.size, duration, bitrate,
+        videoCodec: index % 4 === 0 ? "hevc" : "h264", audioCodec: "aac",
+        width: Math.round((height * 16) / 9), height, targetBitrate: target, savings, error: null,
+      };
+    }).sort((a, b) => b.savings - a.savings || b.size - a.size);
+    return {
+      files, probed: files.length, found: files.length,
+      reclaimable: files.reduce((total, file) => total + file.savings, 0),
+      ffprobe: "C:\\Users\\Demo\\AppData\\Roaming\\FileTree\\tools\\ffprobe.exe",
+    };
+  },
+
+  // Invented rclone remotes and restic snapshots: no tool is run in the demo.
+  rclone_remotes: () => ({ remotes: [{ name: "gdrive", kind: "drive" }, { name: "backup", kind: "s3" }], rclone: "C:\\Tools\\rclone\\rclone.exe" }),
+  rclone_about: () => ({ total: 2_199_023_255_552, used: 1_462_463_299_584, free: 736_559_955_968 }),
+  rclone_list: ({ path }) => (String(path ?? "") ? [
+    { Path: "clip_014.mp4", Name: "clip_014.mp4", Size: 1_288_490_188, IsDir: false },
+    { Path: "clip_015.mp4", Name: "clip_015.mp4", Size: 862_000_640, IsDir: false },
+  ] : [
+    { Path: "Media", Name: "Media", Size: -1, IsDir: true },
+    { Path: "Projects", Name: "Projects", Size: -1, IsDir: true },
+    { Path: "notes.txt", Name: "notes.txt", Size: 4_096, IsDir: false },
+  ]),
+  rclone_coverage: () => ({
+    localFiles: 918, remoteFiles: 902, missingCount: 16, missingBytes: 42_949_672_960,
+    missing: [
+      { relative: "Videos/Movies/Dune Part Two (2024).mkv", path: "Videos/Movies/Dune Part Two (2024).mkv", size: 18_854_930_432, differs: false },
+      { relative: "Videos/Home Videos/summer-2025.mp4", path: "Videos/Home Videos/summer-2025.mp4", size: 12_884_901_888, differs: true },
+      { relative: "Photos/2024/12 December/IMG_2024120001.jpg", path: "Photos/2024/12 December/IMG_2024120001.jpg", size: 9_328_128, differs: false },
+    ],
+  }),
+  restic_snapshots: () => ({
+    restic: "C:\\Tools\\restic\\restic.exe",
+    snapshots: [
+      { id: "a1b2c3d4", time: "2026-09-14T02:00:00Z", hostname: "workstation", paths: ["D:\\Media"], tags: ["nightly"] },
+      { id: "99887766", time: "2026-09-07T02:00:00Z", hostname: "workstation", paths: ["D:\\Media", "D:\\Projects"], tags: [] },
+    ],
+  }),
+  restic_stats: () => ({ total_size: 402_653_184_000, total_file_count: 121_402, snapshots_count: 2 }),
+  restic_coverage: ({ folder }) => {
+    const covered = String(folder ?? "").toLowerCase().startsWith("d:\\media");
+    return {
+      covered,
+      snapshots: covered ? [{ id: "a1b2c3d4", time: "2026-09-14T02:00:00Z", hostname: "workstation", paths: ["D:\\Media"], tags: ["nightly"] }] : [],
+      latest: covered ? "2026-09-14T02:00:00Z" : null,
+      total: 2,
+    };
+  },
+
   // The demo never reaches the network: invented albums for the search panel.
   bunkr_search: ({ query, per, page }) => {
     const size = Math.min(Number(per) || 20, 12);

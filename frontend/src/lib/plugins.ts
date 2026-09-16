@@ -14,6 +14,10 @@
 
 import { BunkrView } from "../components/BunkrView";
 import { CyberdropView } from "../components/CyberdropView";
+import { EverythingView } from "../components/EverythingView";
+import { MediaInsightView } from "../components/MediaInsightView";
+import { RcloneView } from "../components/RcloneView";
+import { ResticView } from "../components/ResticView";
 import type { ComponentType } from "react";
 import type { IconName } from "../components/Icon";
 
@@ -99,7 +103,7 @@ export const PLUGINS: PluginDef[] = [
     website: "voidtools.com",
     icon: "search",
     status: "available",
-    example: true,
+    panel: EverythingView,
     summary: "Search every drive on the machine instantly, without scanning first.",
     about:
       "Everything keeps a live index of every filename on your NTFS volumes. Its panel "
@@ -107,12 +111,12 @@ export const PLUGINS: PluginDef[] = [
       + "in milliseconds — including on drives FileTree has never scanned — and open the "
       + "folder it lives in as a normal FileTree tab.",
     needs: [
-      "The folder you are currently browsing, only to sort local matches first",
+      "Everything's own \"ES\" command-line tool, or its built-in HTTP server",
       "Nothing is written, and no file contents are read",
     ],
     provides: [
       "A search box that matches against every indexed drive as you type",
-      "Results you can open in a FileTree tab or reveal in Explorer",
+      "Results you can open or reveal in Explorer",
       "Coverage of drives that have never been scanned",
     ],
   },
@@ -123,7 +127,7 @@ export const PLUGINS: PluginDef[] = [
     website: "rclone.org",
     icon: "arrow-repeat",
     status: "available",
-    example: true,
+    panel: RcloneView,
     summary: "Put a cloud remote side by side with the folder you just scanned.",
     about:
       "rclone talks to sixty-odd cloud storage providers through one interface. Its panel "
@@ -132,14 +136,22 @@ export const PLUGINS: PluginDef[] = [
       + "you can see rather than assume.",
     needs: [
       "The remotes in your existing rclone config — FileTree never creates or edits them",
-      "The path and file list from your most recent scan, for the comparison",
-      "Read-only until you start a transfer yourself from its panel",
+      "Read access to the local folder you ask it to compare",
+      "Nothing is written: no copy, sync or delete is run from the panel",
     ],
     provides: [
-      "A side-by-side view of a remote and the scanned folder",
-      "A list of local files with no copy on the remote, largest first",
-      "Uploads and downloads queued through the usual transfer manager",
+      "Your remotes with what each one holds and its quota",
+      "A browsable listing of any remote folder",
+      "Local files with no copy on the remote, largest first",
     ],
+  },
+  {
+    id: "media", name: "Media Insight", vendor: "FFmpeg project", website: "ffmpeg.org", icon: "bar-chart", status: "available",
+    summary: "Read what your video actually is, and rank what a re-encode would save.",
+    about: "A scan shows a 12 GB file; it does not show that the file is a 1080p clip at 40 Mbit/s that would look the same at a third of the size. This reads the biggest media in a folder with ffprobe and ranks it by the bytes a re-encode would plausibly save at a sane bitrate for the resolution, then hands your selection to the compression queue.",
+    needs: ["ffprobe, from the same ffmpeg the compression workspace uses", "Read access to the folder you point it at; files are read, never modified"],
+    provides: ["Codec, resolution, length and bitrate per file", "Files ranked by the bytes a re-encode would save", "A selection sent straight to Compress → Monitor"],
+    panel: MediaInsightView,
   },
   {
     id: "restic",
@@ -147,21 +159,22 @@ export const PLUGINS: PluginDef[] = [
     vendor: "restic project",
     website: "restic.net",
     icon: "clock-history",
-    status: "planned",
-    example: true,
+    status: "available",
+    panel: ResticView,
     summary: "See which of your biggest folders no backup snapshot covers.",
     about:
       "A scan tells you what is taking up space; it does not tell you what you would lose. "
       + "Pointed at a restic repository, this panel cross-references your last scan against "
       + "the snapshots in it and ranks the folders that exist nowhere else.",
     needs: [
-      "The repository location and credentials you enter in its panel",
-      "Folder sizes and paths from your most recent scan",
+      "The repository location and its password, which is kept only while the panel is open",
+      "The folder path you ask it about",
+      "Nothing is written: no backup, forget or prune is run from the panel",
     ],
     provides: [
-      "Backup coverage for every folder in the last scan",
-      "Large folders that no snapshot contains, ranked by what they would cost you",
-      "Snapshot history with repository size over time",
+      "Every snapshot in the repository with its paths, host and tags",
+      "What the repository itself occupies",
+      "A straight answer to whether a folder is covered, and by which snapshots",
     ],
   },
 ];
