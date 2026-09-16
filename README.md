@@ -1,29 +1,36 @@
 # FileTree
 
-
+**See what's filling your disks, then deal with it — fast.** FileTree is a low-memory Windows disk-usage explorer with a tree and treemap view, a content-verified duplicate finder, and GPU video/image compression.
 
 ![FileTree Explorer: a scanned folder tree with sizes, share of parent and a treemap](docs/screenshots/explorer.png)
 
 **Current version:** `2.0.0` (performance release in pre-release validation). The v2 desktop uses Tauri 2 with one WebView2 control; Electron is no longer bundled.
 
-> Screenshots come from the [demo build](#demo-build): every drive, file and download shown is invented.
+> Screenshots come from the [demo build](#demo-build)
 
 ## Highlights
 
 - **Explore disk usage** — multi-threaded scans into per-scan SQLite indexes, a virtualized tree table, treemap and 3D treemap, split panes and tabs, live refresh as files change.
 - **Find duplicates** — multi-root scans verified by content, not just name or size, with batch delete/move/copy and a persistent hash cache.
 - **Compress media** — hardware-only (NVENC / Quick Sync / AMD) video and image compression with a live monitor, resumable queue, verified outputs and preserved file dates.
-
 - **Built for huge folders** — paged SQLite queries, bounded renderer memory and lazy loading keep 10M+ item scans responsive.
 
 ## Explore disk usage
 
-Scan a drive or folder and FileTree shows every folder's size, allocated space, file and folder counts, share of its parent and dates, sorted however you like. The treemap below the table shows the same space at a glance.
+Scan a drive or folder and FileTree shows every folder's size, allocated space, file and folder counts, share of its parent and dates, sorted however you like. The treemap below the table shows the same space at a glance: every folder is a tile sized by what it holds, labeled with its item count.
 
-- Open folders in tabs and split panes; **middle-click** a folder to open it in a background tab.
+![Treemap: Videos dwarfs Downloads, Photos and Music inside Media, next to Projects](docs/screenshots/treemap.png)
+
 - Each pane's **Options** button (right end of the address bar) shows or hides its view options: size metric, units, files, filters, columns and quick filters such as *>1 GB* or *Videos*.
-- Search is case-insensitive and tokenized (`-term` excludes, `name:`, `path:`, `ext:`, `type:`, wildcards, optional regex) and runs against the scan index, not the renderer.
 - Native Windows context menus, drag-and-drop, rename, move, copy, Recycle Bin delete and undo, with risk-scoped confirmations.
+
+## Split panes and search
+
+![Four split panes on C:, Program Files, D: and Media, with a "Photos" search filtering every pane](docs/screenshots/multi-screen-search.png)
+
+- Open folders in tabs and split the editor into side-by-side panes; drag tabs between panes, and **middle-click** a folder to open it in a background tab.
+- The **Search** sidebar filters every open pane at once and lists all matches with their full path and size, ready to select or export to CSV/JSON.
+- Search is case-insensitive and tokenized (`-term` excludes, `name:`, `path:`, `ext:`, `type:`, wildcards, optional regex) and runs against the scan index, not the renderer.
 
 ## Find duplicates
 
@@ -41,19 +48,6 @@ Shrink large media in place or into a separate folder:
 - Every output is verified before the original is recycled, deleted or kept, and compressed files keep the original's **creation and modified dates**, so a replacement never looks like a new file.
 - The **Monitor** shows size-weighted progress, per-file stage, speed and ETA, GPU/CPU/disk telemetry and a diagnostics inspector. Pause or resume one run, or use **Pause all** / **Stop all** for every run at once; queued runs survive restarts.
 - **History** keeps a searchable, exportable log with commands and encoder output. Files that didn't shrink are remembered and skipped next time.
-
-
-
-
-
-
-
-- **Setup** for the common download settings, **Monitor** for live transfers, file/error summaries, scraping activity and logs, and **Edit** for named URL workstations with revision history.
-- Config, cache, download history, logs and URL lists live together in one central workspace.
-
-- Stopping a download removes the `.part` files that run left behind.
-
-
 
 <details>
 <summary><strong>Full feature list</strong></summary>
@@ -166,7 +160,7 @@ The desktop executable is at `.\target\release\FileTree.exe`; the CLI is at `.\t
 
 ### Demo build
 
-
+`build-demo.bat` builds **FileTree Demo** (`dist-demo\FileTree Demo\`), which fills every page with invented drives, files, duplicates and compression runs — handy for screenshots and trying the UI. It has its own app identity and data folder and never reads or changes anything on the PC. To see the same data in a browser:
 
 ```powershell
 npm --prefix frontend run demo

@@ -16,14 +16,11 @@ This file is rendered inside the app under **Help → What's New**.
 
 #### Added
 
-
-
-
 - **Pause all** and **Stop all** buttons in the Compress → Monitor run list. Queued runs are handled before active ones, so the scheduler can't start the next queued run part-way through; Stop all asks for confirmation.
 - Middle-click a folder in the tree to open it in a background tab.
 - An **Options** button in each pane's address bar shows or hides that pane's view options toolbar (size, units, filters, columns). It replaces the unlabelled icon in the tab strip. The toolbar also has its own hide button at the end, and **View → Pane Toolbar** toggles the focused pane.
 - **Undo** (Ctrl+Z) now covers moves, copies (the copies go to the Recycle Bin), recycles (restored from the Recycle Bin), renames and new folders in the desktop app. A move or copy is undoable only for items FileTree can confirm landed at their expected path.
-
+- A **demo build** for screenshots: `build-demo.bat` produces *FileTree Demo*, which fills every page with invented drives, files, duplicates and compression runs. It has its own app identity and data folder and never reads or changes anything on the PC. `npm --prefix frontend run demo` shows the same data in a browser.
 
 #### Changed
 
