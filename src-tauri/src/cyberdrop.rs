@@ -1,17 +1,80 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
+    time::UNIX_EPOCH,
 };
 use tauri::{Manager, State};
 
 const MAX_TEXT: usize = 2 * 1024 * 1024;
 static WORKSPACE_LOCK: Mutex<()> = Mutex::new(());
+/// Workspaces this process has already prepared, and the last config parse per
+/// installation. Both exist because every trip through Python costs seconds on
+/// Windows, and opening the plugin's tab used to pay for two of them.
+static WORKSPACE_READY: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static CONFIG_CACHE: OnceLock<Mutex<HashMap<String, (ConfigStamp, Value)>>> = OnceLock::new();
+
+/// Length and modification time of config.yml — enough to notice an edit made
+/// outside FileTree, without reading or parsing the file.
+type ConfigStamp = (u64, u128);
+
+fn config_stamp(path: &Path) -> ConfigStamp {
+    let Ok(meta) = fs::metadata(path) else {
+        return (0, 0);
+    };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    (meta.len(), modified)
+}
+
+/// `init` creates the workspace and is idempotent, so a process that has
+/// already run it for this installation can skip straight to the files.
+fn ensure_workspace(root: &Path, repo: &str) -> Result<(), String> {
+    let key = format!("{}|{repo}", root.display());
+    let ready = WORKSPACE_READY.get_or_init(Mutex::default);
+    if ready
+        .lock()
+        .map(|done| done.contains(&key))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    workspace(root, repo, json!({"action":"init"}))?;
+    if let Ok(mut done) = ready.lock() {
+        done.insert(key);
+    }
+    Ok(())
+}
+
+/// The parsed config, reusing the last parse while config.yml is untouched.
+fn parsed_config(repo: &str, path: &Path, text: &str) -> Result<Value, String> {
+    let stamp = config_stamp(path);
+    let cache = CONFIG_CACHE.get_or_init(Mutex::default);
+    if let Ok(entries) = cache.lock()
+        && let Some((cached, value)) = entries.get(repo)
+        && *cached == stamp
+    {
+        return Ok(value.clone());
+    }
+    let value = config(repo, text, Value::Null)?;
+    remember_config(repo, path, &value);
+    Ok(value)
+}
+
+fn remember_config(repo: &str, path: &Path, value: &Value) {
+    if let Ok(mut entries) = CONFIG_CACHE.get_or_init(Mutex::default).lock() {
+        entries.insert(repo.to_string(), (config_stamp(path), value.clone()));
+    }
+}
 
 fn workspace(root: &Path, repo: &str, mut request: Value) -> Result<Value, String> {
     request["root"] = json!(root);
@@ -224,7 +287,7 @@ pub(crate) async fn cyberdrop_document(
     tauri::async_runtime::spawn_blocking(move || {
         let root = data_root(&app)?;
         let _guard = WORKSPACE_LOCK.lock().map_err(|e| e.to_string())?;
-        workspace(&root, &repo, json!({"action":"init"}))?;
+        ensure_workspace(&root, &repo)?;
         if name != "config.yml" { return Err("Edit URL workstations instead of the active URLs.txt".into()); }
         let path = root.join(&name);
         let mut parsed = Value::Null;
@@ -233,10 +296,12 @@ pub(crate) async fn cyberdrop_document(
                 let text = text.ok_or("Missing document text")?;
                 if name == "config.yml" { parsed = config(&repo, &text, Value::Null)?; }
                 save_text(&path, &text)?;
+                remember_config(&repo, &path, &parsed);
             }
             "patch" if name == "config.yml" => {
                 parsed = config(&repo, &read_text(&path)?, patch.unwrap_or(Value::Null))?;
                 save_text(&path, parsed["text"].as_str().ok_or("Missing configuration")?)?;
+                remember_config(&repo, &path, &parsed);
             }
             "load" => {},
             _ => return Err("Unknown document action".into()),
@@ -244,7 +309,7 @@ pub(crate) async fn cyberdrop_document(
         let content = read_text(&path)?;
         let mut validation_error = None;
         if name == "config.yml" && parsed.is_null() {
-            match config(&repo, &content, Value::Null) {
+            match parsed_config(&repo, &path, &content) {
                 Ok(value) => parsed = value,
                 Err(error) => validation_error = Some(error),
             }

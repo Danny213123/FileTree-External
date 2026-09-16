@@ -26,12 +26,26 @@ import {
 } from "../lib/plugins";
 
 const CATALOG_TAB = "catalog";
+// Which tab was open last. The page unmounts whenever another view takes over,
+// so without this every visit starts back at the catalog.
+const TAB_KEY = "filetree.plugins.tab";
+
+function storedTab(): string {
+  const saved = localStorage.getItem(TAB_KEY);
+  return saved && (saved === CATALOG_TAB || PLUGINS.some((def) => def.id === saved))
+    ? saved
+    : CATALOG_TAB;
+}
 
 type ToggleFn = (id: string, enabled: boolean) => void;
 
 export function PluginsView() {
   const [prefs, setPrefs] = useState<PluginPrefs>(loadPluginPrefs);
-  const [tab, setTab] = useState<string>(CATALOG_TAB);
+  const [tab, setTabState] = useState<string>(storedTab);
+  const setTab = useCallback((next: string) => {
+    setTabState(next);
+    try { localStorage.setItem(TAB_KEY, next); } catch { /* storage full or blocked */ }
+  }, []);
 
   const toggle = useCallback<ToggleFn>((id, enabled) => {
     const apply = () => setPrefs((prev) => {

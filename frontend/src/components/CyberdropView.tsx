@@ -48,20 +48,33 @@ function get(settings: Record<string, unknown>, path: string, fallback: unknown)
   return value ?? fallback;
 }
 const drafts = new Map<string, string>();
+type EditorFile = "workstation" | "config.yml" | "URLs.txt";
+// Leaving the Plugins page unmounts this panel, and connecting again costs two
+// Python launches (workspace init, then the config parse) — seconds on Windows.
+// The last view is kept here so coming back is instant, and refreshed quietly
+// behind the restored screen.
+type Session = { repo: string; ws: Workspace | null; config: Document | null; openTabs: string[]; file: EditorFile; text: string; saved: string };
+let session: Session | null = null;
+const TAB_KEY = "filetree.cyberdrop.tab";
+const MONITOR_TAB_KEY = "filetree.cyberdrop.monitorTab";
+function storedTab(): "setup" | "monitor" | "edit" {
+  const value = localStorage.getItem(TAB_KEY);
+  return value === "monitor" || value === "edit" ? value : "setup";
+}
 export function CyberdropView(_props: PluginPanelProps) {
   const [repo, setRepo] = useState(() => localStorage.getItem("filetree.cyberdrop.repo") || "");
-  const [tab, setTab] = useState<"setup" | "monitor" | "edit">("setup");
-  const [config, setConfig] = useState<Document | null>(null);
-  const [ws, setWs] = useState<Workspace | null>(null);
+  const [tab, setTab] = useState<"setup" | "monitor" | "edit">(storedTab);
+  const [config, setConfig] = useState<Document | null>(() => session?.config ?? null);
+  const [ws, setWs] = useState<Workspace | null>(() => session?.ws ?? null);
   const [patch, setPatch] = useState<Record<string, unknown>>({});
-  const [openTabs, setOpenTabs] = useState<string[]>([]);
-  const [file, setFile] = useState<"workstation" | "config.yml" | "URLs.txt">("workstation");
-  const [text, setText] = useState("");
-  const [saved, setSaved] = useState("");
+  const [openTabs, setOpenTabs] = useState<string[]>(() => session?.openTabs ?? []);
+  const [file, setFile] = useState<EditorFile>(() => session?.file ?? "workstation");
+  const [text, setText] = useState(() => session?.text ?? "");
+  const [saved, setSaved] = useState(() => session?.saved ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
-  const [monitorTab, setMonitorTab] = useState<"progress" | "logs">("progress");
+  const [monitorTab, setMonitorTab] = useState<"progress" | "logs">(() => localStorage.getItem(MONITOR_TAB_KEY) === "logs" ? "logs" : "progress");
   const [monitor, setMonitor] = useState<Monitor>({ status: "Ready", logs: [], started: 0 });
   const [wrap, setWrap] = useState(true);
   const [follow, setFollow] = useState(true);
@@ -69,6 +82,9 @@ export function CyberdropView(_props: PluginPanelProps) {
   const [revisionText, setRevisionText] = useState<string | null>(null);
   const output = useRef<HTMLPreElement>(null);
   const editor = useRef<HTMLTextAreaElement>(null);
+  // The native file input is kept out of sight; its own button opens it, so the
+  // toolbar shows one control in the app's style instead of "Choose File".
+  const importer = useRef<HTMLInputElement>(null);
   const dirty = text !== saved && file !== "URLs.txt";
   const running = monitor.status === "Running";
   const draftKey = file === "workstation" ? ws?.name ?? "" : file;
@@ -90,8 +106,23 @@ export function CyberdropView(_props: PluginPanelProps) {
     const value = await doc("load"); setConfig(value);
     if (value.validationError) setError(value.validationError);
   };
+  // Reconnecting quietly: the restored view stays on screen (and keeps any
+  // unsaved draft) while the workspace and config are re-read behind it.
+  const reconnect = async () => {
+    try {
+      showStation(await workspace("init"));
+      setConfig(await doc("load"));
+    } catch { /* keep showing the cached view */ }
+  };
   // Nothing to connect to until the user has chosen an installation folder.
-  useEffect(() => { if (repo) void perform(initialize); }, []);
+  useEffect(() => {
+    if (!repo) return;
+    if (session?.repo === repo && session.ws) void reconnect();
+    else void perform(initialize);
+  }, []);
+  useEffect(() => { localStorage.setItem(TAB_KEY, tab); }, [tab]);
+  useEffect(() => { localStorage.setItem(MONITOR_TAB_KEY, monitorTab); }, [monitorTab]);
+  useEffect(() => { session = { repo, ws, config, openTabs, file, text, saved }; }, [repo, ws, config, openTabs, file, text, saved]);
   useEffect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -243,14 +274,15 @@ export function CyberdropView(_props: PluginPanelProps) {
       </div>
       <div className="cdl-toolbar">
         <button disabled={busy} onClick={() => newStation()}>New workstation</button>
-        <label>Open URL file<input aria-label="Import URL list" type="file" accept=".txt,text/plain" disabled={busy} onChange={event => {
+        <button disabled={busy} onClick={() => importer.current?.click()}>Open URL file…</button>
+        <input ref={importer} className="cdl-file-input" aria-label="Import URL list" type="file" accept=".txt,text/plain" disabled={busy} tabIndex={-1} onChange={event => {
           const imported = event.target.files?.[0]; event.target.value = "";
           if (!imported) return;
           void perform(async () => {
             if (imported.size > 2 * 1024 * 1024) throw new Error("URL lists must be smaller than 2 MB");
             await saveEditor(); showStation(await workspace("create", { text: await imported.text(), label: imported.name }));
           });
-        }} /></label>
+        }} />
         <label>Quick open<select aria-label="Recent workstations" value={ws?.name ?? ""} disabled={busy || !ws} onChange={event => { const name = event.target.value; void perform(async () => { await saveEditor(); showStation(await workspace("load", { name })); }); }}>
           {ws?.stations.map(item => <option key={item.id} value={item.id}>{item.id} · {item.label}</option>)}
         </select></label>
