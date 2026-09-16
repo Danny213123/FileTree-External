@@ -12,6 +12,7 @@
 // Adding one is a data change: append a PluginDef below and the Plugins page
 // picks up the catalog card and the tab automatically.
 
+import { BunkrView } from "../components/BunkrView";
 import { CyberdropView } from "../components/CyberdropView";
 import type { ComponentType } from "react";
 import type { IconName } from "../components/Icon";
@@ -82,6 +83,14 @@ export const PLUGINS: PluginDef[] = [
     needs: ["Your local Cyberdrop installation and Python environment", "Read/write access to its FileTree configuration and URL list library", "Network and destination folder access when you start a download"],
     provides: ["Setup, Monitor and Edit tabs", "Shared config.yml and saved URL lists", "Start/Stop controls and live CLI output"],
     panel: CyberdropView,
+  },
+  {
+    id: "bunkr", name: "Bunkr Album Search", vendor: "balbums.st", website: "balbums.st", icon: "search", status: "preview",
+    summary: "Search the public Bunkr album index and turn the results into a URL list.",
+    about: "Searches the balbums.st index for album titles and shows what it finds, with the file count each album reports. Tick the albums you want and the panel writes their links as a .txt URL list, or adds them straight to the Cyberdrop plugin's workspace as a named workstation.",
+    needs: ["Network access to the album index when you press Search", "The Cyberdrop plugin's installation folder, only to add a URL list to its workspace"],
+    provides: ["Album search with the index's own match modes, sorting and page size", "Album links, titles and file counts you can pick from", "A .txt URL list, or a workstation handed to Cyberdrop"],
+    panel: BunkrView,
   },
   {
     id: "everything",

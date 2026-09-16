@@ -21,6 +21,7 @@ use tauri::ipc::Channel;
 use tauri::window::{ProgressBarState, ProgressBarStatus};
 use tauri::{AppHandle, Manager, State};
 
+mod bunkr;
 mod cyberdrop;
 mod fileops;
 mod ollama;
@@ -3132,6 +3133,7 @@ pub fn run() {
             cyberdrop::cyberdrop_start,
             cyberdrop::cyberdrop_stop,
             cyberdrop::cyberdrop_status,
+            bunkr::bunkr_search,
             fileops::rename_path,
             fileops::delete_paths,
             fileops::create_folder,

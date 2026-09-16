@@ -144,6 +144,23 @@ const handlers: Record<string, Handler> = {
   cyberdrop_start: () => { cyberdrop.setRunning(true); return null; },
   cyberdrop_stop: () => { cyberdrop.setRunning(false); return null; },
 
+  // The demo never reaches the network: invented albums for the search panel.
+  bunkr_search: ({ query, per, page }) => {
+    const size = Math.min(Number(per) || 20, 12);
+    const term = String(query ?? "demo").trim() || "demo";
+    return {
+      albums: Array.from({ length: size }, (_, index) => ({
+        title: `${term} · demo album ${index + 1 + (Number(page ?? 1) - 1) * size}`,
+        url: `https://example.invalid/a/demo${index + 1}`,
+        files: 4 + ((index * 7) % 40),
+        thumbnail: null,
+      })),
+      page: Number(page ?? 1),
+      pages: 3,
+      url: "https://example.invalid/?search=demo",
+    };
+  },
+
   terminal_profiles: () => [{ id: "powershell", label: "PowerShell" }],
   terminal_spawn: () => ({ id: 1, title: "PowerShell" }),
   file_icons: ({ extensions }) => Object.fromEntries((extensions ?? []).map((extension: string) => [extension, null])),
