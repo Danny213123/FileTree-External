@@ -8,6 +8,7 @@ import { Icon } from "./Icon";
 import { Select } from "./Select";
 import { DriveCapacityBar } from "./DriveCapacityBar";
 import { PathPicker, splitPath } from "./PathPicker";
+import { BOOKMARK_PREVIEW, bookmarkView } from "../lib/bookmarkList";
 import type { DuplicatesController } from "../hooks/useDuplicates";
 import {
   DUPLICATE_SCAN_STEPS,
@@ -53,7 +54,7 @@ const SCAN_LABELS: Partial<Record<ViewId, string>> = {
 // Duplicates all read as the same panel instead of three different ones.
 
 function SideSection({
-  label, defaultOpen = true, open: openProp, onToggle, children,
+  label, defaultOpen = true, open: openProp, onToggle, storageKey, count, children,
 }: {
   label: string;
   defaultOpen?: boolean;
@@ -61,20 +62,38 @@ function SideSection({
    *  open flag to size its virtualizer). Omit for a self-managed section. */
   open?: boolean;
   onToggle?: (open: boolean) => void;
+  /** Remembers this section's open state across restarts. */
+  storageKey?: string;
+  /** Shown beside the label, so a collapsed section still says how much it holds. */
+  count?: number;
   children: ReactNode;
 }) {
-  const [openLocal, setOpenLocal] = useState(defaultOpen);
+  const [openLocal, setOpenLocal] = useState(() => {
+    if (!storageKey) return defaultOpen;
+    try {
+      const saved = localStorage.getItem(`filetree.sidebar.${storageKey}`);
+      return saved == null ? defaultOpen : saved === "1";
+    } catch { return defaultOpen; }
+  });
   const open = openProp ?? openLocal;
+  const toggle = (next: boolean) => {
+    if (onToggle) { onToggle(next); return; }
+    setOpenLocal(next);
+    if (!storageKey) return;
+    try { localStorage.setItem(`filetree.sidebar.${storageKey}`, next ? "1" : "0"); }
+    catch { /* storage full or blocked */ }
+  };
   return (
     <>
       <button
         type="button"
         className={`sb-section${open ? "" : " collapsed"}`}
         aria-expanded={open}
-        onClick={() => (onToggle ? onToggle(!open) : setOpenLocal(!open))}
+        onClick={() => toggle(!open)}
       >
         <span className="sb-section-chev"><Icon name="chevron-down" size={9} /></span>
         <span className="sb-section-label">{label}</span>
+        {count != null && count > 0 && <span className="sb-section-count">{count}</span>}
       </button>
       {open && children}
     </>
@@ -231,6 +250,58 @@ function TagsSection({
 }
 
 // ── Recent scans ─────────────────────────────────────────────────────────────
+// Bookmarks used to be appended to the Locations list, which meant fifty of
+// them buried Recent, Saved scans, Excludes and Tags below the fold. They get
+// their own collapsible section, a preview of the first few, and a filter once
+// there are more than fit comfortably.
+function BookmarksSection({
+  bookmarks, onOpenLocation,
+}: {
+  bookmarks: string[];
+  onOpenLocation: (path: string) => void;
+}) {
+  const [filter, setFilter] = useState("");
+  const [showAll, setShowAll] = useState(false);
+  if (bookmarks.length === 0) return null;
+  const { visible, matched, truncated } = bookmarkView(bookmarks, filter, showAll);
+  return (
+    <SideSection label="Bookmarks" storageKey="bookmarks" count={bookmarks.length}>
+      {bookmarks.length > BOOKMARK_PREVIEW && (
+        <div className="sb-filter">
+          <input
+            type="search"
+            aria-label="Filter bookmarks"
+            placeholder={`Filter ${bookmarks.length} bookmarks`}
+            value={filter}
+            onChange={(event) => setFilter(event.target.value)}
+          />
+        </div>
+      )}
+      <div className="sb-list">
+        {visible.map((b) => (
+          <button
+            key={b}
+            type="button"
+            className="sb-row"
+            title={b}
+            onClick={() => onOpenLocation(b)}
+          >
+            <Icon name="star-fill" size={12} className="sb-row-star" />
+            <span className="sb-row-label">{leafName(b)}</span>
+            <span className="sb-row-meta">{splitPath(b).parent}</span>
+          </button>
+        ))}
+        {visible.length === 0 && <div className="sb-empty">No bookmark matches “{filter.trim()}”.</div>}
+        {(truncated || showAll) && bookmarks.length > BOOKMARK_PREVIEW && !filter.trim() && (
+          <button type="button" className="sb-more" onClick={() => setShowAll(!showAll)}>
+            {truncated ? `Show all ${matched}` : "Show fewer"}
+          </button>
+        )}
+      </div>
+    </SideSection>
+  );
+}
+
 // The drive/folder chips that used to live here duplicated both the Locations
 // list and the target picker, so this section now only carries history: the
 // paths actually scanned, most recent first.
@@ -563,7 +634,7 @@ function LocationsView(props: SideBarProps) {
           onScan={props.onScan}
         />
       )}
-      <SideSection label="Locations" open={locOpen} onToggle={setLocOpen}>
+      <SideSection label="Drives and folders" open={locOpen} onToggle={setLocOpen}>
         <div className="sb-list">
           {props.drives.map((d) => (
             // total === 0 means the volume couldn't be queried (e.g. an empty
@@ -593,20 +664,10 @@ function LocationsView(props: SideBarProps) {
               <span className="sb-row-label">{f.label}</span>
             </button>
           ))}
-          {props.bookmarkList.map((b) => (
-            <button
-              key={b}
-              type="button"
-              className="sb-row"
-              title={b}
-              onClick={() => props.onOpenLocation(b)}
-            >
-              <Icon name="star-fill" size={12} className="sb-row-star" />
-              <span className="sb-row-label">{leafName(b)}</span>
-            </button>
-          ))}
         </div>
       </SideSection>
+
+      <BookmarksSection bookmarks={props.bookmarkList} onOpenLocation={props.onOpenLocation} />
 
       <RecentSection recent={recentPaths} onOpenLocation={props.onOpenLocation} />
 

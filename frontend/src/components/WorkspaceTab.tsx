@@ -21,6 +21,7 @@ import { isNoOpMove, buildWriteFileCommand, buildEditFileCommand, readFileWindow
 import { confirmRisky, isCrossDrive, isSameDrive } from "../lib/confirmRisky";
 import { clearUndo, pushUndo, parentDir } from "../lib/undo";
 import { resolveDroppedPaths } from "../lib/dropPaths";
+import { WATCH_DEBOUNCE_MS, nextWatchDelay } from "../lib/watchBackoff";
 import { claimExternalPaths } from "../api/client";
 import { beginTransfer, finishTransfer, enqueueTransfer, transferDedupeKey } from "../lib/transfers";
 import { searchNodesAdvanced, filtersActive, toServerSearchParams, type SearchFilters } from "../lib/search";
@@ -284,7 +285,6 @@ const QUICK_FILTER_CHIPS: { key: ChipKey; label: string }[] = [
 // Native watcher events are already collapsed into short batches before they
 // cross IPC. This small UI-side window merges adjacent batches without making
 // visible changes wait close to a second.
-const WATCH_DEBOUNCE_MS = 60;
 const WATCH_MAX_BATCH = 6;
 const DIRTY_DIRECTORY_MAX = 512;
 
@@ -637,6 +637,9 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
   const watchGenerationRef = useRef(0);
   const watchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingChangesRef = useRef<Set<string>>(new Set());
+  // Current watcher window, widened while a folder is being churned.
+  const watchDelayRef = useRef(WATCH_DEBOUNCE_MS);
+  const lastWatchFlushRef = useRef(0);
   // Watcher and in-app mutation paths remain here until their shallow snapshot
   // has been grafted into the loaded tree. Unknown lazy branches stay dirty and
   // are retried when the user expands them; they never force a full drive scan.
@@ -1057,6 +1060,8 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     }
     if (watchDebounceRef.current) { clearTimeout(watchDebounceRef.current); watchDebounceRef.current = null; }
     pendingChangesRef.current.clear();
+    watchDelayRef.current = WATCH_DEBOUNCE_MS;
+    lastWatchFlushRef.current = 0;
 
     // Coalesced + gated flush. A big drive (e.g. C:\) churns logs/registry/temp
     // nonstop; patching every change would rebuild the whole node array each
@@ -1066,9 +1071,22 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       watchDebounceRef.current = null;
       if (patchInFlightRef.current) {
         // A patch is still running — retry shortly without losing pending dirs.
-        watchDebounceRef.current = setTimeout(flushWatch, WATCH_DEBOUNCE_MS);
+        watchDebounceRef.current = setTimeout(flushWatch, watchDelayRef.current);
         return;
       }
+      // Not the visible tab: these directories stay in the dirty set and are
+      // re-listed when the tab is selected again. A background tab watching a
+      // folder a compression run is rewriting would otherwise spend the
+      // renderer's memory on listings nobody is looking at.
+      if (!activeRef.current) { pendingChangesRef.current.clear(); return; }
+      // Flushes that keep landing in quick succession mean the folder is being
+      // churned rather than edited, so widen the window before doing the work.
+      const flushedAt = Date.now();
+      watchDelayRef.current = nextWatchDelay(
+        watchDelayRef.current,
+        flushedAt - lastWatchFlushRef.current,
+      );
+      lastWatchFlushRef.current = flushedAt;
       if (suppressWatchRef.current) { pendingChangesRef.current.clear(); return; }
 
       const byPath = new Map<string, NodeRecord>();
@@ -1095,7 +1113,7 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       for (const changedDir of changedDirs) pendingChangesRef.current.add(changedDir);
       // Leading-edge: schedule once, don't reset on every event during a storm.
       if (!watchDebounceRef.current) {
-        watchDebounceRef.current = setTimeout(flushWatch, WATCH_DEBOUNCE_MS);
+        watchDebounceRef.current = setTimeout(flushWatch, watchDelayRef.current);
       }
     };
 
@@ -1257,6 +1275,15 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
     tree.nodeById,
     tree.ensureChildren,
   ]);
+
+  // Coming back to a tab is a fresh burst, whatever the background churn had
+  // widened the window to while it was hidden.
+  useEffect(() => {
+    if (active) {
+      watchDelayRef.current = WATCH_DEBOUNCE_MS;
+      lastWatchFlushRef.current = 0;
+    }
+  }, [active]);
 
   // Opening a previously-unloaded lazy branch makes any retained watcher path
   // patchable. Retry only those newly-known dirty directories; no deep scan.

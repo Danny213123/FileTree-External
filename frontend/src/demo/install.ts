@@ -50,7 +50,8 @@ const handlers: Record<string, Handler> = {
     const drive = fs.driveOf(String(path)) ?? fs.DRIVES[1];
     return { path, filesystem: "NTFS", totalBytes: drive.total, freeBytes: drive.free, bytesPerCluster: 4096 };
   },
-  bookmarks_get: () => ["D:\\Media\\Photos", "D:\\Projects\\filetree", "E:\\Backups"],
+  // Enough bookmarks to show the sidebar behaving at the size real ones reach.
+  bookmarks_get: () => fs.nodes.filter((node) => node.isDir && node.depth === 2).slice(0, 52).map((node) => node.path),
   browse_directories: ({ path }) => (fs.lookup(String(path))?.children ?? []).map((id) => fs.nodes[id])
     .filter((node) => node.isDir).map((node) => ({ name: node.name, path: node.path, hidden: false })),
 

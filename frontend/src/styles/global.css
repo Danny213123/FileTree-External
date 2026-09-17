@@ -5857,6 +5857,13 @@ html.native-context-menu-open .compress-log-vrow:hover { background: transparent
   color: var(--sb-heading); cursor: pointer; user-select: none; text-align: left;
 }
 .sb-section:hover { color: var(--sb-fg); background: var(--sb-hover); box-shadow: none; }
+/* A collapsed section still says how much it is holding. */
+.sb-section-count { margin-left: 6px; padding: 0 5px; border-radius: 8px; font-size: 10px; background: var(--sb-hover); color: var(--muted); }
+.sb-filter { padding: 4px 8px 6px; }
+.sb-filter input { width: 100%; font-size: 12px; padding: 3px 6px; }
+.sb-more { width: calc(100% - 16px); margin: 4px 8px 6px; font-size: 11px; color: var(--muted); background: transparent; border: 1px dashed var(--border); }
+.sb-more:hover { color: var(--fg); border-style: solid; }
+.sb-empty { padding: 6px 10px; font-size: 11px; color: var(--muted); }
 .sb-section .sb-section-chev {
   display: inline-flex; flex: 0 0 12px; justify-content: center;
   transition: transform 120ms ease; color: var(--sb-fg-muted);
