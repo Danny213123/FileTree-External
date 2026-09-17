@@ -33,6 +33,7 @@ import type {
 import { isTauriV2, scanPage, toNodeRecord } from "./v2";
 import { invokeRead } from "./readRequest";
 import { loadCompressionExclusions } from "../lib/compressionExclusions";
+import { openInFolderApp } from "../lib/folderApp";
 import { Channel, invoke } from "@tauri-apps/api/core";
 
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -632,6 +633,9 @@ export async function revealPath(path: string): Promise<void> {
 
 export async function openPath(path: string): Promise<void> {
   if (isTauriV2()) {
+    // A folder goes to the companion file manager when it is installed and the
+    // setting is on; everything else, and every fallback, is the shell's job.
+    if (await openInFolderApp(path)) return;
     await invoke("open_path", { path });
     return;
   }

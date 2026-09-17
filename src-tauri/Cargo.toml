@@ -32,6 +32,8 @@ portable-pty = "0.8"
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
 [target.'cfg(windows)'.dependencies]
+# Per-user shell association for the opt-in folder handler setting.
+winreg = "0.52"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",

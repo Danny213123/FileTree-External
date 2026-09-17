@@ -75,6 +75,9 @@ import {
   type RowDensity,
   type ThemeMode,
 } from "./lib/appearance";
+import {
+  findFolderApp, folderAppEnabled, folderHandlerStatus, setFolderAppEnabled, setFolderHandler,
+} from "./lib/folderApp";
 import { ActivityBar, type ViewId } from "./components/ActivityBar";
 import { SideBar } from "./components/SideBar";
 import { CommandPalette, type PaletteCommand } from "./components/CommandPalette";
@@ -312,6 +315,31 @@ export default function App() {
   // retained as an explicit preference.
   // #9: size heat-tint on table rows. Both are simple localStorage-backed UI
   // toggles (no server round-trip), initialized once from localStorage.
+  // The companion file manager, when it is installed: folders open there
+  // instead of File Explorer unless this is turned off.
+  const [folderAppFound, setFolderAppFound] = useState(false);
+  const [folderAppOn, setFolderAppOn] = useState(folderAppEnabled);
+  useEffect(() => { void findFolderApp().then((path) => setFolderAppFound(!!path)); }, []);
+  const folderAppName = folderAppFound && folderAppOn ? "FileTree Explorer" : "File Explorer";
+  const handleToggleFolderApp = useCallback(() => {
+    setFolderAppOn((previous) => { setFolderAppEnabled(!previous); return !previous; });
+  }, []);
+
+  // Separate switch, because this one changes the machine rather than FileTree:
+  // it registers the companion app as Windows' own handler for folders.
+  const [folderHandlerOn, setFolderHandlerOn] = useState(false);
+  useEffect(() => { void folderHandlerStatus().then((s) => setFolderHandlerOn(s.enabled)).catch(() => {}); }, []);
+  const handleToggleFolderHandler = useCallback(() => {
+    setFolderHandler(!folderHandlerOn)
+      .then((status) => {
+        setFolderHandlerOn(status.enabled);
+        toast.success(status.enabled
+          ? "Windows will open folders with FileTree Explorer. Win+E and the taskbar pin still go to File Explorer."
+          : "Folders open with File Explorer again.");
+      })
+      .catch((reason) => toast.error(String(reason)));
+  }, [folderHandlerOn]);
+
   const [folderDblClickExplorer, setFolderDblClickExplorer] = useState(() => {
     try { return localStorage.getItem("filetree_folder_dblclick_explorer") !== "0"; } catch { return true; }
   });
@@ -2044,7 +2072,9 @@ export default function App() {
         { label: "Configure Columns…", opensColumns: true },
         { label: "Pane Toolbar (view options)", checked: !focusedToolbarHidden, onClick: () => handleToggleToolbar(focusedGroupId) },
         { separator: true },
-        { label: "Double-click opens folder in Explorer", checked: folderDblClickExplorer, onClick: handleToggleFolderDblClick },
+        { label: `Double-click opens folder in ${folderAppName}`, checked: folderDblClickExplorer, onClick: handleToggleFolderDblClick },
+        { label: "Open folders in FileTree Explorer", checked: folderAppOn, disabled: !folderAppFound, onClick: handleToggleFolderApp },
+        { label: "…and make Windows use it for folders too", checked: folderHandlerOn, disabled: !folderAppFound, onClick: handleToggleFolderHandler },
         { label: "Size heat-tint rows", checked: heatTint, onClick: handleToggleHeatTint },
         { separator: true },
         { label: "Dark Theme", checked: darkMode, onClick: handleToggleDark },
@@ -2092,6 +2122,8 @@ export default function App() {
     statusData, tabs.length, focusedGroupId, focusedTabId,
     lowSpaceAlerts, lowSpaceThreshold, cycleLowSpaceThreshold,
     folderDblClickExplorer, heatTint, handleToggleFolderDblClick, handleToggleHeatTint,
+    folderAppName, folderAppOn, folderAppFound, handleToggleFolderApp,
+    folderHandlerOn, handleToggleFolderHandler,
     handleOpenInNewTab, handleCloseTab, handleSaveSession, handleLoadSession,
     handleToggleTerminal, handleToggleChat, handleToggleDark, handleToggleSidebar,
     handleToggleTreemap, handleTogglePreview, handleToggleDetails, handleToggleTmLabels,

@@ -25,6 +25,7 @@ mod bunkr;
 mod cyberdrop;
 mod everything;
 mod fileops;
+mod folderhandler;
 mod mediainfo;
 mod ollama;
 mod rclone;
@@ -2838,6 +2839,79 @@ async fn file_icons(extensions: Vec<String>) -> Result<HashMap<String, Option<St
     .map_err(|error| format!("Shell icon batch worker failed: {error}"))
 }
 
+/// Candidate locations for FileTree Explorer, the companion file manager.
+///
+/// Checked in the order someone would expect it to win: beside this exe (a
+/// packaged install), the sibling source checkout, then the usual install
+/// folders. Returns nothing rather than guessing when it is not installed.
+fn folder_app_candidates() -> Vec<PathBuf> {
+    const EXE: &str = "FileTreeExplorer.exe";
+    let mut candidates = Vec::new();
+    if let Ok(current) = std::env::current_exe()
+        && let Some(dir) = current.parent()
+    {
+        candidates.push(dir.join(EXE));
+        // A source checkout sitting beside FileTree's own.
+        if let Some(repo) = dir.ancestors().nth(2) {
+            candidates.push(
+                repo.join("..")
+                    .join("FileTreeExplorer")
+                    .join("target")
+                    .join("release")
+                    .join(EXE),
+            );
+        }
+    }
+    candidates.extend(tools::program_files(&format!("FileTree Explorer\\{EXE}")));
+    candidates.extend(tools::program_files(&format!(
+        "Programs\\FileTree Explorer\\{EXE}"
+    )));
+    candidates
+}
+
+/// Where FileTree Explorer is, if it is anywhere obvious.
+#[tauri::command]
+async fn locate_folder_app() -> Option<String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        folder_app_candidates()
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .and_then(|candidate| candidate.canonicalize().ok().or(Some(candidate)))
+            .map(|candidate| {
+                candidate
+                    .to_string_lossy()
+                    .trim_start_matches("\\\\?\\")
+                    .to_string()
+            })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Open a folder in the companion file manager.
+///
+/// Returns `false` — rather than an error — when this is not a folder or the
+/// app is not there, so the caller can fall back to the shell's own handler
+/// without treating an ordinary case as a failure.
+#[tauri::command]
+async fn open_folder_app(path: String, exe: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = Path::new(&path);
+        let app = Path::new(&exe);
+        if !target.is_dir() || !app.is_file() {
+            return Ok(false);
+        }
+        tools::command(app)
+            .arg(target)
+            .spawn()
+            .map_err(|error| format!("Could not start {}: {error}", app.display()))?;
+        Ok(true)
+    })
+    .await
+    .map_err(|error| format!("Folder app worker failed: {error}"))?
+}
+
 /// Explorer's own icon for a drive or folder, for the places list.
 ///
 /// Folders only: an icon for a *type* is what `file_icon` is for, and keeping
@@ -3206,6 +3280,10 @@ pub fn run() {
             file_icon,
             file_icons,
             path_icon,
+            locate_folder_app,
+            open_folder_app,
+            folderhandler::folder_handler_status,
+            folderhandler::set_folder_handler,
             file_thumbnail,
             terminal::terminal_profiles,
             terminal::terminal_spawn,
