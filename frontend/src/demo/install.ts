@@ -239,6 +239,8 @@ const handlers: Record<string, Handler> = {
   terminal_profiles: () => [{ id: "powershell", label: "PowerShell" }],
   terminal_spawn: () => ({ id: 1, title: "PowerShell" }),
   file_icons: ({ extensions }) => Object.fromEntries((extensions ?? []).map((extension: string) => [extension, null])),
+  // No shell to ask in the demo, so the places list keeps the bundled glyphs.
+  path_icon: () => null,
   file_thumbnail: ({ path }) => thumbnail(String(path)),
 };
 

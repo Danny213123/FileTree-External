@@ -2838,6 +2838,27 @@ async fn file_icons(extensions: Vec<String>) -> Result<HashMap<String, Option<St
     .map_err(|error| format!("Shell icon batch worker failed: {error}"))
 }
 
+/// Explorer's own icon for a drive or folder, for the places list.
+///
+/// Folders only: an icon for a *type* is what `file_icon` is for, and keeping
+/// this to directories means the command cannot be pointed at a file to learn
+/// anything about it. The icon comes from the shell, so a drive keeps whatever
+/// its manufacturer or autorun.inf gave it.
+#[tauri::command]
+async fn path_icon(path: String) -> Result<Option<String>, String> {
+    if path.trim().is_empty() || path.len() > 4096 {
+        return Ok(None);
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        if !Path::new(&path).is_dir() {
+            return None;
+        }
+        filetree_core::shell_path_icon_data_url(&path)
+    })
+    .await
+    .map_err(|error| format!("Shell icon worker failed: {error}"))
+}
+
 #[tauri::command]
 async fn file_thumbnail(
     state: State<'_, Arc<V2Store>>,
@@ -3184,6 +3205,7 @@ pub fn run() {
             stat_dropped_paths,
             file_icon,
             file_icons,
+            path_icon,
             file_thumbnail,
             terminal::terminal_profiles,
             terminal::terminal_spawn,

@@ -1423,7 +1423,34 @@ pub(crate) fn shell_icon_png(extension: &str) -> Option<Vec<u8>> {
     {
         return Some(hit);
     }
-    let image = render_shell_icon_png(&key)?;
+    let image = render_shell_icon_png(&format!(".{key}"), true)?;
+    icon_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(key, image.clone());
+    Some(image)
+}
+
+/// The icon Explorer shows for one real item.
+///
+/// Unlike [`shell_icon_png`], which asks about a file *type*, this asks the
+/// shell about the item itself, so a drive keeps the icon its manufacturer or
+/// its autorun.inf gave it and a known folder keeps its own glyph.
+#[cfg(windows)]
+pub(crate) fn shell_path_icon_png(path: &str) -> Option<Vec<u8>> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    // Prefixed so a path can never collide with an extension in the cache.
+    let key = format!("path:{}", path.to_ascii_lowercase());
+    if let Some(hit) = icon_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key)
+    {
+        return Some(hit);
+    }
+    let image = render_shell_icon_png(path, false)?;
     icon_cache()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -1499,7 +1526,9 @@ fn normalize_shell_icon_bgra(bgra: &mut [u8]) -> bool {
 
 #[cfg(windows)]
 #[allow(non_snake_case, non_camel_case_types)]
-fn render_shell_icon_png(extension: &str) -> Option<Vec<u8>> {
+/// `target` is either a `.ext` type probe (with `use_file_attributes`, so the
+/// shell answers without touching the disk) or a real path to ask about.
+fn render_shell_icon_png(target: &str, use_file_attributes: bool) -> Option<Vec<u8>> {
     use std::ffi::c_void;
     const SHGFI_ICON: u32 = 0x0000_0100;
     const SHGFI_SMALLICON: u32 = 0x0000_0001;
@@ -1586,18 +1615,20 @@ fn render_shell_icon_png(extension: &str) -> Option<Vec<u8>> {
         fn DestroyIcon(icon: isize) -> i32;
     }
 
-    let wide: Vec<u16> = format!(".{extension}")
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
+    let wide: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
+    let (attributes, extra_flags) = if use_file_attributes {
+        (FILE_ATTRIBUTE_NORMAL, SHGFI_USEFILEATTRIBUTES)
+    } else {
+        (0, 0)
+    };
     unsafe {
         let mut info: ShFileInfoW = std::mem::zeroed();
         if SHGetFileInfoW(
             wide.as_ptr(),
-            FILE_ATTRIBUTE_NORMAL,
+            attributes,
             &mut info,
             std::mem::size_of::<ShFileInfoW>() as u32,
-            SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+            SHGFI_ICON | SHGFI_SMALLICON | extra_flags,
         ) == 0
             || info.hIcon == 0
         {
@@ -1995,6 +2026,11 @@ pub(crate) fn unprotect_secret(value: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(not(windows))]
 pub(crate) fn set_keep_awake(_active: bool) {}
+
+#[cfg(not(windows))]
+pub(crate) fn shell_path_icon_png(_path: &str) -> Option<Vec<u8>> {
+    None
+}
 
 #[cfg(not(windows))]
 pub(crate) fn shell_icon_png(_extension: &str) -> Option<Vec<u8>> {

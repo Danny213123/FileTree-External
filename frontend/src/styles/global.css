@@ -5864,6 +5864,8 @@ html.native-context-menu-open .compress-log-vrow:hover { background: transparent
 .sb-more { width: calc(100% - 16px); margin: 4px 8px 6px; font-size: 11px; color: var(--muted); background: transparent; border: 1px dashed var(--border); }
 .sb-more:hover { color: var(--fg); border-style: solid; }
 .sb-empty { padding: 6px 10px; font-size: 11px; color: var(--muted); }
+/* Shell icons are 16px bitmaps: keep them crisp rather than smoothed. */
+.place-icon { flex: 0 0 auto; image-rendering: -webkit-optimize-contrast; object-fit: contain; }
 .sb-section .sb-section-chev {
   display: inline-flex; flex: 0 0 12px; justify-content: center;
   transition: transform 120ms ease; color: var(--sb-fg-muted);

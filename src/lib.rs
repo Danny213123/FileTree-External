@@ -248,6 +248,17 @@ pub fn shell_icon_data_url(extension: &str) -> Option<String> {
     })
 }
 
+/// The icon Explorer shows for a drive, folder or other real item.
+pub fn shell_path_icon_data_url(path: &str) -> Option<String> {
+    use base64::Engine as _;
+    windows_native::shell_path_icon_png(path).map(|png| {
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        )
+    })
+}
+
 pub fn shell_thumbnail_data_url(path: &str, size: i32, icon_fallback: bool) -> Option<String> {
     use base64::Engine as _;
     windows_native::shell_thumbnail_png(path, size, icon_fallback).map(|png| {
@@ -341,4 +352,31 @@ pub fn show_shell_context_menu(
 
 pub fn run_cli() {
     cli::run();
+}
+
+#[cfg(all(test, windows))]
+mod shell_icon_tests {
+    #[test]
+    fn a_drive_has_the_icon_windows_gives_it() {
+        let icon = super::shell_path_icon_data_url("C:\\").expect("the system drive has an icon");
+        assert!(
+            icon.starts_with("data:image/png;base64,"),
+            "not a PNG: {}",
+            &icon[..40.min(icon.len())]
+        );
+        // A 16x16 icon is never this small; an empty render would be.
+        assert!(
+            icon.len() > 200,
+            "suspiciously small icon: {} bytes",
+            icon.len()
+        );
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_has_no_icon() {
+        assert_eq!(
+            super::shell_path_icon_data_url("Z:\\definitely\\not\\here\\12345"),
+            None
+        );
+    }
 }

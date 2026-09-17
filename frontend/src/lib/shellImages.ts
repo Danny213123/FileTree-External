@@ -156,6 +156,28 @@ export function invalidateShellIcon(extension: string): void {
   if (normalized) iconCache.delete(normalized);
 }
 
+/**
+ * Explorer's icon for one drive or folder, rather than for a file type: a USB
+ * drive keeps its own glyph, and Downloads keeps the arrow.
+ *
+ * Keyed apart from the type icons so a path can never collide with an
+ * extension, and resolves to null anywhere the shell cannot answer (a browser
+ * build, or a drive that has gone away).
+ */
+export function loadShellPathIcon(path: string): Promise<string | null> {
+  const key = path.trim().toLowerCase();
+  if (!key || !isTauriV2()) return Promise.resolve(null);
+  return iconCache.get(`path:${key}`, async () => {
+    try { return await invoke<string | null>("path_icon", { path }); }
+    catch { return null; }
+  });
+}
+
+export function peekShellPathIcon(path: string): string | undefined {
+  const key = path.trim().toLowerCase();
+  return key ? iconCache.peek(`path:${key}`) : undefined;
+}
+
 export function loadShellThumbnail(
   path: string,
   size = 480,

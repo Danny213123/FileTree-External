@@ -9,6 +9,7 @@ import { Select } from "./Select";
 import { DriveCapacityBar } from "./DriveCapacityBar";
 import { PathPicker, splitPath } from "./PathPicker";
 import { BOOKMARK_PREVIEW, bookmarkView } from "../lib/bookmarkList";
+import { PlaceIcon } from "./PlaceIcon";
 import type { DuplicatesController } from "../hooks/useDuplicates";
 import {
   DUPLICATE_SCAN_STEPS,
@@ -647,7 +648,7 @@ function LocationsView(props: SideBarProps) {
               title={d.total > 0 ? `${d.label || d.root} — ${fmtSize(d.free)} free of ${fmtSize(d.total)}` : d.root}
               onClick={() => props.onOpenLocation(d.root)}
             >
-              <Icon name="hdd" size={13} />
+              <PlaceIcon path={d.root} fallback="hdd" />
               <span className="sb-row-label">{d.label || d.root}</span>
               <DriveCapacityBar total={d.total} free={d.free} root={d.root} compact />
             </button>
@@ -660,7 +661,7 @@ function LocationsView(props: SideBarProps) {
               title={f.path}
               onClick={() => props.onOpenLocation(f.path)}
             >
-              <Icon name="folder" size={13} />
+              <PlaceIcon path={f.path} fallback="folder" />
               <span className="sb-row-label">{f.label}</span>
             </button>
           ))}
