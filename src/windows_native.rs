@@ -1458,8 +1458,44 @@ pub(crate) fn shell_path_icon_png(path: &str) -> Option<Vec<u8>> {
     Some(image)
 }
 
+/// Which picture the shell should hand back for an item.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellImage {
+    /// The item's thumbnail, falling back to its icon.
+    Preview,
+    /// The item's thumbnail and nothing else.
+    ThumbnailOnly,
+    /// The item's icon, drawn at the size asked for, never its thumbnail.
+    IconOnly,
+}
+
 #[cfg(windows)]
 pub(crate) fn shell_thumbnail_png(path: &str, size: i32, icon_fallback: bool) -> Option<Vec<u8>> {
+    shell_image_png(
+        path,
+        size,
+        if icon_fallback {
+            ShellImage::Preview
+        } else {
+            ShellImage::ThumbnailOnly
+        },
+    )
+}
+
+/// The item's icon at an arbitrary size.
+///
+/// [`shell_icon_png`] answers from `SHGetFileInfo`, which draws 16 pixels
+/// square; stretching that to 24 device pixels on a scaled display is exactly
+/// what makes a row of icons look blurry. The image factory renders the same
+/// icon at whatever size the display actually needs.
+#[cfg(windows)]
+pub(crate) fn shell_item_icon_png(path: &str, size: i32) -> Option<Vec<u8>> {
+    shell_image_png(path, size, ShellImage::IconOnly)
+}
+
+#[cfg(windows)]
+fn shell_image_png(path: &str, size: i32, kind: ShellImage) -> Option<Vec<u8>> {
     let size = size.clamp(16, 512);
     let metadata = std::fs::metadata(path).ok()?;
     let modified = metadata
@@ -1474,7 +1510,7 @@ pub(crate) fn shell_thumbnail_png(path: &str, size: i32, icon_fallback: bool) ->
         metadata.len(),
         modified,
         size,
-        icon_fallback
+        kind as u8
     );
     if let Some(hit) = thumbnail_cache()
         .lock()
@@ -1484,7 +1520,7 @@ pub(crate) fn shell_thumbnail_png(path: &str, size: i32, icon_fallback: bool) ->
         return Some(hit);
     }
     let _permit = acquire_thumbnail_permit();
-    let image = render_shell_thumbnail_png(path, size, icon_fallback)?;
+    let image = render_shell_thumbnail_png(path, size, kind)?;
     thumbnail_cache()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -1705,7 +1741,7 @@ fn render_shell_icon_png(target: &str, use_file_attributes: bool) -> Option<Vec<
 
 #[cfg(windows)]
 #[allow(non_snake_case, non_camel_case_types)]
-fn render_shell_thumbnail_png(path: &str, size: i32, icon_fallback: bool) -> Option<Vec<u8>> {
+fn render_shell_thumbnail_png(path: &str, size: i32, kind: ShellImage) -> Option<Vec<u8>> {
     use std::ffi::c_void;
     const IID_SHELL_ITEM: [u8; 16] = [
         0x1E, 0x6D, 0x82, 0x43, 0x18, 0xE7, 0xEE, 0x42, 0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B,
@@ -1834,9 +1870,12 @@ fn render_shell_thumbnail_png(path: &str, size: i32, icon_fallback: bool) -> Opt
         let factory_vtbl = *(factory as *mut *mut ImageFactoryVtbl);
         let requested = Size { cx: size, cy: size };
         let mut bitmap = 0isize;
-        let mut result =
-            ((*factory_vtbl).get_image)(factory, requested, SIIGBF_THUMBNAILONLY, &mut bitmap);
-        if (result < 0 || bitmap == 0) && icon_fallback {
+        let mut result = if kind == ShellImage::IconOnly {
+            ((*factory_vtbl).get_image)(factory, requested, SIIGBF_ICONONLY, &mut bitmap)
+        } else {
+            ((*factory_vtbl).get_image)(factory, requested, SIIGBF_THUMBNAILONLY, &mut bitmap)
+        };
+        if (result < 0 || bitmap == 0) && kind == ShellImage::Preview {
             bitmap = 0;
             result = ((*factory_vtbl).get_image)(factory, requested, SIIGBF_ICONONLY, &mut bitmap);
         }
@@ -2043,6 +2082,11 @@ pub(crate) fn shell_thumbnail_png(
     _size: i32,
     _icon_fallback: bool,
 ) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(not(windows))]
+pub(crate) fn shell_item_icon_png(_path: &str, _size: i32) -> Option<Vec<u8>> {
     None
 }
 

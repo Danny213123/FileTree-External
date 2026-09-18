@@ -106,6 +106,17 @@ pub fn reveal_system_path(path: &str) -> Result<(), String> {
     io::reveal_path(path).map_err(|error| error.to_string())
 }
 
+/// Unpack a `.zip` into `destination`.
+///
+/// Entry names that would climb out of the destination are refused outright
+/// rather than sanitised, so a crafted archive cannot write anywhere else.
+pub fn extract_archive(archive: &str, destination: &str) -> Result<(), String> {
+    archive::extract(
+        std::path::Path::new(archive),
+        std::path::Path::new(destination),
+    )
+}
+
 /// Recycle (default) or permanently delete one file or folder. Authorization
 /// and scanned-root policy are enforced by the Tauri command boundary.
 pub fn delete_path(path: &str, permanent: bool) -> Result<(), String> {
@@ -259,6 +270,22 @@ pub fn shell_path_icon_data_url(path: &str) -> Option<String> {
     })
 }
 
+/// The shell's icon for one item, drawn at the size asked for.
+///
+/// [`shell_icon_data_url`] and [`shell_path_icon_data_url`] both return 16
+/// pixels square, which is right for a 100% display and blurry on any other.
+/// A caller that knows how many device pixels it will actually draw into should
+/// ask for that many.
+pub fn shell_item_icon_data_url(path: &str, size: i32) -> Option<String> {
+    use base64::Engine as _;
+    windows_native::shell_item_icon_png(path, size).map(|png| {
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        )
+    })
+}
+
 pub fn shell_thumbnail_data_url(path: &str, size: i32, icon_fallback: bool) -> Option<String> {
     use base64::Engine as _;
     windows_native::shell_thumbnail_png(path, size, icon_fallback).map(|png| {
@@ -377,6 +404,21 @@ mod shell_icon_tests {
         assert_eq!(
             super::shell_path_icon_data_url("Z:\\definitely\\not\\here\\12345"),
             None
+        );
+    }
+
+    #[test]
+    fn asking_for_a_bigger_icon_gets_more_pixels() {
+        let small = super::shell_item_icon_data_url("C:\\", 16).expect("an icon at 16 pixels");
+        let large = super::shell_item_icon_data_url("C:\\", 64).expect("an icon at 64 pixels");
+        assert!(small.starts_with("data:image/png;base64,"));
+        // The point of the size argument: a 64-pixel render is a real render,
+        // not the 16-pixel one stretched, so it carries noticeably more data.
+        assert!(
+            large.len() > small.len(),
+            "64px icon ({} bytes) is no larger than the 16px one ({} bytes)",
+            large.len(),
+            small.len()
         );
     }
 }
