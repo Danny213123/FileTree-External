@@ -92,6 +92,46 @@ function clampFontSize(n: number): number {
 }
 
 /**
+ * Everything another window would need to look like this one.
+ *
+ * These prefs live in this webview's own storage, which a separate app cannot
+ * read, so they are also written to a file beside the other settings and
+ * FileTree Explorer follows it. Read from the same loaders the app itself uses,
+ * so what is published can never disagree with what is applied here.
+ */
+export function appearanceSnapshot(): string {
+  return JSON.stringify({
+    accent: loadAccent(),
+    font: loadFont(),
+    fontSize: loadFontSize(),
+    scale: loadScale(),
+    density: loadDensity(),
+    reduceMotion: loadReduceMotion(),
+    themeMode: loadThemeMode() ?? DEFAULT_THEME_MODE,
+  });
+}
+
+/** Coalesces a slider drag into one write instead of one per tick. */
+let publishTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * Tell the other window how this one looks now.
+ *
+ * Best-effort on purpose: a companion app not picking up a colour change is
+ * not worth interrupting anyone over, and there is nothing useful to do about
+ * it here.
+ */
+export function publishAppearance(): void {
+  if (!isTauriV2()) return;
+  clearTimeout(publishTimer);
+  publishTimer = setTimeout(() => {
+    void import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke("publish_appearance", { appearance: appearanceSnapshot() }))
+      .catch(() => { /* the companion app simply keeps its current look */ });
+  }, 150);
+}
+
+/**
  * The row height to lay rows out at.
  *
  * Density picks the base, but a row shorter than its own text clips the
@@ -251,10 +291,12 @@ export function saveAccent(hex: string): void {
     if (hexToRgb(hex)) localStorage.setItem(ACCENT_KEY, hex);
     else localStorage.removeItem(ACCENT_KEY);
   } catch { /* ignore */ }
+  publishAppearance();
 }
 
 export function saveScale(percent: number): void {
   try { localStorage.setItem(SCALE_KEY, String(clampScale(percent))); } catch { /* ignore */ }
+  publishAppearance();
 }
 
 // ── Theme mode (light / dark / system) ──────────────────────────────────────
@@ -279,6 +321,7 @@ export function loadThemeMode(): ThemeMode | null {
 
 export function saveThemeMode(mode: ThemeMode): void {
   try { localStorage.setItem(THEME_KEY, mode); } catch { /* ignore */ }
+  publishAppearance();
 }
 
 /** Whether `mode` means "dark" right now — reads the OS only for "system". */
@@ -314,6 +357,7 @@ export function loadDensity(): RowDensity {
 
 export function saveDensity(density: RowDensity): void {
   try { localStorage.setItem(DENSITY_KEY, density); } catch { /* ignore */ }
+  publishAppearance();
 }
 
 export function loadFontSize(): number {
@@ -325,6 +369,7 @@ export function loadFontSize(): number {
 
 export function saveFontSize(px: number): void {
   try { localStorage.setItem(FONT_SIZE_KEY, String(clampFontSize(px))); } catch { /* ignore */ }
+  publishAppearance();
 }
 
 /**
@@ -349,6 +394,7 @@ export function saveReduceMotion(on: boolean): void {
     if (on) localStorage.setItem(MOTION_KEY, "1");
     else localStorage.removeItem(MOTION_KEY);
   } catch { /* ignore */ }
+  publishAppearance();
 }
 
 /**
@@ -376,6 +422,7 @@ export function saveFont(stack: string): void {
     if (stack) localStorage.setItem(FONT_KEY, stack);
     else localStorage.removeItem(FONT_KEY);
   } catch { /* ignore */ }
+  publishAppearance();
 }
 
 /** Drives both family tokens: --font for the shell, --vsc-font for the workbench. */
@@ -409,5 +456,8 @@ export function initAppearance(): ThemeMode | null {
   // `darkMode` from an install predating this pref overrides it just after.
   const mode = loadThemeMode();
   applyTheme(resolveDark(mode ?? DEFAULT_THEME_MODE));
+  // Publish once on startup too, so a companion window opened later matches
+  // even when nothing has been changed since it was last published.
+  publishAppearance();
   return mode;
 }

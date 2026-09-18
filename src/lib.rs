@@ -85,6 +85,40 @@ pub fn app_config_json() -> String {
     )
 }
 
+/// Where the two apps agree on how they look.
+///
+/// FileTree owns these settings — accent, font, text size, scale, density,
+/// reduced motion — and keeps them in its webview's own storage, which a
+/// separate app cannot read. So it also publishes them here, beside the other
+/// settings, and FileTree Explorer reads and follows this file. One direction
+/// only: the explorer never writes it, because FileTree is where they are set.
+pub fn appearance_path() -> std::path::PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("FileTree").join("appearance.json")
+}
+
+/// The published appearance, or `{}` when nothing has been published yet.
+pub fn read_appearance() -> String {
+    std::fs::read_to_string(appearance_path()).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Publish the appearance for other windows to follow.
+///
+/// Written whole and replaced in one step, so a reader never catches a
+/// half-written file and falls back to the defaults for a frame.
+pub fn write_appearance(json: &str) -> Result<(), String> {
+    let path = appearance_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    }
+    let staged = path.with_extension("json.new");
+    std::fs::write(&staged, json).map_err(|error| error.to_string())?;
+    std::fs::rename(&staged, &path).map_err(|error| error.to_string())
+}
+
 pub fn drives_json() -> String {
     export::drives_json()
 }

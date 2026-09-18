@@ -2391,6 +2391,22 @@ fn app_config() -> Result<Value, String> {
     json_value(filetree_core::app_config_json())
 }
 
+/// Publish how FileTree looks, so FileTree Explorer can look the same.
+///
+/// These settings live in this webview's own storage, which a separate app
+/// cannot read, so they are also written beside the other settings on disk.
+/// Called whenever one of them changes; failing to publish is not worth
+/// interrupting anyone over, so the caller ignores the result.
+#[tauri::command]
+async fn publish_appearance(appearance: String) -> Result<(), String> {
+    if appearance.len() > 64 * 1024 {
+        return Err("Appearance settings are unexpectedly large".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || filetree_core::write_appearance(&appearance))
+        .await
+        .map_err(|error| format!("Appearance worker failed: {error}"))?
+}
+
 #[tauri::command]
 async fn drives() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(|| json_value(filetree_core::drives_json()))
@@ -3260,6 +3276,7 @@ pub fn run() {
             app_version,
             app_exit,
             app_config,
+            publish_appearance,
             drives,
             special_folders,
             volume_info,
