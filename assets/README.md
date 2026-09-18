@@ -2,6 +2,21 @@
 
 Binary assets bundled into the FileTree `.exe` via `include_bytes!`.
 
+## icon-source.png
+
+The app mark at 1024×1024, drawn by `scripts/make-icon.ps1` and the source the
+icon set in `src-tauri/icons/` is generated from:
+
+```
+powershell -File scripts/make-icon.ps1
+npx tauri icon assets/icon-source.png
+```
+
+Generated rather than hand-drawn so the mark stays editable — the geometry and
+the palette are in the script, not locked inside a binary. `tauri icon` also
+writes `ios/` and `android/` sets; both are deleted, since this is a Windows
+desktop app.
+
 ## bootstrap-icons-1.11.3.ttf
 
 ```

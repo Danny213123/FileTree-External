@@ -133,7 +133,7 @@ export function TitleBar({
         if (nativeWindow && !(event.target as HTMLElement).closest("button, .vsc-menubar, .titlebar-actions, .window-controls")) void windowAction("toggleMaximize");
       }}>
 
-      <Icon name="folder" size={16} className="vsc-titlebar-logo" />
+      <Icon name="appmark" size={15} className="vsc-titlebar-logo" />
       <div className="vsc-menubar">
         {menus.map((menu, idx) => {
           const hasColumns = menu.items.some((it) => it.opensColumns);
