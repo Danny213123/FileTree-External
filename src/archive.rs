@@ -242,9 +242,28 @@ where
 /// through `enclosed_name`, which rejects absolute paths and `..` traversal
 /// (zip-slip), so nothing is ever written outside `dest`.
 pub(crate) fn extract(archive: &Path, dest: &Path) -> Result<(), String> {
+    extract_with_progress(archive, dest, &mut |_, _, _| {})
+}
+
+/// As [`extract`], reporting how far along it is.
+///
+/// `progress` is called with bytes written so far, the total to write, and the
+/// name of the entry just finished. Totals come from the central directory, so
+/// they cost one pass over the index and nothing is decompressed twice.
+pub(crate) fn extract_with_progress(
+    archive: &Path,
+    dest: &Path,
+    progress: &mut dyn FnMut(u64, u64, &str),
+) -> Result<(), String> {
     let file = File::open(archive).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
     fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+
+    let total = (0..zip.len())
+        .filter_map(|i| zip.by_index_raw(i).ok().map(|entry| entry.size()))
+        .sum::<u64>()
+        .max(1);
+    let mut written = 0u64;
 
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
@@ -259,8 +278,13 @@ pub(crate) fn extract(archive: &Path, dest: &Path) -> Result<(), String> {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             let mut out = File::create(&outpath).map_err(|e| e.to_string())?;
-            io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+            written += io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
         }
+        let name = outpath
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        progress(written.min(total), total, &name);
     }
     Ok(())
 }

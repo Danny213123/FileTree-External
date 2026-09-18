@@ -117,6 +117,23 @@ pub fn extract_archive(archive: &str, destination: &str) -> Result<(), String> {
     )
 }
 
+/// As [`extract_archive`], calling `progress` with (bytes done, bytes total,
+/// the name just written) after each entry.
+///
+/// Unpacking is the one file operation Windows has no dialog of its own for,
+/// so whatever is driving it has to show the progress itself.
+pub fn extract_archive_with_progress(
+    archive: &str,
+    destination: &str,
+    progress: &mut dyn FnMut(u64, u64, &str),
+) -> Result<(), String> {
+    archive::extract_with_progress(
+        std::path::Path::new(archive),
+        std::path::Path::new(destination),
+        progress,
+    )
+}
+
 /// Recycle (default) or permanently delete one file or folder. Authorization
 /// and scanned-root policy are enforced by the Tauri command boundary.
 pub fn delete_path(path: &str, permanent: bool) -> Result<(), String> {
@@ -338,6 +355,27 @@ pub fn copy_items_with_windows(
     owner_handle: isize,
 ) -> Result<NativeMoveOutcome, String> {
     windows_native::native_copy_files(paths, destination, owner_handle).map(|result| {
+        NativeMoveOutcome {
+            aborted: result.aborted,
+            moved: result.moved,
+            skipped: result.skipped,
+            failed: result.failed,
+        }
+    })
+}
+
+/// Delete a selection through Explorer's own engine.
+///
+/// [`delete_path`] is the quiet, one-at-a-time route a background job wants.
+/// This is the one a person wants: one operation for the whole selection, with
+/// Windows' progress dialog, its confirmation for a permanent delete, and an
+/// undo entry afterwards.
+pub fn delete_items_with_windows(
+    paths: Vec<String>,
+    owner_handle: isize,
+    permanent: bool,
+) -> Result<NativeMoveOutcome, String> {
+    windows_native::native_delete_files(paths, owner_handle, permanent).map(|result| {
         NativeMoveOutcome {
             aborted: result.aborted,
             moved: result.moved,

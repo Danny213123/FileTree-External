@@ -172,6 +172,29 @@ pub(crate) struct ClipboardFilesResult {
     pub(crate) prefer_move: bool,
 }
 
+/// What the shell's file-operation engine is being asked to do.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferKind {
+    Move,
+    Copy,
+    /// To the Recycle Bin, or past it when `permanent`.
+    Delete {
+        permanent: bool,
+    },
+}
+
+#[cfg(windows)]
+impl TransferKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Move => "move",
+            Self::Copy => "copy",
+            Self::Delete { .. } => "delete",
+        }
+    }
+}
+
 /// Move files/folders through the same `IFileOperation` engine Explorer uses.
 /// Because `FOF_SILENT` is deliberately absent, Windows supplies its normal
 /// progress, collision, cancellation, and elevation UI for non-trivial moves.
@@ -181,7 +204,7 @@ pub(crate) fn native_move_files(
     destination: String,
     owner_handle: isize,
 ) -> Result<NativeMoveResult, String> {
-    native_transfer_files(paths, destination, owner_handle, true)
+    native_transfer_files(paths, destination, owner_handle, TransferKind::Move)
 }
 
 /// Copy files/folders through Explorer's `IFileOperation` engine.
@@ -191,7 +214,28 @@ pub(crate) fn native_copy_files(
     destination: String,
     owner_handle: isize,
 ) -> Result<NativeMoveResult, String> {
-    native_transfer_files(paths, destination, owner_handle, false)
+    native_transfer_files(paths, destination, owner_handle, TransferKind::Copy)
+}
+
+/// Delete through the same engine, for the same reason.
+///
+/// [`recycle_path`](crate::recycle) is the quiet, one-at-a-time route a
+/// background job wants. A person deleting a selection wants what Explorer
+/// gives them: one operation for the lot, a progress dialog when it is slow
+/// enough to need one, the "are you sure" for a permanent delete, and an undo
+/// entry afterwards.
+#[cfg(windows)]
+pub(crate) fn native_delete_files(
+    paths: Vec<String>,
+    owner_handle: isize,
+    permanent: bool,
+) -> Result<NativeMoveResult, String> {
+    native_transfer_files(
+        paths,
+        String::new(),
+        owner_handle,
+        TransferKind::Delete { permanent },
+    )
 }
 
 #[cfg(windows)]
@@ -199,7 +243,7 @@ fn native_transfer_files(
     paths: Vec<String>,
     destination: String,
     owner_handle: isize,
-    move_items: bool,
+    kind: TransferKind,
 ) -> Result<NativeMoveResult, String> {
     use std::ffi::c_void;
     use std::iter::once;
@@ -422,30 +466,36 @@ fn native_transfer_files(
     if owner.is_invalid() {
         return Err("The FileTree window is unavailable".to_string());
     }
+    let deleting = matches!(kind, TransferKind::Delete { .. });
     let destination_path = Path::new(&destination);
-    if !destination_path.is_dir() {
+    if !deleting && !destination_path.is_dir() {
         return Err(format!("Destination is not a folder: {destination}"));
     }
 
     let _ole = OleGuard(unsafe { OleInitialize(None) }.is_ok());
-    let destination_item = shell_item(destination_path)
-        .map_err(|error| format!("Windows could not open the destination: {error}"))?;
-    let operation_name = if move_items { "move" } else { "copy" };
+    let destination_item = if deleting {
+        None
+    } else {
+        Some(
+            shell_item(destination_path)
+                .map_err(|error| format!("Windows could not open the destination: {error}"))?,
+        )
+    };
+    let operation_name = kind.name();
     let operation: IFileOperation =
         unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }
             .map_err(|error| format!("Windows could not start the {operation_name}: {error}"))?;
     unsafe { operation.SetOwnerWindow(owner) }.map_err(|error| {
         format!("Windows could not attach the {operation_name} dialog: {error}")
     })?;
-    let flags = FILEOPERATION_FLAGS(
-        FOF_ALLOWUNDO.0
-            | FOF_NOCONFIRMMKDIR.0
-            | FOF_WANTNUKEWARNING.0
-            | FOFX_ADDUNDORECORD.0
-            | FOFX_RECYCLEONDELETE.0
-            | FOFX_SHOWELEVATIONPROMPT.0,
-    );
-    unsafe { operation.SetOperationFlags(flags) }
+    // A permanent delete keeps neither the Recycle Bin nor an undo entry —
+    // asking for either would quietly turn it back into a recycle.
+    let permanent = matches!(kind, TransferKind::Delete { permanent: true });
+    let mut bits = FOF_NOCONFIRMMKDIR.0 | FOF_WANTNUKEWARNING.0 | FOFX_SHOWELEVATIONPROMPT.0;
+    if !permanent {
+        bits |= FOF_ALLOWUNDO.0 | FOFX_ADDUNDORECORD.0 | FOFX_RECYCLEONDELETE.0;
+    }
+    unsafe { operation.SetOperationFlags(FILEOPERATION_FLAGS(bits)) }
         .map_err(|error| format!("Windows could not configure the {operation_name}: {error}"))?;
 
     let mut result = NativeMoveResult::default();
@@ -460,14 +510,22 @@ fn native_transfer_files(
             result.failed += 1;
             continue;
         }
-        let target = destination_path.join(name);
-        if path_key(source) == path_key(&target) {
-            result.skipped += 1;
-            continue;
-        }
-        if source.is_dir() && within(destination_path, source) {
-            result.failed += 1;
-            continue;
+        // A delete has no destination; the item's own path stands in as the
+        // "target" so the completion checks below read the same either way.
+        let target = if deleting {
+            source.to_path_buf()
+        } else {
+            destination_path.join(name)
+        };
+        if !deleting {
+            if path_key(source) == path_key(&target) {
+                result.skipped += 1;
+                continue;
+            }
+            if source.is_dir() && within(destination_path, source) {
+                result.failed += 1;
+                continue;
+            }
         }
         let source_item = match shell_item(source) {
             Ok(item) => item,
@@ -483,20 +541,14 @@ fn native_transfer_files(
         }
         .into();
         let queued_item = unsafe {
-            if move_items {
-                operation.MoveItem(
-                    &source_item,
-                    &destination_item,
-                    PCWSTR::null(),
-                    Some(&progress_sink),
-                )
-            } else {
-                operation.CopyItem(
-                    &source_item,
-                    &destination_item,
-                    PCWSTR::null(),
-                    Some(&progress_sink),
-                )
+            match (kind, destination_item.as_ref()) {
+                (TransferKind::Move, Some(into)) => {
+                    operation.MoveItem(&source_item, into, PCWSTR::null(), Some(&progress_sink))
+                }
+                (TransferKind::Copy, Some(into)) => {
+                    operation.CopyItem(&source_item, into, PCWSTR::null(), Some(&progress_sink))
+                }
+                _ => operation.DeleteItem(&source_item, Some(&progress_sink)),
             }
         };
         if queued_item.is_err() {
@@ -540,10 +592,11 @@ fn native_transfer_files(
         // extension omits the callback, never infer completion from a partial
         // destination left by a canceled operation or from a pre-existing
         // overwrite target.
+        let gone = std::fs::symlink_metadata(&source).is_err();
         if result.aborted {
             result.skipped += 1;
-        } else if (move_items && std::fs::symlink_metadata(&source).is_err())
-            || (perform_error.is_none() && !target_existed && target.exists())
+        } else if (matches!(kind, TransferKind::Move | TransferKind::Delete { .. }) && gone)
+            || (!deleting && perform_error.is_none() && !target_existed && target.exists())
         {
             result.moved += 1;
         } else {
@@ -577,6 +630,15 @@ pub(crate) fn native_copy_files(
     _owner_handle: isize,
 ) -> Result<NativeMoveResult, String> {
     Err("Native file copies are only available on Windows".to_string())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn native_delete_files(
+    _paths: Vec<String>,
+    _owner_handle: isize,
+    _permanent: bool,
+) -> Result<NativeMoveResult, String> {
+    Err("Native file deletes are only available on Windows".to_string())
 }
 
 #[cfg(windows)]
@@ -1519,7 +1581,11 @@ fn shell_image_png(path: &str, size: i32, kind: ShellImage) -> Option<Vec<u8>> {
     {
         return Some(hit);
     }
-    let _permit = acquire_thumbnail_permit();
+    // Thumbnails are throttled because extracting one can mean decoding a
+    // video frame, and a folder of them would otherwise swamp the shell. An
+    // icon is a lookup, not a decode: gating those behind the same two permits
+    // serialized a whole folder's worth of them for no benefit.
+    let _permit = (kind != ShellImage::IconOnly).then(acquire_thumbnail_permit);
     let image = render_shell_thumbnail_png(path, size, kind)?;
     thumbnail_cache()
         .lock()
