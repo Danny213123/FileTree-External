@@ -1594,11 +1594,29 @@ fn shell_image_png(path: &str, size: i32, kind: ShellImage) -> Option<Vec<u8>> {
     Some(image)
 }
 
+/// How many thumbnails may be extracted at once.
+///
+/// Extracting one can mean decoding a video frame, so this is a real limit and
+/// not a formality. Two was the old fixed value and it left a folder of videos
+/// filling in a pair at a time on any machine; most of each extraction is
+/// spent waiting on the shell rather than on this process's CPU, so a few more
+/// in flight fills the screen sooner without swamping anything.
+#[cfg(windows)]
+fn thumbnail_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|value| (value.get() / 2).clamp(2, 6))
+            .unwrap_or(2)
+    })
+}
+
 #[cfg(windows)]
 fn acquire_thumbnail_permit() -> ThumbnailPermit {
+    let limit = thumbnail_limit();
     let (active, wake) = thumbnail_gate();
     let mut count = active.lock().unwrap_or_else(|error| error.into_inner());
-    while *count >= 2 {
+    while *count >= limit {
         count = wake.wait(count).unwrap_or_else(|error| error.into_inner());
     }
     *count += 1;
