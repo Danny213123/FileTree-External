@@ -295,12 +295,21 @@ pub fn shell_path_icon_data_url(path: &str) -> Option<String> {
 /// ask for that many.
 pub fn shell_item_icon_data_url(path: &str, size: i32) -> Option<String> {
     use base64::Engine as _;
-    windows_native::shell_item_icon_png(path, size).map(|png| {
-        format!(
-            "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(png)
-        )
-    })
+    // The shell has more than one way to hand over a picture and none of them
+    // answers for everything: the image factory declines for some drives and
+    // some known folders — and declines more often inside a windowed process
+    // than a console one — while SHGetFileInfo answers for almost anything but
+    // only ever draws 16 pixels. Ask in order of quality and take the first
+    // that replies, rather than showing an empty box.
+    windows_native::shell_item_icon_png(path, size)
+        .or_else(|| windows_native::shell_thumbnail_png(path, size, true))
+        .or_else(|| windows_native::shell_path_icon_png(path))
+        .map(|png| {
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png)
+            )
+        })
 }
 
 pub fn shell_thumbnail_data_url(path: &str, size: i32, icon_fallback: bool) -> Option<String> {
@@ -443,6 +452,29 @@ mod shell_icon_tests {
             super::shell_path_icon_data_url("Z:\\definitely\\not\\here\\12345"),
             None
         );
+    }
+
+    #[test]
+    fn every_drive_and_known_folder_has_an_icon() {
+        // The image factory declines for some of these — and declines more
+        // often inside a windowed process than under `cargo test`, which is
+        // how a Home page full of empty boxes got shipped. The fallback chain
+        // is what makes the answer reliable, so assert on the whole chain.
+        let mut places = vec!["C:\\".to_string()];
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            for known in ["Desktop", "Documents", "Downloads"] {
+                let path = std::path::Path::new(&home).join(known);
+                if path.is_dir() {
+                    places.push(path.to_string_lossy().into_owned());
+                }
+            }
+        }
+        for place in places {
+            assert!(
+                super::shell_item_icon_data_url(&place, 96).is_some(),
+                "no icon for {place}"
+            );
+        }
     }
 
     #[test]
