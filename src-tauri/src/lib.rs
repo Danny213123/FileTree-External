@@ -2904,6 +2904,12 @@ async fn open_folder_app(path: String, exe: String) -> Result<bool, String> {
         }
         tools::command(app)
             .arg(target)
+            // A child inherits this process's whole environment, and FileTree
+            // sets WebView2 browser arguments on itself to keep its compositor
+            // in software. The explorer is a WebView2 app too, and it comes up
+            // with no window at all when it inherits them — whatever the value
+            // is, which is why this clears the variable rather than fixing it.
+            .env_remove("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
             .spawn()
             .map_err(|error| format!("Could not start {}: {error}", app.display()))?;
         Ok(true)
