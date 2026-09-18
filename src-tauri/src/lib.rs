@@ -3213,6 +3213,62 @@ fn compression_subscribe(
     })
 }
 
+/// Give the window the large icon the taskbar draws.
+///
+/// A window carries two icons, small and large. Tauri sets only the small one,
+/// so Windows has nothing to put on the taskbar button and falls back to the
+/// shell's cached icon for the executable. That cache is stale far more often
+/// than it is current, which is why the taskbar could show the icon this app
+/// shipped with months ago — and only sometimes, depending on what the cache
+/// happened to hold.
+///
+/// The icon comes from this executable's own resource, so it is always the one
+/// that was bundled and there is no second copy to keep in step.
+#[cfg(windows)]
+fn set_taskbar_icon(window: &tauri::WebviewWindow) {
+    const IMAGE_ICON: u32 = 1;
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
+    /// The resource id Windows gives an application's icon group.
+    const IDI_APPLICATION: usize = 32512;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn LoadImageW(
+            instance: isize,
+            name: *const u16,
+            kind: u32,
+            cx: i32,
+            cy: i32,
+            load: u32,
+        ) -> isize;
+        fn SendMessageW(window: isize, message: u32, wparam: usize, lparam: isize) -> isize;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> isize;
+    }
+
+    let Ok(handle) = window.hwnd() else { return };
+    let hwnd = handle.0 as isize;
+    unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        // MAKEINTRESOURCE: the id is passed in place of a name pointer.
+        let name = IDI_APPLICATION as *const u16;
+        // 256 is the largest Windows asks for; 32 is what a title bar uses.
+        for (kind, size) in [(ICON_BIG, 256), (ICON_SMALL, 32)] {
+            let icon = LoadImageW(module, name, IMAGE_ICON, size, size, 0);
+            if icon != 0 {
+                SendMessageW(hwnd, WM_SETICON, kind, icon);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn set_taskbar_icon(_window: &tauri::WebviewWindow) {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // The demo build must never touch the user's FileTree data. Every store,
@@ -3241,6 +3297,13 @@ pub fn run() {
     let store = V2Store::open_default().expect("initialize FileTree v2 state");
     let runtime = DesktopRuntime::new(Arc::clone(&store));
     let app = tauri::Builder::default()
+        .setup(|app| {
+            use tauri::Manager as _;
+            if let Some(window) = app.get_webview_window("main") {
+                set_taskbar_icon(&window);
+            }
+            Ok(())
+        })
         .manage(store)
         .manage(runtime)
         .manage(FsWatchRegistry::default())
