@@ -3,6 +3,7 @@ import type { NodeRecord, SortKey, Metric, Unit } from "../api/types";
 import { type FilterRule, type CompiledRule, compileRules, applyCompiledRules } from "./useFilterRules";
 import { attributeLetters } from "../lib/attributes";
 import { fetchChildren, ScanStaleError } from "../api/client";
+import { CHILD_FETCH_LIMIT } from "../lib/treeLimits";
 
 // ── Quick-filter chips ───────────────────────────────────────────────────────
 // Toolbar toggle chips that each contribute a predicate ANDed onto the active
@@ -114,6 +115,9 @@ export interface LazyOptions {
   /** Called when the backend reports the cached scan changed (409) — the host
    *  should refetch the scan. */
   onStale?: () => void;
+  /** Called when a directory holds more children than one expansion may pull,
+   *  so the host can say so rather than letting rows go missing in silence. */
+  onTruncated?: (info: { path: string; loaded: number }) => void;
 }
 
 // SQLite scan ids are ordinary sequential integers. Watcher-created entries are
@@ -297,13 +301,17 @@ function buildDirCache(
 // so without a bound a huge tree could materialise hundreds of thousands of rows
 // — the very freeze the bundle system avoids in the normal (unfiltered) view.
 const FILTER_ROW_CAP = 5000;
-// Keep the ordinary page cache at sixteen 500-row pages, then reserve the same
-// bounded amount for rows beneath folders the user actively expands. Without
-// this reserve, one wide directory (for example Downloads with ~8,000 direct
-// children) fills the cache and every later expansion is silently admitted as
-// zero rows.
-const MAX_CACHED_LAZY_NODES = 16 * 500;
-const MAX_ACTIVE_LAZY_NODES = 16 * 500;
+// A page cache for browsing, plus the same again reserved for rows beneath
+// folders the user actively expands. Without that reserve, one wide directory
+// fills the cache and every later expansion is silently admitted as zero rows.
+//
+// Both are sized from what a single expansion may fetch, so a folder that fits
+// under the fetch limit always fits in the store too. They used to be 8,000
+// each while the fetch also stopped at 8,000: a directory of that size filled
+// the whole active reserve by itself, and a download folder of twelve thousand
+// could never be shown whole however the user sorted it.
+const MAX_CACHED_LAZY_NODES = CHILD_FETCH_LIMIT;
+const MAX_ACTIVE_LAZY_NODES = CHILD_FETCH_LIMIT;
 const MAX_RETAINED_LAZY_NODES = MAX_CACHED_LAZY_NODES + MAX_ACTIVE_LAZY_NODES;
 
 /** Single source of truth for folder and synthetic file-bundle twisties. */
@@ -463,6 +471,13 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
   selectedIdRef.current = selectedId;
   const [sortKey, setSortKeyState] = useState<SortKey>("size");
   const [sortDir, setSortDir] = useState<1 | -1>(-1);
+  // Read by `ensureChildren`, which is a stable callback: a wide directory is
+  // fetched in the order the user is looking at, so the rows that arrive are
+  // the ones at the top of their list rather than the biggest by default.
+  const sortKeyRef = useRef(sortKey);
+  sortKeyRef.current = sortKey;
+  const sortDirRef = useRef(sortDir);
+  sortDirRef.current = sortDir;
   const [filter, setFilter] = useState("");
   const [filterRules, setFilterRules] = useState<FilterRule[]>([]);
   const [chips, setChips] = useState<Set<ChipKey>>(new Set());
@@ -616,7 +631,17 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       return;
     }
 
-    void fetchChildren({ rootPath: lz.rootPath, scanId: lz.scanId, dirId, scannedAt: lz.scannedAt })
+    void fetchChildren({
+      rootPath: lz.rootPath,
+      scanId: lz.scanId,
+      dirId,
+      scannedAt: lz.scannedAt,
+      sort: sortKeyRef.current,
+      dir: sortDirRef.current === 1 ? "asc" : "desc",
+      onTruncated: (loaded) => {
+        lazyRef.current?.onTruncated?.({ path: directory.path, loaded });
+      },
+    })
       .then((fetched) => {
         const current = lazyRef.current;
         if (!current?.enabled
@@ -683,9 +708,18 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
           // arrive from SQLite under its stable database id, so id-only merging
           // produces two visible rows. Treat a normalized Windows path as the
           // child identity and also repair duplicate references already present.
+          //
+          // Scoped to this directory's own children, deliberately. Searching the
+          // whole tree by path adopts whatever else happens to share the key —
+          // and paths are not reliably unique here, because a file whose parent
+          // row is missing from the query's join is reported under a bare
+          // filename. Two same-named files in different folders would then make
+          // one directory claim the other's row. Within a single directory the
+          // key cannot collide at all: a folder cannot hold two entries of the
+          // same name.
           const retainedPathIds = new Map<string, number>();
           for (const node of retained) {
-            if (!node.path) continue;
+            if (!node.path || node.parent !== dirId) continue;
             const key = normalizedNodePath(node.path);
             if (!retainedPathIds.has(key)) retainedPathIds.set(key, node.id);
           }
@@ -917,6 +951,20 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       const targetNode = oldByPath.get(normalizedNodePath(changedPath));
       if (!targetNode) return prevNodes; // not in tree, ignore
 
+      // Matching an incoming entry against the *whole* tree by path is not safe:
+      // a match here keeps the matched node's entire subtree (see below), so one
+      // duplicate key grafts a foreign folder's contents under this one. Paths
+      // are not reliably unique — a file whose parent row is missing from the
+      // scan query's join is reported under a bare filename — so match only
+      // against this directory's own children, where a name cannot repeat.
+      const oldById = new Map<number, NodeRecord>();
+      for (const n of prevNodes) oldById.set(n.id, n);
+      const oldChildByPath = new Map<string, NodeRecord>();
+      for (const childId of targetNode.children) {
+        const child = oldById.get(childId);
+        if (child?.path) oldChildByPath.set(normalizedNodePath(child.path), child);
+      }
+
       const miniById = new Map<number, NodeRecord>();
       for (const n of newNodes) miniById.set(n.id, n);
       const miniRoot = miniById.get(0);
@@ -944,7 +992,7 @@ export function useTreeState(lazy?: LazyOptions): UseTreeStateReturn {
       for (const childId of miniRoot.children) {
         const child = miniById.get(childId);
         if (!child) continue;
-        const old = child.path ? oldByPath.get(normalizedNodePath(child.path)) : undefined;
+        const old = child.path ? oldChildByPath.get(normalizedNodePath(child.path)) : undefined;
         if (child.dir && old && old.dir) {
           // Existing subfolder: keep its old subtree (id, size, descendants).
           preservedDirPaths.push(normalizedNodePath(old.path));

@@ -1,3 +1,4 @@
+import { CHILD_FETCH_LIMIT, CHILD_PAGE_SIZE } from "../lib/treeLimits";
 import type {
   NodeRecord,
   ScanResult,
@@ -247,26 +248,36 @@ export async function fetchChildren(opts: {
   sort?: string;
   dir?: "asc" | "desc";
   signal?: AbortSignal;
+  /**
+   * Called when the directory holds more than one expansion may pull.
+   *
+   * Stopping here used to be silent, which made a wide folder look like it had
+   * simply lost children — and which of them went missing depended on the sort
+   * the *fetch* used, not the sort on screen, so it came and went as the user
+   * re-sorted. A caller that cannot say so should at least know.
+   */
+  onTruncated?: (loaded: number) => void;
 }): Promise<NodeRecord[]> {
   if (isTauriV2() && opts.scanId) {
     const out: NodeRecord[] = [];
     let offset = 0;
-    // A single expansion is capped at the same sixteen pages as the renderer
-    // LRU. Very wide folders remain bounded instead of recreating a giant map.
-    for (let pageIndex = 0; pageIndex < 16; pageIndex++) {
+    const maxPages = Math.ceil(CHILD_FETCH_LIMIT / CHILD_PAGE_SIZE);
+    for (let pageIndex = 0; pageIndex < maxPages; pageIndex++) {
       if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
       const page = await scanPage({
         scanId: opts.scanId,
         parentId: opts.dirId,
         offset,
-        limit: 500,
+        limit: CHILD_PAGE_SIZE,
         sort: opts.sort,
         direction: opts.dir,
       });
       out.push(...page.items.map(toNodeRecord));
       offset += page.items.length;
-      if (!page.hasMore || page.items.length === 0) break;
+      if (!page.hasMore || page.items.length === 0) return out;
     }
+    // Every page came back full and the last one still reported more.
+    opts.onTruncated?.(out.length);
     return out;
   }
   const out: NodeRecord[] = [];

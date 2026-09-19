@@ -130,6 +130,47 @@ describe("useTreeState watcher patches", () => {
     });
   });
 
+  it("never adopts a same-named folder from elsewhere in the tree", async () => {
+    // A watcher patch matches incoming entries against what it already has, and
+    // a match keeps the matched node's whole subtree. Matching across the whole
+    // tree by path meant one duplicate key grafted a foreign folder's contents
+    // under this one — folders from unrelated places appearing spliced together.
+    const lazy: LazyOptions = {
+      enabled: true, rootPath: "E:\\", scannedAt: 1, scanId: "scan-1",
+    };
+    const { result } = renderHook(() => useTreeState(lazy));
+
+    // Two folders in different places that normalize to the same path key, as
+    // happens when the scan query reports an entry under a bare name.
+    const elsewhere = node({
+      id: 20, parent: 0, name: "Shared", path: "Shared", depth: 1, children: [21],
+    });
+    const foreignChild = node({
+      id: 21, parent: 20, name: "not-mine.mp4", path: "Shared\\not-mine.mp4",
+      dir: false, depth: 2, size: 999, files: 1,
+    });
+    const host = node({ id: 30, parent: 0, name: "Host", path: "E:\\Host", depth: 1, children: [] });
+
+    act(() => result.current.setNodes([
+      node({ children: [20, 30] }), elsewhere, foreignChild, host,
+    ]));
+
+    // "Host" gains a subfolder whose reported path collides with `elsewhere`.
+    act(() => result.current.patchDirectory("e:\\Host", [
+      node({ path: "e:\\Host", name: "Host", children: [1] }),
+      node({ id: 1, parent: 0, path: "Shared", name: "Shared", depth: 1 }),
+    ]));
+
+    await waitFor(() => {
+      expect(result.current.nodeById.get(30)?.children.length).toBe(1);
+    });
+    const adopted = result.current.nodeById.get(30)!.children[0];
+    expect(adopted).not.toBe(20);
+    // And the unrelated folder keeps its own child rather than losing it.
+    expect(result.current.nodeById.get(20)?.children).toEqual([21]);
+    expect(result.current.nodeById.get(adopted)?.children ?? []).toEqual([]);
+  });
+
   it("preserves an existing file id and selection across watcher metadata updates", async () => {
     const lazy: LazyOptions = {
       enabled: true,

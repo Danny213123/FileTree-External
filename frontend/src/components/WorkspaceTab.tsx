@@ -422,6 +422,19 @@ const WorkspaceTabInner = forwardRef<WorkspaceTabHandle, WorkspaceTabProps>(func
       scanId: data.scanId,
       loadDirectory: isTauriV2() ? fetchV2DirectorySnapshot : undefined,
       onStale: () => onStaleRef.current(),
+      // A folder too wide to hold in one expansion has to say so. It used to
+      // stop silently, so the missing rows looked like a display fault — and
+      // because the fetch had its own sort, re-sorting changed which children
+      // were absent, which made it look like one folder's contents leaking
+      // into another's.
+      onTruncated: ({ path, loaded }) => {
+        const name = path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
+        toast.info(
+          `"${name}" has more than ${loaded.toLocaleString()} items. `
+          + "Showing the first " + loaded.toLocaleString()
+          + " in the current sort order; sort differently to see other entries.",
+        );
+      },
     };
   }, [data?.lazy, data?.rootPath, data?.scannedAt, data?.scanId]);
   const tree = useTreeState(lazyOptions);
