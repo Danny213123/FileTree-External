@@ -12,6 +12,26 @@ This file is rendered inside the app under **Help → What's New**.
 
 ## [2.0.0-alpha.2] - Unreleased
 
+### 2026-09-18
+
+#### Added
+
+- FileTree has its own icon: a treemap, which is what the app draws. It replaces the stock Tauri icon both apps shipped with — the same green dot, byte for byte, so nothing in a taskbar told them apart. The mark is drawn by `scripts/make-icon.ps1` rather than checked in as a binary nobody can edit, and the title bar now shows it instead of a generic folder.
+- FileTree publishes its appearance — accent, font, text size, scale, density and reduced motion — to `%APPDATA%\FileTree\appearance.json` whenever one changes, so **FileTree Explorer** can look the same. These settings live in this webview's own storage, which a separate app cannot read. Written whole and renamed into place, so a reader never catches a half-written file, and a slider drag coalesces into one write.
+- `shell_item_icon_data_url`, which renders a shell icon at the size it will be drawn at rather than at a fixed 16 pixels — stretching 16 into the 24 device pixels a 150% display asks for is visible blurriness.
+- `delete_items_with_windows`, so a selection can be deleted through the same `IFileOperation` engine move and copy use: one operation for the lot, a progress window when it is slow enough to need one, the confirmation for a permanent delete, and an undo entry afterwards.
+- `extract_archive_with_progress`, so a caller unpacking a zip can draw a progress bar — the one file operation Windows has no dialog of its own for.
+
+#### Fixed
+
+- Double-clicking a folder appeared to do nothing when "open folders in FileTree Explorer" was on. FileTree sets WebView2 browser arguments on itself to keep its compositor in software, a child process inherits the whole environment, and the explorer — also a WebView2 app — came up with no window at all. Any value does it, so the variable is cleared for the child rather than tuned.
+- The taskbar could show a months-old icon, and only sometimes. A window carries a small icon and a large one; Tauri sets only the small one, so Windows had nothing for the taskbar button and fell back to the shell's icon cache, which is stale far more often than it is current. Both are now set from the executable's own icon resource.
+- A shell icon that the image factory declines to draw — which it does for several drives and known folders, and more often inside a windowed process than a console one — now falls back to the thumbnail API and then to `SHGetFileInfo`, instead of leaving an empty box.
+
+#### Changed
+
+- Icon renders are no longer queued behind the thumbnail limit. Extracting a thumbnail can mean decoding a video frame, so a limit is right; an icon is a lookup, and gating those behind the same two permits serialised a whole folder of them for no benefit. The thumbnail limit itself now follows the machine — half its threads, between two and six — where it was fixed at two.
+
 ### 2026-09-15
 
 #### Added
