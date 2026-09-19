@@ -7327,6 +7327,20 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
   animation: ft-shimmer 1.4s ease infinite;
 }
 .skeleton-size { width: 64px; flex: 0 0 auto; }
+/* The card has to fit the pane it is centred in. In a split view one pane can
+   be a couple of hundred pixels wide, and a card built around a fixed 260px
+   progress track simply overflowed and was clipped by the window edge — the
+   count and the Cancel button went with it. Everything below shrinks. */
+.scan-overlay { padding: 12px; box-sizing: border-box; }
+.scan-overlay-card {
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.scan-overlay-card .df-progress-track { width: 100%; max-width: 260px; }
+.scan-overlay-title,
+.scan-overlay-count { max-width: 100%; text-align: center; overflow-wrap: anywhere; }
+
 .scan-overlay-card {
   position: relative;
   z-index: 1;
@@ -7334,7 +7348,7 @@ code.md-path:hover { border-color: var(--vsc-focus); text-decoration: none; }
   flex-direction: column;
   align-items: center;
   gap: 8px;
-  padding: 22px 28px;
+  padding: 22px clamp(12px, 8%, 28px);
   background: var(--surface);
   border: 1px solid var(--vsc-border);
   border-radius: var(--radius);
