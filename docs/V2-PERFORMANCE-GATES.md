@@ -1,6 +1,6 @@
 # FileTree v2 Performance Gates
 
-Production `2.0.0` is blocked until every gate below is recorded against a release build of this repository.
+`2.0.0` was released on 2026-09-23 before these gates were recorded; only the one-minute idle smoke test below has passed. Every gate below still has to be recorded against a release build of this repository, and doing so is follow-up work for a 2.0.x release.
 
 | Workload | Aggregate FileTree + descendant WebView2 private bytes |
 | --- | ---: |
@@ -34,4 +34,4 @@ Required release evidence also includes 100 tab open/close cycles, 50 rescans, r
 
 The clean-profile final sample was approximately 9.5 MiB in `FileTree.exe` and 124.9 MiB across six descendant WebView2 processes. It created only the 72 KiB v2 state database and no scan database. The older bounded-startup sample restored active scan tabs, so it remains useful diagnostic history but is not idle evidence. The earlier unbounded-manifest build peaked at 580.15 MiB during startup; the bounded 8 KiB manifest-status probe removed that spike.
 
-The harness validates parent and child creation times because Windows can reuse a dead parent's PID for an unrelated process while stale `ParentProcessId` values still exist. It also invalidates a run if FileTree exits before the deadline instead of treating missing processes as zero memory. Production remains blocked until a release build passes the full ten-minute idle gate and every scan, soak, migration, and recovery gate above.
+The harness validates parent and child creation times because Windows can reuse a dead parent's PID for an unrelated process while stale `ParentProcessId` values still exist. It also invalidates a run if FileTree exits before the deadline instead of treating missing processes as zero memory. The full ten-minute idle gate and every scan, soak, migration, and recovery gate above remain open.

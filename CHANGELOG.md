@@ -10,7 +10,30 @@ groups are folded into release notes when the version ships.
 
 This file is rendered inside the app under **Help → What's New**.
 
-## [2.0.0-alpha.2] - Unreleased
+## [2.0.0] - 2026-09-23
+
+The first stable release of FileTree 2, the Tauri 2 rewrite. It takes in both alpha builds: the dated notes below were logged as `2.0.0-alpha.2`, and the rewrite itself is described under `2.0.0-alpha.1`.
+
+**Known gap:** 2.0.0 ships before the memory and soak gates in `docs/V2-PERFORMANCE-GATES.md` have been recorded against a release build. Only a one-minute clean-profile idle smoke test has passed. Running the full gates is follow-up work for a 2.0.x release.
+
+### 2026-09-23
+
+#### Added
+
+- **Cyberdrop side-load compression** has the Compress page's options. It already had a preset and what to do with originals; it now also has the **Custom** preset with **Resolution** and a **Quality** slider, plus **Codec**, **Encoder**, **Parallel files**, **Zip level**, **Minimum size** and **Add [COMPRESSED] tag**. Resolution and Quality show the chosen preset's values, and changing either switches to Custom, as on the Compress page. Every batch sent to the compression queue carries all of them, and the workspace rejects anything the Compress page would not allow.
+- Side-load can **delete originals permanently**. It applies unattended to every later download run and cannot be undone, so choosing it asks for confirmation first, and the Originals field stays red while it is on. Each original is still removed only after its compressed copy passes verification.
+- **Auto-save** for Cyberdrop URL workstations: a save follows a pause in typing and switching to another app. Saves run in the background, so the caret, the scroll position and anything typed during the save are kept. Loading a workstation for download is still a separate, explicit step.
+
+#### Changed
+
+- The Cyberdrop editor works like a tabbed editor. A **+** at the end of the file tabs creates a workstation and a folder icon opens a URL file, in place of two toolbar buttons. The toolbar splits into what is being edited (workstation, rename, document) on the left and actions on the right, with **Load for download** as the main one. The workstation list shows its name first.
+- The Cyberdrop editor no longer warns that changes are not loaded for download yet. An unchanged loaded workstation shows **Loaded for download**, and the version picker is labelled **History**.
+- With no workstation open, the editor offers **Create workstation** and **Open URL file…** instead of a line of text.
+
+#### Fixed
+
+- Changing a Cyberdrop setting made the whole form flash. Every change disabled all the controls until its save finished; side-load options and the compression mode now update at once and save behind the form, and quick successive changes, such as dragging a slider, are saved together. Controls throughout the Cyberdrop view only look disabled once an action has taken more than a quarter of a second, and a new compression-mode section fades in.
+- `build-portable.bat` closed instantly on failure, taking the error with it. It now stays open and shows the exit code. The usual failure was an empty `dist-portable\FileTree` that another window or terminal held open; the build now clears the folder's contents and reuses it, and names the likely cause when a file inside is locked.
 
 ### 2026-09-18
 
@@ -116,7 +139,7 @@ This file is rendered inside the app under **Help → What's New**.
 - Fixed v2 file interactions and thumbnail stalls, opening paged files on double-click, duplicate drag moves, and cross-tab refresh after a move.
 - Removed inline file icons from rows while preserving hover previews.
 
-## [2.0.0-alpha.1] - Unreleased
+## [2.0.0-alpha.1] - Pre-release
 
 ### Changed
 

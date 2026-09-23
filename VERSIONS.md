@@ -8,8 +8,9 @@ Current version: **2.0.0** (`VERSION`, `Cargo.toml`, `src-tauri/tauri.conf.json`
 
 | Version | Date | Summary |
 | --- | --- | --- |
-| 2.0.0-alpha.2 | Unreleased | Compression Pause all/Stop all, preserved file dates, appearance editor, its own icon, appearance shared with FileTree Explorer |
-| 2.0.0-alpha.1 | Unreleased | Electron → Tauri 2 rewrite, per-scan SQLite, paged rendering, memory budgets |
+| 2.0.0 | 2026-09-23 | First stable FileTree 2: the Tauri rewrite and both alphas, plus Cyberdrop side-load options and a reworked URL editor (memory gates still open) |
+| 2.0.0-alpha.2 | Pre-release | Compression Pause all/Stop all, preserved file dates, appearance editor, its own icon, appearance shared with FileTree Explorer |
+| 2.0.0-alpha.1 | Pre-release | Electron → Tauri 2 rewrite, per-scan SQLite, paged rendering, memory budgets |
 | 1.14.7 | 2026-08-24 | Persist no-gain compression skips across presets and encoders |
 | 1.14.6 | 2026-08-24 | Skip partial downloads; ZIP64 for files over 4 GiB |
 | 1.14.5 | 2026-08-24 | Prevent renderer black screen on very large compression runs |
