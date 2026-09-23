@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
-from cyberdrop_workspace import operate
+from cyberdrop_workspace import operate, SIDELOAD_DEFAULTS
 from cyberdrop_runner import install_completion_hook
 
 
@@ -80,13 +80,15 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(self.call("mode", mode=mode)["compressionMode"], mode)
 
     def test_sideload_settings_survive_mode_changes_and_are_validated(self):
-        self.assertEqual(self.call()["sideload"], {"preset": "balanced", "originalAction": "keep"})
-        self.assertEqual(self.call("sideload", settings={"preset": "high"})["sideload"],
-                         {"preset": "high", "originalAction": "keep"})
+        defaults = dict(SIDELOAD_DEFAULTS)
+        self.assertEqual(self.call()["sideload"], defaults)
+        self.assertEqual(self.call("sideload", settings={"preset": "high"})["sideload"], {**defaults, "preset": "high"})
         self.call("mode", mode="filetree")
-        self.assertEqual(self.call("sideload", settings={"originalAction": "recycle"})["sideload"],
-                         {"preset": "high", "originalAction": "recycle"})
-        for bad in ({"preset": "custom"}, {"originalAction": "delete"}, {"unknown": "x"}, "high"):
+        self.assertEqual(self.call("sideload", settings={"originalAction": "recycle", "codec": "h265", "customQuality": 30})["sideload"],
+                         {**defaults, "preset": "high", "originalAction": "recycle", "codec": "h265", "customQuality": 30})
+        self.assertEqual(self.call("sideload", settings={"originalAction": "delete"})["sideload"]["originalAction"], "delete")
+        for bad in ({"originalAction": "trash"}, {"unknown": "x"}, "high", {"concurrency": 3}, {"concurrency": True},
+                    {"tagFilename": 1}, {"customQuality": 50}, {"minSizeBytes": 7}, {"encoder": "x264"}):
             with self.assertRaises(ValueError):
                 self.call("sideload", settings=bad)
 

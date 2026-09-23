@@ -485,10 +485,9 @@ pub(crate) async fn cyberdrop_start(
         let download_root = PathBuf::from(configured["settings"]["download_folder"].as_str().unwrap_or("downloads/cyberdrop-dl"));
         let download_root = if download_root.is_absolute() { download_root } else { Path::new(&repo).join(download_root) };
         run.download_root = Some(download_root.clone());
-        let sideload = json!({
-            "preset": view["sideload"]["preset"].as_str().unwrap_or("balanced"),
-            "originalAction": view["sideload"]["originalAction"].as_str().unwrap_or("keep"),
-        });
+        // The workspace validates every side-load field (the Compress page's
+        // options); missing fields fall back to the request's own defaults.
+        let sideload = if view["sideload"].is_object() { view["sideload"].clone() } else { json!({ "preset": "balanced", "originalAction": "keep" }) };
         if let Some(stdout) = child.stdout.take() { capture_downloads(stdout, Arc::clone(&run.logs), Arc::clone(&run.progress), runtime, exclude_paths.unwrap_or_default(), (mode == "filetree").then_some(download_root), sideload); }
         if let Some(stderr) = child.stderr.take() { capture(stderr, Arc::clone(&run.logs)); }
         run.started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();

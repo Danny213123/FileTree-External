@@ -2,7 +2,9 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("../api/client", () => ({ openPath: vi.fn(async () => {}) }));
+vi.mock("../lib/dialogs", async original => ({ ...await original<typeof import("../lib/dialogs")>(), confirmDialog: vi.fn(async () => true) }));
 import { invoke } from "@tauri-apps/api/core";
+import { confirmDialog } from "../lib/dialogs";
 import { openPath } from "../api/client";
 import { CyberdropView } from "./CyberdropView";
 import type { PluginDef } from "../lib/plugins";
@@ -91,6 +93,39 @@ describe("Cyberdrop workstations", () => {
     await waitFor(() => expect(api).toHaveBeenCalledWith("cyberdrop_workspace", expect.objectContaining({ request: { action: "sideload", settings: { originalAction: "recycle" } } })));
     expect(screen.getByLabelText("Side-load preset")).toHaveValue("high");
   });
+  it("asks before deleting side-load originals permanently", async () => {
+    await mount();
+    await waitFor(() => expect(screen.getByLabelText("Compression mode")).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("Compression mode"), { target: { value: "filetree" } });
+    const originals = await screen.findByLabelText("Side-load originals");
+    fireEvent.change(originals, { target: { value: "keep" } });
+    await waitFor(() => expect(api).toHaveBeenCalledWith("cyberdrop_workspace", expect.objectContaining({ request: { action: "sideload", settings: { originalAction: "keep" } } })));
+    vi.mocked(confirmDialog).mockResolvedValueOnce(false);
+    fireEvent.change(originals, { target: { value: "delete" } });
+    await waitFor(() => expect(confirmDialog).toHaveBeenCalledTimes(1));
+    expect(originals).toHaveValue("keep");
+    fireEvent.change(originals, { target: { value: "delete" } });
+    await waitFor(() => expect(api).toHaveBeenCalledWith("cyberdrop_workspace", expect.objectContaining({ request: { action: "sideload", settings: { originalAction: "delete" } } })));
+    expect(originals).toHaveValue("delete");
+  });
+  it("switches side-load to Custom and saves quick changes together", async () => {
+    await mount();
+    await waitFor(() => expect(screen.getByLabelText("Compression mode")).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("Compression mode"), { target: { value: "filetree" } });
+    // The panel's session cache can carry another test's preset; start from Balanced.
+    fireEvent.change(await screen.findByLabelText("Side-load preset"), { target: { value: "balanced" } });
+    await waitFor(() => expect(api).toHaveBeenCalledWith("cyberdrop_workspace", expect.objectContaining({ request: { action: "sideload", settings: { preset: "balanced" } } })));
+    api.mockClear();
+    const quality = screen.getByLabelText("Side-load quality");
+    expect(quality).toHaveValue("24");
+    fireEvent.change(quality, { target: { value: "30" } });
+    fireEvent.change(screen.getByLabelText("Side-load codec"), { target: { value: "h265" } });
+    // The form updates at once and stays usable while the save runs.
+    expect(screen.getByLabelText("Side-load preset")).toHaveValue("custom");
+    expect(screen.getByLabelText("Side-load codec")).toBeEnabled();
+    await waitFor(() => expect(api).toHaveBeenCalledWith("cyberdrop_workspace", expect.objectContaining({ request: { action: "sideload", settings: { preset: "custom", customQuality: 30, customMaxHeight: 1080, codec: "h265" } } })));
+    expect(api.mock.calls.filter(([, body]) => (body as { request?: { action?: string } })?.request?.action === "sideload")).toHaveLength(1);
+  });
   it("waits for an installation folder before connecting", () => {
     localStorage.removeItem("filetree.cyberdrop.repo");
     render(<CyberdropView plugin={{} as PluginDef} />);
@@ -132,4 +167,56 @@ describe("Cyberdrop live progress and editor tabs", () => {
     expect(screen.getByLabelText("Workstation editor")).toBeEnabled();
     expect(screen.getByRole("button", { name: "Rename" })).toBeEnabled();
   });
+});
+
+
+describe("uninterrupted URL editing", () => {
+  it("keeps focus, caret, scroll, and newer edits while saving", async () => {
+    await mount();
+    fireEvent.click(screen.getByRole("tab", { name: "Edit" }));
+    const editor = await screen.findByLabelText("Workstation editor") as HTMLTextAreaElement;
+    fireEvent.click(screen.getByRole("checkbox", { name: "Auto-save" }));
+    const previous = api.getMockImplementation()!;
+    let release!: () => void;
+    api.mockImplementation(async (command, args) => {
+      if (command === "cyberdrop_workspace" && (args as any).request.action === "save") await new Promise<void>(resolve => { release = resolve; });
+      return previous(command, args);
+    });
+    editor.focus();
+    fireEvent.change(editor, { target: { value: "first link\n" } });
+    editor.setSelectionRange(3, 3); editor.scrollTop = 100;
+    fireEvent.keyDown(editor, { key: "s", ctrlKey: true });
+    await waitFor(() => expect(release).toBeDefined());
+    expect(editor).toBeEnabled(); expect(editor).toHaveFocus();
+    expect(editor.selectionStart).toBe(3); expect(editor.scrollTop).toBe(100);
+    expect(screen.queryByText("Saved revision")).not.toBeInTheDocument();
+    fireEvent.change(editor, { target: { value: "first link\nsecond link\n" } });
+    release();
+    await waitFor(() => expect(screen.getByText("Unsaved")).toBeInTheDocument());
+    expect(editor.value).toBe("first link\nsecond link\n");
+    expect(editor).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+  });
+  it("saves on app switch without loading the download input or showing a banner", async () => {
+    await mount();
+    fireEvent.click(screen.getByRole("tab", { name: "Edit" }));
+    const editor = await screen.findByLabelText("Workstation editor");
+    fireEvent.change(editor, { target: { value: "https://example.com/copied\n" } });
+    fireEvent.blur(window);
+    await waitFor(() => expect(api).toHaveBeenCalledWith("cyberdrop_workspace", expect.objectContaining({ request: { action: "save", name: "URLs-A2B64", text: "https://example.com/copied\n" } })));
+    expect(api.mock.calls.some(([command, args]) => command === "cyberdrop_workspace" && (args as any).request.action === "stage")).toBe(false);
+    expect(screen.queryByText("Saved revision")).not.toBeInTheDocument();
+    expect(editor).toBeEnabled();
+  });
+});
+
+
+it("auto-saves pasted URLs after a pause in typing", async () => {
+  await mount();
+  fireEvent.click(screen.getByRole("tab", { name: "Edit" }));
+  const editor = await screen.findByLabelText("Workstation editor");
+  editor.focus();
+  fireEvent.change(editor, { target: { value: "https://example.com/idle-save\n" } });
+  await waitFor(() => expect(api).toHaveBeenCalledWith("cyberdrop_workspace", expect.objectContaining({ request: { action: "save", name: "URLs-A2B64", text: "https://example.com/idle-save\n" } })), { timeout: 2500 });
+  expect(editor).toHaveFocus();
 });

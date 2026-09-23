@@ -145,16 +145,35 @@ def initialize(root, base):
     write(marker, json.dumps({"created": stamp(), "base": str(base)}))
 
 
-# Side-load settings sent with each FileTree compression batch. Custom needs
-# per-job values, and permanent deletion is left to the Compress page.
-SIDELOAD_DEFAULTS = {"preset": "balanced", "originalAction": "keep"}
-SIDELOAD_CHOICES = {"preset": ("max", "more", "balanced", "high"), "originalAction": ("keep", "recycle")}
+# Side-load settings sent with each FileTree compression batch; they mirror the
+# Compress page's options. The compression job verifies each copy before it
+# disposes of the original, whichever originalAction is chosen.
+SIDELOAD_DEFAULTS = {"preset": "balanced", "originalAction": "keep", "tagFilename": True,
+                     "codec": "h264", "encoder": "auto", "concurrency": 2, "zipLevel": -1, "minSizeBytes": 0,
+                     "customMaxHeight": 1080, "customQuality": 26}
+SIDELOAD_CHOICES = {
+    "preset": ("max", "more", "balanced", "high", "custom"),
+    "originalAction": ("keep", "recycle", "delete"),
+    "tagFilename": (True, False),
+    "codec": ("h264", "h265", "av1"),
+    "encoder": ("auto", "nvenc", "qsv", "vce"),
+    "concurrency": (1, 2),
+    "zipLevel": tuple(range(-1, 10)),
+    "minSizeBytes": tuple(n * 1024 for n in (0, 256, 512, 1024, 2048, 5120, 10240, 25600, 51200, 102400)),
+    "customMaxHeight": (0, 480, 720, 1080, 1440),
+    "customQuality": tuple(range(16, 41)),
+}
+
+
+def sideload_valid(key, value):
+    # type() keeps True from passing as 1 and 1 from passing as True.
+    return key in SIDELOAD_CHOICES and type(value) is type(SIDELOAD_DEFAULTS[key]) and value in SIDELOAD_CHOICES[key]
 
 
 def preferences(root):
     prefs = json.loads((root / "preferences.json").read_text())
     saved = prefs.get("sideload") if isinstance(prefs.get("sideload"), dict) else {}
-    prefs["sideload"] = {key: saved[key] if saved.get(key) in SIDELOAD_CHOICES[key] else default
+    prefs["sideload"] = {key: saved[key] if sideload_valid(key, saved.get(key)) else default
                          for key, default in SIDELOAD_DEFAULTS.items()}
     return prefs
 
@@ -201,8 +220,7 @@ def operate(request):
         write(root / "preferences.json", json.dumps(prefs))
     elif action == "sideload":
         settings = request.get("settings")
-        if not isinstance(settings, dict) or any(key not in SIDELOAD_CHOICES or value not in SIDELOAD_CHOICES[key]
-                                                 for key, value in settings.items()):
+        if not isinstance(settings, dict) or not all(sideload_valid(key, value) for key, value in settings.items()):
             raise ValueError("Invalid side-load settings")
         prefs = preferences(root)
         prefs["sideload"].update(settings)

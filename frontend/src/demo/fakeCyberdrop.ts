@@ -22,7 +22,7 @@ const workspaceState = {
   sideload: { preset: "balanced", originalAction: "keep" },
 };
 
-export function workspace(request: { action: string; mode?: string; settings?: Record<string, string>; text?: string; name?: string; label?: string }) {
+export function workspace(request: { action: string; mode?: string; settings?: Record<string, string | number | boolean>; text?: string; name?: string; label?: string }) {
   if (request.action === "mode" && request.mode) workspaceState.compressionMode = request.mode;
   if (request.action === "sideload") workspaceState.sideload = { ...workspaceState.sideload, ...request.settings };
   if (request.action === "save" && request.text != null) workspaceState.text = request.text;
