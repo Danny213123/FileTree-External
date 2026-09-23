@@ -35,7 +35,21 @@ function Remove-PathSafe {
     throw "Refusing to remove $Label outside the v2 worktree: $resolved"
   }
   Write-Host "==> Removing stale $Label"
-  Remove-Item -LiteralPath $resolved -Recurse -Force
+  try {
+    Remove-Item -LiteralPath $resolved -Recurse -Force
+  } catch {
+    # An Explorer window or terminal open in the folder (or a program started
+    # from it) locks the folder itself, though not what is inside. Clear the
+    # contents instead; the empty folders left behind are reused below.
+    try {
+      Get-ChildItem -LiteralPath $resolved -Recurse -Force -File | Remove-Item -Force
+    } catch {
+      throw "Cannot clear $resolved ($($_.Exception.Message)). Close FileTree and any window or terminal open inside it, then run the build again."
+    }
+    Get-ChildItem -LiteralPath $resolved -Recurse -Force -Directory | Sort-Object { $_.FullName.Length } -Descending |
+      ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    Write-Host "    $resolved is open elsewhere; cleared its contents instead."
+  }
 }
 
 function Ensure-Dependencies {
